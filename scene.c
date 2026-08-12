@@ -612,6 +612,31 @@ GLuint scene_tex(const scene_t *s, const char *name)
 
 int scene_keep_rest(batch_t *b)
 {
+    /* Asking for a rest copy IS the declaration that this batch's vertices are
+       about to be rewritten every frame, so it cannot keep the static VBO
+       scene_load gave it: a VBO holds the vertices as they were PACKED, and the
+       animation would go on happening in main memory where the GPU never looks.
+       Dropping the buffers puts the batch back on client pointers, which is
+       where water.c has always been -- water is excluded by flag at load, so
+       this is a no-op there and the rule now covers both animators with one
+       mechanism instead of a second list to keep in step.
+
+       That is not hypothetical: the antenna was buffered when the vertex
+       buffers went in, and drew as a welded stick for as long as it was. The
+       chain kept simulating and every check in vis_test part 5 kept passing,
+       because all of them read b->verts.
+
+       Before the early return, not after. The rest copy is what is idempotent
+       here; the unbuffering has to hold on every call, or a second animator
+       binding to an already-kept batch would inherit a live VBO. */
+    if (b->gl_vbo) {
+        glDeleteBuffers(1, &b->gl_vbo);
+        b->gl_vbo = 0;
+    }
+    if (b->gl_ibo) {
+        glDeleteBuffers(1, &b->gl_ibo);
+        b->gl_ibo = 0;
+    }
     if (b->rest)
         return 1;
     b->rest = malloc(sizeof(vtx_t) * b->nverts);

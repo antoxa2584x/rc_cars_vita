@@ -196,13 +196,25 @@ typedef struct {
  * vitaGL's is_full_vbo stays true (ffp.c:1437), the index scan is skipped and
  * each stream becomes a pointer into the buffer rather than a copy of it.
  *
- * WHICH BATCHES GET ONE: those whose vertices never change, which is all of them
- * except BATCH_ANY_WATER -- water.c rewrites `verts` from `rest` every frame for
- * the swell and the UV scroll, and draws them through its own path rather than
- * scene_draw. gl_vbo stays 0 there and draw_pass falls back to client pointers,
- * so a water batch handed to scene_draw would still be correct, just slow.
+ * WHICH BATCHES GET ONE: those whose vertices never change. Two things take a
+ * batch back off the GPU, and between them they are the whole exception list:
+ *
+ *   - BATCH_ANY_WATER never gets one. water.c rewrites `verts` from `rest`
+ *     every frame for the swell and the UV scroll, and draws them through its
+ *     own path rather than scene_draw. gl_vbo stays 0 and draw_pass falls back
+ *     to client pointers, so a water batch handed to scene_draw would still be
+ *     correct, just slow.
+ *   - scene_keep_rest DELETES one. Asking for a rest copy is the declaration
+ *     that an animator is about to rewrite the vertices, so the buffer would go
+ *     stale the moment it was asked for. antenna.c is the caller that needs
+ *     this -- it bends the ANTENNA part's mesh in main memory, which a live VBO
+ *     silently ignores, and the whip drew as a welded stick for as long as it
+ *     was buffered.
+ *
  * Nothing else mutates vertices: carparts.c hides a batch by zeroing nidx, the
- * rig moves parts by matrix, and envmap.c writes into a buffer of its own.
+ * rig moves parts by matrix, and envmap.c writes into a buffer of its own. A
+ * new animator does not have to be added to a list here -- it has to call
+ * scene_keep_rest, which it needs anyway to have a rest pose to work from.
  *
  * THE UNBIND AT THE END OF scene_draw IS LOAD-BEARING. In GL a bound
  * GL_ARRAY_BUFFER turns every subsequent gl*Pointer argument into an OFFSET, and
@@ -312,7 +324,9 @@ void scene_draw(const scene_t *s, unsigned int mask, unsigned int match);
 GLuint scene_tex(const scene_t *s, const char *name);
 
 /* Keep an untouched copy of a batch's vertices so an animator can work from
-   rest each frame. Idempotent; returns 0 if out of memory. */
+   rest each frame, and drop the batch's vertex buffers so that what the
+   animator writes is what draws -- see SCENE VERTEX BUFFERS above. Needs a GL
+   context. Idempotent; returns 0 if out of memory. */
 int scene_keep_rest(batch_t *b);
 
 /*

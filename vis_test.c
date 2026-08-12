@@ -1730,6 +1730,129 @@ static void part5_antenna(void)
        "tip (%.4f, %.4f) against rest (%.4f, %.3f)",
        b->verts[b->nverts - 1].x, b->verts[b->nverts - 1].y, rest_tip, a.tip_y);
 
+    /* --- and the deformation has to REACH THE SCREEN ---------------------
+     *
+     * Every check above reads b->verts, and scene_load puts a car's batches in
+     * a static VBO. So a buffered antenna simulates perfectly, passes all of
+     * them, and draws the pose it was PACKED with -- which is what happened
+     * when the vertex buffers went in, and what got reported as "the antenna is
+     * static". No amount of asserting harder on the CPU vertices could see it:
+     * the gap was that this fixture could not express the state. Buffer the
+     * batch exactly as scene_load would, then read the geometry back through
+     * the recorder, which resolves an offset against the buffer's own contents.
+     */
+    {
+        GLuint vbo = 0, ibo = 0;
+        antenna_t a3;
+        float cpu_max = 0.f, drawn_max = 0.f;
+        int d;
+
+        glGenBuffers(1, &vbo);
+        glGenBuffers(1, &ibo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vtx_t) * b->nverts),
+                     b->verts, GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(sizeof(unsigned short) * b->nidx),
+                     b->idx, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        b->gl_vbo = vbo;
+        b->gl_ibo = ibo;
+
+        /* Re-binding a batch that already HAS a rest copy is the path that
+           matters: scene_keep_rest returns early on the copy, so the
+           unbuffering has to happen before that return or the second track
+           load of a session would ship the bug. */
+        antenna_init(&a3, s, 0);
+        ck(a3.ready && !b->gl_vbo && !b->gl_ibo,
+           "binding the antenna takes its batch back off the GPU",
+           "ready=%d vbo=%u ibo=%u", a3.ready,
+           (unsigned)b->gl_vbo, (unsigned)b->gl_ibo);
+
+        acc[0] = 6.f;
+        for (i = 0; i < 300; i++)
+            antenna_step(&a3, m, acc, 0.f, 1.f / 60.f);
+        acc[0] = 0.f;
+        antenna_apply(&a3);
+
+        /* The mesh is a 8 mm column about x = 0, so |x| out at the tip IS the
+           deflection. Compare what was drawn against what was computed rather
+           than against a number: a stale buffer draws the packed +-0.004 and
+           cannot reach anywhere near it. */
+        for (k = 0; k < (int)b->nverts; k++)
+            if (fabsf(b->verts[k].x) > cpu_max) cpu_max = fabsf(b->verts[k].x);
+        gl_cap_reset();
+        scene_draw(s, 0, 0);
+        for (d = 0; d < glcap.n_draws; d++) {
+            int q;
+            for (q = 0; q < glcap.draws[d].count; q++) {
+                float x = fabsf(glcap.pos[glcap.draws[d].first + q][0]);
+                if (x > drawn_max) drawn_max = x;
+            }
+        }
+        ck(cpu_max > 0.01f && near(drawn_max, cpu_max, 1e-5f),
+           "and the bent whip is the geometry that actually draws",
+           "drawn %.4f m off axis, simulated %.4f, packed %.4f",
+           drawn_max, cpu_max, 0.004f);
+    }
+
+    /* --- and on the REAL packed cars -------------------------------------
+     *
+     * The fixture above is a four-vertex column with a part table written by
+     * hand, so it cannot say whether car<n>.vsc carries an ANTENNA part at all
+     * -- and a car packed without one binds nothing, simulates nothing, and
+     * draws a welded stick. Same symptom, different cause, and only the real
+     * asset can tell them apart. scene_load is also the only thing that
+     * buffers a batch for real. A missing car is a FAILED check, not a skip.
+     */
+    {
+        static const char *files[3] = {
+            "assets/car1.vsc", "assets/car2.vsc", "assets/car3.vsc"
+        };
+        static const char *names[3] = { "Overkill", "Buggy", "Hummer" };
+        int ci;
+
+        for (ci = 0; ci < 3; ci++) {
+            scene_t cs;
+            antenna_t ac;
+            float bend = 0.f;
+
+            if (!scene_load(files[ci], &cs)) {
+                ck(0, "the packed car loads (run from rccars_vita/)",
+                   "%s", files[ci]);
+                continue;
+            }
+            antenna_init(&ac, &cs, ci);
+            ck(ac.ready && ac.batch && !ac.batch->gl_vbo && !ac.batch->gl_ibo,
+               "the packed car carries an ANTENNA part, and binding it takes "
+               "that batch off the GPU",
+               "%s: ready=%d, %u verts, vbo %u", names[ci], ac.ready,
+               ac.batch ? ac.batch->nverts : 0u,
+               ac.batch ? (unsigned)ac.batch->gl_vbo : 0u);
+            if (ac.ready) {
+                acc[0] = 6.f;
+                for (i = 0; i < 300; i++)
+                    antenna_step(&ac, m, acc, 0.f, 1.f / 60.f);
+                acc[0] = 0.f;
+                antenna_apply(&ac);
+                for (k = 0; k < (int)ac.batch->nverts; k++) {
+                    float dx = fabsf(ac.batch->verts[k].x
+                                     - ac.batch->rest[k].x);
+                    if (dx > bend) bend = dx;
+                }
+                /* Against the whip's own length, not a constant: the three
+                   cars' antennae differ in height and in chainLength. */
+                ck(bend > 0.05f * (ac.tip_y - ac.base_y),
+                   "and the real mesh bends when the car accelerates",
+                   "%s: %.1f mm on a %.0f mm whip", names[ci], bend * 1000.f,
+                   (ac.tip_y - ac.base_y) * 1000.f);
+            }
+            scene_release(&cs);
+        }
+    }
+
     /* --- a scene without the part is simply inert ------------------------ */
     {
         scene_t *bare = make_scene(tex, 1);
