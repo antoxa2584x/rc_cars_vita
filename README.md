@@ -28,6 +28,7 @@ tracks, all three cars, terrain collision, props, audio and music.
 
 ## Layout
 
+    build.sh            resources -> .vpk, in one command
     main.c              frame loop, input, vitaGL renderer
     rb.c contact.c      the transcribed integrator and contact solve
     collide.c col.c     sphere/terrain collision against the .col grid
@@ -48,35 +49,65 @@ tracks, all three cars, terrain collision, props, audio and music.
     CMakeLists.txt      builds eboot.bin and packages the .vpk
     BUILD.md            the working notes: every fix, trap and measurement
 
-## Assets are not in this repo
+## Quick start
+
+You need your own copy of RC Cars. Put its files in `game_data/` at the root of
+this tree and run `./build.sh`:
+
+    mkdir game_data
+    cp -r "/path/to/RC Cars"/{RCCars.pack,RCCarsDB,Tracks,Autoexec.gm,GameIcon.ico} game_data/
+    cp "/path/to/RC Cars"/header.jpg game_data/     # optional, see below
+    ./build.sh
+
+or, from an install the script can reach, let it link them itself — 330 MB that
+does not need copying:
+
+    ./build.sh --import "/path/to/RC Cars"
+
+That converts every resource and produces `build/rccars_viewer.vpk`. Each of its
+nine stages is skipped when its output is already newer than its input, so the
+second run goes straight to compiling; `-s` runs one stage, `--force` redoes
+everything, `--help` lists the rest.
+
+| `game_data/` | used by |
+|---|---|
+| `RCCars.pack` | the textures, the wavs, Settings and Splines |
+| `RCCarsDB/` | the `.sb` scene databases — tracks, cars, props |
+| `Tracks/` | the soundtrack MP3s |
+| `Autoexec.gm` | the playlist that orders them |
+| `GameIcon.ico` | the bubble icon |
+| `header.jpg` | the LiveArea wallpaper and gate — **optional**; without it the LiveArea is derived from the icon |
+
+Nothing under `game_data/` is written to, and none of it is in this repository.
+
+## What the build produces, and what is not tracked
 
 `assets/` and the `sce_sys/` artwork are **generated from your own copy of the
 game** and are deliberately untracked — around 480 MB of converted geometry,
 collision grids, textures, sounds and music derived from a commercial release.
+`build.sh` is the whole pipeline:
 
-They are produced by the tools in `rccars_re/`, which lives alongside this
-repository. In short:
+| stage | tool | output |
+|---|---|---|
+| `unpack` | `unpack_tiox.py` | 1,875 files out of `RCCars.pack` |
+| `lightmap` | `sb2obj.py` | the lightmap atlases embedded in each `.sb` |
+| `tracks` | `pack_vsc.py`, `pack_col.py` | ten `.vsc` scenes and their `.col` grids |
+| `cars` | `pack_vsc.py` | three rigged cars, with shadow and env-map data |
+| `props` | `pack_props.py` | the 13 knockable props, one file for all tracks |
+| `sound` | `pack_snd.py` | 118 sounds at 22050 Hz, plus 18 MP3s |
+| `tables` | `gen_tracks.py`, `gen_font.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, the app art |
+| `check` | `vsc_check.py` | every packed scene, exit 0 = clean |
+| `build` | cmake + make | `build/rccars_viewer.vpk` |
 
-    DB="/path/to/RC Cars/RCCarsDB"
-    RE=../rccars_re
-
-    for t in beach_1 beach_2 beach_3 beach_4 country_1 country_2 \
-             country_3 country_4 urban_1 urban_2; do
-        python3 $RE/pack_vsc.py "$DB/$t.sb" assets/$t.vsc --markers
-        python3 $RE/pack_col.py "$DB/$t.sb" assets/$t.col
-    done
-    # the three cars, with rig, shadow silhouette, env-map classes and effects
-    # (see BUILD.md for the full --extra-tex lists)
-    python3 $RE/pack_props.py assets/props.vsc
-    python3 $RE/pack_snd.py --out assets
-    python3 $RE/gen_tracks.py "$DB" tracks.h --assets assets
-    python3 $RE/gen_sce_sys.py         # bubble icon and LiveArea art
-
-`BUILD.md` has the exact commands, including the flags that matter.
+The tools live in `rccars_re/`, alongside this repository; point `--re` at them
+if they are somewhere else. `BUILD.md` explains why each conversion flag is what
+it is, and the script cross-references it at the interesting ones.
 
 Several tracked headers are generated too and are marked as such at the top of
 the file — `tracks.h`, `font.h`, `rb_data.h`, `physics_data.h`, `prop_data.h`,
-`fx_data.h`, `vis_data.h`. Regenerate them rather than editing by hand.
+`fx_data.h`, `vis_data.h`. Regenerate them rather than editing by hand. The
+`rb_*`/`physics_*`/`prop_*`/`fx_*`/`vis_*` ones come from the disassembly rather
+than from `game_data/`, so `build.sh` does not touch them.
 
 ## Runtime formats
 
@@ -99,9 +130,13 @@ and simply leave the newer subsystems dark.
 
 ## Build
 
-Requires VitaSDK and a **custom vitaGL build**. Stock vitaGL creates two GXM
-contexts — one for its splash screen — and Vita3K supports one, so `vglInit`
-fails and the app dies dereferencing null at `0x78`:
+`./build.sh` does all of this; what follows is what it runs and why, for when
+something goes wrong.
+
+Requires VitaSDK, Python with Pillow, and a **custom vitaGL build**. Stock
+vitaGL creates two GXM contexts — one for its splash screen — and Vita3K
+supports one, so `vglInit` fails and the app dies dereferencing null at `0x78`
+(`./build.sh --build-vitagl` does this for you):
 
     git clone https://github.com/Rinnegatamante/vitaGL && cd vitaGL
     make NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 INDICES_SPEEDHACK=1 \
