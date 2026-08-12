@@ -1,0 +1,31 @@
+# CMake / VitaSDK build trees
+build/
+mintest/build/
+
+# Game-derived content. Everything here is generated from a personal copy of
+# RC Cars by the scripts in ../rccars_re (pack_vsc.py, pack_props.py,
+# gen_sce_sys.py) and must not be redistributed. See BUILD.md.
+assets/
+sce_sys/icon0.png
+sce_sys/livearea/contents/bg.png
+sce_sys/livearea/contents/startup.png
+
+# Host-side test harnesses, built ad hoc with gcc (no extension, so listed
+# by name). Their sources -- rb_test.c, vis_test.c -- are tracked.
+allstarts
+antheight
+audio_test
+carparts_test
+ceiling
+flipped
+menu_test
+meshalign
+proptest
+rb_test
+rockroll
+ui_test
+vis_test
+wetcheck
+
+# Logs from the Vita and from the build
+*.log

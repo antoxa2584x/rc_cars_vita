@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.jpg binary
+*.vsc binary
+*.col binary
+*.sbk binary
+*.vpk binary
+*.self binary
+*.velf binary
