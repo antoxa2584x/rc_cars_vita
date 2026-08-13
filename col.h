@@ -24,6 +24,15 @@ typedef struct {
        pack_col.py on why this is not rb_wheel_contact.surface. */
     unsigned char *surf;
     unsigned int default_surf;
+    /* COL4: the ENGINE's own surface class per triangle, 0 = "no opinion".
+       This is FUN_00534fc0's data, recovered -- see pack_col.eng_surface_class.
+       NULL on any older grid, and then col_surface_at answers 0 everywhere.
+       Separate from `surf` above on purpose: that one is a keyword guess at the
+       same idea and drives AUDIO, this one is the game's own answer and drives
+       the tyre marks. Still not plumbed into rb_wheel_contact.surface -- doing
+       that turns on carSurfaceDrag's deep-sand branch and is a handling change,
+       not a visual one. */
+    unsigned char *eng_surf;
     /* COL3: the water surface height per cell, COL_NO_WATER where the cell has
        none. NULL on an older grid, and then there is no water anywhere -- which
        is exactly what this port did before the grid carried it. See pack_col.py's
@@ -64,6 +73,13 @@ int  col_load(const char *path, col_t *c);
 /* Material of the surface under (x,z) nearest at or below y. Falls back to the
    track's default, so this always returns a usable class and never fails. */
 int  col_material_at(const col_t *c, float x, float y, float z);
+
+/* The engine's surface class under (x,z) at about y: 0 none, 1 sand, 2 wetsand,
+   3 dunesand, 4 grass, 5 gravel, 6 metal, 7 wood, 8 stone. 0 on a pre-COL4
+   grid. Takes the MINIMUM positive class over the faces in a band at the
+   contact, which is what FUN_00534fc0 does and is what lets a decal defer to
+   the floor it is laid on. */
+int  col_surface_at(const col_t *c, float x, float y, float z);
 
 /* Water surface height at (x, z). Returns 0 and leaves *y untouched where there
    is none. Backs rb_world.water -- which is what makes carSurfaceDrag's water

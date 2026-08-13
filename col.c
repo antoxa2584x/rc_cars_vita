@@ -33,7 +33,7 @@ int col_load(const char *path, col_t *c)
     FILE *f = fopen(path, "rb");
     char magic[4];
     unsigned int ncell, nref;
-    int v2, v3;
+    int v2, v3, v4;
 
     memset(c, 0, sizeof(*c));
     if (!f)
@@ -43,10 +43,14 @@ int col_load(const char *path, col_t *c)
        surface height per cell. Both older versions still load: a COL1 grid reports
        the default material everywhere (a duller-sounding car, not a broken one)
        and a COL1 or COL2 grid reports no water anywhere (no water drag, which is
-       what the port did before the grid carried it). */
+       what the port did before the grid carried it). COL4 adds the ENGINE's own
+       surface class per triangle; without it col_surface_at answers 0 and the
+       tyre marks fall back to one flat strength, which is what they had. */
     if (memcmp(magic, "COL1", 4) && memcmp(magic, "COL2", 4)
-        && memcmp(magic, "COL3", 4)) { fclose(f); return 0; }
-    v3 = memcmp(magic, "COL3", 4) == 0;
+        && memcmp(magic, "COL3", 4) && memcmp(magic, "COL4", 4))
+        { fclose(f); return 0; }
+    v4 = memcmp(magic, "COL4", 4) == 0;
+    v3 = v4 || memcmp(magic, "COL3", 4) == 0;
     v2 = v3 || memcmp(magic, "COL2", 4) == 0;
     rd(f, &c->minx, 4); rd(f, &c->minz, 4); rd(f, &c->cell, 4);
     rd(f, &c->nx, 4); rd(f, &c->nz, 4); rd(f, &c->ntris, 4);
@@ -77,6 +81,16 @@ int col_load(const char *path, col_t *c)
         if (c->water_y && !rd(f, c->water_y, n * sizeof(float))) {
             free(c->water_y);
             c->water_y = NULL;
+        }
+    }
+    if (v4 && c->water_y) {
+        /* Same discipline as the water grid above: only if everything in front
+           of it read cleanly, because a short read has already moved the cursor
+           and anything from here would be garbage rather than absent. */
+        c->eng_surf = malloc(c->ntris);
+        if (c->eng_surf && !rd(f, c->eng_surf, c->ntris)) {
+            free(c->eng_surf);
+            c->eng_surf = NULL;
         }
     }
     fclose(f);
@@ -113,6 +127,7 @@ void col_free(col_t *c)
     free(c->idx);
     free(c->surf);
     free(c->water_y);
+    free(c->eng_surf);
     free(c->ref_ylo);
     free(c->ref_yhi);
     memset(c, 0, sizeof(*c));
@@ -176,6 +191,89 @@ int col_material_at(const col_t *c, float x, float y, float z)
         }
     }
     return mat;
+}
+
+/* Broad phase, defined further down with the sphere/segment queries. */
+static int tri_y_reach(const col_t *c, unsigned int k, float y, float r);
+
+/* Height of a triangle's plane over (x, z), or 0 if (x, z) is outside it. */
+static int tri_y_at(const float *t, float x, float z, float *out)
+{
+    float ax = t[0], az = t[2], bx = t[3], bz = t[5], cx = t[6], cz = t[8];
+    float d, w0, w1, w2;
+
+    d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+    if (d > -1e-9f && d < 1e-9f)
+        return 0;
+    w0 = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d;
+    w1 = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d;
+    w2 = 1.f - w0 - w1;
+    if (w0 < -0.001f || w1 < -0.001f || w2 < -0.001f)
+        return 0;
+    *out = w0 * t[1] + w1 * t[4] + w2 * t[7];
+    return 1;
+}
+
+int col_surface_at(const col_t *c, float x, float y, float z)
+{
+    int cx, cz;
+    unsigned int cell, k;
+    float best = -1e30f;
+    int cls = 0;
+
+    if (!c->eng_surf || !c->ntris)
+        return 0;
+    cx = (int)((x - c->minx) / c->cell);
+    cz = (int)((z - c->minz) / c->cell);
+    if (cx < 0 || cz < 0 || (unsigned)cx >= c->nx || (unsigned)cz >= c->nz)
+        return 0;
+    cell = (unsigned)cz * c->nx + (unsigned)cx;
+
+    /* Two sweeps, because the engine's rule is NOT "the topmost face wins".
+       FUN_00534fc0 takes the MINIMUM class over the faces at the contact,
+       skipping 0 -- and 0 means "no opinion", which is exactly what a decal
+       carries. `wt_wetsand` sits a centimetre above the sand it modulates, so
+       picking the topmost face would have every transition strip in the game
+       report 0 and mark nothing; taking the min over the band lets the sand
+       underneath decide. That is the whole reason the original loops rather
+       than picks.
+
+       THE PORT'S: the 5 cm band. The engine has the contact's own face list and
+       needs no geometric window at all. This one is set above every decal lift
+       measured in the shipped tracks (5-21 mm, median 1 cm) and far below any
+       genuine floor-over-floor gap in them. */
+    for (k = c->start[cell]; k < c->start[cell + 1]; k++) {
+        const float *t = &c->tris[(size_t)c->idx[k] * 9];
+        float ty;
+        if (tri_y_at(t, x, z, &ty) && ty <= y + 0.25f && ty > best)
+            best = ty;
+    }
+    if (best < -1e29f)
+        return 0;
+    for (k = c->start[cell]; k < c->start[cell + 1]; k++) {
+        unsigned int ti = c->idx[k];
+        const float *t = &c->tris[(size_t)ti * 9];
+        float ty;
+        int e;
+        /* Y-first reject, the same one the sphere and segment queries use, and
+           for the same reason: a cell is a 3 m column over the WHOLE height of
+           the level, so most of what is in it is a roof or a seabed. Valid only
+           on THIS sweep -- `best` is by construction the highest face at or
+           below y + 0.25, so the band is [best - 0.05, best] and a triangle
+           whose Y extent misses it cannot land in it. The first sweep has no
+           lower bound at all and so cannot be rejected this way, which is why
+           col_material_at above has no reject either. */
+        if (!tri_y_reach(c, k, best - 0.025f, 0.035f))
+            continue;
+        if (!tri_y_at(t, x, z, &ty))
+            continue;
+        if (ty > y + 0.25f || ty < best - 0.05f)
+            continue;
+        e = c->eng_surf[ti];
+        if (e > 0 && (cls == 0 || e < cls))
+            cls = e;
+    }
+    return cls;
 }
 
 int col_ground_at(const col_t *c, float x, float z, float ceil_y,

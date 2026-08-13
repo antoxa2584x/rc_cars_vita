@@ -866,7 +866,7 @@ unsigned int acc_ticks = 0;
             float eye[3];
             eye[0] = ex; eye[1] = ey; eye[2] = ez;
             fx_step(&fx, &rc, &col, eye, dt);
-            trace_step(&traces, &rc, dt);
+            trace_step(&traces, &rc, &col, dt);
         }
 
         /* Frame budget: mark the boundary between simulation and submission. See

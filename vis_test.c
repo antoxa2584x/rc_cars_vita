@@ -2245,7 +2245,7 @@ static int drive_trace2(trace_t *tr, rb_car *c, int steps, float step_m,
             c->hit[k].point[1] = 0.f;
             c->hit[k].point[2] = z + c->m[2] * lx + c->m[10] * lz;
         }
-        trace_step(tr, c, 1.f / 60.f);
+        trace_step(tr, c, NULL, 1.f / 60.f);
         x += c->m[8] * step_m;
         z += c->m[10] * step_m;
     }
@@ -2672,7 +2672,7 @@ static void part7_trace(void)
         for (i = 0; i < 30; i++) {
             for (k = 0; k < 4; k++)
                 c.hit[k].active = 0;
-            trace_step(&tr, &c, 1.f / 60.f);
+            trace_step(&tr, &c, NULL, 1.f / 60.f);
         }
         for (k = 0; k < 4; k++)
             c.hit[k].active = 1;

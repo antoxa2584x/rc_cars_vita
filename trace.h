@@ -70,6 +70,7 @@
 #include "fx_data.h"
 #include "rb.h"
 #include "scene.h"
+#include "col.h"                        /* col_surface_at */
 
 /* TRACE_RING_REAR, the larger of the two. Rounded up so one array serves both. */
 #define TRACE_RING 48
@@ -93,13 +94,34 @@
    mark at half strength (0x00554384). */
 #define TRACE_FRONT_STRENGTH 0.5f
 
-/* FUN_0052f310's jump table at 0x0052f6dc keys the strength on the surface id
-   that FUN_00534fc0 returns: 1 -> 0.7, 2 -> 1.0, 3 -> 0.3, 5 and 7 -> 0.6, and
-   4 and 6 leave NO mark at all. That classifier is not recovered (it is the same
-   one CLAUDE.md records as missing for the surface sounds), and the port's own
-   material classes are a different set, so mapping one onto the other would be a
-   guess. Every surface gets the table's strongest value until it is recovered --
-   which is what the port already drew, so nothing regresses. */
+/* FUN_0052f310 keys the strength on the surface class FUN_00534fc0 returns, and
+   BOTH halves of that are now recovered -- the classifier out of the texture's
+   own 0x3408 data (pack_col.eng_surface_class) and this table out of the jump
+   table at 0x0052f6dc, read as:
+
+       52f500  dec eax; cmp eax,6; ja <no mark>      so only classes 1..7 mark
+       52f511  1.0   0x3f800000        52f525  0.3   0x3e99999a
+       52f51b  0.7   0x3f333333        52f52f  0.6   0x3f19999a
+
+   table[class-1] = { 0.7, 1.0, 0.3, none, 0.6, none, 0.6 }, i.e.
+
+       1 sand     0.7      4 grass    NONE      7 wood   0.6
+       2 wetsand  1.0      5 gravel   0.6       0 default / 8 stone  NONE
+       3 dunesand 0.3      6 metal    NONE
+
+   which reads exactly as it should once the classes have names: grass and metal
+   take no rubber, churned dune sand holds least of the three sands, and wet sand
+   holds most -- and the mark texture is called t_halfdry_tire2_<n>.
+
+   The port drew every surface at 1.0, the strongest entry in the table, for as
+   long as the classifier was missing. That is why the marks read as painted-on
+   stripes rather than rubber. */
+#define TRACE_SURF_CLASSES 9
+#define TRACE_STRENGTH_TABLE { 0.f, 0.7f, 1.0f, 0.3f, 0.f, 0.6f, 0.f, 0.6f, 0.f }
+
+/* What a mark is laid at when the grid cannot say -- a pre-COL4 collision file,
+   or a face the artists left with no surface bit. The table's strongest value,
+   which is what the port drew everywhere before, so an old grid is unchanged. */
 #define TRACE_STRENGTH 1.0f
 
 typedef struct {
@@ -163,7 +185,9 @@ void trace_init(trace_t *tr, const scene_t *src);
 void trace_fit_tyres(trace_t *tr, const scene_t *src);
 
 /* Sample every wheel in contact and age everything. Call once per frame. */
-void trace_step(trace_t *tr, const rb_car *c, float dt);
+/* `col` may be NULL, and on a pre-COL4 grid it answers 0 anyway: both cases fall
+   back to TRACE_STRENGTH, which is what the port laid everywhere before. */
+void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt);
 
 /* Every live strip, as quads. `eye` drives FUN_0052fd00's 20 m cull. */
 void trace_draw(trace_t *tr, const float eye[3]);

@@ -336,7 +336,7 @@ static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
 
 /* ------------------------------------------------------------------ step */
 
-void trace_step(trace_t *tr, const rb_car *c, float dt)
+void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
 {
     int w, k;
 
@@ -392,10 +392,29 @@ void trace_step(trace_t *tr, const rb_car *c, float dt)
         half_w = (tr->half_w[w] > 0.f ? tr->half_w[w]
                                       : c->wheel[w].radius * TRACE_WIDTH_FRAC)
                  * carani_tire_width(c);
+        /* What this surface takes. FUN_0052f310 calls the classifier at
+           0x0052f4f8 and indexes the jump table at 0x0052f6dc with the class it
+           returns; classes 0, 4, 6 and 8 -- default, grass, metal and stone --
+           jump past the whole mark and lay nothing. See TRACE_STRENGTH_TABLE.
+           Falling through here rather than laying a zero-strength mark is what
+           the original does, and it also means the next sample on ground that
+           DOES mark starts a fresh strip rather than joining across the gap. */
+        {
+            static const float st[TRACE_SURF_CLASSES] = TRACE_STRENGTH_TABLE;
+            int cls = col ? col_surface_at(col, h->point[0], h->point[1],
+                                           h->point[2]) : 0;
+            if (!col || !col->eng_surf)
+                strength = TRACE_STRENGTH;      /* no data: as before */
+            else if (cls > 0 && cls < TRACE_SURF_CLASSES)
+                strength = st[cls];
+            else
+                strength = 0.f;
+            if (strength <= 0.f)
+                continue;
+        }
         /* FUN_0052f310 at 0x0052f537 halves the strength for wheels 0 and 1 --
            the front pair -- so the steered wheels leave a fainter mark than the
-           driven ones. The base is the port's; see TRACE_STRENGTH. */
-        strength = TRACE_STRENGTH;
+           driven ones. */
         if (w < 2)
             strength *= TRACE_FRONT_STRENGTH;
         /* Which of the four marks. The engine loads all four and the choice is
