@@ -38,6 +38,31 @@
 #ifndef ENVMAP_H
 #define ENVMAP_H
 
+/* THE PORT'S, and it has a derivation rather than a taste behind it.
+ *
+ * The engine renders the car's surroundings into `S_SKY` every FrameSkipNmb+1
+ * frames at TextureSizePow2 -- so the image it reflects is a sphere map of the
+ * whole environment, which from a 20 cm car at ground level is roughly HALF
+ * TERRAIN and half sky. The port cannot re-render, so it binds the track's sky
+ * DOME texture instead, which is sky and nothing else.
+ *
+ * That substitution roughly doubles the sky's share of the reflection, and the
+ * skies are strongly coloured: beach_1's `sky_up` averages RGB (92, 156, 213).
+ * At EnvMapBody's own 0.439 the paint came out visibly BLUE rather than glossy
+ * -- reported as "car body looks bluish, not glance plastic". (It read as a
+ * neutral sheen before only by accident: the sky classifier was picking the
+ * `column` texture, mean RGB (148, 144, 130), off the wrong batch.)
+ *
+ * So the alphas are scaled by the sky's share of a real environment map. Half is
+ * the horizon: a sphere map centred on the car splits sky above from ground
+ * below. Applied to the three PAINTED classes only -- glass and chrome (GRE1,
+ * alpha 1.000) genuinely mirror whatever is there, and halving them would make
+ * a windscreen look painted.
+ *
+ * Set it to 1.0 to get the recovered alphas back unscaled. The honest fix is to
+ * render the surroundings, at which point this constant goes away. */
+#define ENVMAP_SKY_ONLY_FRAC 0.5f
+
 #include "scene.h"
 
 typedef struct {

@@ -17,11 +17,14 @@
 
 float envmap_alpha(unsigned int env_class)
 {
+    /* The scale is the sky's share of a real environment map -- the port reflects
+       a sky-only image where the engine reflects a render of everything. GRE1 is
+       glass and chrome and is left alone. See ENVMAP_SKY_ONLY_FRAC. */
     switch (env_class) {
-    case ENV_BODY:     return (float)ENVMAP_BODY / 255.f;
+    case ENV_BODY:     return (float)ENVMAP_BODY / 255.f * ENVMAP_SKY_ONLY_FRAC;
     case ENV_GRE1:     return (float)ENVMAP_GRE1 / 255.f;
-    case ENV_GRE2:     return (float)ENVMAP_GRE2 / 255.f;
-    case ENV_UPGRADES: return (float)ENVMAP_UPGRADES / 255.f;
+    case ENV_GRE2:     return (float)ENVMAP_GRE2 / 255.f * ENVMAP_SKY_ONLY_FRAC;
+    case ENV_UPGRADES: return (float)ENVMAP_UPGRADES / 255.f * ENVMAP_SKY_ONLY_FRAC;
     default:           return 0.f;
     }
 }

@@ -525,10 +525,18 @@ no terrain collision either -- the car drives on a fixed Y plane.
 
 ### Sky
 
-Meshes matching `--sky` (default `^pCylinder`) are flagged in the scene file and
-drawn first, camera-locked with `glDepthMask(GL_FALSE)`, so the dome never
-clips the world or occludes anything. Format bumped to **VSC3** for the batch
-flags field.
+Meshes whose TEXTURE matches `--sky` (default `^sky`) are flagged in the scene
+file and drawn first, camera-locked with `glDepthMask(GL_FALSE)`, so the dome
+never clips the world or occludes anything. Format bumped to **VSC3** for the
+batch flags field.
+
+The default used to be the mesh-NAME regex `^pCylinder`, and that was wrong on 8
+of the 10 tracks in both directions -- 1,868 triangles of ordinary geometry drawn
+camera-locked (beach_1's column shafts, beach_3's round walls near the start, the
+`kooler` barrels on three tracks) and five domes not flagged at all, which also
+left `envmap_init` with no sky for the car's glance. `vsc_check.py` now asserts
+exactly one sky batch and that it is as wide as the level. Reasoning in full at
+`pack_vsc.py`'s `SKY_TEX_RE`.
 
 ### Alpha testing
 
