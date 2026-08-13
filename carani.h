@@ -68,11 +68,18 @@
 #include "rb.h"
 #include <stdio.h>
 
-/* 40 rather than 32: the Buggy packs 30 parts (4 wheels, 12 wishbone nodes, 8
-   spring halves, the antenna, four booster tips and the root) and the Hummer 29.
-   carani_read_parts drops the overflow and keeps the stream in sync, so the cost
-   of getting this wrong is a batch that silently stops articulating. */
-#define CARANI_MAX_PARTS 40
+/* 56 rather than 40. The Buggy packs 38 parts (4 wheels, 12 wishbone nodes, 8
+   spring halves, the antenna, the root, four booster tips, and the four
+   booster_<n> / compressor_<n> pairs that name the exhaust LEVELS), the Hummer
+   37 and the Overkill 30 -- and 40 left the Buggy two spare, which is no margin
+   for a rig that has now grown twice.
+
+   The cost of getting this wrong also got worse when the exhausts became parts.
+   carani_read_parts drops the overflow and keeps the stream in sync, so it used
+   to cost a batch that silently stopped articulating; now a dropped part also
+   costs carparts_bind the level it reads off that part's NAME, and leaves the
+   batch pointing past rig.n at a draw matrix nothing initialised. */
+#define CARANI_MAX_PARTS 56
 #define CARANI_MAX_SPRINGS 8        /* proc1: SPRING_{FRONT,REAR}_1..4 */
 #define CARANI_MAX_SPRING_PAIRS 6   /* proc2: 4 pairs, proc3: 6 */
 
