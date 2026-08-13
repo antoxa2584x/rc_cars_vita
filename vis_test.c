@@ -28,6 +28,7 @@
 #include "col.h"
 #include "vis_data.h"
 #include "fx.h"
+#include "fx_data.h"      /* fx_surf[] -- the dust rows the engine's class picks */
 #include "trace.h"
 #include "carani.h"       /* carani_tire_width -- the mark follows the tyre */
 #include "rb_data.h"      /* RB_CARS[].tune, the game's own upgrades.ini rows */
@@ -1894,6 +1895,21 @@ static void plane_material(col_t *c, int mat, int fallback)
     c->default_surf = (unsigned)fallback;
 }
 
+/* COL4: the ENGINE's own class per triangle, which is a different array and a
+   different question from plane_material's keyword guess above. Pass cls < 0 to
+   take the array away again, i.e. to be a pre-COL4 grid. */
+static void plane_eng_surface(col_t *c, int cls)
+{
+    unsigned int i;
+    free(c->eng_surf);
+    c->eng_surf = NULL;
+    if (cls < 0)
+        return;
+    c->eng_surf = malloc(c->ntris);
+    for (i = 0; i < c->ntris; i++)
+        c->eng_surf[i] = (unsigned char)cls;
+}
+
 /* A car standing on the plane at y = 0, nose along +Z, all four wheels down. */
 static void fake_car(rb_car *c, float speed, float yaw_deg)
 {
@@ -2084,8 +2100,9 @@ static void part6_fx(void)
        rgb_wet[0], rgb_wet[1], rgb_wet[2],
        rgb_sand[0], rgb_sand[1], rgb_sand[2]);
 
-    /* ---- a puff grows and fades over its life -------------------------- */
+    /* ---- a puff shrinks and fades over its life ------------------------ */
     plane_material(&plane, SURF_SAND, SURF_ASPHALT);
+    plane_eng_surface(&plane, 1);                     /* engine: sand, 1 s */
     emit_once(&fx, &c, &plane, 1.f / 60.f, 2);
     n = fx_probe(&fx, &sz0, &al0, NULL);
     {
@@ -2098,10 +2115,25 @@ static void part6_fx(void)
             fx_step(&fx, &c, &plane, eye, 1.f / 60.f);
     }
     fx_probe(&fx, &szL, &alL, NULL);
-    ck(n > 0 && szL > sz0 * 4.f,
-       "a puff grows as it ages", "%.4f m -> %.4f m across", sz0, szL);
+    /* DynamicScale multiplies the REMAINING life in seconds (fx_scale), so a
+       particle is largest at birth and settles to the base sprite size. This
+       check used to assert the opposite and passed for as long as the ramp ran
+       backwards; the exhaust is where that showed, because at a life of 0.06 s
+       the two readings differ by 11x. */
+    ck(n > 0 && szL < sz0 * 0.5f,
+       "a puff is biggest at birth and shrinks", "%.4f m -> %.4f m across",
+       sz0, szL);
     ck(alL < al0 * 0.7f,
        "and fades", "alpha %.0f -> %.0f", al0, alL);
+    /* AND HOW BIG IT GETS, bound to the car rather than to the constant that
+       sets it -- FX_DUST_SPRITE_SCALE could otherwise move and drag this check
+       along with it. A puff at its largest should be the sort of size the car
+       is; it was 2.3x the car's LENGTH, which is what "tyre dust too strong"
+       was. The floor stops the opposite mistake of tuning the dust to nothing. */
+    ck(sz0 > RB_CARS[0].extent[2] * 0.2f && sz0 < RB_CARS[0].extent[2] * 1.3f,
+       "and it is about the size of the car, not bigger than it",
+       "%.3f m across at birth, car is %.3f m long (%.2fx)",
+       sz0, RB_CARS[0].extent[2], sz0 / RB_CARS[0].extent[2]);
 
     /* ---- the near-camera radius --------------------------------------- */
     {
@@ -2124,6 +2156,114 @@ static void part6_fx(void)
            "%d quads at 30 m, %d draws at 0 m", drawn_far, drawn_near);
     }
 
+    /* ---- and the EXHAUST is not subject to it -------------------------
+     *
+     * ZIgnoreRad is the dust system's callback and the exhaust registers none:
+     * both create functions zero-fill their descriptor and only the dust writes
+     * the slot (0x0052e07e against 0x005301f7). Sharing one pool in the port let
+     * the dust's radius hide the smoke, and EG_LIFE is 0.06 s at EG_SPEED
+     * 0.98 m/s -- 6 cm of travel against a chase camera 0.79-1.35 m away -- so
+     * the exhaust could never be drawn at ANY speed, on any track.
+     *
+     * Nothing here could have caught that: every other exhaust check goes
+     * through fx_probe, whose eye is 30 m away precisely so the cull cannot
+     * interfere. The state the bug lives in is a camera at CHASE distance, so
+     * that is the fixture, and both systems are measured through the same eye
+     * -- the claim is about which system, not about which distance. */
+    {
+        static const float right[3] = {1.f, 0.f, 0.f};
+        static const float up[3] = {0.f, 1.f, 0.f};
+        float pipe[3] = {0.05f, 0.06f, -0.20f};
+        /* ON the car, so both systems are well inside FX_ZIGNORE_RAD. The claim
+           is about which SYSTEM the radius applies to, so one eye measures
+           both. */
+        float eye_on[3] = {0.f, 0.f, 0.f};
+        /* cam.c's recovered rest pose: defDistXZ 0.7929 m behind, defDistY
+           0.3636 m above. This is where the camera actually is at its CLOSEST. */
+        float eye_chase[3] = {0.f, 0.3636f, -0.7929f};
+        int dust_near, gas_near, dust_chase;
+
+        plane_material(&plane, SURF_SAND, SURF_SAND);
+        plane_eng_surface(&plane, -1);
+        fake_car(&c, 5.f, 0.f);
+        emit_once(&fx, &c, &plane, 1.f / 60.f, 10);
+        gl_cap_reset();
+        fx_draw(&fx, eye_on, right, up);
+        dust_near = glcap.n_draws;
+        /* And the same dust from where the chase camera really sits: this is
+           the reported bug. A rear contact patch is 0.776 m from that eye, so
+           at the recovered 2 m radius the plume could not start until it had
+           fallen ~1.2 m behind the tyre -- three car lengths. */
+        gl_cap_reset();
+        fx_draw(&fx, eye_chase, right, up);
+        dust_chase = glcap.n_draws;
+
+        plane_material(&plane, SURF_ASPHALT, SURF_ASPHALT);   /* no dust */
+        fx_set_pipe(&fx, pipe);
+        fake_car(&c, 5.f, 0.f);
+        c.in.accel = 1;
+        c.in.throttle = 1.f;
+        emit_once(&fx, &c, &plane, 1.f / 60.f, 10);
+        gl_cap_reset();
+        fx_draw(&fx, eye_on, right, up);
+        gas_near = glcap.n_draws;
+
+        ck(gas_near > 0 && dust_near == 0,
+           "the near-camera radius is the dust's rule and not the exhaust's",
+           "on the car: %d smoke draws, %d dust draws", gas_near, dust_near);
+        ck(dust_chase > 0,
+           "and dust raised at the tyres is visible from the chase camera",
+           "%d draws at the recovered rest pose %.3f m back, %.3f m up",
+           dust_chase, 0.7929f, 0.3636f);
+    }
+
+    /* ---- the dust table is indexed by the ENGINE's class, not the keyword ----
+     *
+     * fx_surf[] is indexed by the id FUN_0052ee10 switches on, and COL4 carries
+     * exactly that id. It used to be indexed with col_material_at's keyword
+     * guess instead -- pack_col.py's own docstring says that array is audio only
+     * -- and the two disagree on the surface a beach is made of: `sand_halfdry`
+     * is in SURF_RE's `wetsand` pattern while the engine's own data gives it
+     * class 1, SAND. DustX_TimeLife is 1.0 s on sand and 0.05 s on wet sand, and
+     * a 0.05 s particle cannot cross ZIgnoreRad before it dies, so that one
+     * disagreement was the whole of "no dust on the beach".
+     *
+     * Set the two arrays AGAINST each other, both ways round, so the check can
+     * only pass if the engine's class is what is read. */
+    {
+        float life_eng_sand, life_eng_wet;
+        int k;
+
+        plane_material(&plane, SURF_WETSAND, SURF_WETSAND);
+        plane_eng_surface(&plane, 1);                 /* engine says SAND */
+        fake_car(&c, 5.f, 0.f);
+        emit_once(&fx, &c, &plane, 1.f / 60.f, 4);
+        life_eng_sand = 0.f;
+        for (k = 0; k < FX_MAX_PARTICLES; k++)
+            if (fx.p[k].used && fx.p[k].life > life_eng_sand)
+                life_eng_sand = fx.p[k].life;
+
+        plane_material(&plane, SURF_SAND, SURF_SAND);
+        plane_eng_surface(&plane, 2);                 /* engine says WETSAND */
+        emit_once(&fx, &c, &plane, 1.f / 60.f, 4);
+        life_eng_wet = 0.f;
+        for (k = 0; k < FX_MAX_PARTICLES; k++)
+            if (fx.p[k].used && fx.p[k].life > life_eng_wet)
+                life_eng_wet = fx.p[k].life;
+
+        ck(life_eng_sand >= fx_surf[1].life && life_eng_wet <= fx_surf[2].life,
+           "the engine's own surface class picks the dust row",
+           "eng sand %.3f s (row 1 is %.3f), eng wetsand %.3f s (row 2 is %.3f)",
+           life_eng_sand, fx_surf[1].life, life_eng_wet, fx_surf[2].life);
+
+        /* And a pre-COL4 grid still raises dust rather than going silent. */
+        plane_material(&plane, SURF_SAND, SURF_SAND);
+        plane_eng_surface(&plane, -1);
+        ck(emit_once(&fx, &c, &plane, 1.f / 60.f, 4) > 0,
+           "a pre-COL4 grid falls back to the keyword map", "%d particles",
+           fx.n_live);
+    }
+
     /* ---- the exhaust -------------------------------------------------- */
     {
         static const float eye[3] = {0.f, 0.f, 0.f};
@@ -2141,6 +2281,22 @@ static void part6_fx(void)
         n_on = emit_once(&fx, &c, &plane, 1.f / 60.f, 30);
         ck(n_off == 0 && n_on > 0, "the pipe smokes on the throttle and not off it",
            "%d particles off, %d on", n_off, n_on);
+
+        /* And HOW BIG it is, bound to the car rather than to any constant that
+           could move it. DynamicScale multiplies the remaining life in seconds
+           and the exhaust lives 0.06 s, so the peak is 29.3*0.06 + 1 = 2.76x the
+           base sprite -- a puff a fifth of a car long. Read as an age fraction
+           it was the full 30.3x, 0.91 m on a 0.42 m car: bigger than the thing
+           emitting it, which is what was reported. Half a car length is an order
+           of magnitude clear of both. */
+        {
+            float sz_gas = 0.f;
+            fx_probe(&fx, &sz_gas, NULL, NULL);
+            ck(sz_gas > 0.f && sz_gas < RB_CARS[0].extent[2] * 0.5f,
+               "and the puff is smaller than the car it comes out of",
+               "%.3f m across, car is %.3f m long",
+               sz_gas, RB_CARS[0].extent[2]);
+        }
 
         /* Where it comes out. The pipe is in BODY space and the emitter has to
            put it through the car matrix -- so turn the car and the plume has to
@@ -2180,6 +2336,81 @@ static void part6_fx(void)
                "the smoke leaves the pipe, through the body matrix",
                "nearest particle %.1f mm from the transformed tip, one frame of "
                "travel is %.1f mm", best * 1000.f, (tol - 0.01f) * 1000.f);
+        }
+
+        /* AND ALONG THE PIPE, not along the car.
+         *
+         * On the REAL cars, because a synthetic fixture has no rig and takes
+         * fx_set_pipe's body -Z fallback -- which is exactly the assumption
+         * under test, so it could only ever agree with itself. The Buggy's
+         * level 1 pipe exits at (-0.565, 0, -0.825) in body space, 34.4 deg off
+         * the back of the car, so the plume direction can tell the two apart;
+         * the old code sent it straight backwards out of a pipe pointing down
+         * the left flank. Bound to the ANGLE between the plume and the node's
+         * own axis, which is a property of the car, not of any constant here. */
+        {
+            const char *files[3] = {"assets/car1.vsc", "assets/car2.vsc",
+                                    "assets/car3.vsc"};
+            const char *cname[3] = {"Overkill", "Buggy", "Hummer"};
+            int ci, worst_ci = -1;
+            float worst_deg = 0.f, spread = 0.f;
+
+            for (ci = 0; ci < 3; ci++) {
+                scene_t cs;
+                float ang, back;
+                if (!scene_load(files[ci], &cs))
+                    continue;
+                fx_init(&fx, &cs);
+                fx.tex = 1;            /* the fixture scene has no dust sprite */
+                fx.enabled = 1;
+                if (fx_pipe_from_rig(&fx, &cs.rig, 0)) {
+                    /* The car at identity, so body space IS world space. It
+                       has to be MOVING -- the rate curve gives nothing at rest
+                       -- and spawn_gas adds the car's velocity to the ejection,
+                       which move() then decays on vx/vz but not vy. Subtracting
+                       the raw car velocity therefore leaves a few degrees of
+                       residue that is the damping, not the pipe. */
+                    fake_car(&c, 5.f, 0.f);
+                    c.in.accel = 1;
+                    c.in.throttle = 1.f;
+                    plane_material(&plane, SURF_ASPHALT, SURF_ASPHALT);
+                    emit_once(&fx, &c, &plane, 1.f / 60.f, 1);
+                    {
+                        int k, found = 0;
+                        float d[3] = {0.f, 0.f, 0.f}, n;
+                        /* spawn_gas writes EG_SPEED*dir + the CAR's velocity,
+                           and at 5 m/s the car term is 5x the ejection -- so
+                           the ejection has to be isolated or this measures the
+                           car's heading. */
+                        for (k = 0; k < FX_MAX_PARTICLES; k++)
+                            if (fx.p[k].used) {
+                                d[0] = fx.p[k].vx - c.body.v[0];
+                                d[1] = fx.p[k].vy - c.body.v[1];
+                                d[2] = fx.p[k].vz - c.body.v[2];
+                                found = 1; break;
+                            }
+                        n = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                        if (found && n > 1e-6f) {
+                            float dot = (d[0]*fx.pipe_dir[0] + d[1]*fx.pipe_dir[1]
+                                         + d[2]*fx.pipe_dir[2]) / n;
+                            if (dot > 1.f) dot = 1.f;
+                            if (dot < -1.f) dot = -1.f;
+                            ang = acosf(dot) * 57.29578f;
+                            back = acosf(-fx.pipe_dir[2] > 1.f ? 1.f
+                                         : -fx.pipe_dir[2]) * 57.29578f;
+                            if (ang > worst_deg) { worst_deg = ang; worst_ci = ci; }
+                            if (back > spread) spread = back;
+                        }
+                    }
+                }
+                scene_release(&cs);
+            }
+            ck(worst_ci >= 0 && worst_deg < 15.f && spread > 20.f,
+               "the smoke leaves along the PIPE, not along the car",
+               "worst %.2f deg off its own pipe axis (%s), against pipes up to "
+               "%.1f deg off the back of the car -- the old body -Z would score "
+               "that second number",
+               worst_deg, worst_ci >= 0 ? cname[worst_ci] : "-", spread);
         }
 
         /* The backfire. A rising edge of the Jump action above 10 km/h holds

@@ -2,10 +2,10 @@
  * fx.c -- the wheel dust and the exhaust smoke, transcribed. See fx.h for the
  * map of which function each part came out of, and fx_data.h for the constants.
  *
- * Three things in here are the port's rather than the game's, and each says so
- * where it is defined: FX_SPRITE_UNIT, the billboard construction, and the
- * direction of the DynamicScale ramp (which is argued from the code, not
- * guessed -- see fx_scale).
+ * Two things in here are the port's rather than the game's, and each says so
+ * where it is defined: FX_SPRITE_UNIT and the billboard construction. The
+ * direction of the DynamicScale ramp used to be a third; it is read off the
+ * two scale callbacks now -- see fx_scale.
  */
 
 #include "fx.h"
@@ -20,15 +20,93 @@
  * that function is not transcribed -- so the base is the port's one free
  * parameter here. 0.01 m per unit is the engine's own habit everywhere else a
  * size comes out of a slider (ShadowSize raw*0.01, ShadowShift raw*0.01-0.5,
- * every anim_cp key raw*0.01), and it puts the numbers where they belong on a
- * 1:10 car: a dust puff is born 1.5 cm across and grows to 49 cm behind a rear
- * wheel over its second of life, 37 cm behind a front one.
+ * every anim_cp key raw*0.01).
+ *
+ * BOTH systems pass the same base. FUN_00477940 takes (system, ScaleX,
+ * ScaleXDisp, ScaleY, ScaleYDisp) straight out of the loader -- the dust at
+ * 0x0052ed1f from [0x576028..0x576034], the exhaust at 0x00530b60 from
+ * [0x5761f8..0x576204], and both quadruples are 1.0 in the image -- so there is
+ * no per-system base to recover, and nothing distinguishes the two but their
+ * own keys.
+ *
+ * WHAT THIS CONSTANT IMPLIES MOVED when the DynamicScale ramp was corrected
+ * (see fx_scale): the peak is at BIRTH now, not at death. An exhaust puff is
+ * born 8 cm across and settles to 3 cm; a dust puff is born 98 cm across behind
+ * a rear wheel, 75 cm behind a front one, and settles to the same 3 cm. The
+ * justification that stood here before -- "born 1.5 cm and grows to 49 cm" --
+ * was measured against the ramp running backwards, so this base has never been
+ * checked against the behaviour it actually produces, and the dust figure is
+ * wider than the car is long. Left alone: it is the one free parameter in the
+ * file and the reported fault was the exhaust. It wants its own pass.
  */
 #define FX_SPRITE_UNIT 0.01f
+
+/*
+ * THE PORT'S, and dust only. Reported as "tyre dust too strong, should be
+ * lighter" once the dust was visible at the tyres at all.
+ *
+ * The ramp direction and the table behind it are not in doubt -- the scale is
+ * DynamicScale against the REMAINING life in seconds (fx_scale), and `+0xc` is
+ * an elapsed counter, confirmed twice: neither spawn function seeds it, so it
+ * starts at zero and accumulates, which makes `p[8] - p[0xc]` the time left.
+ * What that lands on is a rear puff born 0.975 m across on a 0.422 m car, and
+ * with two rear wheels emitting ~65/s into a 1 s life that is ~130 live sprites
+ * of about a metre at alpha 0.59, which composites to a wall.
+ *
+ * The multiplier is here rather than in FX_SPRITE_UNIT because that base is
+ * SHARED with the exhaust and the 12:1 ratio between them is the game's own
+ * (dust 32.5x against smoke 30.3 x 0.06 s = 2.76x). Shrinking the base would
+ * take the exhaust down with it, and the exhaust is where it should be: 8.3 cm,
+ * a fifth of a car. So the dust gets its own scale and nothing else moves.
+ *
+ * 0.43 puts a rear puff at its largest at 0.42 m -- the length of the car,
+ * rather than 2.3x it. Front dust is 0.32 m (DynamicScaleForw is 25, not 32.5),
+ * and both still collapse to the base by the time they die. It is a taste
+ * number: it is anchored to the car so it is at least measurable, but nothing in
+ * the game's data says what a dust puff should span, because the one constant
+ * that would say it -- the renderer's world unit behind FUN_00477940 -- is not
+ * transcribed. Raise it toward 1.0 for the heavier plume.
+ *
+ * The other lever, if this is still too much, is the ALPHA rather than the size:
+ * the per-surface DustX_ColorA is recovered (sand 150, wetsand 120, gravel 200)
+ * but the ramp that fades it is the port's own linear one, and at these overlaps
+ * the fill is what reads as weight.
+ */
+#define FX_DUST_SPRITE_SCALE 0.43f
 
 /* FUN_0052e320 walks the cameras and gives up if none is within 12 m of the
    wheel. One camera here. */
 #define FX_EMIT_RANGE 12.0f
+
+/*
+ * THE PORT'S, and the one place here that knowingly departs from a recovered
+ * number. DUSTX_ZIGNORE_RAD is 2.000 m and it is right -- raw 20 from
+ * car_dustx.ini's slider default over the 10.0 pushed at 0x0052ec34, and the
+ * flag it sets is read at 0x004775c8 as "skip this particle". The mechanism is
+ * transcribed exactly. What does not survive is the SIZE of it against this
+ * camera.
+ *
+ * The plume becomes visible exactly where the sphere ends, and nothing else
+ * moves that boundary -- not the launch speed, not the lifetime. Measured
+ * against cam.c's own recovered rest pose (defDistXZ 0.7929 m behind,
+ * defDistY 0.3636 m above), a rear contact patch sits 0.776 m from the eye, so
+ * a 2 m sphere swallows the whole car and 1.2 m beyond it: dust could not
+ * appear until it had fallen about 1.2 m behind the tyre that raised it, three
+ * car lengths back. Reported as "tyre dust appears too far behind from tyres",
+ * and that is the arithmetic of it.
+ *
+ * 0.30 m keeps what the rule is FOR -- a particle that has come close enough to
+ * the lens to smear across it, which happens reversing into the camera or when
+ * a puff blows forward -- and clears the contact patch by better than 2x at the
+ * camera's CLOSEST (0.776 m at rest; it pulls back to 1.35 m at speed, so the
+ * margin only grows). Set this to DUSTX_ZIGNORE_RAD for the recovered
+ * behaviour; it is one line and nothing else reads either constant.
+ *
+ * Whether the original really looked like that is not something this project
+ * can settle: the radius, the sense, the consumer and the camera constants are
+ * each verified separately and they do compose to a 1.2 m gap.
+ */
+#define FX_ZIGNORE_RAD 0.30f
 
 /* FUN_0052e320's gate on the curve input, in km/h. Also FUN_005303c0's. */
 #define FX_MIN_KMH 0.25f
@@ -97,20 +175,49 @@ static float speed_kmh(const rb_car *c)
                  + c->body.v[2] * c->body.v[2]) * 3.6f;
 }
 
-/* The engine's surface id for a wheel, via the port's own texture-keyed grid.
-   col_material_at returns a SURF_* class (pack_col.py); FX_SURF_MAP takes it to
-   the id FUN_0052ee10 switches on. */
+/* The engine's surface id for a wheel -- the id FUN_0052ee10 switches on, which
+   is the index fx_surf[] is built for.
+ *
+ * COL4 IS THAT ID, so this is the identity and there is no mapping step. The
+ * grid carries FUN_00534fc0's own answer per triangle (pack_col.eng_surface_class)
+ * and col_surface_at applies the engine's own min-over-positive rule to it.
+ *
+ * It used to go through col_material_at + FX_SURF_MAP instead, and that was
+ * wrong twice over. pack_col.py's own docstring says that classification "drives
+ * AUDIO ONLY" -- it is a keyword guess at the texture NAME, it agrees with the
+ * engine's data on 26% of the 319 textures and has no opinion on 47%. And the
+ * disagreement lands exactly where it hurts: `sand_halfdry`, one of the two
+ * surfaces a beach is made of, is in SURF_RE's `wetsand` pattern while the
+ * engine's own data gives it word4 0x020 = class 1 SAND. That is the difference
+ * between DustX_TimeLife 1.0 s and 0.05 s -- and with ZIgnoreRad hiding anything
+ * within 2 m of the camera, a 0.05 s particle can never travel far enough to be
+ * drawn at all. Half a second of dust became none, on the tracks most of the
+ * driving happens on. The other half of "no dust" is in fx_draw.
+ *
+ * Falls back to the old path on a pre-COL4 grid, where eng_surf is NULL and
+ * col_surface_at would answer 0 -- i.e. no dust anywhere -- rather than silently
+ * turning the effect off for an asset that has not been repacked.
+ */
 static int surf_id(const col_t *col, const float p[3])
 {
-    static const int map[] = FX_SURF_MAP;
     int m;
 
     if (!col)
         return 0;
-    m = col_material_at(col, p[0], p[1], p[2]);
-    if (m < 0 || m >= (int)(sizeof(map) / sizeof(map[0])))
+    if (col->eng_surf) {
+        m = col_surface_at(col, p[0], p[1], p[2]);
+    } else {
+        static const int map[] = FX_SURF_MAP;
+        m = col_material_at(col, p[0], p[1], p[2]);
+        if (m < 0 || m >= (int)(sizeof(map) / sizeof(map[0])))
+            return 0;
+        m = map[m];
+    }
+    /* 6 metal, 7 wood, 8 stone and anything else ship no surf_<kind>.crs, so
+       they fall to the default table, whose IntScale is 0. */
+    if (m < 0 || m >= FX_SURF_N)
         return 0;
-    return map[m];
+    return m;
 }
 
 /* --------------------------------------------------------------- the pool */
@@ -138,6 +245,12 @@ void fx_set_pipe(fx_t *fx, const float p[3])
     fx->pipe[0] = p[0];
     fx->pipe[1] = p[1];
     fx->pipe[2] = p[2];
+    /* Straight out the back until something says otherwise. That is what a car
+       with no rig gets, and it is what this port assumed for every car until the
+       pipe nodes were read -- see fx_pipe_from_rig. */
+    fx->pipe_dir[0] = 0.0f;
+    fx->pipe_dir[1] = 0.0f;
+    fx->pipe_dir[2] = -1.0f;
     fx->have_pipe = 1;
 }
 
@@ -162,11 +275,42 @@ int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster)
                main.c reconciles them with glTranslatef(0, -wheel_plane_y, 0), so
                the same shift belongs here -- 57 mm on the Overkill, which is most
                of the height of the pipe above the road. */
-            float p[3];
+            float p[3], d[3], n;
             p[0] = rig->part[i].rest[12];
             p[1] = rig->part[i].rest[13] - carani_wheel_plane_y(rig);
             p[2] = rig->part[i].rest[14];
             fx_set_pipe(fx, p);
+            /* AND WHICH WAY IT POINTS -- the node's own +Z, row 2 of its rest
+               matrix.
+             *
+             * The port used to eject every car's smoke along body -Z, "straight
+             * out the back", which is an assumption and not a recovered fact.
+             * It is right only for a tailpipe that happens to be axis-aligned.
+             * Measured over all 12 booster_<n>_end nodes, body -Z is off by
+             * 9.2 deg on the Hummer's level 1, 34.4 deg on the Buggy's, 35.2 on
+             * the Buggy's level 3, 70 on the Overkill's level 3 and a full
+             * 90 deg on the Hummer's level 3, whose pipe exits straight out the
+             * left flank at (-1, 0, 0). Reported as "on hummer and buggy at
+             * least on first exhausts, smoke desynced from exhaust real exit".
+             *
+             * The node frame is the artists' own statement and it checks out as
+             * a set: all 12 have +Z aimed out of the car -- z-component from
+             * -0.341 to -1.000, one of them exactly 0 and purely lateral -- and
+             * NOT ONE points forward. An arbitrary axis would not do that. It is
+             * the same thing carani.c already trusts when it reads the Hummer's
+             * wheel spin sign off rest[8].
+             *
+             * Falls back to whatever fx_set_pipe left (body -Z) if the row is
+             * degenerate, so a car packed without a rig is unchanged. */
+            d[0] = rig->part[i].rest[8];
+            d[1] = rig->part[i].rest[9];
+            d[2] = rig->part[i].rest[10];
+            n = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (n > 1e-6f) {
+                fx->pipe_dir[0] = d[0] / n;
+                fx->pipe_dir[1] = d[1] / n;
+                fx->pipe_dir[2] = d[2] / n;
+            }
         }
         return 1;
     }
@@ -251,6 +395,7 @@ static void spawn_dust(fx_t *fx, const float pos[3], const float vel[3],
         return;
     memset(p, 0, sizeof(*p));
     p->used = 1;
+    p->sys = FX_SYS_DUST;
     p->life = rnd_sym(fx) * t->life_disp + t->life;
     if (p->life < 1e-06f)
         p->life = 1e-06f;                   /* 0x358637bd, the no-table case */
@@ -268,8 +413,8 @@ static void spawn_dust(fx_t *fx, const float pos[3], const float vel[3],
 
     p->sx = DUSTX_SCALE_X + rnd_sym(fx) * DUSTX_SCALE_X_DISP;
     p->sy = DUSTX_SCALE_Y + rnd_sym(fx) * DUSTX_SCALE_Y_DISP;
-    p->sx *= FX_SPRITE_UNIT;
-    p->sy *= FX_SPRITE_UNIT;
+    p->sx *= FX_SPRITE_UNIT * FX_DUST_SPRITE_SCALE;
+    p->sy *= FX_SPRITE_UNIT * FX_DUST_SPRITE_SCALE;
     /* FUN_0052e180 picks the ramp on the WHEEL INDEX -- < 2 is the front pair. */
     p->grow = (wheel < 2) ? DUSTX_DYN_SCALE_FORW : DUSTX_DYN_SCALE;
     p->r = (unsigned char)t->r;
@@ -368,6 +513,7 @@ static void spawn_gas(fx_t *fx, const float pos[3], const float dir[3],
         return;
     memset(p, 0, sizeof(*p));
     p->used = 1;
+    p->sys = FX_SYS_GAS;
     p->life = rnd_sym(fx) * EG_LIFE_DISP + EG_LIFE;
     if (fx->explode_t > 0.0f)
         p->life *= 3.0f;
@@ -509,18 +655,24 @@ void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
         float pos[3], dir[3];
 
         gas_colour(fx, dt);
-        /* FUN_0050bcc0 transforms a body-space point and vector by the car
-           matrix. The point is the fitted booster's own `_end` node; the
-           direction is the body's -Z, straight out the back. */
+        /* FUN_0050bcc0 transforms a body-space point AND a vector by the car
+           matrix -- it is handed esi+0x8 and esi+0x14, two separate vec3s off
+           the emitter (0x00530422, 0x00530438), which is why the direction is
+           carried rather than assumed. The point is the fitted booster's own
+           `_end` node and the direction is that node's own axis; see
+           fx_pipe_from_rig for why it is not simply the body's -Z. */
         pos[0] = fx->pipe[0] * c->m[0] + fx->pipe[1] * c->m[4]
                  + fx->pipe[2] * c->m[8] + c->m[12];
         pos[1] = fx->pipe[0] * c->m[1] + fx->pipe[1] * c->m[5]
                  + fx->pipe[2] * c->m[9] + c->m[13];
         pos[2] = fx->pipe[0] * c->m[2] + fx->pipe[1] * c->m[6]
                  + fx->pipe[2] * c->m[10] + c->m[14];
-        dir[0] = -c->m[8];
-        dir[1] = -c->m[9];
-        dir[2] = -c->m[10];
+        dir[0] = fx->pipe_dir[0] * c->m[0] + fx->pipe_dir[1] * c->m[4]
+                 + fx->pipe_dir[2] * c->m[8];
+        dir[1] = fx->pipe_dir[0] * c->m[1] + fx->pipe_dir[1] * c->m[5]
+                 + fx->pipe_dir[2] * c->m[9];
+        dir[2] = fx->pipe_dir[0] * c->m[2] + fx->pipe_dir[1] * c->m[6]
+                 + fx->pipe_dir[2] * c->m[10];
         n = emit_count(rate, dt, &fx->carry_gas);
         while (n-- > 0)
             spawn_gas(fx, pos, dir, c->body.v, spinning, loaded);
@@ -551,24 +703,47 @@ void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
 /* ------------------------------------------------------------------ draw */
 
 /*
- * FUN_00530330 is the shorter of the two scale callbacks and the one that
- * settles which way the ramp runs:
+ * FUN_00530330 is the shorter of the two scale callbacks:
  *
  *     k = (DynamicScale - 1) * (p[8] - p[0xc]) + 1
  *
- * with no clamp on the interpolant at all, while FUN_0052e180 wraps the same
- * expression in `if (t < 0) k = 1; else if (t <= 1) ...`. An unclamped affine
- * blend between 1 and DynamicScale is only meaningful if t is a 0..1 fraction,
- * and the guard in the other version is there for the ends of that range. So
- * t is the age fraction, k runs 1 -> DynamicScale, and the particle GROWS.
+ * and `p[8] - p[0xc]` is LIFE MINUS AGE -- the remaining life IN SECONDS, not a
+ * 0..1 fraction. +0x8 is life: FUN_005306d0 stores the TimeLife result there
+ * four times over as it applies the backfire, spinning and loaded multipliers
+ * (0x00530712, 0x00530731, 0x00530743, 0x00530755), which is spawn_gas's own
+ * arithmetic. So t counts DOWN, k starts at its largest and falls to 1, and a
+ * particle SHRINKS over its life.
+ *
+ * This note used to argue the opposite -- that an unclamped affine blend is
+ * only meaningful over a 0..1 interpolant, so t had to be the age fraction and
+ * the particle had to grow. The expression above was written down correctly and
+ * then read as a fraction. What settles it is FUN_0052e180, the dust's version,
+ * which has the clamps the exhaust's lacks (its wheel-index test `cmp
+ * [ecx+0x8],2` at 0x0052e1a2 is the same < 2 split spawn_dust makes):
+ *
+ *     t > 1       ->  DynamicScale        0x0052e1cb / 0x0052e216
+ *     0 <= t <= 1 ->  (D - 1) * t + 1     0x0052e241
+ *     t < 0       ->  1.0                 0x0052e1af / 0x0052e1fd
+ *
+ * Those two arms MEET at t = 1, where the affine one gives exactly D. A
+ * piecewise function is continuous at the boundary its own author put there --
+ * and under the age-fraction reading t can never exceed 1, so the first arm
+ * would be unreachable and the meeting point a coincidence. t is seconds.
+ *
+ * It is also the only reading that makes DynamicScale's magnitude sensible. The
+ * exhaust lives 0.06 s, so its 30.3 buys k = 29.3*0.06 + 1 = 2.76 at birth -- an
+ * 8 cm puff on a 42 cm car. Read as a fraction it was the full 30.3, a sprite
+ * 91 cm across hanging off the back of the car, which is exactly what "exhaust
+ * smoke effect too big" was. The dust's 25 and 32.5 are read against a life of
+ * 1.0-1.25 s and so do reach their constants, through the t > 1 arm.
  */
 static float fx_scale(const fx_particle *p)
 {
-    float t = p->life > 1e-09f ? p->age / p->life : 1.0f;
+    float t = p->life - p->age;         /* remaining life, SECONDS */
     if (t < 0.0f)
         return 1.0f;
     if (t > 1.0f)
-        t = 1.0f;
+        return p->grow;
     return (p->grow - 1.0f) * t + 1.0f;
 }
 
@@ -612,15 +787,40 @@ void fx_draw(const fx_t *fx, const float eye[3],
 
         if (!p->used)
             continue;
-        /* ZIgnoreRad: FUN_0052e270 flags a particle within 2 m of the camera so
-           it is not drawn. Without it the dust behind the car fills the screen
-           the moment the chase camera closes in -- and this camera sits 0.79 m
-           behind the car, well inside the radius the original was tuned for. */
-        ex = p->x - eye[0];
-        ey = p->y - eye[1];
-        ez = p->z - eye[2];
-        if (ex * ex + ey * ey + ez * ez < DUSTX_ZIGNORE_RAD * DUSTX_ZIGNORE_RAD)
-            continue;
+        /* ZIgnoreRad: FUN_0052e270 flags a particle within the radius of the
+           camera so it is not drawn -- verbatim, including the sense: it SETS
+           the flag when NEARER than the radius (0x0052e2ff) and clears it when
+           farther (0x0052e30f), and the consumer at 0x004775c8 does
+           `test byte [particle],0x2 ; jne` straight past the submit call, so the
+           bit means SKIP. What the port changes is the radius; see
+           FX_ZIGNORE_RAD.
+
+           IT IS THE DUST SYSTEM'S CALLBACK AND THE EXHAUST HAS NONE. Each
+           system fills a zeroed descriptor and hangs its callbacks off it; the
+           slot this test lives in is +0xec, and only the dust writes it:
+
+               dust    0x0052e07e   mov [esp+0xec], 0x52e270
+               exhaust 0x005301f7   writes +0xe8 and +0xf4, NEVER +0xec
+
+           and both descriptors are zero-filled first (`rep stos` of 0x67 dwords
+           from +0x8, at 0x0052e03f and 0x005301c3), so the exhaust's slot is a
+           null callback -- the engine never hides a smoke particle for being
+           close. `exhausted_gas` has no ZIgnoreRad key either.
+
+           Applying the dust's radius to the smoke made the exhaust IMPOSSIBLE
+           to see, not merely rare: EG_LIFE is 0.06 s and EG_SPEED 0.98 m/s, so
+           a puff travels ~6 cm before it dies, while the chase camera sits
+           0.79-1.35 m away. Every smoke particle spent its whole life inside
+           the 2 m sphere. Reported as "exhaust not shown even there is
+           particles in logs", and the log was right -- they were spawning,
+           ageing and being skipped one line into the draw loop. */
+        if (p->sys == FX_SYS_DUST) {
+            ex = p->x - eye[0];
+            ey = p->y - eye[1];
+            ez = p->z - eye[2];
+            if (ex * ex + ey * ey + ez * ez < FX_ZIGNORE_RAD * FX_ZIGNORE_RAD)
+                continue;
+        }
         if (nv + 6 > FX_MAX_PARTICLES * 6)
             break;
 

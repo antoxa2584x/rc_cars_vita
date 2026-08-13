@@ -23,7 +23,9 @@
  *   - the base sprite size FUN_00477940 sets, which ScaleX/ScaleY multiply;
  *   - the billboard construction (the engine hands the sprite to its own
  *     particle renderer, which is not transcribed);
- *   - which way FUN_0052e180's DynamicScale ramp runs.
+ * Which way the DynamicScale ramp runs used to be on that list. It is read off
+ * the two scale callbacks now -- t is the remaining life in SECONDS and a
+ * particle SHRINKS; see fx_scale.
  */
 
 #ifndef FX_H
@@ -37,6 +39,13 @@
    per system. The port shares one pool between the two, so it is sized once. */
 #define FX_MAX_PARTICLES 2048
 
+/* Which system emitted a particle. The engine keeps the two pools apart
+   entirely; the port shares one, so a particle has to say where it came from.
+   Only ONE thing reads it -- the ZIgnoreRad hide test, which belongs to the
+   dust system and to nothing else. See fx_draw. */
+#define FX_SYS_DUST  0
+#define FX_SYS_GAS   1
+
 typedef struct {
     float x, y, z;          /* +0x10  position, world */
     float vx, vy, vz;       /* +0x28  velocity */
@@ -47,6 +56,7 @@ typedef struct {
     float grow;             /* DynamicScale for this particle */
     unsigned char r, g, b, a;
     unsigned char used;
+    unsigned char sys;      /* FX_SYS_*, the port's: the engine has two pools */
 } fx_particle;
 
 typedef struct {
@@ -69,6 +79,12 @@ typedef struct {
     /* Where the pipe is, in body space. Taken from the car's own
        `booster_<n>_end` node -- see fx_set_pipe. */
     float pipe[3];
+    /* And which way it POINTS, body space, unit. The node's own +Z: every one
+       of the 12 booster_<n>_end nodes across the three cars has its local +Z
+       aimed out of the car, and not one points forward -- see
+       fx_pipe_from_rig. Defaults to body -Z, which is what fx_set_pipe leaves
+       and what a car with no rig gets. */
+    float pipe_dir[3];
     int have_pipe;
 } fx_t;
 
