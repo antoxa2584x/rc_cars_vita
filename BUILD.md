@@ -364,6 +364,9 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c -lm -o ui_test  # menu drawing
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
+    gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \
+        col.c rb.c rbcar.c contact.c collide.c carani.c \
+        -lm -o curb                    # driving AT a low obstacle / a kerb
     gcc -I../rccars_vita -O2 -fno-fast-math -ffp-contract=off \
         ../rccars_re/wetcheck.c col.c rb.c contact.c collide.c rbcar.c \
         -lm -o wetcheck                         # water, against the real grids

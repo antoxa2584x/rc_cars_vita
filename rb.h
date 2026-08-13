@@ -461,6 +461,39 @@ int  rb_gather_spheres(const rb_car *c, float out[][4]);
  * gather: suspRetract leaves the wheel clear by radius*0.01, so a zero-tolerance
  * query reports no contact at all. `opaque` matches the original's unused
  * body-pointer argument. */
+/* Time-of-impact bisection passes on the BODY spheres -- the port's stand-in for
+   carSubstepContact (0x004f0270), which the original reaches through the shell
+   query this port does not have.
+ *
+ * The failure it exists for was photographed on hardware: a car driven at
+ * beach_2's 0.23 m gas-station kerb ends up INSIDE it, resting, reporting
+ * `contacts=1111 emb=0 spd=0` -- perfectly happy. Probing that pose, only 2 of
+ * the 13 collision spheres overlapped anything, both WHEELS, both against the
+ * kerb's TOP face. Not one body sphere reported contact, because col_sphere is a
+ * closest-point query and a sphere buried deeper inside a solid than its own
+ * radius is near nothing at all. So `emb` stays 0, rb_body_depenetrate finds
+ * nothing to push, and the car occupies the concrete indefinitely.
+ *
+ * Depenetration cannot fix that -- it needs the overlap it cannot see. The cure
+ * has to stop the car ENTERING, which is what the original's bisection does: it
+ * walks the substep back to the moment of touching so the body never ends a step
+ * inside geometry.
+ *
+ * Gating on a SEGMENT CROSSING rather than on penetration is the whole trick, and
+ * the distinction matters -- rb_car_tick's own note records that gating the
+ * advance on a penetration test makes a landing car crawl, because the springs
+ * are never allowed to compress. A resting or settling body sphere does not sweep
+ * THROUGH a face; only one entering solid matter does.
+ *
+ * WHEELS ARE DELIBERATELY EXEMPT. carUpdateSuspension resolves a touching wheel
+ * geometrically by retracting the strut, and that overlap is the recovered
+ * behaviour, not a fault. Gating on it would refuse every landing.
+ *
+ * 6 passes bisect a substep to 1/64 of itself; at RB_MAX_SUBSTEP that is 65 us,
+ * and a body sphere moving at the 20 m/s momentum clamp covers 1.3 mm in it --
+ * comfortably inside RB_CONTACT_TOL, so the contact solve still sees the touch. */
+#define RB_TOI_PASSES 6
+
 #define RB_CONTACT_TOL   0.006f   /* carPhysTick's tolerance, call site 0x4f5fc9 */
 
 /* Slack allowed before a solid overlap counts as penetration, applied as a

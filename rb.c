@@ -773,6 +773,40 @@ static float rb_ccd_limit(rb_car *c, float dt)
     return (float)limit;
 }
 
+/* Did any BODY sphere sweep THROUGH a face between two poses?
+ *
+ * The port's stand-in for carSubstepContact's shell query -- see RB_TOI_PASSES in
+ * rb.h for why this is a crossing test and not a penetration test, and why the
+ * wheels are exempt. `pre` must have come from rb_gather_spheres at the earlier
+ * pose; the car is currently AT the later one.
+ */
+static int rb_body_swept_through(rb_car *c, const float pre[][4], int npre)
+{
+    float post[RB_MAX_SPHERES][4];
+    int n, i;
+
+    if (!c->world || !c->world->segment)
+        return 0;
+    n = rb_gather_spheres(c, post);
+    if (n > npre)
+        n = npre;
+    for (i = c->nwheels; i < n; i++) {
+        float dx, dy, dz;
+        if (pre[i][3] <= 0.0f)
+            continue;
+        dx = post[i][0] - pre[i][0];
+        dy = post[i][1] - pre[i][1];
+        dz = post[i][2] - pre[i][2];
+        /* Below a tenth of a millimetre there is nothing to cross, and asking
+           anyway is 9 segment queries a substep for no answer. */
+        if (dx * dx + dy * dy + dz * dz < 1e-8f)
+            continue;
+        if (c->world->segment(c->world->ctx, pre[i], post[i]))
+            return 1;
+    }
+    return 0;
+}
+
 /* 0x004f5e50 -- one frame.
  *
  * At most four substeps, in carPhysTick's own order (its call sequence at
@@ -814,8 +848,9 @@ static float rb_ccd_limit(rb_car *c, float dt)
 float rb_car_tick(rb_car *c, float dt)
 {
     float y0[RB_STATE_N], y1[RB_STATE_N];
+    float pre[RB_MAX_SPHERES][4];
     float remaining = dt;
-    int iter = 0, stuck, event;
+    int iter = 0, stuck, event, toi, npre = 0;
 
     if (!c->world || !c->world->sphere) {
         rb_car_get_state(c, y0);
@@ -898,8 +933,36 @@ float rb_car_tick(rb_car *c, float dt)
          * caused. That is the original's signal.
          */
         rb_car_get_state(c, y0);
+        npre = rb_gather_spheres(c, pre);
         rb_euler_step(c, y0, step, y1);
         rb_car_set_state(c, y1);
+
+        /* TIME OF IMPACT. If that advance swept a body sphere through a face,
+           walk it back to the largest step that did not -- carSubstepContact's
+           job, and the only thing that stops the car ENDING a substep inside
+           solid geometry. See RB_TOI_PASSES. */
+        toi = 0;
+        if (rb_body_swept_through(c, pre, npre)) {
+            float lo = 0.0f, hi = step;
+            int k;
+            for (k = 0; k < RB_TOI_PASSES; k++) {
+                float mid = 0.5f * (lo + hi);
+                rb_euler_step(c, y0, mid, y1);
+                rb_car_set_state(c, y1);
+                if (rb_body_swept_through(c, pre, npre))
+                    hi = mid;
+                else
+                    lo = mid;
+            }
+            /* Commit the last known-good pose. `step` itself is NOT reduced: the
+               substep's worth of time has passed either way, and shortening it
+               would leave `remaining` unspent and let the loop retry the same
+               blocked advance until its budget ran out -- a stall rather than a
+               wall. The body simply does not get there. */
+            rb_euler_step(c, y0, lo, y1);
+            rb_car_set_state(c, y1);
+            toi = 1;
+        }
 
         /* --- the contact solve (carPhysTick, 0x4f5f9c..0x4f6120) -------------
          *
@@ -921,6 +984,14 @@ float rb_car_tick(rb_car *c, float dt)
          * rb_body_depenetrate's job instead -- see its note in rb.h.
          */
         event = rb_collide(c, 0.0f, -RB_PENETRATION_SLACK, 1, -1, 0);
+        /* A bisected substep IS a contact event even though it ends CLEAR of the
+           surface -- that is the point of it. Without this the inward velocity is
+           never absorbed: the car stops where it should, then presses into the
+           face again every substep forever. rb_coll_list's RB_CONTACT_TOL window
+           is what finds the touch the bisection stopped just short of, and
+           rb_body_depenetrate is a no-op here because nothing is overlapping. */
+        if (toi)
+            event = 1;
         stuck = 0;
         if (!event) {
             stuck = rb_car_update_suspension(c, step, 0, 0);
