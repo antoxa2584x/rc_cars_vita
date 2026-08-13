@@ -281,9 +281,24 @@ typedef struct {
        off in the retail game. Kept because editing the .crs turns it on. */
     float speed_ang_max_rel;        /* tire[12] */
     /* engine, cfgEngineParams -> 0x014c46d0 + i*0x4c */
+    float boost_up;                 /* engine[0]  boostSpeedUp, meter units/s */
+    float boost_down;               /* engine[1]  boostSpeedDown, meter units/s */
     float speed_base_max;           /* engine[2]  km/h -- see PHYSICS.md */
     float speed_boost_max;          /* engine[3]  km/h */
     float boost_ratio;              /* engine[4] = speed_boost_max/speed_base_max */
+    /* engine[7..10], UPGRADES.ini [BOOSTERS] -- config-block offsets 0x1c..0x28,
+       between the two curves and the [RESONATORS] pair, exactly where the other
+       two upgrade tables live. Its ONLY consumer is the boost meter: it scales
+       the fill rate, and through the capacity remap it scales how much meter
+       there is to fill. Nothing multiplies speed or acceleration by it directly
+       -- the boost itself is worth a flat 1.2x accel and speed_boost_max, and
+       the booster buys how OFTEN you get that. See rb_boost_update. */
+    float booster_upgrade[4];
+    /* FUN_0050b7f0's reference range for the capacity remap. Two GLOBAL numbers
+       carried per car so the model needs no access to the car table, the same
+       way boost_ratio is carried rather than derived at the point of use.
+       gen_rb_data.py has the derivation, including which cars they come from. */
+    float boost_ref_lo, boost_ref_hi;
     float resonator_speed[4];       /* engine[11..14] RESONATORS <car>Upgrades */
     float resonator_accel[4];       /* engine[15..18] RESONATORS <car>Upgrades_SPL_OY */
     rb_curve accel;                 /* engine[6]  <CAR>.bspl */
@@ -304,7 +319,15 @@ typedef struct {
     int   brake;            /* phys+0x5774 bit0 -- also the drift trigger */
     float brake_amount;     /* phys+0x5778  0..1 */
     int   blocked;          /* phys+0x5784 bit0: drive inhibited by the game */
-    int   boost;            /* phys+0x573c */
+    /* phys+0x573c -- NOT the button. This is the boost meter's verdict, the
+       only thing carEngineAccel reads, and its only writer is rb_boost_update.
+       Set it by calling that, not by hand. */
+    int   boost;
+    /* phys+0x5754 bit0 -- the raw Boost action, kept because the rest clamp's
+       wake test is about what the DRIVER is doing, not about whether a burn
+       happens to be running (the original tests the action dwords there and
+       never 0x573c). rb_boost_update takes it as its argument. */
+    int   boost_button;
     /* phys+0x577c bit0 -- the Jump action. The original's input layer numbers
        its eight player actions 1 Boost, 2 Left, 3 Right, 4 Forw, 5 Back,
        6 JUMP, 7 Brake, 8 Reset (the binding table at 0x004e4188 onward), and
@@ -328,6 +351,14 @@ struct rb_car {
     int       drive_blocked;/* phys + 0x57ec */
     int       tire_upgrade; /* phys + 0xe45c + i*0xb0, 0..3 */
     int       reso_upgrade; /* phys + 0xe454 + i*0xb0, 0..3 */
+    int       boost_upgrade;/* phys + 0xe458 + i*0xb0, 0..3 -- the slot BETWEEN
+                               the other two, which is how it was found */
+    /* The boost meter, FUN_004f3800. See rb_boost_update. */
+    float     boost_tank;   /* phys + 0x5740: what is left, 0 .. capacity */
+    float     boost_arm_t;  /* phys + 0x5734: free-running, reset when it empties */
+    int       boost_lock;   /* phys + 0x572c: emptied, needs a refill to re-arm */
+    int       boost_latch;  /* phys + 0x5728: the button was seen held */
+    float     boost_time;   /* phys + 0x5738: how long this burn has run */
     int       car_index;    /* phys + 0x54: 0 Overkill, 1 Buggy, 2 Hummer */
     int       embedded;     /* phys + 0x0c: a wheel is buried in geometry */
     float     susp_ramp;    /* phys + 0x08: extension-rate ramp, 0..0.5 */
@@ -403,6 +434,38 @@ float rb_curve_eval(const rb_curve *cv, float x);                      /* 0x40f8
 float rb_tire_grip(const rb_car *c, int rear);                         /* 0x4ee180 */
 int   rb_tire_drifting(const rb_car *c);                               /* 0x4ee130 */
 float rb_engine_accel(rb_car *c, float *restrict_out);                 /* 0x4eea50 */
+
+/* --- the boost meter (contact.c) ------------------------------------------
+ *
+ * `in.boost` is NOT the button. The button feeds a meter, and the meter decides
+ * whether the engine is boosting -- FUN_004f3800 is the only writer of
+ * phys+0x573c, and carEngineAccel is the only reader. Before this was recovered
+ * the port wired the button straight through, which gave unlimited boost.
+ *
+ * The meter holds `rb_boost_capacity` units, fills at
+ *
+ *      boost_up * booster_upgrade[level] * RB_BOOST_FILL_SCALE
+ *
+ * every frame whatever the button is doing, and while a burn is running ALSO
+ * drains at boost_down -- both approaches run, so the net rate while boosting is
+ * the difference. That is where the [BOOSTERS] table lands, and it is the whole
+ * of what the booster upgrade buys. On the shipped data (all three cars fill at
+ * 1.5 and drain at 5.4545) a level-1 Overkill holds 50 units and nets -4.31/s
+ * while boosting; a level-4 Buggy holds 100 and nets -3.60/s, so the upgrade is
+ * worth roughly 2.3x the boost per charge.
+ */
+#define RB_BOOST_FILL_SCALE  0.95f   /* 0x55498c, on the fill rate only */
+#define RB_BOOST_ARM_TIME    0.9f    /* 0x554768, s since the meter last emptied */
+#define RB_BOOST_REARM       10.0f   /* 0x5549a8, units needed to re-arm, held */
+#define RB_BOOST_EMPTY       0.01f   /* 0x5544a4, below this the meter is empty */
+#define RB_BOOST_CAP_MIN     50.0f   /* 0x5549a4 */
+#define RB_BOOST_CAP_MAX     100.0f  /* 0x554474 */
+
+/* Takes the tuning and a level rather than a car, so the menu can quote the
+   tank size for a level the car is not wearing yet. */
+float rb_boost_capacity(const rb_tuning *tune, int level);             /* 0x50b7f0 */
+void  rb_boost_update(rb_car *c, int button, float dt);                /* 0x4f3800 */
+void  rb_boost_reset(rb_car *c);        /* fill it -- call AFTER boost_upgrade */
 
 void  rb_angular_accel(rb_body *b, const float pts[][3], int n,
                        const float f[][3], float out[3]);              /* 0x476ba0 */

@@ -110,6 +110,120 @@ float rb_tire_grip(const rb_car *c, int rear)
 /* engine                                                                    */
 /* ------------------------------------------------------------------------- */
 
+/* 0x0050b7f0 -- the capacity of the boost meter, in meter units.
+ *
+ * A linear remap of this car's booster strength onto 50..100 against a fixed
+ * reference range, rounded to a whole number (the original adds 0.5 and runs it
+ * through _ftol, then fild's it straight back, so the value is integral but
+ * travels as a float). gen_rb_data.py derives boost_ref_lo / boost_ref_hi and
+ * documents which cars they come from.
+ *
+ * On the shipped data this is 50 / 63 / 79 / 93 for the Overkill and
+ * 50 / 67 / 83 / 100 for the Buggy and the Hummer.
+ */
+float rb_boost_capacity(const rb_tuning *tune, int lvl)
+{
+    double t, lo = tune->boost_ref_lo, hi = tune->boost_ref_hi;
+
+    if (lvl < 0 || lvl >= 4)
+        lvl = 0;
+    t = (double)tune->boost_up * tune->booster_upgrade[lvl];
+
+    if (t < lo)
+        return RB_BOOST_CAP_MIN;
+    if (t > hi)
+        return RB_BOOST_CAP_MAX;
+    if (fabs(hi - lo) < 1e-6)
+        return 0.0f;
+    return (float)floor((t - lo) * (double)RB_BOOST_CAP_MIN / (hi - lo)
+                        + RB_BOOST_CAP_MIN + 0.5);
+}
+
+/* Fill the meter. The original's car-reset path does exactly this and no more --
+ * 0x004f27e6 calls FUN_0050b7f0 and stores the result straight into phys+0x5740
+ * -- so the arm timer keeps running across a respawn and the lockout is left to
+ * clear itself, which it does on the next update now that the meter is full.
+ * Call it AFTER setting boost_upgrade: the capacity depends on the level. */
+void rb_boost_reset(rb_car *c)
+{
+    c->boost_tank = rb_boost_capacity(&c->tune, c->boost_upgrade);
+}
+
+/* 0x004f3800 -- the boost meter. Sets c->in.boost, which is what the engine
+ * reads; see the header for the shape and for why the button is not it.
+ *
+ * Called once per FRAME, not per substep -- the original's call site is the
+ * per-car frame loop at 0x004f7051, alongside the suspension ramp and the jump,
+ * and it is passed the frame's dt.
+ *
+ * Two pieces of the original are transcribed as reached rather than as written:
+ *
+ *  - releasing the button clears the lockout (0x4f38bf) even though holding it
+ *    through an empty meter does not. So tapping does get you a sliver of boost
+ *    the moment the arm timer expires. It is worth about 27% duty against the
+ *    21% the fill rate allows outright, so it is not an exploit, and it is what
+ *    the machine code does.
+ *  - the button-released path's "if the latch was set, reset the arm timer"
+ *    (0x4f38cb) is UNREACHABLE: 0x4f3847, four instructions earlier on the same
+ *    path, has already zeroed the latch. Written out here the same way, so the
+ *    timer keeps running across a release exactly as it does in the original.
+ */
+void rb_boost_update(rb_car *c, int button, float dt)
+{
+    float cap = rb_boost_capacity(&c->tune, c->boost_upgrade);
+    double rate;
+    int lvl = c->boost_upgrade, engaged = 0;
+
+    if (lvl < 0 || lvl >= 4)
+        lvl = 0;
+
+    /* 0x4f3831: this advances every frame, whatever the button is doing. */
+    c->boost_arm_t += dt;
+
+    if (!button) {
+        c->boost_latch = 0;                       /* 0x4f3847 */
+        c->boost_lock  = 0;                       /* 0x4f38bf */
+    } else if (c->boost_arm_t > RB_BOOST_ARM_TIME) {   /* 0x4f3854, strict */
+        if (c->boost_lock) {
+            if (c->boost_tank > RB_BOOST_REARM) {      /* 0x4f3871, strict */
+                engaged = 1;
+                c->boost_lock = 0;
+            }
+            c->boost_latch = 1;
+        } else if (c->boost_tank >= RB_BOOST_EMPTY) {  /* 0x4f388e */
+            engaged = 1;
+            c->boost_latch = 1;
+        } else {
+            /* Ran dry: lock out and restart the arm timer. */
+            c->boost_lock  = 1;
+            c->boost_arm_t = 0.0f;
+            c->boost_latch = 1;
+        }
+    }
+
+    /* 0x4f3926: the fill. This runs unconditionally -- while a burn is on, the
+       drain below is applied on top of it, so the two rates subtract. The sign
+       test is the original's own: the rate is a product of shipped positives,
+       but a negative one drains toward empty instead. */
+    rate = (double)c->tune.boost_up * c->tune.booster_upgrade[lvl]
+           * RB_BOOST_FILL_SCALE;
+    if (rate > -1e-6)
+        c->boost_tank = rb_move_towards(c->boost_tank, cap, (float)rate, dt);
+    else
+        c->boost_tank = rb_move_towards(c->boost_tank, 0.0f,
+                                        (float)fabs(rate), dt);
+
+    if (engaged) {                                /* 0x4f398a */
+        c->boost_time += dt;
+        c->boost_tank  = rb_move_towards(c->boost_tank, 0.0f,
+                                         c->tune.boost_down, dt);
+        c->in.boost = 1;
+    } else {                                      /* 0x4f3979 */
+        c->boost_time = 0.0f;
+        c->in.boost = 0;
+    }
+}
+
 /* 0x004eea50 -- returns the commanded acceleration in m/s^2, and through
  * restrict_out the engine-braking magnitude from the <CAR>_RESTRICT curve.
  *

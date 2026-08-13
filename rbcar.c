@@ -47,6 +47,10 @@ void rbcar_init(rb_car *c, int car, const rb_world *w,
     c->rest_damp = 1;
     c->max_contacts = 4;
     c->tune = d->tune;
+    /* A car arrives with a full boost meter, as it does off the original's
+       reset path. Callers that set boost_upgrade afterwards should call
+       rb_boost_reset again -- the capacity depends on the level. */
+    rb_boost_reset(c);
 
     /* phys+0x08, the suspension extension-rate ramp. It is UNRECOVERED: only the
      * resets are transcribed (see rb_susp_ramp_reset), the writer is not, so this
@@ -298,8 +302,20 @@ void rbcar_step(rb_car *c, float throttle, float brake, float steer,
     c->in.throttle     = throttle;
     c->in.brake        = (brake > 0.01f);
     c->in.brake_amount = brake;
-    c->in.boost        = boost;
     c->in.blocked      = 0;
+
+    /* `boost` is the BUTTON, and the button is not what the engine reads. It
+       feeds a meter which decides whether a burn is running, and the meter is
+       where the [BOOSTERS] upgrade is spent -- see rb_boost_update. Driven from
+       here, per tick, because the original drives it from the per-car frame
+       loop (0x004f7051) with the frame's dt, the same place the suspension ramp
+       below is advanced from.
+
+       THE THROTTLE GATE IS THE ORIGINAL'S, and it is at its call site too: the
+       argument is built at 0x004f7032 as (Boost action & 1) AND (Forw action &
+       1), so boost does nothing while coasting. */
+    c->in.boost_button = boost ? 1 : 0;
+    rb_boost_update(c, (boost && c->in.accel) ? 1 : 0, dt);
 
     /* Steering. The real thing is carSteering (0x004f2d60), which drives this
        through a per-car spline and is not transcribed; this is a rate-limited

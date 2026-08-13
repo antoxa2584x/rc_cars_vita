@@ -800,7 +800,10 @@ void rb_car_rest_update(rb_car *c, float dt)
        The one bit still unmapped is 0x575c, which cannot move a stationary car
        on its own -- the effect of leaving it out is that a car being steered and
        nothing else is allowed to fall asleep. */
-    if (c->in.accel || c->in.brake || c->in.boost || c->in.blocked
+    /* boost_button, not boost: this asks what the driver is holding, and
+       in.boost is now the meter's verdict -- an empty meter must not be able to
+       let a car the driver is still leaning on fall asleep. */
+    if (c->in.accel || c->in.brake || c->in.boost_button || c->in.blocked
         || c->in.jump) {
         c->rest_slow_t   = 0.0f;
         c->rest_spin_t   = 0.0f;

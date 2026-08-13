@@ -270,6 +270,10 @@ static void respawn(void)
     rbcar_init(&rc, cur_car, col_rb_world(&col), t->x, gy, t->z, t->yaw);
     rc.tire_upgrade = menu.tires;
     rc.reso_upgrade = menu.reso;
+    rc.boost_upgrade = menu.boost;
+    /* On the grid with a full meter, at whatever capacity this booster level
+       buys. AFTER the line above, not before -- the capacity reads it. */
+    rb_boost_reset(&rc);
     /* Throw away time banked across the load or the teleport: the world did not
        experience it, and spending it would run several ticks on the first frame
        at the new spawn. */
@@ -543,6 +547,11 @@ unsigned int acc_ticks = 0;
            live -- no reload, and the effect is visible while driving. */
         rc.tire_upgrade = menu.tires;
         rc.reso_upgrade = menu.reso;
+        /* Deliberately NOT rb_boost_reset: changing the booster mid-race moves
+           the capacity and the fill rate, and the meter fills toward the new
+           one at the new rate. Topping it up on a menu press would be a free
+           tank of boost every time the row is touched. */
+        rc.boost_upgrade = menu.boost;
 
         /* The two upgrades the car WEARS. Only rebuilt when a level actually
            changes: carparts_apply rebinds textures and index counts, which is
@@ -1180,7 +1189,8 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                 const float *up = &rc.m[4];
                 float c1 = up[1] > 1.f ? 1.f : (up[1] < -1.f ? -1.f : up[1]);
                 rlog("[rccars] rb tilt=%d deg  contacts=%d%d%d%d  "
-                              "len=%d %d %d %d mm  emb=%d  spd=%d cm/s\n",
+                              "len=%d %d %d %d mm  emb=%d  spd=%d cm/s  "
+                              "boost=%d/%d %s\n",
                               (int)(acosf(c1) * 57.295776f),
                               rc.hit[0].active, rc.hit[1].active,
                               rc.hit[2].active, rc.hit[3].active,
@@ -1189,7 +1199,16 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                               (int)(rc.wheel[2].len * 1000.f),
                               (int)(rc.wheel[3].len * 1000.f),
                               rc.embedded,
-                              (int)(rbcar_speed(&rc) * 100.f));
+                              (int)(rbcar_speed(&rc) * 100.f),
+                              /* The boost meter. It has NO on-screen gauge yet,
+                                 so a finite resource is otherwise invisible --
+                                 this is the only way to see why boost stopped.
+                                 The original draws one; 0x004eb200 is where it
+                                 hands the pair to the HUD. */
+                              (int)rc.boost_tank,
+                              (int)rb_boost_capacity(&rc.tune, rc.boost_upgrade),
+                              rc.boost_lock ? "locked" :
+                                  (rc.in.boost ? "ON" : "--"));
             }
             if (car.has_rig) {
                 /* Rig telemetry, for the same reason: "the wheels look wrong"

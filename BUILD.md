@@ -360,7 +360,10 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         ../rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c rlog.c -lm -o proptest                # the knockable props
-    gcc -I. -O2 ../rccars_re/menu_test.c menu.c -lm -o menu_test    # the menu
+    gcc -I. -O2 ../rccars_re/menu_test.c menu.c contact.c rb.c collide.c \
+        -lm -o menu_test    # the menu. The model is on this line because the
+                            # booster row quotes rb_boost_capacity -- the menu
+                            # names the tank size the upgrade buys.
     gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c -lm -o ui_test  # menu drawing
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound

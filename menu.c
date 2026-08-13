@@ -144,12 +144,14 @@ static void row_value(const menu_t *m, int row, char *out, int n)
                  (double)d->tune.resonator_accel[m->reso]);
         break;
     case MENU_BOOST:
-        /* The exhaust the car wears. Level names the UPGRADES<n> subtree, and
-           the multiplier is UPGRADES.ini's [BOOSTERS] row for this car -- shown
-           so the number is visible even though nothing reads it yet. */
-        snprintf(out, n, "< %d >  exhaust %d  (boost x%.2f, not wired)",
+        /* The exhaust the car wears, and the boost meter -- one number does
+           both. UPGRADES.ini's [BOOSTERS] row scales the rate the meter refills
+           at, and through FUN_0050b7f0's remap it also sets how much meter
+           there is, so both are quoted rather than the bare multiplier. */
+        snprintf(out, n, "< %d >  exhaust %d  refill x%.2f  tank %d",
                  m->boost + 1, m->boost + 1,
-                 (double)RB_BOOSTER_UPGRADE[wrap(m->car, 3)][m->boost]);
+                 (double)d->tune.booster_upgrade[m->boost],
+                 (int)rb_boost_capacity(&d->tune, m->boost));
         break;
     case MENU_VOL_SFX:
     case MENU_VOL_MUSIC: {

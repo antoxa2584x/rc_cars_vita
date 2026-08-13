@@ -1886,6 +1886,202 @@ static void timestep_checks(void)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* part 8: the boost meter (FUN_004f3800, capacity FUN_0050b7f0)             */
+/* ------------------------------------------------------------------------- */
+/*
+ * `in.boost` used to be the button wired straight through, so boost was
+ * unlimited and the [BOOSTERS] upgrade reached nothing at all. What the meter
+ * has to be is FINITE and UPGRADEABLE, so these checks are bound to what the
+ * driver gets out of it -- how long one burn lasts, how much of a minute is
+ * spent boosting, how far the car travels -- and not to the meter's own
+ * constants. Asserting `tank == capacity` would pass against any capacity, and
+ * this suite has shipped that mistake six times; see CLAUDE.md.
+ */
+
+/* Drive flat out for `secs` with the boost button in `button`. Returns the
+ * number of ticks the ENGINE was boosting -- c->in.boost, which is what
+ * carEngineAccel reads -- and reports the first continuous burn, the distance
+ * covered, and the boosting ticks in the SECOND HALF of the window.
+ *
+ * That last one is the refill rate on its own. Once the meter the car started
+ * with has been spent, every later burn begins from the re-arm threshold, so
+ * what is left is a duty cycle set by how fast the meter fills -- and a mutant
+ * that scales only the CAPACITY by the booster level survives every check that
+ * looks at the first burn or at the whole window. */
+static int boost_run(int car, int level, int button, float secs,
+                     float *first_out, float *dist_out, int *tail_out)
+{
+    rb_car c;
+    int i, n = (int)(secs * 60.0f + 0.5f), on = 0, first = 0, ended = 0, tail = 0;
+    float x0, z0;
+
+    settle(&c, car);
+    c.boost_upgrade = level;
+    rb_boost_reset(&c);
+    x0 = c.body.x[0];
+    z0 = c.body.x[2];
+
+    for (i = 0; i < n; i++) {
+        rbcar_step(&c, 1.0f, 0.0f, 0.0f, button, 1.0f / 60.0f);
+        if (c.in.boost) {
+            on++;
+            if (i >= n / 2) tail++;
+            if (!ended) first++;
+        } else if (first) {
+            ended = 1;
+        }
+    }
+    if (tail_out)
+        *tail_out = tail;
+    if (first_out)
+        *first_out = first / 60.0f;
+    if (dist_out) {
+        double dx = (double)c.body.x[0] - x0, dz = (double)c.body.x[2] - z0;
+        *dist_out = (float)sqrt(dx * dx + dz * dz);
+    }
+    return on;
+}
+
+static void boost_checks(void)
+{
+    rb_car c;
+    int lvl, on[4], tail[4], rising;
+    float first[4], dist_boost, dist_plain, junk;
+
+    puts("\n-- part 8: the boost meter (0x004f3800) --");
+
+    /* (1) THE CAPACITY ENDPOINTS. FUN_0050b7f0 clamps below its reference range
+       and at the top of it, and the shipped data lands exactly on both ends --
+       which is the evidence that the remap was read the right way round. Those
+       two values are the ones interpolation cannot produce. */
+    printf("capacity  Overkill %.0f %.0f %.0f %.0f   Buggy %.0f %.0f %.0f %.0f\n",
+           (double)rb_boost_capacity(&RB_CARS[0].tune, 0),
+           (double)rb_boost_capacity(&RB_CARS[0].tune, 1),
+           (double)rb_boost_capacity(&RB_CARS[0].tune, 2),
+           (double)rb_boost_capacity(&RB_CARS[0].tune, 3),
+           (double)rb_boost_capacity(&RB_CARS[1].tune, 0),
+           (double)rb_boost_capacity(&RB_CARS[1].tune, 1),
+           (double)rb_boost_capacity(&RB_CARS[1].tune, 2),
+           (double)rb_boost_capacity(&RB_CARS[1].tune, 3));
+    ck(rb_boost_capacity(&RB_CARS[1].tune, 0) == RB_BOOST_CAP_MIN,
+       "the weakest booster in the game sits on the bottom of the range");
+    ck(rb_boost_capacity(&RB_CARS[1].tune, 3) == RB_BOOST_CAP_MAX,
+       "the strongest sits on the top of it");
+    ck(rb_boost_capacity(&RB_CARS[0].tune, 0) == RB_BOOST_CAP_MIN,
+       "and a booster below the range is clamped, not extrapolated");
+    for (lvl = 1; lvl < 4; lvl++)
+        ck(rb_boost_capacity(&RB_CARS[0].tune, lvl)
+           > rb_boost_capacity(&RB_CARS[0].tune, lvl - 1),
+           "capacity rises with the booster level");
+
+    /* (2) A car arrives with the meter its booster buys, not the level-0 meter
+       it was constructed with. */
+    settle(&c, 0);
+    c.boost_upgrade = 3;
+    rb_boost_reset(&c);
+    ck(c.boost_tank == rb_boost_capacity(&RB_CARS[0].tune, 3),
+       "rb_boost_reset fills to the level actually fitted");
+
+    /* (3) THE GATE. The button is not boost: the original ANDs it with the
+       throttle at its own call site (0x004f7032), so a coasting car cannot
+       boost however hard the button is held. */
+    ck(boost_run(0, 3, 1, 3.0f, NULL, NULL, NULL) > 0,
+       "throttle + button does boost");
+    {
+        rb_car d;
+        int i, idle = 0;
+        settle(&d, 0);
+        d.boost_upgrade = 3;
+        rb_boost_reset(&d);
+        for (i = 0; i < 180; i++) {
+            rbcar_step(&d, 0.0f, 0.0f, 0.0f, 1, 1.0f / 60.0f);
+            idle += d.in.boost ? 1 : 0;
+        }
+        printf("button held 3 s with no throttle: %d boosting ticks, "
+               "meter %.1f\n", idle, (double)d.boost_tank);
+        ck(idle == 0, "the button alone does nothing -- boost needs the throttle");
+        ck(d.in.boost_button == 1,
+           "but the raw action stays visible to the rest clamp");
+        ck(d.boost_tank > rb_boost_capacity(&RB_CARS[0].tune, 3) - 0.001f,
+           "and a meter that never fired is still full");
+    }
+
+    /* (4) IT IS FINITE -- the whole of the bug. Held down, the burn must stop.
+       Bound to "less than the window", which no choice of constants satisfies
+       if the drain is disconnected. */
+    for (lvl = 0; lvl < 4; lvl++)
+        on[lvl] = boost_run(0, lvl, 1, 120.0f, &first[lvl], NULL, &tail[lvl]);
+    puts("Overkill, 120 s flat out with boost held:");
+    for (lvl = 0; lvl < 4; lvl++)
+        printf("   level %d: first burn %5.2f s, %6.2f s boosting of 120, "
+               "%5.2f s in the last 60 (steady state)\n",
+               lvl + 1, (double)first[lvl], on[lvl] / 60.0, tail[lvl] / 60.0);
+    for (lvl = 0; lvl < 4; lvl++) {
+        ck(on[lvl] < 120 * 60, "the meter runs out -- boost is not unlimited");
+        ck(first[lvl] > 0.5f && first[lvl] < 30.0f,
+           "and one burn is a usable length, not a frame and not forever");
+    }
+
+    /* (5) THE PAYOFF, and the check that dies if the upgrade is unwired: a
+       better booster buys strictly more boost, both in one burn (a bigger
+       meter) and over a minute (a faster refill). Ordering, not magnitudes --
+       nothing here is satisfied by copying a constant out of rb_data.h. */
+    rising = 1;
+    for (lvl = 1; lvl < 4; lvl++)
+        if (!(first[lvl] > first[lvl - 1]) || !(on[lvl] > on[lvl - 1]))
+            rising = 0;
+    ck(rising, "every booster level buys a longer burn AND more boost overall");
+    ck(on[3] * 4 > on[0] * 5,
+       "and the range is worth having -- level 4 beats level 1 by over 25%");
+
+    /* The upgrade has TWO halves -- a bigger meter and a faster refill -- and
+       everything above sees only the first, because all of it is dominated by
+       the tank the car starts with. Scaling the capacity alone and leaving the
+       fill rate on level 1 passes every one of those checks; it was a live
+       mutant. This is the other half on its own: once the starting tank is
+       spent, every later burn begins from the same re-arm threshold, so what is
+       left is a duty cycle, and a duty cycle can only rise if the RATE does. */
+    rising = 1;
+    for (lvl = 1; lvl < 4; lvl++)
+        if (!(tail[lvl] > tail[lvl - 1]))
+            rising = 0;
+    ck(rising, "and it refills faster too -- the steady-state duty cycle rises");
+    ck(tail[3] * 5 > tail[0] * 6,
+       "measurably so, not by a tick or two");
+
+    /* (6) IT REACHES THE ENGINE. carEngineAccel is the only consumer, so the
+       proof is on the ground: the same car over the same window gets further
+       with the button held. */
+    (void)boost_run(0, 3, 1, 10.0f, &junk, &dist_boost, NULL);
+    (void)boost_run(0, 3, 0, 10.0f, &junk, &dist_plain, NULL);
+    printf("10 s flat out: %.2f m boosting, %.2f m plain\n",
+           (double)dist_boost, (double)dist_plain);
+    ck(dist_boost > dist_plain + 0.5f,
+       "boost actually moves the car -- in.boost reaches the engine");
+
+    /* (7) IT COMES BACK. Run it dry, let go, and the meter refills -- one burn
+       a race is the failure mode on the other side of (4). */
+    {
+        rb_car d;
+        int i;
+        float low;
+        settle(&d, 0);
+        d.boost_upgrade = 3;
+        rb_boost_reset(&d);
+        for (i = 0; i < 60 * 60; i++)          /* burn it down */
+            rbcar_step(&d, 1.0f, 0.0f, 0.0f, 1, 1.0f / 60.0f);
+        low = d.boost_tank;
+        for (i = 0; i < 30 * 60; i++)          /* then coast for 30 s */
+            rbcar_step(&d, 0.0f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
+        printf("after a minute of burning: %.1f units, +30 s idle: %.1f\n",
+               (double)low, (double)d.boost_tank);
+        ck(d.boost_tank > low + 1.0f, "the meter refills when it is left alone");
+        ck(d.boost_tank <= rb_boost_capacity(&RB_CARS[0].tune, 3) + 0.001f,
+           "and never past its capacity");
+    }
+}
+
 int main(void)
 {
     rb_car c;
@@ -2751,6 +2947,9 @@ int main(void)
 
     /* ================= part 7: the fixed timestep ===================== */
     timestep_checks();
+
+    /* ================= part 8: the boost meter ======================== */
+    boost_checks();
 
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails != 0;

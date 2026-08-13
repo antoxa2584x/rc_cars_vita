@@ -86,12 +86,12 @@ typedef struct {
     int reso;           /* 0..3 -- top speed and acceleration. No visual: the
                            resonator is the one upgrade of the three with no
                            mesh or texture family in Car.sb */
-    int boost;          /* 0..3 -- the exhaust the car wears (UPGRADES1..4).
-                           VISUAL ONLY so far: UPGRADES.ini's [BOOSTERS] table is
-                           not in rb_data.h and where the original applies it is
-                           not recovered, so wiring it to the model would be a
-                           guess. Guessing is how this port got three of its
-                           worst bugs; see PHYSICS.md */
+    int boost;          /* 0..3 -- the exhaust the car wears (UPGRADES1..4), and
+                           the size and refill rate of the boost meter.
+                           UPGRADES.ini's [BOOSTERS] table is engine[7..10] and
+                           its one consumer is FUN_004f3800; see rb_boost_update.
+                           Live, like the other two: the model reads the index
+                           every frame, no reload. */
     /* 0 = full, 1 = half, 2 = quarter resolution -- the game's own RenderQual /
        VIDEO_TexQual, implemented as mip levels skipped at upload. The three
        levels land on exactly the sizes of the original's Textures.1/.2/.3.

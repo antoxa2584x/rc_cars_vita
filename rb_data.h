@@ -59,9 +59,14 @@ static const rb_car_data RB_CARS[3] = {
       /* water         */ 0.191919f,
       /* tire_upgrade  */ {0.900000f,1.020000f,1.100000f,1.200000f},
       /* spin_extra    */ 0.000000f,
+      /* boost_up      */ 1.500000f,
+      /* boost_down    */ 5.454546f,
       /* speed_base    */ 27.000000f,
       /* speed_boost   */ 35.000000f,
       /* boost_ratio   */ 1.296296f,
+      /* booster_upg   */ {0.800000f,0.970000f,1.110000f,1.240000f},
+      /* boost_ref_lo  */ 1.275000f,
+      /* boost_ref_hi  */ 1.950000f,
       /* reso_speed    */ {0.920000f,0.970000f,1.070000f,1.120000f},
       /* reso_accel    */ {0.700000f,0.800000f,0.900000f,1.000000f},
       /* accel curve   */ { rb_accel1, 3 },
@@ -107,9 +112,14 @@ static const rb_car_data RB_CARS[3] = {
       /* water         */ 0.191919f,
       /* tire_upgrade  */ {0.970000f,1.120000f,1.250000f,1.450000f},
       /* spin_extra    */ 0.000000f,
+      /* boost_up      */ 1.500000f,
+      /* boost_down    */ 5.454546f,
       /* speed_base    */ 27.000000f,
       /* speed_boost   */ 35.000000f,
       /* boost_ratio   */ 1.296296f,
+      /* booster_upg   */ {0.850000f,1.000000f,1.150000f,1.300000f},
+      /* boost_ref_lo  */ 1.275000f,
+      /* boost_ref_hi  */ 1.950000f,
       /* reso_speed    */ {0.980000f,1.040000f,1.100000f,1.170000f},
       /* reso_accel    */ {0.750000f,0.850000f,0.950000f,1.000000f},
       /* accel curve   */ { rb_accel2, 4 },
@@ -155,9 +165,14 @@ static const rb_car_data RB_CARS[3] = {
       /* water         */ 0.191919f,
       /* tire_upgrade  */ {0.970000f,1.050000f,1.120000f,1.250000f},
       /* spin_extra    */ 0.000000f,
+      /* boost_up      */ 1.500000f,
+      /* boost_down    */ 5.454546f,
       /* speed_base    */ 27.000000f,
       /* speed_boost   */ 35.000000f,
       /* boost_ratio   */ 1.296296f,
+      /* booster_upg   */ {0.850000f,1.000000f,1.150000f,1.300000f},
+      /* boost_ref_lo  */ 1.275000f,
+      /* boost_ref_hi  */ 1.950000f,
       /* reso_speed    */ {0.980000f,1.050000f,1.110000f,1.170000f},
       /* reso_accel    */ {0.750000f,0.850000f,0.950000f,1.000000f},
       /* accel curve   */ { rb_accel3, 3 },
@@ -178,15 +193,6 @@ static const rb_car_data RB_CARS[3] = {
     /* sag      */ 0.119437f,
     /* k_speed  */ 4.181818f,
     /* radius   */ 0.059091f },
-};
-
-/* Scripts/upgrades.ini [BOOSTERS]. VISUAL SELECTION ONLY: the model
- * does not read this, because where the original applies it is not
- * recovered. See carparts.c and the note on menu_t.boost. */
-static const float RB_BOOSTER_UPGRADE[3][4] = {
-    { 0.800000f, 0.970000f, 1.110000f, 1.240000f },   /* Overkill */
-    { 0.850000f, 1.000000f, 1.150000f, 1.300000f },   /* Buggy */
-    { 0.850000f, 1.000000f, 1.150000f, 1.300000f },   /* Hummer */
 };
 
 /* Camera, from Settings/Camera.crs via physLoadCamera (0x004f9da0).
