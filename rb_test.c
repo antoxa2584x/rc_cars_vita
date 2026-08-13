@@ -653,6 +653,372 @@ static void rig_checks(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* part 5b: the other two procs, against the REAL packed cars                 */
+/* ------------------------------------------------------------------------- */
+
+/* Rotation about Y that carries unit `a` onto unit `b`, in degrees, signed.
+   Negating BOTH vectors leaves it alone, so it does not care which way along
+   its own axle a wheel node happens to point -- which the three cars disagree
+   about. */
+static float yaw_between(const float a[3], const float b[3])
+{
+    return (float)(atan2((double)a[2] * b[0] - (double)a[0] * b[2],
+                         (double)a[0] * b[0] + (double)a[2] * b[2])
+                   * 57.2957795);
+}
+
+/* Unit direction of a part's own +Z in model space -- for a wheel node, the
+   axle it spins about. */
+static void rig_axle(const carani_t *r, int p, float o[3])
+{
+    const float *m = r->world[p];
+    double n = sqrt((double)m[8] * m[8] + (double)m[9] * m[9]
+                    + (double)m[10] * m[10]);
+    if (n < 1e-9) n = 1.0;
+    o[0] = (float)(m[8] / n); o[1] = (float)(m[9] / n); o[2] = (float)(m[10] / n);
+}
+
+static void rig_checks_23(void)
+{
+    static carani_t rig;
+    rb_car c;
+    rb_world w;
+    int car, i;
+
+    puts("\n-- part 5b: the Buggy's wishbones and the Hummer's third axle --");
+
+    /* 1. WHICH WAY A WHEEL ROLLS, on all three cars. The Overkill's proc has
+          been right since the rig was written, so running the same probe over
+          all three makes the other two answerable to it rather than to
+          themselves -- and the Hummer's wheel nodes are modelled along -X where
+          the other two are along +X, which is why its own proc spins them by
+          -spin. A wheel rolling backwards is not something a check on the
+          ANGLE would notice; this asks where the tread at the bottom of the
+          wheel goes, and forward travel is +Z. */
+    for (car = 0; car < 3; car++) {
+        char path[32];
+        float p0[RB_MAX_WHEELS][3], p1[3];
+        int back = 0, seen = 0;
+
+        sprintf(path, "assets/car%d.vsc", car + 1);
+        if (!rig_load(&rig, path)) {
+            ck(0, "assets/carN.vsc loads a rig (repack with pack_vsc.py --rig)");
+            continue;
+        }
+        memset(&w, 0, sizeof w);
+        rbcar_init(&c, car, &w, 0.f, 0.f, 0.f, 0.f);
+        carani_bind(&rig, &c);
+
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].spin = 0.f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++)
+            if (rig.wheel[i] >= 0)
+                rig_pt(&rig, rig.wheel[i], 0.f, -1.f, 0.f, p0[i]);
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].spin = 0.10f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            if (rig.wheel[i] < 0)
+                continue;
+            rig_pt(&rig, rig.wheel[i], 0.f, -1.f, 0.f, p1);
+            seen++;
+            if (p1[2] - p0[i][2] < -1e-4f)
+                back++;
+        }
+        printf("car%d (proc %d): %d of %d wheels put the tread at the bottom "
+               "BACKWARDS as spin grows\n", car + 1, rig.proc, back, seen);
+        ck(seen == c.nwheels && back == seen,
+           "every wheel rolls forwards when the car drives forwards");
+    }
+
+    /* ---- 2. the Buggy ---- */
+    if (!rig_load(&rig, "assets/car2.vsc")) {
+        ck(0, "assets/car2.vsc loads a rig");
+        return;
+    }
+    memset(&w, 0, sizeof w);
+    rbcar_init(&c, 1, &w, 0.f, 0.f, 0.f, 0.f);
+    carani_bind(&rig, &c);
+
+    ck(rig.proc == 2, "the Buggy takes carAniProc2");
+    {
+        int armed = 0, pairs = rig.n_pairs;
+        for (i = 0; i < c.nwheels; i++)
+            if (rig.wheel[i] >= 0 && rig.arm_up[i] >= 0 && rig.arm_down[i] >= 0
+                && rig.arm_knuckle[i] >= 0)
+                armed++;
+        printf("Buggy: %d parts, %d corners with a full wishbone, %d spring "
+               "pairs\n", rig.n, armed, pairs);
+        ck(armed == 4, "all four wishbones bound");
+        ck(pairs == 4, "all four spring pairs bound");
+        ck(rig.support[0] < 0 && rig.support[1] < 0,
+           "and no steering knuckle, which is why the wheel itself must turn");
+    }
+
+    /* Steering has to reach the WHEELS -- the report was that it does not. */
+    {
+        float a0[RB_MAX_WHEELS][3], a1[3], fy = 0.f, ry = 0.f;
+        c.steer = 0.f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++)
+            rig_axle(&rig, rig.wheel[i], a0[i]);
+        c.steer = 25.f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_axle(&rig, rig.wheel[i], a1);
+            if (c.wheel[i].mount[2] > 0.f) fy = yaw_between(a0[i], a1);
+            else                           ry = yaw_between(a0[i], a1);
+        }
+        printf("Buggy steer 25: front wheel yaw %+.2f deg, rear %+.2f\n",
+               (double)fy, (double)ry);
+        ck(fabsf(fy - c.steer) < 0.01f,
+           "the Buggy's front wheels turn by the body's steer angle");
+        ck(fabsf(ry) < 0.01f, "and its rear wheels do not turn");
+        c.steer = 0.f;
+    }
+
+    /* The wishbone: each corner moves on its own, the wheel keeps its camber,
+       and the spring halves keep pointing at each other while they do. */
+    {
+        float y0[RB_MAX_WHEELS], y1[RB_MAX_WHEELS], p[3];
+        float ax0[3], ax1[3], camber;
+        int drop = 0;                       /* the corner that is commanded */
+        for (i = 0; i < c.nwheels; i++)
+            c.wheel[i].len = c.wheel[i].len_free - c.wheel[i].sag;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 0.f, p);
+            y0[i] = p[1];
+        }
+        rig_axle(&rig, rig.wheel[drop], ax0);
+
+        c.wheel[drop].len += 0.030f;        /* 30 mm of droop on one corner */
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 0.f, p);
+            y1[i] = p[1];
+        }
+        rig_axle(&rig, rig.wheel[drop], ax1);
+        camber = (float)(acos(ax0[0] * ax1[0] + ax0[1] * ax1[1]
+                              + ax0[2] * ax1[2] > 1.0 ? 1.0
+                              : ax0[0] * ax1[0] + ax0[1] * ax1[1]
+                                + ax0[2] * ax1[2]) * 57.2957795);
+        printf("Buggy 30 mm droop on corner 0: that node %+.4f m, the other "
+               "three %+.4f %+.4f %+.4f, camber %.3f deg\n",
+               (double)(y1[0] - y0[0]), (double)(y1[1] - y0[1]),
+               (double)(y1[2] - y0[2]), (double)(y1[3] - y0[3]), (double)camber);
+        /* A BAND, not a number: the arms carry the wheel down and the upright's
+           counter-rotation carries a little of it back, which is the original's
+           own approximation -- its sweep tables are built with the upright at
+           rest. What must be true is that the wheel goes DOWN and goes most of
+           the way, so both "nothing happens" and "the sign is inverted" die. */
+        ck(y1[0] - y0[0] < -0.015f && y1[0] - y0[0] > -0.035f,
+           "a drooped corner carries its own wheel down with it");
+        for (i = 1; i < c.nwheels; i++)
+            ck(fabsf(y1[i] - y0[i]) < 1e-5f,
+               "and leaves the other three alone -- these corners are independent");
+        /* The upright exists to keep the wheel upright. Delete its opposite
+           rotation and this is what moves. */
+        ck(camber < 0.5f, "the upright cancels the arms and the wheel keeps its camber");
+
+        {
+            int k, moved = 0;
+            float worst = 1.f;
+            for (k = 0; k < rig.n_pairs; k++) {
+                int lo = rig.spair[k][0], hi = rig.spair[k][1];
+                float o[3], e[3], d[3], ax[3], n, dot, len;
+                rig_pt(&rig, lo, 0.f, 0.f, 0.f, o);
+                rig_pt(&rig, hi, 0.f, 0.f, 0.f, e);
+                d[0] = e[0]-o[0]; d[1] = e[1]-o[1]; d[2] = e[2]-o[2];
+                len = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                d[0] /= len; d[1] /= len; d[2] /= len;
+                n = (float)sqrt((double)rig.world[lo][4]*rig.world[lo][4]
+                                + (double)rig.world[lo][5]*rig.world[lo][5]
+                                + (double)rig.world[lo][6]*rig.world[lo][6]);
+                ax[0] = rig.world[lo][4]/n;
+                ax[1] = rig.world[lo][5]/n;
+                ax[2] = rig.world[lo][6]/n;
+                dot = ax[0]*d[0] + ax[1]*d[1] + ax[2]*d[2];
+                if (dot < worst) worst = dot;
+                if (fabsf(len - 0.1016f) > 0.002f && fabsf(len - 0.0909f) > 0.002f)
+                    moved++;
+            }
+            printf("Buggy springs after the droop: worst aim %.5f, %d of %d "
+                   "pairs at a new length\n", (double)worst, moved, rig.n_pairs);
+            ck(worst > 0.999f,
+               "every spring half still points at the other one");
+            ck(moved >= 1, "and the drooped corner's spring has actually moved");
+        }
+        c.wheel[drop].len -= 0.030f;
+    }
+
+    /* The arm angle is clamped by springs[12]/springs[13], the two keys only the
+       Buggy ships. Measured on the ARM, not on the wheel: the upright takes some
+       of the wheel's travel back, so how far the wheel fell says little about how
+       far the arm swung. And bound to the linkage folding rather than to the
+       clamp's own 35.45 degrees -- with nothing stopping it the solve runs to the
+       end of the arm's circle, which is 79 degrees over on this corner. */
+    {
+        float d0[3], d1[3], swing;
+        int drop = 0, arm = rig.arm_up[0];
+        for (i = 0; i < c.nwheels; i++)
+            c.wheel[i].len = c.wheel[i].len_free - c.wheel[i].sag;
+        carani_update(&rig, &c);
+        d0[0] = rig.world[arm][4]; d0[1] = rig.world[arm][5];
+        d0[2] = rig.world[arm][6];
+        c.wheel[drop].len += 0.200f;        /* far past anything the car can do */
+        carani_update(&rig, &c);
+        d1[0] = rig.world[arm][4]; d1[1] = rig.world[arm][5];
+        d1[2] = rig.world[arm][6];
+        {
+            double n0 = sqrt((double)d0[0]*d0[0] + (double)d0[1]*d0[1]
+                             + (double)d0[2]*d0[2]);
+            double n1 = sqrt((double)d1[0]*d1[0] + (double)d1[1]*d1[1]
+                             + (double)d1[2]*d1[2]);
+            double dp = ((double)d0[0]*d1[0] + (double)d0[1]*d1[1]
+                         + (double)d0[2]*d1[2]) / (n0 * n1);
+            if (dp > 1.0) dp = 1.0;
+            else if (dp < -1.0) dp = -1.0;
+            swing = (float)(acos(dp) * 57.2957795);
+        }
+        printf("Buggy 200 mm of droop: the wishbone swung %.2f deg\n",
+               (double)swing);
+        ck(swing > 1.f && swing < 60.f,
+           "the wishbone swings, and its clamp stops it short of folding up");
+        c.wheel[drop].len -= 0.200f;
+    }
+
+    /* ---- 3. the Hummer ---- */
+    if (!rig_load(&rig, "assets/car3.vsc")) {
+        ck(0, "assets/car3.vsc loads a rig");
+        return;
+    }
+    memset(&w, 0, sizeof w);
+    rbcar_init(&c, 2, &w, 0.f, 0.f, 0.f, 0.f);
+    carani_bind(&rig, &c);
+
+    ck(rig.proc == 3, "the Hummer takes carAniProc3");
+    {
+        int bound = 0;
+        for (i = 0; i < c.nwheels; i++)
+            if (rig.wheel[i] >= 0)
+                bound++;
+        printf("Hummer: %d parts, %d of %d wheels bound, axles %d/%d/%d, "
+               "%d spring pairs\n", rig.n, bound, c.nwheels, rig.axle_front,
+               rig.axle_rear, rig.axle_middle, rig.n_pairs);
+        ck(c.nwheels == 6 && bound == 6, "all six wheels bound");
+        ck(rig.axle_middle >= 0, "the middle axle is bound");
+        ck(rig.pair_middle[0] >= 0 && rig.pair_middle[1] >= 0,
+           "and both of its wheels found it");
+        ck(rig.n_pairs == 6, "all six spring pairs bound");
+    }
+
+    /* THE REPORTED BUG: the middle pair rode the body instead of the ground.
+       The check is not "the middle axle moved" -- it is that the middle pair
+       answers the SAME command with the SAME travel as the other two, because
+       what was wrong was that it did not behave like them. */
+    {
+        float y0[RB_MAX_WHEELS], y1[RB_MAX_WHEELS], p[3];
+        float dfront, dmid, drear;
+        for (i = 0; i < c.nwheels; i++)
+            c.wheel[i].len = c.wheel[i].len_free - c.wheel[i].sag;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 0.f, p);
+            y0[i] = p[1];
+        }
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].len += 0.030f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 0.f, p);
+            y1[i] = p[1];
+        }
+        dfront = y1[rig.pair_front[0]]  - y0[rig.pair_front[0]];
+        drear  = y1[rig.pair_rear[0]]   - y0[rig.pair_rear[0]];
+        dmid   = y1[rig.pair_middle[0]] - y0[rig.pair_middle[0]];
+        printf("Hummer 30 mm of even droop: front %+.4f m, middle %+.4f, "
+               "rear %+.4f\n", (double)dfront, (double)dmid, (double)drear);
+        ck(dmid < -0.025f && dmid > -0.035f,
+           "the middle pair follows the ground rather than the body");
+        ck(fabsf(dmid - dfront) < 0.003f && fabsf(dmid - drear) < 0.003f,
+           "and follows it by as much as the front and rear pairs do");
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].len -= 0.030f;
+    }
+
+    /* One middle wheel down and the other up is a roll, not a slide: the axle
+       is solid, so its two wheels must go opposite ways. */
+    {
+        float y0[2], y1[2], p[3];
+        int L = rig.pair_middle[0], R = rig.pair_middle[1];
+        for (i = 0; i < c.nwheels; i++)
+            c.wheel[i].len = c.wheel[i].len_free - c.wheel[i].sag;
+        carani_update(&rig, &c);
+        rig_pt(&rig, rig.wheel[L], 0.f, 0.f, 0.f, p); y0[0] = p[1];
+        rig_pt(&rig, rig.wheel[R], 0.f, 0.f, 0.f, p); y0[1] = p[1];
+        c.wheel[L].len += 0.030f;
+        c.wheel[R].len -= 0.030f;
+        carani_update(&rig, &c);
+        rig_pt(&rig, rig.wheel[L], 0.f, 0.f, 0.f, p); y1[0] = p[1];
+        rig_pt(&rig, rig.wheel[R], 0.f, 0.f, 0.f, p); y1[1] = p[1];
+        printf("Hummer middle axle, left down / right up: left %+.4f m, "
+               "right %+.4f\n", (double)(y1[0]-y0[0]), (double)(y1[1]-y0[1]));
+        ck(y1[0] - y0[0] < -0.025f && y1[1] - y0[1] > 0.025f,
+           "the middle axle rolls, each wheel to its own height");
+        c.wheel[L].len -= 0.030f;
+        c.wheel[R].len += 0.030f;
+    }
+
+    /* The middle axle SLIDES, and a slide with nothing bounding it would take
+       the axle through the floor of the car. 100 mm is the bound here: not the
+       clamp itself (45 mm), just far enough under the 200 mm commanded that only
+       something stopping it can pass. */
+    {
+        float p[3], y0, y1;
+        int L = rig.pair_middle[0];
+        for (i = 0; i < c.nwheels; i++)
+            c.wheel[i].len = c.wheel[i].len_free - c.wheel[i].sag;
+        carani_update(&rig, &c);
+        rig_pt(&rig, rig.wheel[L], 0.f, 0.f, 0.f, p);
+        y0 = p[1];
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].len += 0.200f;
+        carani_update(&rig, &c);
+        rig_pt(&rig, rig.wheel[L], 0.f, 0.f, 0.f, p);
+        y1 = p[1];
+        printf("Hummer 200 mm of droop: the middle axle slid %.4f m\n",
+               (double)(y0 - y1));
+        ck(y0 - y1 < 0.100f, "the middle axle's slide is bounded");
+        for (i = 0; i < c.nwheels; i++) c.wheel[i].len -= 0.200f;
+    }
+
+    /* The middle pair steers WITH the front, and by less. The fraction itself is
+       0.3 in the image; asserting that number here would only be asserting the
+       constant against itself, so this asserts the shape -- same way, smaller,
+       and the rear not at all. */
+    {
+        float a0[RB_MAX_WHEELS][3], a1[3];
+        float fy = 0.f, my = 0.f, ry = 0.f;
+        c.steer = 0.f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++)
+            rig_axle(&rig, rig.wheel[i], a0[i]);
+        c.steer = 25.f;
+        carani_update(&rig, &c);
+        for (i = 0; i < c.nwheels; i++) {
+            rig_axle(&rig, rig.wheel[i], a1);
+            if (c.wheel[i].mount[2] > 0.02f)       fy = yaw_between(a0[i], a1);
+            else if (c.wheel[i].mount[2] < -0.02f) ry = yaw_between(a0[i], a1);
+            else                                   my = yaw_between(a0[i], a1);
+        }
+        printf("Hummer steer 25: front %+.2f deg, middle %+.2f, rear %+.2f\n",
+               (double)fy, (double)my, (double)ry);
+        ck(fabsf(fy - c.steer) < 0.01f, "the Hummer's front pair takes the lock");
+        ck(fabsf(ry) < 0.01f, "its rear pair does not steer");
+        ck(my * fy > 0.f && fabsf(my) > 0.5f && fabsf(my) < fabsf(fy),
+           "and its middle pair steers the same way as the front, by less");
+        c.steer = 0.f;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* part 6: the Jump action, and water                                        */
 /* ------------------------------------------------------------------------- */
 
@@ -2378,6 +2744,7 @@ int main(void)
 
     /* ================= part 5: the car rig ============================ */
     rig_checks();
+    rig_checks_23();
 
     /* ================= part 6: Jump, and water ======================== */
     jump_water_checks();

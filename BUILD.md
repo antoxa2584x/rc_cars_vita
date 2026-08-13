@@ -510,11 +510,19 @@ can never offer one that will not load.
 reusable glyph atlas: `Faces/` and `FacesSys/` are avatar portraits and
 `Interface.sb` carries only dialog skins.
 
-Pass `--rig` for all three cars even though only `carAniProc1` is transcribed.
-`carani_bind` resolves rig nodes by name and stores -1 for anything missing, so
-the Hummer picks up 12 parts (knuckles, both axles, six wheels) and the Buggy its
-four wheels; the Buggy's knuckles are named `AXLE_FRONT_*_UP/DOWN/WHEEL` rather
-than `_SUPPORT`, so it rolls but does not visibly steer.
+Pass `--rig` for all three cars. `CAR_RIG` is the union of the game's own three
+node tables (`0x00572fcc`, `0x005731b8`, `0x005733f0`), so one flat list covers
+all three procs: Car1 packs 22 parts, the Buggy 30 (four wheels, twelve wishbone
+nodes, eight spring halves) and the Hummer 29 (six wheels, two knuckles, three
+axles, twelve spring halves). `carani_bind` resolves by name, stores -1 for
+anything missing, and picks the proc from what it found. **Repack all three after
+touching `CAR_RIG`** -- a rig node that is not a part flattens into the body batch
+and then simply never moves, which is what kept the Buggy's suspension and
+steering frozen and the Hummer's middle axle welded to the body.
+
+Splitting a batch per part costs draw calls: the Buggy goes 17 -> 36 batches and
+the Hummer 23 -> 34, on 3,631 and 3,890 triangles. Car1 has been at 28 for as long
+as it has had a rig.
 
 ### Handling is a PLACEHOLDER
 
