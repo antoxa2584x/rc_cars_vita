@@ -35,6 +35,37 @@ typedef struct { float x, y, z, u, v, lu, lv; } vtx_t;
 #define BATCH_COAST   4u    /* the foam band along the shoreline */
 #define BATCH_STREAM  8u    /* the stream */
 #define BATCH_FALL   16u    /* the waterfall */
+/* A signed detail map: MULTIPLIED onto the ground, not drawn as a surface.
+   The texture is near-greyscale with a border of neutral 128, so under the
+   engine's blend mode 5 (dst' = 2*src*dst) it darkens the middle of the strip
+   and fades to nothing at its own edges -- transparency with no alpha channel
+   anywhere. pack_vsc.py's signed_detail_map decides it from the pixels.
+
+   In these ten tracks it is exactly one texture, `wt_wetsand`: the sand /
+   wet-sand transition strip, 151 meshes and 9,198 triangles across the set,
+   authored a centimetre above the terrain and carrying no lightmap. Drawn
+   opaque, which is what the port did, it is a flat grey band with two hard
+   edges -- the "sharp transition" as reported. main.c draws these in their own
+   pass; the blend is the one trace.c already uses for a tyre mark, which is the
+   same kind of object. */
+#define BATCH_MODULATE 32u
+
+/* The level artists tagged this mesh `TRANSP<n><A|B>` -- draw it ALPHA-BLENDED
+   rather than alpha-tested.
+
+   These are the marks painted on the track: `icon_start`, `icon_chp_1/3`,
+   `icon_arrow_1/2`, `icon_pacific`, `icon_shc_1`, plus glass, lamp glass and
+   some foliage. Their alpha is a soft ramp -- 18% to 36% of their texels sit
+   strictly between transparent and opaque -- and the app was putting them
+   through `glAlphaFunc(GL_GREATER, 0.5)`, which is a HARD CUT: every texel above
+   half became fully opaque and everything below vanished. A ground marking meant
+   to look sprayed on came out as a solid sticker with a jagged edge.
+
+   Blended, the ramp survives and the mark reads as paint on the surface. main.c
+   draws these after the opaque world with depth writes off. See TRANSP_RE in
+   pack_vsc.py for why a mesh NAME is the right key here and was the wrong one
+   for the sky. */
+#define BATCH_TRANSP 64u
 
 #define BATCH_ANY_WATER (BATCH_WATER | BATCH_COAST | BATCH_STREAM | BATCH_FALL)
 

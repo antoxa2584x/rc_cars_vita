@@ -904,8 +904,66 @@ unsigned int acc_ticks = 0;
            see scene.h. */
         scene_frustum_from_gl();
         /* The solid world. Water is excluded here and drawn by water.c below,
-           because it moves and because the foam has to blend. */
-        scene_draw(&track, BATCH_SKY | BATCH_ANY_WATER, 0);
+           because it moves and because the foam has to blend; the transition
+           decals are excluded because they MULTIPLY this rather than being part
+           of it. */
+        scene_draw(&track, BATCH_SKY | BATCH_ANY_WATER | BATCH_MODULATE
+                          | BATCH_TRANSP, 0);
+
+        /* The sand / wet-sand transition, and anything else the artists authored
+           as a signed detail map. Same object as a tyre mark and the same blend:
+           the engine's mode 5, 2*src*dst, so the strip's neutral-128 border
+           leaves the ground untouched and its middle darkens it. See
+           BATCH_MODULATE in scene.h.
+           Simpler than trace.c in one way -- there is no per-vertex strength to
+           lerp, so plain GL_MODULATE against a white current colour is enough
+           and no combiner is needed. It DOES need the colour forced white: with
+           no colour array bound, src = texture * current colour, and whatever
+           drew last owns that. */
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+        glDepthMask(GL_FALSE);
+        /* Both halves, as trace.c and water.c do for their coplanar decals: the
+           artists' own 1 cm lift stops separating anything far out, and the
+           offset scales with depth slope but depends on what GXM makes of its
+           units. */
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.f, -2.f);
+        scene_draw(&track, BATCH_MODULATE, BATCH_MODULATE);
+        glPolygonOffset(0.f, 0.f);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+
+        /* The marks the artists PAINTED on the track -- start line, checkpoint
+           and arrow icons -- plus glass and the tagged foliage. Their alpha is a
+           soft ramp and the ordinary path puts it through GL_GREATER 0.5, which
+           is a hard cut; blended, the ramp survives and the mark reads as paint
+           rather than a sticker. See BATCH_TRANSP.
+
+           GREATER 0 rather than the test off, so the fully transparent region
+           stays a real cut-out and does not cost a blend; depth writes off,
+           because these are decals and several of them overlap the same ground.
+           The polygon offset is the same pair the other decals use -- most of
+           these icons are painted flat on the track surface. */
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.f);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.f, -2.f);
+        scene_draw(&track, BATCH_TRANSP, BATCH_TRANSP);
+        glPolygonOffset(0.f, 0.f);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        /* Put the threshold back: scene_draw turns the test on per batch for the
+           alpha-keyed ones and would otherwise inherit GREATER 0, which passes
+           every cut-out texel and un-does the foliage. */
+        glAlphaFunc(GL_GREATER, 0.5f);
 
         /* The shadow goes down on the terrain before anything transparent, and
            before the car, so the car is never drawn through its own decal. The
