@@ -210,10 +210,33 @@ void rbcar_init(rb_car *c, int car, const rb_world *w,
                 gn[0] = (float)(gn[0] / nl);
                 gn[1] = (float)(gn[1] / nl);
                 gn[2] = (float)(gn[2] / nl);
-                /* shortest rotation from world up to the surface normal */
-                ax[0] = -(double)gn[2];   /* cross((0,1,0), n) */
+                /* Shortest rotation from world up to the surface normal.
+                 *
+                 * THE AXIS IS cross(up, n) AND THE SIGN WAS INVERTED, which
+                 * rotated the body AWAY from the normal by the slope angle
+                 * instead of onto it -- so a car spawned on a slope of t was
+                 * left at 2t to the ground it was standing on, not 0. Measured
+                 * before the fix, on a plane and with the wheel clearance taken
+                 * along the surface normal:
+                 *
+                 *    slope   body vs normal   wheels (mm, - is buried)
+                 *      2      4.000 deg        -9.8  +9.9  -9.8  +9.9
+                 *      5     10.000 deg       -24.0 +25.0 -24.0 +25.0
+                 *     10     20.000 deg       -46.4 +50.1 -46.4 +50.1
+                 *     20     40.000 deg       -83.5 +97.8 -83.5 +97.8
+                 *
+                 * i.e. exactly double, in the giveaway 1:2 ratio, with one side
+                 * of the car buried and the other hanging. The averaged ride
+                 * height below is symmetric and cannot cause that; only the
+                 * attitude can. It survived because the suspension then spends
+                 * the first few frames dragging the car onto the surface, so on
+                 * the ten real race starts (0.7 to 5.7 degrees) the end state
+                 * still looked right -- allstarts measures where the car settles,
+                 * not what it was handed.
+                 */
+                ax[0] =  (double)gn[2];   /* cross((0,1,0), n) */
                 ax[1] = 0.0;
-                ax[2] =  (double)gn[0];
+                ax[2] = -(double)gn[0];
                 s2 = sqrt(ax[0] * ax[0] + ax[2] * ax[2]);
                 cth = gn[1];
                 if (cth > 1.0) cth = 1.0;

@@ -13,7 +13,7 @@
 
 
 static const char *const ROW_LABEL[MENU_ROWS] = {
-    "Track", "Car", "Tires", "Resonator", "Booster",
+    "Track", "Car", "Skin", "Tires", "Resonator", "Booster",
     "Sound volume", "Music volume", "Texture quality", "Texture colours",
     "Restart at race start", "Resume", "Quit"
 };
@@ -29,9 +29,14 @@ void menu_init(menu_t *m, int track, int car)
 {
     memset(m, 0, sizeof(*m));
     m->track = wrap(track, N_TRACKS);
-    m->car = wrap(car, 3);
+    m->car = wrap(car, MENU_N_CARS);
     m->req_track = -1;
     m->req_car = -1;
+    /* Every car starts on the skin its model ships wearing -- skin 1, the only
+       one Car.sb references. One is also all a car is known to HAVE until a scene
+       has been loaded and counted, so the row cannot offer paint that is missing
+       during the first frames. */
+    m->skins = 1;
     /* Sound full, music a little under it: the soundtrack is a constant bed and
        the engine is the thing the player is steering by. */
     m->vol_sfx = MENU_VOL_STEPS;
@@ -51,9 +56,21 @@ static void adjust(menu_t *m, int d)
         m->req_track = m->track;
         break;
     case MENU_CAR:
-        m->car = wrap(m->car + d, 3);
+        m->car = wrap(m->car + d, MENU_N_CARS);
         m->req_car = m->car;
         break;
+    /* Wraps over what the LOADED car has, which is 1 on a car packed without the
+       extra skin atlases -- the row then simply will not move, rather than
+       cycling through three positions that all look the same. `skins` can only
+       shrink under the selection when the car changes, and load_car re-applies
+       from this same array, so the clamp is here where the index is written. */
+    case MENU_SKIN: {
+        int n = m->skins > 0 ? m->skins : 1;
+        int c = wrap(m->car, MENU_N_CARS);
+        if (n > MENU_SKINS) n = MENU_SKINS;
+        m->skin[c] = wrap(m->skin[c] + d, n);
+        break;
+    }
     case MENU_TIRES: m->tires  = wrap(m->tires + d, 4); break;
     case MENU_RESO:  m->reso   = wrap(m->reso + d, 4);  break;
     case MENU_BOOST: m->boost  = wrap(m->boost + d, 4); break;
@@ -121,7 +138,8 @@ void menu_input(menu_t *m, unsigned int buttons, unsigned int prev)
 /* The value column for each row. */
 static void row_value(const menu_t *m, int row, char *out, int n)
 {
-    const rb_car_data *d = &RB_CARS[wrap(m->car, 3)];
+    const int c = wrap(m->car, MENU_N_CARS);
+    const rb_car_data *d = &RB_CARS[c];
 
     switch (row) {
     case MENU_TRACK:
@@ -131,6 +149,20 @@ static void row_value(const menu_t *m, int row, char *out, int n)
     case MENU_CAR:
         snprintf(out, n, "< %s >", d->name);
         break;
+    case MENU_SKIN: {
+        /* A number and how many there are, because the game gives these no names
+           -- they are four paint jobs, `car_askin<car><skin>`, and inventing
+           "Rally Blue" here would be inventing data. The same reason the tuning
+           rows quote their multiplier instead of a marketing word.
+         *
+         * When a car has only the one, SAY SO. Otherwise the row looks broken:
+           it will not move and there is nothing on screen to explain why. */
+        int have = m->skins > 0 ? m->skins : 1;
+        if (have > MENU_SKINS) have = MENU_SKINS;
+        snprintf(out, n, "< %d >  of %d%s", m->skin[c] + 1, have,
+                 have > 1 ? "" : "  (not packed for this car)");
+        break;
+    }
     case MENU_TIRES:
         /* carTireGrip multiplies the axle coefficient by this. */
         snprintf(out, n, "< %d >  grip x%.2f",

@@ -62,6 +62,7 @@
 #include "tracks.h"
 #include "ui.h"
 #include "menu.h"
+#include "ai.h"
 #include "carparts.h"
 #include "audio.h"
 #include "sfx.h"
@@ -77,6 +78,9 @@
    headers are visible, so it is where the two are held together. */
 #if MENU_TEXQUAL_LEVELS != SCENE_TEX_QUALITY_LEVELS
 #error "menu.h's MENU_TEXQUAL_LEVELS and scene.h's SCENE_TEX_QUALITY_LEVELS disagree"
+#endif
+#if MENU_SKINS != CARPARTS_SKINS
+#error "menu.h's MENU_SKINS and carparts.h's CARPARTS_SKINS disagree"
 #endif
 
 #define SCR_W 960
@@ -133,6 +137,22 @@ static envmap_t envmap;
 /* Collision now lives in col.c, which also exposes the sphere and segment
    queries the transcribed physics needs (rb_world). */
 static col_t col;
+
+/* The AI opponents -- recorded laps, replayed and rubber-banded. See ai.h, and
+ * note what it says about the mode this port does NOT take: they are on rails,
+ * so they neither shove the player nor get shoved.
+ *
+ * ONE SCENE PER DISTINCT MODEL the roster needs, so up to three and usually two
+ * or three. They cannot share the player's `car` scene: carani writes the
+ * animated matrices INTO the scene's rig, so a frame that drew the player and
+ * then an opponent of the same model would draw the player twice in the
+ * opponent's pose. Two opponents on the SAME model can share one scene, because
+ * draw_ai animates and draws each one before touching the next. */
+static ai_t     ai;
+static scene_t  ai_scene[3];
+static shadow_t ai_shadow[3];
+static int      ai_model[3];        /* 1 once loaded and rig-bound */
+static ai_track ai_tr;
 
 /* ------------------------------------------------------------------ state */
 
@@ -297,11 +317,80 @@ static void respawn(void)
     /* The engine's own reset cue. Also the one place the loops are guaranteed
        to be re-evaluated against a car that has just teleported. */
     sfx_respawn();
+    /* A restart puts the field back on its own grid. ai_reset also drops every
+       cursor, so an opponent does not keep the lap it was on. */
+    ai_reset(&ai);
+    sfx_ai_silence();
 
     rlog("[rccars] start: %s  (%d,%d,%d) cm  yaw=%d deg  car=%s\n",
                   TRACKS[cur_track].name,
                   (int)(t->x * 100.f), (int)(gy * 100.f), (int)(t->z * 100.f),
                   (int)t->yaw, rbcar_name(cur_car));
+}
+
+/* ai_track.spine, bound to checkpoint.c's own spine. The original asks the same
+   question of the player and of every opponent (FUN_004ea120), so this is the one
+   function both sides are measured with. */
+static int ai_spine(void *ctx, float x, float y, float z,
+                    float *dist, int *cp)
+{
+    return cp_spine_dist((const checkpoints_t *)ctx, x, y, z, dist, cp);
+}
+
+/* Load the roster and the models it needs. Called by load_track AFTER cp_init,
+ * because the spine has to exist before the rubber band can read it.
+ *
+ * The single-race path for now: every opponent in the layout starts, and the
+ * static coefficient is the track's own CoeffCommonOpponents with no difficulty
+ * multiplier -- which is what the original does outside the championship
+ * (FUN_004f11b0 gates the multiplier on the mode being 1). When there is a
+ * championship to be in, this is the one call that changes. */
+static void load_ai(int idx)
+{
+    int i, k;
+
+    sfx_ai_silence();
+    for (k = 0; k < 3; k++) {
+        if (ai_model[k]) {
+            scene_release(&ai_scene[k]);
+            ai_model[k] = 0;
+        }
+    }
+    ai_free(&ai);
+
+    ai_tr.ctx = &cps;
+    ai_tr.spine = ai_spine;
+    ai_tr.spine_len = cps.spine_len;
+
+    if (!ai_init(&ai, idx, "app0:assets", col_rb_world(&col),
+                 1 /* normal */, 0 /* single race */))
+        return;
+
+    /* One scene per model the roster actually asks for, and no more: a car .vsc
+       is 3.7 to 4.2 MB, so loading all three when the field uses two is 4 MB of
+       heap for nothing. */
+    for (i = 0; i < ai.n; i++) {
+        char path[128];
+        int c = ai.car[i].car;
+        if (c < 0 || c > 2 || ai_model[c])
+            continue;
+        snprintf(path, sizeof(path), "app0:assets/car%d.vsc", c + 1);
+        if (!scene_load(path, &ai_scene[c])) {
+            rlog("[rccars] ai: cannot load %s -- opponent invisible\n", path);
+            continue;
+        }
+        /* Bind the rig ONCE per model. carani_bind resolves the wheel mapping
+           from the mount positions, which are the model's, so every opponent on
+           this model shares the binding -- and draw_ai re-animates it per car
+           before drawing, which is what makes sharing safe. */
+        if (ai_scene[c].has_rig)
+            carani_bind(&ai_scene[c].rig, &ai.car[i].rb);
+        /* ShadowSize and ShadowShift are per-car, so the decal is per model too. */
+        shadow_init(&ai_shadow[c], &ai_scene[c], c);
+        ai_model[c] = 1;
+    }
+    rlog("[rccars] ai: %d opponent(s) on %d model(s)\n", ai.n,
+         ai_model[0] + ai_model[1] + ai_model[2]);
 }
 
 static int load_track(int idx)
@@ -343,6 +432,9 @@ static int load_track(int idx)
     sfx_set_track(idx, &col);
     /* The props belong to this track and this grid -- both were just rebuilt. */
     prop_init(&props, props_scene.n_batches ? &props_scene : NULL, &col, idx);
+    /* The opponents are per-track too: their recorded laps ARE this track. After
+       cp_init, because the rubber band reads that spine. */
+    load_ai(idx);
     return 1;
 }
 
@@ -373,7 +465,14 @@ static int load_car(int idx)
        top of each other -- 662 overlapping triangles of exhaust on the Overkill.
        See carparts.h. */
     carparts_bind(&parts, &car);
-    carparts_apply(&parts, &car, menu.tires, menu.boost);
+    /* How many skins THIS model has. The menu cannot work it out -- it is a
+       property of the packed scene, and a car packed without the three extra
+       atlases has exactly one -- so it is handed over here, before the apply, and
+       the stored per-car choice is clamped into what is really available. */
+    menu.skins = parts.n_skin > 0 ? parts.n_skin : 1;
+    if (menu.skin[idx] >= menu.skins)
+        menu.skin[idx] = 0;
+    carparts_apply(&parts, &car, menu.tires, menu.boost, menu.skin[idx]);
 
     /* The dust sprite and the four tyre marks are packed into the CAR, so both
        follow it. The pipe is the fitted booster's own node. */
@@ -382,10 +481,87 @@ static int load_car(int idx)
     trace_init(&traces, &car);
     trace_clear(&traces);
     rlog("[rccars] parts: %d exhausts  %d wheel batches  "
-                  "tyres '%s' %d/4 levels packed\n",
+                  "tyres '%s' %d/4 levels packed  "
+                  "skins %d/%d packed ('%s'%s%s) on %d+%d batches\n",
                   parts.n_boost, parts.n_wheel,
-                  parts.family[0] ? parts.family : "-", parts.n_tire);
+                  parts.family[0] ? parts.family : "-", parts.n_tire,
+                  parts.n_skin, CARPARTS_SKINS,
+                  parts.skin[0].family[0] ? parts.skin[0].family : "-",
+                  parts.skin[1].family[0] ? "+" : "",
+                  parts.skin[1].family[0] ? parts.skin[1].family : "",
+                  parts.skin[0].n_batch, parts.skin[1].n_batch);
     return 1;
+}
+
+/* THE OPPONENTS' DRAW.
+ *
+ * Same shape as the player's own block above and for the same reasons -- the
+ * body matrix goes in without a transpose, the model is dropped onto its own
+ * wheel-centre plane, the exhaust is a second blended pass -- with three
+ * differences, each of which is here rather than in ai.c because it is about
+ * drawing and not about the model:
+ *
+ *   - the rig is ANIMATED THEN DRAWN, per car. carani writes into the scene's
+ *     rig, so two opponents on the same model must not both be posed before
+ *     either is drawn. That is the only reason one scene can serve several cars.
+ *   - a distance cap. AI_DRAW_DIST is THE PORT'S: nothing recovered says when an
+ *     opponent stops being drawn, and it is NOT AI_DIST_CAM, which is the
+ *     original's radius for deciding whether to SIMULATE one. 80 m on a 0.42 m
+ *     car is about five pixels across at this field of view, and the rubber band
+ *     holds the field inside +-45 m of the player anyway, so this almost never
+ *     fires -- which is why the count is logged rather than assumed.
+ *   - no dust, no tyre marks, no antenna, no glance. Every one of those is a
+ *     per-car particle system or vertex stream, and five of them is the cost the
+ *     whole AI was kept cheap to avoid. Stated here so it is a decision and not
+ *     an omission.
+ */
+#define AI_DRAW_DIST 80.0f
+static int ai_drawn;
+
+static void draw_ai(const float eye[3])
+{
+    int i;
+
+    ai_drawn = 0;
+    if (ai.n <= 0)
+        return;
+
+    /* A rigged scene is drawn under its own body matrix, so a model-space box
+       tested against the world frustum means nothing -- the same reason the
+       player's block turns culling off. */
+    scene_cull_off();
+    for (i = 0; i < ai.n; i++) {
+        const ai_car *a = &ai.car[i];
+        int c = a->car;
+        scene_t *sc;
+        float dx, dz;
+
+        if (c < 0 || c > 2 || !ai_model[c])
+            continue;
+        dx = a->rb.body.x[0] - eye[0];
+        dz = a->rb.body.x[2] - eye[2];
+        if (dx * dx + dz * dz > AI_DRAW_DIST * AI_DRAW_DIST)
+            continue;
+        sc = &ai_scene[c];
+
+        if (sc->has_rig)
+            carani_update(&sc->rig, &a->rb);
+        if (show_vis)
+            shadow_draw(&ai_shadow[c], &col, ai_matrix(&ai, i));
+
+        glPushMatrix();
+        glMultMatrixf(ai_matrix(&ai, i));
+        glTranslatef(0.f, -carani_wheel_plane_y(&sc->rig), 0.f);
+        scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+        /* The pipes and boosters, exactly as for the player: OPAQUE, and only
+           the alpha-test reference dropped, because their ARGB4444 alpha sits
+           at a plateau just under the world's cut-out threshold. */
+        glAlphaFunc(GL_GREATER, 0.f);
+        scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        glPopMatrix();
+        ai_drawn++;
+    }
 }
 
 int main(void)
@@ -553,19 +729,28 @@ unsigned int acc_ticks = 0;
            tank of boost every time the row is touched. */
         rc.boost_upgrade = menu.boost;
 
-        /* The two upgrades the car WEARS. Only rebuilt when a level actually
-           changes: carparts_apply rebinds textures and index counts, which is
-           wasted work at 60 Hz for something the player changes by hand. */
+        /* The two upgrades the car WEARS, and the paint. Only rebuilt when one of
+           them actually changes: carparts_apply rebinds textures and index counts,
+           which is wasted work at 60 Hz for something the player changes by hand.
+           The skin needs no reload for the same reason the tyres do not -- the
+           alternate atlases are already uploaded, and this re-points a GLuint. */
         {
-            static int shown_tires = -1, shown_boost = -1;
-            if (shown_tires != menu.tires || shown_boost != menu.boost) {
-                carparts_apply(&parts, &car, menu.tires, menu.boost);
+            static int shown_tires = -1, shown_boost = -1, shown_skin = -1;
+            /* cur_car, not menu.car: menu.car can be a frame ahead of the model
+               while req_car is pending, and this must repaint the car that is
+               loaded. load_car does its own apply for the one arriving. */
+            int want_skin = menu.skin[cur_car >= 0 && cur_car < MENU_N_CARS
+                                      ? cur_car : 0];
+            if (shown_tires != menu.tires || shown_boost != menu.boost
+                || shown_skin != want_skin) {
+                carparts_apply(&parts, &car, menu.tires, menu.boost, want_skin);
                 /* A different exhaust is a different pipe, in a different
                    place -- the four booster_<n>_end nodes are up to 18 cm
                    apart on the Overkill. */
                 fx_pipe_from_rig(&fx, &car.rig, menu.boost);
                 shown_tires = menu.tires;
                 shown_boost = menu.boost;
+                shown_skin = want_skin;
             }
         }
 
@@ -658,6 +843,31 @@ unsigned int acc_ticks = 0;
                 if (ticks > 0) {
                     int pi;
                     prop_step(&props, &rc, ticks * RBCAR_TICK_DT);
+                    /* The opponents advance on the same banked ticks, but ONE AT
+                       A TIME rather than on ticks*dt in one go: ai_step's
+                       acceleration limit and cursor walk are written for a 1/60
+                       tick, and handing it 2/60 would quietly halve the
+                       resolution of both. It is cheap enough to loop -- a
+                       polyline walk and a spline lookup per car. */
+                    float ai_bump = 0.f;
+                    for (pi = 0; pi < ticks; pi++) {
+                        float h;
+                        ai_step(&ai, cps.enabled ? &ai_tr : NULL,
+                                rc.body.x[0], rc.body.x[1], rc.body.x[2],
+                                cps.lap, RBCAR_TICK_DT);
+                        /* Solid opponents. Immediately after the step so the
+                           contact sees the pose it just wrote, and inside the
+                           tick loop so a bump is resolved at the rate the
+                           physics runs at rather than once a frame. */
+                        h = ai_collide_player(&ai, &rc, RBCAR_TICK_DT);
+                        if (h > ai_bump)
+                            ai_bump = h;
+                    }
+                    /* One cue per frame however many ticks touched, the way the
+                       prop hits are one cue per event -- sfx_car_hit rate-limits
+                       itself on top. */
+                    if (ai_bump > 0.f)
+                        sfx_car_hit(ai_bump);
                     /* Every prop the car just STARTED touching makes its own
                        noise -- stone.sb names a wav per model, see prop_data.h
                        and sfx_prop_hit. prop_t.hit is an EDGE (prop.h) and
@@ -854,6 +1064,41 @@ unsigned int acc_ticks = 0;
 
             if (use_rb)
                 sfx_update(&rc, eye3, vyaw, dt);
+            /* One positional engine per opponent. Driven every frame, not every
+               tick: it is a voice's gain and pitch, not part of the model. The
+               ratio is the opponent's own speed over its own top speed, so an
+               opponent on a different car sounds like that car. Stopped past the
+               audible radius so a distant field costs no voices at all -- there
+               are 24 in the mixer and the player's three layers plus the surface
+               loop and the bed have first call on them. */
+            {
+                int i;
+                for (i = 0; i < SFX_AI_MAX; i++) {
+                    if (i >= ai.n) {
+                        sfx_ai_motor(i, eye3, 0.f, 0);
+                        continue;
+                    }
+                    {
+                        const ai_car *a = &ai.car[i];
+                        /* Its own top speed, the same expression sfx.c uses for
+                           the player's: speedBaseMax is km/h and the resonator
+                           upgrade scales it, so the note rises with the upgrade
+                           the way the car's actual top speed does. */
+                        int r = a->rb.reso_upgrade;
+                        float top = a->rb.tune.speed_base_max;
+                        int near_enough;
+                        if (r >= 0 && r < 4)
+                            top *= a->rb.tune.resonator_speed[r];
+                        top /= 3.6f;
+                        if (top < 0.5f)
+                            top = 0.5f;
+                        near_enough = ai_within(&ai, i, eye3[0], eye3[1],
+                                                eye3[2], SFX_AI_RMAX);
+                        sfx_ai_motor(i, a->rb.body.x, a->speed / top,
+                                     near_enough && !menu.open);
+                    }
+                }
+            }
 
             /* The port owns lap progression (the race module was never
                transcribed), so the cue hangs off cp_step's own `next`. */
@@ -1048,11 +1293,12 @@ unsigned int acc_ticks = 0;
                 glRotatef(-veh.roll, 0.f, 0.f, 1.f);
             }
             antenna_apply(&antenna);
-            scene_draw(&car, BATCH_SKY | BATCH_TRANSLUCENT, 0);
-            /* The exhaust last, and BLENDED.
+            scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+            /* The exhaust last, OPAQUE, and with only the ALPHA-TEST REFERENCE
+             * moved.
              *
              * Every <prefix>turbo_<n> texture is ARGB4444 with a large plateau
-             * at alpha nibble 7 -- 0.467 once expanded to a byte, over 9 to 23%
+             * at alpha nibble 7 -- 0.467 once expanded to a byte, over 1 to 23%
              * of the image. The world's cut-out test is
              * glAlphaFunc(GL_GREATER, 0.5), which sits just above it, so every
              * one of those texels was being discarded and the pipes and
@@ -1060,16 +1306,21 @@ unsigned int acc_ticks = 0;
              * meshes' own UVs on the packed cars: 25 of the Overkill's 76
              * booster-1 vertices sample alpha 119, 48 of booster-4's 214.
              *
-             * GREATER 0 rather than no test at all, so the alpha-0 region stays
-             * a real cut-out. Depth writes stay ON: the tube overlaps itself,
-             * and letting the near wall reject the far one is both cheaper and
-             * closer to right than sorting a 200-triangle mesh every frame. */
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+             * THIS PASS USED TO BLEND, and that was a second bug in the other
+             * direction -- it made solid brass velocity stacks and painted
+             * muffler barrels 47% see-through, reported as "car boosters and
+             * exhaust looks semi transparent". The plateau is not an opacity;
+             * see BATCH_ALPHA_LOWREF in scene.h for the artwork and the shop
+             * icons that settle it, and for the engine's own blend selector.
+             *
+             * GREATER 0 rather than no test at all, so the alpha-0 region -- the
+             * bores looking into the stacks -- stays a real cut-out. Its own
+             * pass rather than the body's, because the threshold is global state
+             * in this fixed-function path and the rest of the car still needs
+             * 0.5. Depth writes were never off here and stay on. */
             glAlphaFunc(GL_GREATER, 0.f);
-            scene_draw(&car, BATCH_SKY | BATCH_TRANSLUCENT, BATCH_TRANSLUCENT);
+            scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
             glAlphaFunc(GL_GREATER, 0.5f);
-            glDisable(GL_BLEND);
             /* The glance goes on last, over the paint and the exhaust both --
                EnvMapUpgrades exists precisely because the bolt-on pipe is
                env-mapped too. Inside the same matrix push, because it re-draws
@@ -1080,6 +1331,15 @@ unsigned int acc_ticks = 0;
                 envmap_draw(&envmap, &car, n3);
             }
             glPopMatrix();
+        }
+
+        /* The opponents, after the player's car and before the water, for the
+           same reason the props are: they are opaque and the foam blends over
+           them. See draw_ai. */
+        {
+            float aeye[3];
+            aeye[0] = ex; aeye[1] = ey; aeye[2] = ez;
+            draw_ai(aeye);
         }
 
         /* Water last of the world: the sea surface and the stream are opaque,
@@ -1209,6 +1469,31 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                               (int)rb_boost_capacity(&rc.tune, rc.boost_upgrade),
                               rc.boost_lock ? "locked" :
                                   (rc.in.boost ? "ON" : "--"));
+            }
+            if (ai.n > 0) {
+                /* The field, once a second. Placing, and for the nearest
+                   opponent the two numbers that say whether the rubber band is
+                   working: how far ahead of the player it is, and what
+                   coefficient that bought it. Without these, "the opponents feel
+                   wrong" has nothing behind it. */
+                int i, best = 0;
+                float bd = 1e30f;
+                for (i = 0; i < ai.n; i++) {
+                    float dx = ai.car[i].rb.body.x[0] - rc.body.x[0];
+                    float dz = ai.car[i].rb.body.x[2] - rc.body.x[2];
+                    float d = dx * dx + dz * dz;
+                    if (d < bd) { bd = d; best = i; }
+                }
+                rlog("[rccars] ai: %d cars, %d drawn, player P%d/%d;  nearest"
+                             " %s %d m away  lead=%d m  coeff=%d%%  lap %d"
+                             "  spd=%d cm/s%s\n",
+                             ai.n, ai_drawn, ai_player_place(&ai), ai.n + 1,
+                             ai.car[best].name, (int)sqrtf(bd),
+                             (int)ai.car[best].lead,
+                             (int)(ai.car[best].coeff * 100.f),
+                             ai.car[best].lap,
+                             (int)(ai.car[best].speed * 100.f),
+                             ai.car[best].airborne ? "  airborne" : "");
             }
             if (car.has_rig) {
                 /* Rig telemetry, for the same reason: "the wheels look wrong"

@@ -107,7 +107,7 @@ The conversion tools live in `rccars_re/`, alongside this repository; point
 | **right stick** | camera orbit — springs back |
 | **✕** | boost |
 | **○** | jump; on the roof or a side, rights the car where it stands |
-| **START** | menu — track, car, tuning parts, texture quality, quit |
+| **START** | menu — track, car, skin, tuning parts, texture quality, quit |
 | **□** | toggle shadow, water animation and checkpoint arrows |
 | **SELECT** | free-fly camera |
 
@@ -148,7 +148,11 @@ of it is already sitting in the data, recovered and unused.
 
 - [ ] Championship structure over the ten tracks
 - [ ] Upgrades: the three tyre levels and the turbo sets are already packed per
-      car, and `carparts.c` already shows the fitted parts on the model
+      car, and `carparts.c` already shows the fitted parts on the model — as it
+      does the car's paint, four skins each, which the menu can already pick
+- [ ] Give each AI driver its own skin: `ailayouts.ini` names one per driver and
+      `ai_data.h` already carries it, and since the player's Skin row packed the
+      alternate atlases into every car, an opponent has them resident for free
 - [ ] Unlocks — cars, tracks, parts
 - [ ] Prize money and a shop
 

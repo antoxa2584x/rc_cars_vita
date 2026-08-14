@@ -70,6 +70,32 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
             c->cp[k].ground = gy;
     }
 
+    /* The spine's cumulative arc length, in the loader's stitching order, and
+       closed: the last leg runs from the final point back to cp_0. */
+    {
+        double run = 0.0;
+        const float *prev = NULL;
+        for (k = 0; k < c->n; k++) {
+            int j;
+            for (j = 0; j < c->cp[k].n; j++) {
+                const float *p = c->cp[k].p[j];
+                if (prev)
+                    run += sqrt((double)(p[0] - prev[0]) * (p[0] - prev[0])
+                                + (double)(p[1] - prev[1]) * (p[1] - prev[1])
+                                + (double)(p[2] - prev[2]) * (p[2] - prev[2]));
+                c->cum[k][j] = (float)run;
+                prev = p;
+            }
+        }
+        if (prev && c->n > 0) {
+            const float *p = c->cp[0].p[0];
+            run += sqrt((double)(p[0] - prev[0]) * (p[0] - prev[0])
+                        + (double)(p[1] - prev[1]) * (p[1] - prev[1])
+                        + (double)(p[2] - prev[2]) * (p[2] - prev[2]));
+        }
+        c->spine_len = (float)run;
+    }
+
     /* FUN_0052a9b0 loads both three-frame sets by name. Its own error strings
        call cp_ar_2 the "common" arrow and cp_ar_3 the "custom" one. */
     for (k = 0; k < 3; k++) {
@@ -127,6 +153,32 @@ void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
     /* one lap per wrap past the last checkpoint back to the start line */
     if (prev == c->n - 1 && c->next == 0)
         c->lap++;
+}
+
+int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,
+                  float *dist, int *cp)
+{
+    float near2 = 1e30f;
+    int k, j, bk = -1, bj = 0;
+
+    (void)y;
+    if (!c || c->n <= 0)
+        return 0;
+    for (k = 0; k < c->n; k++) {
+        for (j = 0; j < c->cp[k].n; j++) {
+            float d2 = dist2_xz(c->cp[k].p[j], x, z);
+            if (d2 < near2) {
+                near2 = d2;
+                bk = k;
+                bj = j;
+            }
+        }
+    }
+    if (bk < 0)
+        return 0;
+    if (dist) *dist = c->cum[bk][bj];
+    if (cp) *cp = bk;
+    return 1;
 }
 
 float cp_dist_to_next(const checkpoints_t *c, float x, float y, float z)

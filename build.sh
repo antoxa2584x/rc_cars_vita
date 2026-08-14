@@ -32,8 +32,9 @@
 #   5. props    the 13 knockable props, one file for all tracks    (pack_props.py)
 #   6. sound    the sound bank and the music                       (pack_snd.py)
 #   7. tables   tracks.h, the menu font, the bubble and LiveArea   (gen_*.py)
-#   8. check    vsc_check.py over every packed scene
-#   9. build    cmake + make -> build/rccars_viewer.vpk
+#   8. ai       ai_data.h and ten .aip opponent paths       (gen_ai_data/pack_ai)
+#   9. check    vsc_check.py over every packed scene
+#  10. build    cmake + make -> build/rccars_viewer.vpk
 #
 # Every stage is skipped when its output is already newer than its input, so a
 # re-run after editing one .c file goes straight to stage 9. --force redoes
@@ -55,7 +56,7 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 
 JOBS="$(nproc 2>/dev/null || echo 4)"
 FORCE=0
-STAGES="unpack lightmap tracks cars props sound tables check build"
+STAGES="unpack lightmap tracks cars props sound tables ai check build"
 WANT=""
 NO_MUSIC=0
 CLEAN=0
@@ -365,8 +366,34 @@ fi
 # references: the three upgrade tyre levels the car is not currently wearing,
 # `dust` (shared by both particle systems) and the four tyre-mark sprites.
 # The per-car lists differ because each car ships wearing a different level.
+#
+# THE SKINS ARE THE SAME KIND OF THING, and they are the engine's own feature.
+# RCCars.exe builds its body texture names with sprintf: FUN_0049fc80 validates
+# 0 <= car < 3 and 0 <= skin < 4, formats "car_askin%i%i" and "car_bskin%i%i"
+# from (car+1, skin+1), and FUN_0050bf90 hands the two results to FUN_005352a0,
+# which walks the model and re-points every texture whose name STARTS WITH
+# `car_askin` / `car_bskin`. Car.sb ships wearing skin 1 (car_askin11,
+# car_askin21 + car_bskin21, car_askin31 + car_bskin31), so the other three of
+# each are asked for here -- exactly the reason the tyre levels are.
+#
+# ONLY CAR 1 HAS ONE PAGE. FUN_0049fc80's switch loads `b` for cars 2 and 3 and
+# writes NULL for car 1, and the shipped art agrees: there is no car_bskin1<n>
+# in any of the three texture sets. Two independent statements of the same fact,
+# which is why this list is not symmetric.
+#
+# COST: a skin is 512x512 RGB565 with a full chain, 699 KB in the file and the
+# same on the GPU at quality High (175 KB at Medium, 44 KB at Low). Three extra
+# skins is +2.1 MB on the Overkill and +4.2 MB on the other two, so a car .vsc
+# roughly doubles -- still small against a 35 MB track, but every RESIDENT car
+# scene pays it, and load_ai keeps up to three more. Dropping the skins from a
+# car's list here is all it takes to get that back: carparts_bind then reports
+# one skin, the menu row pins itself at 1/1, and no code changes.
 
 FX=dust,t_halfdry_tire2_1,t_halfdry_tire2_2,t_halfdry_tire2_3,t_halfdry_tire2_4
+
+SKIN1=car_askin12,car_askin13,car_askin14
+SKIN2=car_askin22,car_askin23,car_askin24,car_bskin22,car_bskin23,car_bskin24
+SKIN3=car_askin32,car_askin33,car_askin34,car_bskin32,car_bskin33,car_bskin34
 
 pack_car() {                      # pack_car <n> <subtree> <extra-tex>
     local out="$ASSETS/car$1.vsc"
@@ -381,9 +408,9 @@ pack_car() {                      # pack_car <n> <subtree> <extra-tex>
 if wanted cars; then
     step "Packing cars"
     [ -f "$DB/Car.sb" ] || die "$DB/Car.sb missing"
-    pack_car 1 Car1 tire3_1,tire3_2,tire3_4      # Overkill
-    pack_car 2 Car2 tire2_1,tire2_2,tire2_4      # Buggy
-    pack_car 3 Car3 tire3_2,tire3_3,tire3_4      # Hummer
+    pack_car 1 Car1 tire3_1,tire3_2,tire3_4,$SKIN1      # Overkill
+    pack_car 2 Car2 tire2_1,tire2_2,tire2_4,$SKIN2      # Buggy
+    pack_car 3 Car3 tire3_2,tire3_3,tire3_4,$SKIN3      # Hummer
 fi
 
 # ----------------------------------------------------------- 5. the props ---
@@ -488,7 +515,33 @@ PY
     fi
 fi
 
-# ------------------------------------------------------------- 8. the check ---
+# -------------------------------------------------------- 8. the opponents ---
+# The AI's roster and the recorded laps it replays. AFTER the tracks, because
+# pack_ai.py PROVES the level-name mapping by probing every path against the
+# packed .col grid it belongs to -- 0% of samples off-grid against the right one,
+# 52-99% against any other -- and refuses to write anything that fails. It also
+# measures the per-car body-frame lift there, and the measurement needs all ten
+# grids however few tracks are being packed. AFTER `tables` too, because it
+# reports each path's offset from the track's own race start out of tracks.h.
+# See "The AI opponents" in CLAUDE.md.
+
+if wanted ai; then
+    step "Packing the AI opponents"
+    if current "$VITA/ai_data.h" "$EXTRACTED/Scripts" "$RE/gen_ai_data.py"; then
+        skip "ai_data.h"
+    else
+        run python3 "$RE/gen_ai_data.py" --root "$EXTRACTED" -o "$VITA/ai_data.h"
+    fi
+    if current "$ASSETS/beach_1.aip" "$EXTRACTED/CarProfiles" "$RE/pack_ai.py"; then
+        skip "ten .aip files"
+    else
+        run python3 "$RE/pack_ai.py" --profiles "$EXTRACTED/CarProfiles" \
+            --data "$VITA/ai_data.h" --tracks "$VITA/tracks.h" \
+            --col "$ASSETS" --out "$ASSETS"
+    fi
+fi
+
+# ------------------------------------------------------------- 9. the check ---
 
 if wanted check; then
     step "Checking packed scenes"
@@ -506,7 +559,7 @@ if wanted check; then
     run python3 "$RE/vsc_check.py" "${vscs[@]}"
 fi
 
-# ------------------------------------------------------------- 9. the build ---
+# ------------------------------------------------------------ 10. the build ---
 
 if wanted build; then
     step "Building"

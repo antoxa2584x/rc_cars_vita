@@ -94,6 +94,16 @@ typedef struct {
 typedef struct {
     cp_t cp[CP_MAX];
     int n;
+    /* Cumulative arc length along the stitched CLOSED spine at each point, and
+     * its total. Built once by cp_init in the loader's own order --
+     * cp_0, cp_0_1..., cp_1, cp_1_1..., wrapping back to cp_0 -- which is the
+     * polyline FUN_004e9560 accumulates its running length over.
+     *
+     * This exists for the AI. The rubber band compares an opponent's progress
+     * with the player's, and the original measures both as distance along this
+     * spine (FUN_004ea120 -> FUN_004eb630 = spine_len * (lap - 1) + this). */
+    float cum[CP_MAX][CP_MAX_POINTS];
+    float spine_len;
     int next;                     /* the checkpoint being headed for */
     int lap;
     float t;
@@ -116,5 +126,16 @@ void cp_draw(checkpoints_t *c, const float eye[3]);
 
 /* Metres along the spine from the car to the next checkpoint's centre. */
 float cp_dist_to_next(const checkpoints_t *c, float x, float y, float z);
+
+/* Progress along the closed spine at (x, y, z), WITHIN a lap: `dist` metres from
+ * the start line to the nearest spine point, `cp` the checkpoint that owns it.
+ * Either output may be NULL. -> 0 when there is no spine loaded, leaving both
+ * untouched.
+ *
+ * Same rule cp_step uses for progression, and for the same reason -- proximity to
+ * a checkpoint 30 to 90 m away says nothing about where on the track a car is.
+ * Backs ai.h's `ai_track.spine`. */
+int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,
+                  float *dist, int *cp);
 
 #endif

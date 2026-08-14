@@ -1,5 +1,5 @@
 /*
- * carparts.h -- show the upgrade parts the player has picked.
+ * carparts.h -- show the upgrade parts the player has picked, and the skin.
  *
  * RC Cars models two of its three upgrades on the car itself, and it does them
  * two different ways:
@@ -13,6 +13,44 @@
  *
  * The RESONATOR has no visual -- it is the only one of the three with no mesh or
  * texture family behind it in Car.sb.
+ *
+ * THE SKIN is not an upgrade at all -- it is the car's paint, four per car -- but
+ * it is the same retexturing operation as the tyres, on the same scene, so it
+ * lives here rather than in a file of its own.
+ *
+ * The engine BUILDS the names instead of tabling them. FUN_0049fc80 validates
+ * 0 <= car < 3 and 0 <= skin < 4, sprintf's "car_askin%i%i" and "car_bskin%i%i"
+ * from (car+1, skin+1), resolves both through the texture-by-name call at
+ * 0x0046e180 -- the one fx.c gets "dust" from -- and returns 0 unless it found
+ * what that car needs. FUN_0050bf90, the same function that switches the exhaust
+ * groups, hands each result to FUN_005352a0, which walks the model and re-points
+ * every texture whose name STARTS WITH the prefix it was given: `car_askin` and
+ * `car_bskin`, no digits (the comparison is a strncmp over strlen(prefix), at
+ * 0x0053533c). So a repaint is a PREFIX match over the model's own texture refs,
+ * which is how Car.sb can ship wearing `car_askin11` and still be repainted by a
+ * name no mesh in it has ever referenced.
+ *
+ * TWO PAGES, AND CAR 1 HAS ONLY ONE. FUN_0049fc80's switch loads both pages for
+ * cars 2 and 3 and writes NULL for the second on car 1; the shipped art says the
+ * same thing independently, there being no car_bskin1<n> in any of the three
+ * texture sets. Neither fact is inferred from the other, and this file needs no
+ * car index to know it -- a car has the pages its own meshes reference.
+ *
+ * WHAT A SKIN COVERS, measured on the packed cars rather than assumed: the
+ * painted shell (ENV_BODY), the glass and chrome (ENV_GRE1), the Hummer's
+ * lamps/bumpers class (ENV_GRE2), and the ANTENNA -- whose whip is textured off
+ * the same atlas on the Buggy and the Hummer and carries no env class at all.
+ * 536 / 505 / 792 triangles of 3778 / 3631 / 3890. It is paint and trim; it moves
+ * no geometry, which is why nothing outside this file has to know a skin changed.
+ *
+ * It does NOT cover the exhausts. Those are ENV_UPGRADES and wear their own
+ * <prefix>turbo_<n> atlases, so the booster row and this one never fight over a
+ * batch -- and the per-car detail atlases (overkill_dviglo, overkill_mashi,
+ * mashineriya) are env-mapped too and are not paint either. So "env-mapped"
+ * implies nothing about being painted; the implication runs the other way, and
+ * only that direction is worth asserting (carparts_test does, using the env
+ * field, which pack_vsc.py fills from ENVIR_CAR_BODY NODE names -- a different
+ * rule from the texture names this file keys on, hence a real cross-check).
  *
  * WHY THIS EXISTS AT ALL: pack_vsc.py flattens the whole car subtree, so all
  * four UPGRADES groups end up in the scene and every one of them draws. Before
@@ -70,6 +108,27 @@
    texture would be more. Sized well clear of the 8 the three cars use. */
 #define CARPARTS_MAX_BOOST_BATCHES 16
 
+/* Skins, and the two atlas pages one is made of. Both are the engine's own
+   numbers, not room to grow: FUN_0049fc80 rejects a skin index outside 0..3 and
+   there is no third prefix anywhere in the image. */
+#define CARPARTS_SKINS 4
+#define CARPARTS_SKIN_PAGES 2
+/* The painted batches. Six on the Hummer, the most of the three. */
+#define CARPARTS_MAX_SKIN_BATCHES 16
+
+/* One atlas page -- `car_askin` or `car_bskin` -- as this car uses it. A car that
+   references only the first leaves the second's n_batch at 0, and nothing about
+   it is then looked at. */
+typedef struct {
+    int          batch[CARPARTS_MAX_SKIN_BATCHES];
+    int          n_batch;
+    GLuint       tex[CARPARTS_SKINS];       /* 0 = not packed for this skin */
+    /* "car_askin1" -- the prefix plus this car's own digit, taken from whichever
+       skin texture the model ships wearing. The engine derives it from the car
+       index; there is no car index here, and the model already says. */
+    char         family[24];
+} carparts_skin_page;
+
 typedef struct {
     /* Every exhaust batch on the car, each tagged with the level it belongs to.
        A flat list rather than one slot per level, because a level is made of
@@ -92,14 +151,26 @@ typedef struct {
     int          n_tire;
 
     char         family[24];                    /* "tire2" / "tire3", for logs */
+
+    /* the paint. Page 0 is `car_askin`, page 1 `car_bskin`. */
+    carparts_skin_page skin[CARPARTS_SKIN_PAGES];
+    /* How many skins this car can actually be given, counted from 1 UPWARD and
+       stopping at the first one any painted page is missing. Consecutive rather
+       than a count of what is present, so the menu can wrap over 0..n_skin-1 with
+       no gaps to map around, and so a half-packed car degrades to the skins it
+       really has instead of to a hole. Always at least 1 on a car with paint --
+       the model ships wearing skin 1 -- and 0 on a scene with none. */
+    int          n_skin;
 } carparts_t;
 
 /* Resolve the parts of an already-loaded car scene. Safe on a scene with none;
    everything then reports zero and carparts_apply does nothing. */
 void carparts_bind(carparts_t *p, const scene_t *car);
 
-/* Show `booster` (0..3) and put level `tires` (0..3) on the wheels. Levels with
-   no geometry or no texture are left as they are rather than blanked. */
-void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster);
+/* Show `booster` (0..3), put level `tires` (0..3) on the wheels and `skin`
+   (0..CARPARTS_SKINS-1) on the paint. Levels and skins with no geometry or no
+   texture are left as they are rather than blanked. */
+void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster,
+                    int skin);
 
 #endif

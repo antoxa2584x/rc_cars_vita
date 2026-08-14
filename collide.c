@@ -878,9 +878,59 @@ int rb_car_at_rest(rb_car *c)
  *
  * `depth_out` may be NULL when only the flag is wanted. Depth is 0 for a wheel
  * resting exactly tangent, which is still touching -- rb_susp_retract depends on
- * that distinction, so the return value and the depth are NOT interchangeable. */
+ * that distinction, so the return value and the depth are NOT interchangeable.
+ *
+ * THE DEPTH IS MEASURED ALONG THE BODY UP AXIS, NOT ALONG THE CONTACT NORMAL,
+ * and that distinction is the whole of "the car flips over small rocks".
+ *
+ * rb_susp_retract's only lever is the spring LENGTH, so the quantity it needs is
+ * "how far along the strut must this wheel travel to clear?" -- which is what the
+ * original computes, by intersecting a ray along the body up axis against the
+ * contact sphere (suspRetract, 0x004fb9e0). This used to return the closest-point
+ * overlap `r - |centre - point|` instead, with a comment calling it "the same
+ * quantity by a shorter route". It is the same quantity only when the contact
+ * normal IS the body up axis -- flat ground, which is every case the harnesses
+ * built -- and it is short by 1/cos(angle) everywhere else.
+ *
+ * Being short is not a rounding error, because retract feeds its own output back
+ * in: raising the wheel by an under-estimate leaves it still touching, so the next
+ * pass measures a smaller overlap and raises it by less again. Against a face
+ * tilted t off vertical each pass recovers only cos(t) of what is left, so the
+ * length converges GEOMETRICALLY to the tangent point and never reaches clearance.
+ * Five passes run out, rb_susp_retract discards the whole retraction and reports
+ * stuck -- on a wheel it had in fact resolved to within a float. Measured on a
+ * 3 cm step, an edge normal 38 degrees off vertical: passes 0..4 gave depths
+ * 4.5, 0.7, 0.2, 0.0, 0.0 mm, having spent 5.4 mm of a 68.2 mm budget with
+ * nothing bottomed out, and still returned failure.
+ *
+ * carPhysTick reads that failure as "the strut has run out of travel and left a
+ * wheel overlapping", which is a CONTACT EVENT -- so a 3 cm rock was handed to
+ * the impulse solve as though it were a wall, at the full approach speed, and
+ * FUN_004f0750's dv = 0.05 - vrel asked for 3.2 m/s of velocity change at a
+ * contact patch 90 mm below the centre of mass. |w| went 0.04 -> 10.13 rad/s in
+ * one frame and the car cartwheeled.
+ *
+ * The along-up distance is the positive root of |d + t*u| = r, d = centre - point:
+ *
+ *     t = sqrt((d.u)^2 - |d|^2 + r^2) - (d.u)
+ *
+ * which collapses to exactly `r - |d|` when u is parallel to d, so flat ground is
+ * bit-for-bit what it always was. Two guards, both deliberate:
+ *
+ *   - only when d.u > 0, i.e. the contact is BELOW the wheel centre along the
+ *     strut. Retracting cannot clear something the wheel is jammed under, and the
+ *     far root of that quadratic would be the distance out the other SIDE of the
+ *     obstacle -- a large number that would blow the budget and turn an overhang
+ *     into a contact event. Those contacts keep the closest-point overlap, which
+ *     is what ceiling.c has always measured.
+ *   - a vertical face gives d.u = 0, hence t = sqrt(r^2 - |d|^2), which is finite
+ *     and can exceed the 0.95-radius budget. That is correct and is the wall case:
+ *     a wall still stops the car, because clearing it really would mean lifting
+ *     the wheel over the top of it.
+ */
 static int wheel_probe(const rb_car *c, int i, double *depth_out)
 {
+    const float *up = &c->m[4];        /* body up: matrix row 1 */
     float p[3], r;
     rb_world_hit hits[8];
     int nh = 0, h, touching;
@@ -899,7 +949,17 @@ static int wheel_probe(const rb_car *c, int i, double *depth_out)
         double dx = (double)p[0] - hits[h].point[0];
         double dy = (double)p[1] - hits[h].point[1];
         double dz = (double)p[2] - hits[h].point[2];
-        double d = (double)r - sqrt(dx * dx + dy * dy + dz * dz);
+        double dd = dx * dx + dy * dy + dz * dz;
+        double d  = (double)r - sqrt(dd);
+
+        if (d > 0.0) {
+            double du = dx * up[0] + dy * up[1] + dz * up[2];
+            if (du > 0.0) {
+                double disc = du * du - dd + (double)r * r;
+                if (disc > 0.0)
+                    d = sqrt(disc) - du;
+            }
+        }
         if (d > worst)
             worst = d;
     }

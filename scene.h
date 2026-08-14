@@ -69,12 +69,48 @@ typedef struct { float x, y, z, u, v, lu, lv; } vtx_t;
 
 #define BATCH_ANY_WATER (BATCH_WATER | BATCH_COAST | BATCH_STREAM | BATCH_FALL)
 
-/* Set at RUNTIME, never packed -- deliberately well clear of pack_vsc.py's bit
-   range so the two cannot collide as either side grows. carparts.c raises it on
-   the exhaust groups, whose textures carry a real half-transparent region
-   rather than a cut-out; main.c then draws those batches blended, after the
-   opaque ones. See carparts.h. */
-#define BATCH_TRANSLUCENT 0x1000u
+/*
+ * Set at RUNTIME, never packed -- deliberately well clear of pack_vsc.py's bit
+ * range so the two cannot collide as either side grows. carparts.c raises it on
+ * the exhaust groups; main.c draws those batches in their own pass with the
+ * alpha-test reference dropped to 0, and OPAQUE. See carparts.h.
+ *
+ * THE EXHAUST IS NOT TRANSLUCENT, AND THIS FLAG USED TO BE NAMED AS THOUGH IT
+ * WERE. Every <prefix>turbo_<n> is ARGB4444 whose alpha sits on a plateau at
+ * nibble 7 -- 119 as a byte, 0.467 -- over 1.3 to 22.4% of the image, and the
+ * world's cut-out test is glAlphaFunc(GL_GREATER, 0.5), just above it. So those
+ * texels were being discarded and the pipes and boosters had holes punched
+ * through them. The fix for THAT was to draw the batches BLENDED, which traded
+ * the holes for 47%-opaque bodywork -- reported as "car boosters and exhaust
+ * looks semi transparent", and it was.
+ *
+ * What the plateau actually covers is SOLID METAL, checked in the artwork on all
+ * three cars: the Overkill's brass velocity stacks and their flanges and nut,
+ * the Buggy's magenta muffler barrel and pipe elbow, the Hummer's blue barrel
+ * and cone insert. THE ARTISTS' OWN SHOP ICONS SETTLE IT -- upgr_boost<1..3>_<n>
+ * are renders of these very parts, and in all nine the stacks, barrels and scoop
+ * fronts are fully opaque, with the car's bodywork completely hidden behind
+ * them. (Same class of evidence as upgr_tires* under "A fitted tyre is wider".)
+ * Alpha 119 is not an opacity the engine reads: the exhausts are simply the only
+ * 12 ARGB textures on a car whose other 14 are RGB with no alpha channel at all,
+ * so there is nothing else on the car for the engine to have read alpha from.
+ *
+ * The engine's own blend selector agrees that opaque is expressible and is the
+ * default. FUN_0045c3c0 tests the material flags byte and calls FUN_0045c6e0,
+ * whose mode 0 -- taken whenever bit 0x1 is CLEAR -- is
+ * SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE) at 0x0045c6f7. Its jump table at
+ * 0x0045c964 puts plain SRCALPHA/INVSRCALPHA on mode 2 (bit 0x2, 0x0045c7e5) and
+ * the documented 2*src*dst on mode 5 (bit 0x20, 0x0045c911) -- the tyre marks'
+ * own mode, which is what confirms the decode. Car.sb declares no MOD_MATERIAL
+ * node at all and every car texture's 0x3408 words 3 and 4 are 0, so nothing in
+ * the car's data asks for a blend mode.
+ *
+ * So the THRESHOLD is the whole point of this flag and the blend was the bug.
+ * GREATER 0 rather than no test at all, because the alpha-0 region -- the dark
+ * bores looking into the stacks -- stays a real cut-out. That half was already
+ * reasoned through and is not what was reported wrong.
+ */
+#define BATCH_ALPHA_LOWREF 0x1000u
 
 /*
  * Set at RUNTIME by scene_load: this batch's texture has texels the alpha test

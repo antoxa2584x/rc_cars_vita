@@ -39,6 +39,7 @@
 enum {
     MENU_TRACK = 0,
     MENU_CAR,
+    MENU_SKIN,
     MENU_TIRES,
     MENU_RESO,
     MENU_BOOST,
@@ -75,6 +76,17 @@ enum {
    compile-time check that the two agree. */
 #define MENU_TEXQUAL_LEVELS 3
 
+/* Overkill, Buggy, Hummer. The engine's own bound, not a guess: FUN_0049fc80
+   rejects a car index outside 0..2 and rb_data.h's RB_CARS has three rows. Named
+   because the skin selection is one slot PER car and an array wants a size. */
+#define MENU_N_CARS 3
+
+/* MUST MATCH carparts.h's CARPARTS_SKINS -- mirrored for the same reason
+   MENU_TEXQUAL_LEVELS is: carparts.h includes scene.h and so drags in the GL
+   layer, and menu.c is kept clear of it so menu_test can build without vitaGL.
+   main.c includes both and carries the compile-time check that they agree. */
+#define MENU_SKINS 4
+
 typedef struct {
     int open;
     int row;
@@ -82,6 +94,19 @@ typedef struct {
     /* current selections */
     int track;
     int car;            /* 0 Overkill, 1 Buggy, 2 Hummer */
+    /* The paint, PER CAR -- one slot each, not one selection shared. The four
+       skins of the Overkill are four different textures from the four of the
+       Buggy (car_askin1<n> against car_askin2<n>), so "skin 3" means a different
+       colour on each car and remembering it per car is the only reading of the
+       picker that survives switching. Indexed by `car`; 0..MENU_N_CARS-1.
+       Purely visual, and live -- carparts_apply re-points a texture. */
+    int skin[MENU_N_CARS];
+    /* How many skins the CURRENTLY LOADED car actually has, 1..MENU_SKINS.
+       The menu cannot know this -- it is a property of the packed scene, and a car
+       packed without the three extra skin atlases has exactly one -- so main.c
+       writes it after every load_car from carparts_t::n_skin. 1 until then, which
+       pins the row rather than letting it offer paint that is not there. */
+    int skins;
     int tires;          /* 0..3 -- grip, and the wheel texture */
     int reso;           /* 0..3 -- top speed and acceleration. No visual: the
                            resonator is the one upgrade of the three with no

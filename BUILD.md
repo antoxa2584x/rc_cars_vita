@@ -291,16 +291,26 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
     # the three cars. --shadow-tex bakes the top-down silhouette the projected
     # shadow uses and fits its radius to the car; --envmap classifies the body's
     # env-mapped parts and packs their vertex normals for the glance (writes
-    # VSC7); --extra-tex packs the upgrade tyre levels, only one of which any mesh
-    # actually references, plus the two effect sprite sets -- `dust`, which both
-    # particle systems share, and the four `t_halfdry_tire2_<n>` tyre marks.
+    # VSC7); --extra-tex packs the upgrade tyre levels and the three alternate
+    # SKINS, neither of which any mesh references, plus the two effect sprite
+    # sets -- `dust`, which both particle systems share, and the four
+    # `t_halfdry_tire2_<n>` tyre marks.
+    #
+    # The skin lists are not symmetric: car 1 has one atlas page and the other
+    # two have two, which is FUN_0049fc80's own switch and also the shipped art
+    # (no car_bskin1<n> exists). See "The paint" in CLAUDE.md. Dropping the skins
+    # from a car's list is the supported way to get the ~4 MB back -- carparts.c
+    # then reports one skin and the menu's Skin row pins itself at 1/1.
     FX=dust,t_halfdry_tire2_1,t_halfdry_tire2_2,t_halfdry_tire2_3,t_halfdry_tire2_4
+    S1=car_askin12,car_askin13,car_askin14
+    S2=car_askin22,car_askin23,car_askin24,car_bskin22,car_bskin23,car_bskin24
+    S3=car_askin32,car_askin33,car_askin34,car_bskin32,car_bskin33,car_bskin34
     python3 $RE/pack_vsc.py "$DB/Car.sb" assets/car1.vsc --subtree Car1 --rig \
-        --shadow-tex 256 --envmap --extra-tex tire3_1,tire3_2,tire3_4,$FX
+        --shadow-tex 256 --envmap --extra-tex tire3_1,tire3_2,tire3_4,$S1,$FX
     python3 $RE/pack_vsc.py "$DB/Car.sb" assets/car2.vsc --subtree Car2 --rig \
-        --shadow-tex 256 --envmap --extra-tex tire2_1,tire2_2,tire2_4,$FX
+        --shadow-tex 256 --envmap --extra-tex tire2_1,tire2_2,tire2_4,$S2,$FX
     python3 $RE/pack_vsc.py "$DB/Car.sb" assets/car3.vsc --subtree Car3 --rig \
-        --shadow-tex 256 --envmap --extra-tex tire3_2,tire3_3,tire3_4,$FX
+        --shadow-tex 256 --envmap --extra-tex tire3_2,tire3_3,tire3_4,$S3,$FX
 
     # Only the CARS get --envmap. No track has an ENVIR_CAR_BODY or *_GRE<n> node,
     # so a track would pack VSC7 with nothing in the new field; tracks stay VSC6.
@@ -347,7 +357,7 @@ leaves the previous binary sitting there to answer for it:
 
     rm -f rb_test vis_test carparts_test menu_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest ceiling audio_test colprof \
-          flipped antheight
+          flipped antheight aitest
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -395,6 +405,10 @@ leaves the previous binary sitting there to answer for it:
         ../rccars_re/flipped.c scene.c carani.c col.c rb.c rbcar.c contact.c \
         collide.c rlog.c ../rccars_re/glstub_host.c \
         -lm -o flipped                  # a car on its ROOF, on the real grids
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
+        ../rccars_re/aitest.c ai.c col.c rb.c rbcar.c contact.c collide.c \
+        carani.c scene.c rlog.c ../rccars_re/glstub_host.c \
+        -lm -o aitest        # the AI opponents, on the real .aip and .col files
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         ../rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
         contact.c collide.c rlog.c ../rccars_re/glstub_host.c \
@@ -486,6 +500,12 @@ of them is the painted shell, and that every packed normal is unit length. Same
 shape of assertion as the lightmap one, for the same reason -- the classes are
 resolved by NAME MATCHING at pack time, so a rename in `Car.sb` leaves a car that
 loads and draws perfectly and simply has no shine on it.
+
+It asserts the same thing for the SKINS: all four on every `car_?skin<car>` page
+the file carries, and the number of pages matching the CAR DIGIT in the names --
+one for car 1, two for the others. The second clause is the one that catches a car
+packed with *another* car's skins, which loads, looks right at skin 1 and repaints
+into a different car's colours at skin 2.
 
     python3 ../rccars_re/vsc_check.py assets/car1.vsc assets/car2.vsc \
         assets/car3.vsc assets/beach_1.vsc

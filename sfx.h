@@ -90,6 +90,55 @@ void sfx_respawn(void);         /* cp_reset */
    -- PROP_MIN_SPEED and friends in sfx.c. */
 void sfx_prop_hit(int model, const float pos[3], float speed);
 
+/* ------------------------------------------------------------- the opponents
+ *
+ * One positional engine loop per AI car, because that is all the shipped data
+ * can support: `motorAI_accel1` is the ONLY motorAI wav in the pack. snd.dat
+ * names `motorAI_decel3` too and there is no file for it -- one of the eleven
+ * entries the engine's own findsoundpath() fails on -- so where the player gets
+ * three layers (car_motor, car_motor_2, car_motor_ws) an opponent gets one,
+ * pitched by how fast it is going.
+ *
+ * `slot` is 0..SFX_AI_MAX-1 and must stay the same for the same opponent from
+ * frame to frame; it is the voice's identity. `speed_ratio` is the car's speed
+ * over its own top speed. `active` 0 stops the voice, which is how an opponent
+ * outside the audible radius costs nothing.
+ *
+ * The RADII are the port's and are anchored to the prop channels rather than
+ * invented: stone.sb gives every knockable object rmin 30 / rmax 8, i.e. full
+ * volume to 8 m and silence past it, and a car is a much bigger noise than a
+ * falling can. SFX_AI_RMAX is that scaled to the length of a straight these
+ * tracks have. Nothing recovered says how loud an opponent is -- the engine
+ * attaches carAI_* to its own channels and the channel volumes in chn.dat carry
+ * no radii. */
+#define SFX_AI_MAX 5
+
+/* Radii, gain and the pitch band, all THE PORT'S. The pitch range is the same
+ * 0.80..1.70 the player's own sustained layer runs over, so an opponent
+ * alongside reads as the same kind of engine. SFX_AI_RMAX is out here because
+ * the CALLER needs it: mix_pan already attenuates to silence past it, so the
+ * only reason to stop a distant voice is the voice budget, and only the caller
+ * knows where the listener is. */
+#define SFX_AI_RMIN  6.0f
+#define SFX_AI_RMAX  40.0f
+#define SFX_AI_GAIN  0.55f
+#define SFX_AI_PITCH_LO 0.80f
+#define SFX_AI_PITCH_HI 1.70f
+
+void sfx_ai_motor(int slot, const float pos[3], float speed_ratio, int active);
+
+/* Stop every opponent voice -- on a track change, a restart, or a pause. */
+void sfx_ai_silence(void);
+
+/* Car against car: `car_cdt_car`, which `snd.dat` names and which had nothing to
+ * raise it until the opponents became solid. Not positional -- it is the
+ * player's own car being hit, and the engine puts the car's collision cues on
+ * its own car_CDT&Boost channel with the rest of them, which is what
+ * sfx_prop_hit already does for `car_cdt_obj`. `speed` is the closing speed in
+ * m/s; anything under PROP_MIN_SPEED is a nudge and is ignored, and it
+ * rate-limits itself the same way the prop cue does. */
+void sfx_car_hit(float speed);
+
 /* Master levels, 0..1. Persisted by the menu. */
 void sfx_volumes(float sfx, float music);
 float sfx_vol_sfx(void);

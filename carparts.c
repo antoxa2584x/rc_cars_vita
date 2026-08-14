@@ -55,6 +55,42 @@ static int turbo_tex_suffix(const char *name)
     return name[n - 1] - '0';
 }
 
+/* "car_askin21" -> page 0 and family "car_askin2"; "car_bskin31" -> page 1 and
+   "car_bskin3". Returns the page, or -1.
+
+   The two prefixes are the engine's, verbatim: FUN_0050bf90 passes them to
+   FUN_005352a0 as `car_askin` and `car_bskin`, and that function matches by
+   PREFIX. What follows is two digits, the car and the skin, and only the FIRST
+   belongs in the family -- a car wears one car and four skins.
+
+   Requiring exactly two digits after the prefix is what stops this claiming a
+   name it should not: `car_askin` bare, or a three-digit variant, is not one of
+   the twelve textures FUN_0049fc80 can build. */
+static int skin_family(const char *name, char *out, size_t out_n)
+{
+    const size_t pre = 9;                        /* strlen("car_askin") */
+    int page;
+
+    if (strncmp(name, "car_askin", pre) == 0)
+        page = 0;
+    else if (strncmp(name, "car_bskin", pre) == 0)
+        page = 1;
+    else
+        return -1;
+
+    if (strlen(name) != pre + 2)
+        return -1;
+    if (name[pre] < '1' || name[pre] > '3')      /* the car */
+        return -1;
+    if (name[pre + 1] < '1' || name[pre + 1] > '0' + CARPARTS_SKINS)
+        return -1;
+    if (pre + 1 >= out_n)
+        return -1;
+    memcpy(out, name, pre + 1);
+    out[pre + 1] = 0;
+    return page;
+}
+
 /* "tire3_3" -> "tire3". Returns 0 if this is not a tire texture. */
 static int tire_family(const char *name, char *out, size_t out_n)
 {
@@ -73,7 +109,7 @@ static int tire_family(const char *name, char *out, size_t out_n)
 void carparts_bind(carparts_t *p, const scene_t *car)
 {
     unsigned int i;
-    int k;
+    int k, pg;
 
     memset(p, 0, sizeof(*p));
 
@@ -110,6 +146,33 @@ void carparts_bind(carparts_t *p, const scene_t *car)
         if (b->tex >= car->n_tex)
             continue;
         tn = car->tex_names[b->tex];
+
+        /* THE PAINT, and it does NOT `continue`. On the shipped cars nothing is
+           both painted and an exhaust -- the four exhaust groups wear their own
+           <prefix>turbo_<n> atlases -- so today the two orders agree. Falling
+           through anyway is what keeps that a MEASUREMENT rather than a
+           dependency: were a repack ever to paint an exhaust group, dropping out
+           here would leave exactly one level wearing the skin the car was packed
+           with, visible only on that level and only after a repaint.
+
+           Nothing below can claim a `car_?skin<c><s>` name in the other
+           direction: it is neither `tire*` nor a `turbo`. */
+        {
+            char fam[24];
+            int page = skin_family(tn, fam, sizeof(fam));
+            if (page >= 0) {
+                carparts_skin_page *sp = &p->skin[page];
+                /* The first one seen names the page for the whole car. A later
+                   batch on a DIFFERENT family is not this car's paint and is left
+                   alone -- the family carries the car digit, so this is the guard
+                   against a scene holding more than one car's meshes. */
+                if (!sp->family[0])
+                    memcpy(sp->family, fam, strlen(fam) + 1);
+                if (strcmp(sp->family, fam) == 0
+                    && sp->n_batch < CARPARTS_MAX_SKIN_BATCHES)
+                    sp->batch[sp->n_batch++] = (int)i;
+            }
+        }
 
         /* A car packed before `booster_<n>` became a part has every exhaust on
            __root__, and then the suffix is all there is. That fallback is wrong
@@ -153,11 +216,50 @@ void carparts_bind(carparts_t *p, const scene_t *car)
                 p->n_tire++;
         }
     }
+
+    /* One texture per skin per painted page. The name is the engine's own
+       sprintf with the car digit already in the family, so `car_askin2` + '3' is
+       exactly the `car_askin23` FUN_0049fc80 would have asked for. */
+    for (pg = 0; pg < CARPARTS_SKIN_PAGES; pg++) {
+        carparts_skin_page *sp = &p->skin[pg];
+        if (!sp->n_batch)
+            continue;
+        for (k = 0; k < CARPARTS_SKINS; k++) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "%s%d", sp->family, k + 1);
+            sp->tex[k] = scene_tex(car, nm);
+        }
+    }
+
+    /* How far up the skins go, counting from 1 and stopping at the first one ANY
+       painted page is missing. A skin is a page pair on the Buggy and the Hummer
+       and one page on the Overkill, and half a repaint is worse than none -- the
+       shell would change and the lamps would not. Consecutive rather than a
+       count, so the menu can wrap 0..n_skin-1 with nothing to map around.
+
+       This is also the whole of the fallback for an asset packed without the
+       three extra skins: n_skin comes out 1, and every caller is then pinned to
+       the paint the model ships wearing without knowing why. */
+    p->n_skin = 0;
+    for (k = 0; k < CARPARTS_SKINS; k++) {
+        int have = 0, all = 1;
+        for (pg = 0; pg < CARPARTS_SKIN_PAGES; pg++) {
+            if (!p->skin[pg].n_batch)
+                continue;
+            have = 1;
+            if (!p->skin[pg].tex[k])
+                all = 0;
+        }
+        if (!have || !all)
+            break;
+        p->n_skin = k + 1;
+    }
 }
 
-void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster)
+void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster,
+                    int skin)
 {
-    int k, i;
+    int k, i, pg;
 
     if (!car || !car->n_batches)
         return;
@@ -166,21 +268,24 @@ void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster)
     if (booster >= CARPARTS_LEVELS) booster = CARPARTS_LEVELS - 1;
     if (tires < 0) tires = 0;
     if (tires >= CARPARTS_LEVELS) tires = CARPARTS_LEVELS - 1;
+    if (skin < 0) skin = 0;
+    if (skin >= CARPARTS_SKINS) skin = CARPARTS_SKINS - 1;
 
     /* Exactly one exhaust. Hiding is a zero index count, so scene_draw's
        glDrawElements draws nothing and no other file has to know.
 
-       The exhausts are also the only geometry on the car that is genuinely
-       half-transparent, so they are marked BATCH_TRANSLUCENT here and main.c
-       draws them blended after the rest of the body. Marking every level, not
-       just the visible one, keeps the flag a property of the batch. */
+       The exhausts are also the only geometry on the car whose texture carries
+       solid area BELOW the world's 0.5 cut-out threshold, so they are marked
+       BATCH_ALPHA_LOWREF here and main.c draws them in a pass with the alpha-test
+       reference dropped to 0 -- opaque, NOT blended; see scene.h. Marking every
+       level, not just the visible one, keeps the flag a property of the batch. */
     for (k = 0; k < p->n_boost; k++) {
         int b = p->boost_batch[k];
         if (b < 0 || (unsigned)b >= car->n_batches)
             continue;
         car->batches[b].nidx = (p->boost_level[k] == booster)
                                ? p->boost_nidx[k] : 0;
-        car->batches[b].flags |= BATCH_TRANSLUCENT;
+        car->batches[b].flags |= BATCH_ALPHA_LOWREF;
     }
 
     /* If this car has no group for the chosen level, fall back to the highest
@@ -205,6 +310,26 @@ void carparts_apply(carparts_t *p, scene_t *car, int tires, int booster)
             int b = p->wheel_batch[i];
             if ((unsigned)b < car->n_batches)
                 car->batches[b].gl_tex = p->tire_tex[tires];
+        }
+    }
+
+    /* The paint. Per page, and only where that page has the skin packed -- a page
+       missing it keeps what it has, which is the same policy the tyres take and
+       for the same reason: a car whose extra skins were not packed must look like
+       the car it was packed as, not like a car with no texture.
+     *
+     * PER PAGE rather than gated on the pair, because the two pages are separate
+     * textures on separate batches and there is nothing to be gained by refusing
+     * to repaint the shell when the trim's atlas is missing. n_skin already keeps
+     * a caller that respects it from ever asking. */
+    for (pg = 0; pg < CARPARTS_SKIN_PAGES; pg++) {
+        const carparts_skin_page *sp = &p->skin[pg];
+        if (!sp->tex[skin])
+            continue;
+        for (i = 0; i < sp->n_batch; i++) {
+            int b = sp->batch[i];
+            if ((unsigned)b < car->n_batches)
+                car->batches[b].gl_tex = sp->tex[skin];
         }
     }
 }

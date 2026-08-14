@@ -142,6 +142,13 @@ static struct {
     int ui_snd[5];
     int snd_landing, snd_splash, snd_cp, snd_wrong, snd_prestart, snd_reset;
     int snd_brake, snd_cdt_obj;
+    /* The opponents: one positional loop each off the single motorAI wav that
+       ships. See sfx.h. */
+    int snd_ai_motor;
+    int snd_cdt_car;
+    float car_cool;
+    loop_t l_ai[SFX_AI_MAX];
+    float ai_pos[SFX_AI_MAX][3];
     /* One bank index per PROP_MODELS entry. Several share a wav, so several
        entries share an index -- mix_load refcounts, so that is free. */
     int prop_snd[PROP_N_MODELS];
@@ -255,6 +262,15 @@ int sfx_init(void)
     S.snd_reset    = find_load("cp_reset");
     S.snd_brake    = find_load("car_break");
     S.snd_cdt_obj  = find_load("car_cdt_obj");
+    /* The opponents' engine. Loaded once at init rather than with the car,
+       because it does not depend on which car the PLAYER drives -- and it is one
+       sample against the motor family's three. */
+    S.snd_ai_motor = find_load("motorAI_accel1");
+    S.snd_cdt_car  = find_load("car_cdt_car");
+    for (i = 0; i < SFX_AI_MAX; i++) {
+        S.l_ai[i].snd = S.snd_ai_motor;
+        S.l_ai[i].v = MIX_NOVOICE;
+    }
 
     /* The prop sounds belong in the common set rather than being paged per
        track. There are only seven distinct wavs behind the thirteen models
@@ -377,6 +393,15 @@ void sfx_pause(int paused)
         loop_stop(&S.l_ws);
         loop_stop(&S.l_surf);
         loop_stop(&S.l_amb);
+        /* The opponents go quiet too. sfx_ai_motor also declines to start a
+           voice while paused, so nothing restarts them until the world runs
+           again -- one-shots are deliberately left to ring out, which is what
+           sfx_pause has always done. */
+        {
+            int i;
+            for (i = 0; i < SFX_AI_MAX; i++)
+                loop_stop(&S.l_ai[i]);
+        }
         audio_unlock();
     }
 }
@@ -513,6 +538,7 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
     if (S.hit_cool > 0.f) S.hit_cool -= dt;
     if (S.brake_cool > 0.f) S.brake_cool -= dt;
     if (S.cdt_cool > 0.f) S.cdt_cool -= dt;
+    if (S.car_cool > 0.f) S.car_cool -= dt;
     for (i = 0; i < PROP_N_MODELS; i++)
         if (S.prop_cool[i] > 0.f) S.prop_cool[i] -= dt;
 
@@ -601,6 +627,73 @@ void sfx_prop_hit(int model, const float pos[3], float speed)
         one_shot(S.snd_cdt_obj, 0.55f + 0.45f * g, 1.f);
         S.cdt_cool = PROP_CDT_COOL;
     }
+    audio_unlock();
+}
+
+void sfx_ai_motor(int slot, const float pos[3], float speed_ratio, int active)
+{
+    loop_t *l;
+    float pitch, gain;
+    mix_t *m;
+
+    if (!S.ok || slot < 0 || slot >= SFX_AI_MAX)
+        return;
+    l = &S.l_ai[slot];
+    if (l->snd < 0)
+        return;
+
+    audio_lock();
+    if (!active || S.paused) {
+        loop_stop(l);
+        audio_unlock();
+        return;
+    }
+    S.ai_pos[slot][0] = pos[0];
+    S.ai_pos[slot][1] = pos[1];
+    S.ai_pos[slot][2] = pos[2];
+    speed_ratio = clampf(speed_ratio, 0.f, 1.4f);
+    pitch = SFX_AI_PITCH_LO
+          + (SFX_AI_PITCH_HI - SFX_AI_PITCH_LO) * clampf(speed_ratio, 0.f, 1.f);
+    gain = SFX_AI_GAIN * S.vol_sfx;
+    m = audio_mix();
+    if (!mix_alive(m, l->v))
+        l->v = mix_play_3d(m, l->snd, pos[0], pos[1], pos[2],
+                           SFX_AI_RMIN, SFX_AI_RMAX, gain, pitch, 1,
+                           PRIO_ENGINE);
+    else {
+        mix_set_pos(m, l->v, pos[0], pos[1], pos[2]);
+        mix_set(m, l->v, gain, pitch);
+    }
+    audio_unlock();
+}
+
+void sfx_car_hit(float speed)
+{
+    float g;
+
+    if (!S.ok || S.snd_cdt_car < 0 || S.paused)
+        return;
+    if (speed < PROP_MIN_SPEED)
+        return;                     /* a nudge, not a hit */
+    if (S.car_cool > 0.f)
+        return;
+    g = clampf((speed - PROP_MIN_SPEED) / (PROP_FULL_SPEED - PROP_MIN_SPEED),
+               0.f, 1.f);
+    g = PROP_GAIN_FLOOR + (1.f - PROP_GAIN_FLOOR) * g;
+    S.car_cool = PROP_CDT_COOL;
+    audio_lock();
+    one_shot(S.snd_cdt_car, g, 0.96f + 0.08f * g);
+    audio_unlock();
+}
+
+void sfx_ai_silence(void)
+{
+    int i;
+    if (!S.ok)
+        return;
+    audio_lock();
+    for (i = 0; i < SFX_AI_MAX; i++)
+        loop_stop(&S.l_ai[i]);
     audio_unlock();
 }
 
