@@ -30,6 +30,7 @@
 #include "fx.h"
 #include "fx_data.h"      /* fx_surf[] -- the dust rows the engine's class picks */
 #include "trace.h"
+#include "sun.h"
 #include "carani.h"       /* carani_tire_width -- the mark follows the tyre */
 #include "rb_data.h"      /* RB_CARS[].tune, the game's own upgrades.ini rows */
 #include "rbcar.h"        /* rbcar_init, to bind a real car's rig to its mesh */
@@ -4755,6 +4756,204 @@ static void part12_propdraw(void)
     }
 }
 
+/* ------------------------------------------------------------------ part 13
+ * The sun and its lens flare (sun.c).
+ *
+ * Bound to the three things the subsystem IS, none of which a capture of the
+ * vertices alone can see: the two BLEND MODES (the disc alpha-blends and the
+ * flare adds -- the art settles which, see sun.h), the LINE OF SIGHT (state 0
+ * returns before drawing anything, so a sun behind a building has no flare
+ * rather than a faint one), and the GHOST CHAIN STRADDLING the view centre,
+ * which is what the loader's two negated Dists are for.
+ */
+static int g_sun_block;                  /* what the stub world answers */
+
+static int sun_seg_stub(void *u, const float a[3], const float b[3])
+{
+    (void)u; (void)a; (void)b;
+    return g_sun_block;
+}
+
+static void part13_sun(void)
+{
+    static const char *tex[] = { "sun_disc", "lens_flare_1", "lens_flare_2",
+                                 "lens_flare_3", "shine" };
+    scene_t *s = make_scene(tex, 5);
+    scene_t *bare = make_scene(tex, 5);
+    sun_t sun;
+    float eye[3] = { 0.f, 0.f, 0.f };
+    float right[3] = { 1.f, 0.f, 0.f }, up[3] = { 0.f, 1.f, 0.f };
+    int i, n_add, n_alpha;
+
+    (void)sun_seg_stub;
+    printf("\n-- part 13: the sun and its lens flare --\n");
+
+    /* A track with a SUN_AF marker, and one without -- the second is urban_1 and
+       urban_2, whose .sb genuinely has no such node. */
+    add_marker(s, "cp_1", 1.f, 0.f, 1.f, 0.f);
+    add_marker(s, SUN_MARKER_NAME, 40.f, 30.f, -100.f, 0.f);
+    add_marker(bare, "cp_1", 1.f, 0.f, 1.f, 0.f);
+
+    sun_init(&sun, bare);
+    ck(!sun.enabled, "a track with no SUN_AF marker has no sun",
+       "enabled=%d", sun.enabled);
+    gl_cap_reset();
+    sun_draw(&sun, eye, right, up, 65.f, 960.f / 544.f, 1.f);
+    ck(glcap.n_draws == 0, "and draws nothing at all",
+       "%d draws", glcap.n_draws);
+
+    sun_init(&sun, s);
+    ck(sun.enabled, "a track with one has a sun", "enabled=%d", sun.enabled);
+    ck(sun.pos[1] == 30.f && sun.pos[2] == -100.f,
+       "at the marker's own world position, not a direction",
+       "(%.1f %.1f %.1f)", sun.pos[0], sun.pos[1], sun.pos[2]);
+    ck(sun.state == SUN_OFF,
+       "and starts with the flare off -- no cast has happened yet",
+       "state=%d", sun.state);
+
+    /* ---- the line of sight ---- */
+    g_sun_block = 0;
+    sun_step(&sun, NULL, eye, 1.f / 60.f);
+    ck(sun.n_casts == 1, "the first step casts immediately",
+       "%d casts", sun.n_casts);
+    ck(sun.state == SUN_FADE_IN, "a clear sun starts the flare fading IN",
+       "state=%d", sun.state);
+
+    /* Full over FadeTime, bound to the recovered constant from both sides
+       rather than to a frame count. */
+    for (i = 0; i < 200 && sun.state != SUN_ON; i++)
+        sun_step(&sun, NULL, eye, 1.f / 60.f);
+    {
+        float t = (float)i / 60.f;
+        ck(t > SUN_FADE_TIME * 0.6f && t < SUN_FADE_TIME * 1.5f,
+           "and reaches full in about FadeTime",
+           "%.3f s against FadeTime %.3f", t, SUN_FADE_TIME);
+    }
+    ck(sun.alpha == 1.f, "at full strength", "alpha=%.3f", sun.alpha);
+
+    /* THROTTLED, and that is a cost decision worth holding to: at 60 Hz over a
+       second it fires about 1/SUN_RAY_PERIOD times, not 60. */
+    sun.n_casts = 0;
+    for (i = 0; i < 60; i++)
+        sun_step(&sun, NULL, eye, 1.f / 60.f);
+    ck(sun.n_casts >= 1 && sun.n_casts <= 4,
+       "the line-of-sight cast is throttled, not one per frame",
+       "%d casts in a second at period %.2f s", sun.n_casts, SUN_RAY_PERIOD);
+
+    /* ---- the two blend modes ---- */
+    gl_cap_reset();
+    sun_draw(&sun, eye, right, up, 65.f, 960.f / 544.f, 1.f);
+    n_alpha = n_add = 0;
+    for (i = 0; i < glcap.n_draws; i++) {
+        if (glcap.draws[i].blend_src == GL_SRC_ALPHA
+            && glcap.draws[i].blend_dst == GL_ONE_MINUS_SRC_ALPHA)
+            n_alpha++;
+        if (glcap.draws[i].blend_src == GL_SRC_COLOR
+            && glcap.draws[i].blend_dst == GL_ONE)
+            n_add++;
+    }
+    ck(glcap.n_draws == 6, "the disc and the five sprites are all submitted",
+       "%d draws", glcap.n_draws);
+    ck(n_alpha == 1,
+       "the disc ALPHA-blends: flags 0xa0000003 mode 2, and sun_disc keeps its "
+       "RGB while its alpha ramps",
+       "%d of %d", n_alpha, glcap.n_draws);
+    ck(n_add == 5,
+       "the five flare sprites ADD: flags 0xa0200005 mode 3 = SRCCOLOR/ONE, and "
+       "their alpha is 255 everywhere while the RGB ramps to black",
+       "%d of %d", n_add, glcap.n_draws);
+    ck(!glcap.draws[0].depth_mask,
+       "nothing in the pass writes depth", "disc depth_mask=%d",
+       glcap.draws[0].depth_mask);
+
+    /* ---- the chain STRADDLES the view centre ----
+     *
+     * Dist1 and Dist2 are negated by the loader (0x00479c3a, 0x00479c5d), so two
+     * of the four ghosts land on the FAR side of the view centre from the sun.
+     * That is the whole reason the negation is there, and nothing else in this
+     * file would notice if it were dropped: the chain would still be a chain,
+     * just all on one side. The sun is off to the +X side here, so a ghost's
+     * signed offset from the screen centre has to change sign across the four.
+     */
+    {
+        int pos_side = 0, neg_side = 0;
+        /* Draws 1..4 are the four ghosts, in Dist order. Each is a world-space
+           billboard, so the quantity to look at is its LATERAL offset from the
+           view axis -- (centre - eye) . right -- and the sun here is off to the
+           +right side. Two ghosts must come out on each side of the axis. */
+        for (i = 1; i <= 4 && i < glcap.n_draws; i++) {
+            int v = glcap.draws[i].first;
+            float c0[3], lat;
+            int k;
+            for (k = 0; k < 3; k++)
+                c0[k] = 0.5f * (glcap.pos[v][k] + glcap.pos[v + 2][k]) - eye[k];
+            lat = c0[0] * right[0] + c0[1] * right[1] + c0[2] * right[2];
+            if (lat > 0.f) pos_side++;
+            else if (lat < 0.f) neg_side++;
+        }
+        ck(pos_side == 2 && neg_side == 2,
+           "two ghosts fall either side of the view axis -- the negated "
+           "Dist1/Dist2",
+           "%d toward the sun, %d away", pos_side, neg_side);
+    }
+
+    /* ---- BLOCKED: the flare goes entirely, the disc stays ----
+     *
+     * This is the check the whole subsystem exists for. `col_segment` reporting a
+     * hit has to take the flare all the way to state 0 and stop it being drawn --
+     * a flare that merely dimmed would still be a bright wash over a building.
+     */
+    /* A NULL world answers "clear" by design, so the block is applied to the
+       CAST RESULT and the next cast is held off -- what is under test here is the
+       state machine and the draw gate, and col_segment has its own coverage in
+       colprof and wetcheck. */
+    g_sun_block = 1;
+    sun.clear = 0;
+    sun.ray_timer = 1e9f;
+    for (i = 0; i < 400 && sun.state != SUN_OFF; i++)
+        sun_step(&sun, NULL, eye, 1.f / 60.f);
+    ck(sun.state == SUN_OFF, "a blocked sun drives the flare all the way to OFF",
+       "state=%d after %.3f s", sun.state, (float)i / 60.f);
+    {
+        float t = (float)i / 60.f;
+        ck(t > SUN_FADE_TIME * 0.6f && t < SUN_FADE_TIME * 1.5f,
+           "and takes about FadeTime to get there, not a frame",
+           "%.3f s against FadeTime %.3f", t, SUN_FADE_TIME);
+    }
+    ck(sun.alpha == 0.f, "with nothing left of the fade", "alpha=%.3f",
+       sun.alpha);
+    gl_cap_reset();
+    sun_draw(&sun, eye, right, up, 65.f, 960.f / 544.f, 1.f);
+    ck(glcap.n_draws == 1,
+       "with the flare off ONLY the disc is drawn -- state 0 returns before the "
+       "ghosts", "%d draws", glcap.n_draws);
+    ck(glcap.draws[0].blend_src == GL_SRC_ALPHA,
+       "and it is still the alpha-blended one", "src=%#x",
+       glcap.draws[0].blend_src);
+
+    /* The disc grows with distance so that it subtends a FIXED screen angle --
+       the port's substitute for a screen-space quad, and wrong in either
+       direction if the derivation slips. Twice as far must be twice as wide. */
+    {
+        float w1, w2;
+        gl_cap_reset();
+        sun_draw(&sun, eye, right, up, 65.f, 960.f / 544.f, 1.f);
+        w1 = glcap.pos[glcap.draws[0].first + 1][0]
+             - glcap.pos[glcap.draws[0].first][0];
+        sun.pos[0] *= 2.f; sun.pos[1] *= 2.f; sun.pos[2] *= 2.f;
+        gl_cap_reset();
+        sun_draw(&sun, eye, right, up, 65.f, 960.f / 544.f, 1.f);
+        w2 = glcap.pos[glcap.draws[0].first + 1][0]
+             - glcap.pos[glcap.draws[0].first][0];
+        ck(w1 > 1e-4f && w2 > 1.9f * w1 && w2 < 2.1f * w1,
+           "the disc subtends a fixed ANGLE: twice as far, twice as wide",
+           "%.4f m then %.4f m", w1, w2);
+    }
+
+    free(s->tex_ids); free(s->tex_names); free(s->markers); free(s);
+    free(bare->tex_ids); free(bare->tex_names); free(bare->markers); free(bare);
+}
+
 /* Empty the shared pool without touching any emitter's carry. */
 static void clear_pool(fx_t *fx)
 {
@@ -5252,6 +5451,7 @@ int main(void)
     part10_culling();
     part11_vertexbuffers();
     part12_propdraw();
+    part13_sun();
     part14_aifx();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;

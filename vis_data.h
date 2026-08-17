@@ -141,4 +141,49 @@
 #define ANT3_VOLUME                0.030000f   /*  */
 
 
+/* ---- the sun and its lens flare: FUN_00479b70 loads
+   Settings/LENS_FLARE, FUN_00478fd0 places it, FUN_00479070
+   builds the disc, FUN_00479250 the ghost chain and
+   FUN_004797c0 draws all five sprites.
+
+   The sun's WORLD POSITION is not here -- it is the SUN_AF
+   marker in each track's own .sb, which pack_vsc.py exports.
+   Eight tracks have one; urban_1 and urban_2 do not, and the
+   original draws no sun on those two. ---- */
+
+#define SUN_SIZE                   0.050000f   /* SizeSun, a fraction of the viewport half-width */
+#define SUN_COLOR_R                255   /* ColorRSun, 0..255 */
+#define SUN_COLOR_G                255   /* ColorGSun */
+#define SUN_COLOR_B                188   /* ColorBSun */
+#define SUN_RAY_PERIOD             0.500000f   /* TimeShootRay: seconds between line-of-sight casts */
+#define SUN_FADE_TIME              0.250000f   /* FadeTime: seconds to fade the flare in or out */
+#define SUN_CAM_OFFSET             0.000000f   /* CamOffset: added to the camera's focal distance */
+
+/* The four lens GHOSTS, in FUN_00479250's own order: a point
+   `Dist` metres from the view centre along the line to the sun,
+   at the camera's focal depth. Negative is the far side of the
+   centre from the sun -- which is what a lens ghost does. */
+#define SUN_DIST1                  -0.050000f   /* Dist1, negated at 0x00479c3a */
+#define SUN_DIST2                  -0.020000f   /* Dist2, negated at 0x00479c5d */
+#define SUN_DIST3                  0.040000f   /* Dist3 */
+#define SUN_DIST4                  0.110000f   /* Dist4 */
+
+/* The five SPRITE sizes and colours. Sprite 5 sits on the sun
+   itself and is the `shine`; 2 and 4 are left white by the
+   loader (0x00479ce6 onward writes 0xff into those slots), which
+   is why only 1 and 3 have keys. */
+#define SUN_FLARE_SIZE1            0.450000f   /* Size1 */
+#define SUN_FLARE_SIZE2            0.030000f   /* Size2 */
+#define SUN_FLARE_SIZE3            0.100000f   /* Size3 */
+#define SUN_FLARE_SIZE4            0.020000f   /* Size4 */
+#define SUN_FLARE_SIZE5            0.500000f   /* Size5 */
+#define SUN_FLARE_RGB1           200, 255, 201   /* ColorR1/G1/B1 */
+#define SUN_FLARE_RGB2           255, 255, 255   /* not a key: the loader writes 0xff */
+#define SUN_FLARE_RGB3           171, 255, 170   /* ColorR3/G3/B3 */
+#define SUN_FLARE_RGB4           255, 255, 255   /* not a key: the loader writes 0xff */
+#define SUN_FLARE_RGB5           255, 255, 255   /* not a key: the loader writes 0xff */
+
+/* Settings/Sky.crs, one key, and no consumer recovered. */
+#define SKY_HOR_ANGLE_RAW          3   /* horAngle, raw 0..100 -- conversion and consumer unknown */
+
 #endif /* VIS_DATA_H */

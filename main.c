@@ -48,6 +48,7 @@
 #include "physics.h"
 #include "col.h"
 #include "rbcar.h"
+#include "sun.h"
 #include "cam.h"
 #include "carani.h"
 #include "prop.h"
@@ -100,6 +101,7 @@ static props_t props;
 
 /* What is loaded right now. The menu changes these; load_track/load_car act. */
 static int cur_track = 0, cur_car = 0;
+static sun_t sun;
 static menu_t menu;
 
 /* The upgrade parts the car wears: which exhaust, and which tyres. Rebound with
@@ -553,6 +555,10 @@ static int load_track(int idx)
     water_free(&water);
     water_init(&water, &track, &col);
     cp_init(&cps, &track, &col);
+    /* The sun: the SUN_AF marker out of this track's own .sb, plus the five
+       flare textures --markers packed beside it. urban_1 and urban_2 carry no
+       marker and get no sun, which is the original's own answer for them. */
+    sun_init(&sun, &track);
     /* The glance's source is this track's sky -- the engine's S_SKY slot, which
        it fills at runtime, and the ten tracks do not share one sky texture. */
     envmap_init(&envmap, &track);
@@ -1649,6 +1655,22 @@ unsigned int acc_ticks = 0;
                 cam_basis(vpitch, vyaw, right, up);
                 fx_draw(&fx, eye, right, up);
             }
+            /* The sun, over the world and under the arrows. Its step is here
+               rather than up with cp_step because what the flare responds to is
+               whether the sun is visible from the EYE, and the eye is not known
+               until the camera has been placed. The line-of-sight cast inside is
+               throttled to one every SUN_RAY_PERIOD (0.5 s), so this is nothing
+               like a ray per frame.
+
+               The disc is a world billboard and is depth-tested, so scenery
+               occludes it; the ghosts are a screen pass gated by the cast. */
+            cam_basis(vpitch, vyaw, right, up);
+            sun_step(&sun, &col, eye, dt);
+            /* 65 degrees and the aspect are this pass's own projection, set
+               a few hundred lines up; the 1.0 m is the ghost chain's layout
+               depth, the original's unrecovered cam+0x158. */
+            sun_draw(&sun, eye, right, up, 65.f,
+                     (float)SCR_W / (float)SCR_H, 1.f);
             cp_draw(&cps, eye);
         }
 

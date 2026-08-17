@@ -53,6 +53,10 @@ typedef void GLvoid;
 #define GL_ALPHA_TEST            0x0BC0
 #define GL_CULL_FACE             0x0B44
 #define GL_DEPTH_TEST            0x0B71
+/* GL_ONE and GL_ZERO: sun.c's flare pass is SRCCOLOR/ONE, which is the
+   original's blend mode 3 (0x0045c81e sets DESTBLEND <- 2 = D3DBLEND_ONE). */
+#define GL_ZERO                  0
+#define GL_ONE                   1
 #define GL_SRC_COLOR             0x0300
 #define GL_SRC_ALPHA             0x0302
 #define GL_ONE_MINUS_SRC_ALPHA   0x0303
