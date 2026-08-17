@@ -61,6 +61,7 @@
 #include "envmap.h"
 #include "tracks.h"
 #include "ui.h"
+#include "hud.h"
 #include "menu.h"
 #include "ai.h"
 #include "carparts.h"
@@ -125,6 +126,12 @@ static antenna_t antenna;
 static water_t water;
 static checkpoints_t cps;
 static int show_vis = 1;
+
+/* The one piece of on-screen feedback over the world: HIT, when the car knocks a
+   prop. Not one of the transcribed subsystems and it does not ride on show_vis --
+   that button turns the port's rendering experiments off, and this is the
+   acknowledgement for a collision that really happened. See hud.h. */
+static hud_t hud;
 
 /* The three effects the car itself throws off, all the game's own as well: the
    wheel dust and exhaust smoke (fx.c, car_dustx / exhausted_gas), the tyre marks
@@ -337,6 +344,8 @@ static void place_car(float x, float z, float ref_y, float yaw)
        quad stretching from wherever the car was to where it landed. The wheels
        stay in contact across it, so nothing else would break the strip. */
     trace_clear(&traces);
+    /* And the HIT pop, which belongs to a collision that is now in the past. */
+    hud_reset(&hud);
 
     /* the pose mirror the HUD and the free-fly camera read */
     vehicle_init(&veh, cur_car, x, gy + 0.06f, z, yaw);
@@ -771,6 +780,15 @@ int main(void)
     respawn();
 
     ui_init();
+    /* The game's own HIT banner. It rides in props.vsc rather than in every
+       track because that scene is loaded once, before the first track, and never
+       reloaded -- so the binding never has to be renewed. scene_tex returns 0 on
+       a scene that failed to load or on one packed before --extra-tex msg_hits,
+       and hud.c then falls back to the compiled-in font. */
+    hud_init(&hud, scene_tex(&props_scene, "msg_hits"));
+    rlog("[rccars] hud: msg_hits %s\n",
+         hud.tex ? "bound (the game's own HIT banner)"
+                 : "NOT PACKED -- falling back to the built-in font");
 
     if (car.has_rig)
         rlog("[rccars] rig: wheels %d %d %d %d  knuckles %d %d  "
@@ -944,6 +962,7 @@ unsigned int acc_ticks = 0;
             rlog("[rccars] checkpoint %d passed (lap %d)\n",
                  cps.passed + 1, cps.lap);
         }
+        hud_step(&hud, dt);
 
         float lx = axis(pad.lx), ly = axis(pad.ly);
         float rx = axis(pad.rx), ry = axis(pad.ry);
@@ -1041,9 +1060,18 @@ unsigned int acc_ticks = 0;
                        sfx_prop_hit rate-limits itself, so running this every
                        frame is correct rather than merely cheap. */
                     for (pi = 0; pi < props.n; pi++)
-                        if (props.p[pi].hit)
+                        if (props.p[pi].hit) {
                             sfx_prop_hit(props.p[pi].model, props.p[pi].pos,
                                          props.p[pi].hit_speed);
+                            /* And SAY so on screen. A can is often behind the
+                               camera by the time it moves, so the noise was the
+                               only acknowledgement the player got. hud_hit
+                               applies the same speed floor sfx_prop_hit does, so
+                               the two agree about what counts as a knock; a
+                               cluster of cans in one pass counts up inside a
+                               single pop rather than stacking words. */
+                            hud_hit(&hud, props.p[pi].hit_speed);
+                        }
                 }
                 if (ticks < 0 && ++phys_clip_log <= 10)
                     rlog("[rccars] physics: frame took %.1f ms, past "
@@ -1554,6 +1582,11 @@ unsigned int acc_ticks = 0;
             }
             cp_draw(&cps, eye);
         }
+
+        /* HIT, over the world and UNDER the menu -- the menu dims everything
+           behind it, and a word floating over a paused game reads as part of the
+           menu. Its own ortho pass, bracketed by hud_draw itself. */
+        hud_draw(&hud, SCR_W, SCR_H);
 
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)

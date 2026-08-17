@@ -107,7 +107,8 @@ static void flush(int nv, GLuint tex)
 }
 
 static int quad(int n, float x0, float y0, float x1, float y1,
-                float u0, float u1, float r, float g, float b, float a)
+                float u0, float v0, float u1, float v1,
+                float r, float g, float b, float a)
 {
     static const int IX[6] = { 0, 1, 2, 0, 2, 3 };
     float px[4], py[4], pu[4], pv[4];
@@ -116,10 +117,10 @@ static int quad(int n, float x0, float y0, float x1, float y1,
     if (n + 6 > MAX_VTX)
         return n;
 
-    px[0] = x0; py[0] = y0; pu[0] = u0; pv[0] = 0.0f;
-    px[1] = x1; py[1] = y0; pu[1] = u1; pv[1] = 0.0f;
-    px[2] = x1; py[2] = y1; pu[2] = u1; pv[2] = 1.0f;
-    px[3] = x0; py[3] = y1; pu[3] = u0; pv[3] = 1.0f;
+    px[0] = x0; py[0] = y0; pu[0] = u0; pv[0] = v0;
+    px[1] = x1; py[1] = y0; pu[1] = u1; pv[1] = v0;
+    px[2] = x1; py[2] = y1; pu[2] = u1; pv[2] = v1;
+    px[3] = x0; py[3] = y1; pu[3] = u0; pv[3] = v1;
 
     for (k = 0; k < 6; k++) {
         uivtx *v = &g_v[n + k];
@@ -136,9 +137,20 @@ void ui_rect(float x, float y, float w, float h,
 {
     int n;
     glDisable(GL_TEXTURE_2D);
-    n = quad(0, x, y, x + w, y + h, 0.0f, 0.0f, r, g, b, a);
+    n = quad(0, x, y, x + w, y + h, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b, a);
     flush(n, 0);
     glEnable(GL_TEXTURE_2D);
+}
+
+void ui_image(float x, float y, float w, float h, unsigned int tex,
+              float u0, float v0, float u1, float v1,
+              float r, float g, float b, float a)
+{
+    int n;
+    if (!tex)
+        return;
+    n = quad(0, x, y, x + w, y + h, u0, v0, u1, v1, r, g, b, a);
+    flush(n, (GLuint)tex);
 }
 
 float ui_text_w(float scale, const char *s)
@@ -168,7 +180,8 @@ void ui_text(float x, float y, float scale,
                glyph in along the seam. */
             float half = 0.5f / (float)(FONT_CW * FONT_COUNT);
             n = quad(n, x, y, x + cw, y + chh,
-                     (float)i * step + half, (float)(i + 1) * step - half,
+                     (float)i * step + half, 0.0f,
+                     (float)(i + 1) * step - half, 1.0f,
                      r, g, b, a);
         }
         x += cw;

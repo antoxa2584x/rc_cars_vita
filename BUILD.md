@@ -10,7 +10,8 @@ there is nothing to translate.
     main.c            vitaGL renderer + flying camera
     CMakeLists.txt    builds eboot.bin and packages the .vpk
     assets/*.vsc      packed scenes (produced by ../rccars_re/pack_vsc.py)
-    assets/props.vsc  the 13 knockable props, VSC8 (../rccars_re/pack_props.py)
+    assets/props.vsc  the 13 knockable props + the !HIT! banner, VSC8
+                      (../rccars_re/pack_props.py)
     sce_sys/          bubble icon + LiveArea art (../rccars_re/gen_sce_sys.py)
     mintest/          20-line vitaGL app, used to isolate runtime failures
 
@@ -33,8 +34,11 @@ Two packaging gotchas worth remembering:
 
     export VITASDK=/usr/local/vitasdk PATH=$VITASDK/bin:$PATH
     python3 ../rccars_re/pack_vsc.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.vsc
-    python3 ../rccars_re/pack_props.py assets/props.vsc   # the 13 knockable props,
-                                                         # ONE file for all ten tracks
+    python3 ../rccars_re/pack_props.py assets/props.vsc \
+        --extra-tex msg_hits          # the 13 knockable props, ONE file for all
+                                      # ten tracks -- plus the game's own !HIT!
+                                      # banner, which belongs in this file
+                                      # because it is the only LOAD-ONCE scene
     mkdir -p build && cd build
     cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake ..
     make -j8            # -> rccars_viewer.vpk
@@ -383,7 +387,12 @@ leaves the previous binary sitting there to answer for it:
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
-    gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c -lm -o ui_test  # menu drawing
+    gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c hud.c -lm -o ui_test
+                            # menu drawing and the !HIT! banner. hud.c is on this
+                            # line because it draws THROUGH ui.c, so the same
+                            # recorder reads back what really went on screen --
+                            # WHICH CELL of the atlas, at the recovered size, in
+                            # the recovered vertical band.
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \

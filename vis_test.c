@@ -4674,6 +4674,48 @@ static void part12_propdraw(void)
     }
     scene_release(s);
     free(s);
+
+    /* --- and the REAL shared scene carries the HIT banner -----------------
+     *
+     * `msg_hits` is the game's own on-screen message texture (RCCars.exe loads
+     * six of them by name at 0x004af195; this is the fourth) and hud.c binds it
+     * by name out of props.vsc. It rides in THIS file rather than in the ten
+     * tracks because props.vsc is the app's one load-once scene.
+     *
+     * This is the link in that chain nothing else can see: ui_test covers hud.c
+     * against a stand-in texture id and has no assets, and the packer has no
+     * checker for a VSC8 file. So the question here is only "is it really in
+     * there, at the size the message slot expects" -- and a missing one is a
+     * FAILED check, not a skip: hud.c would silently fall back to the font. */
+    {
+        scene_t ps;
+        if (!scene_load("assets/props.vsc", &ps)) {
+            ck(0, "the shared props scene loads (run from rccars_vita/)",
+               "assets/props.vsc");
+        } else {
+            GLuint t = scene_tex(&ps, "msg_hits");
+            int lvl0 = -1, k;
+            ck(t != 0,
+               "props.vsc carries msg_hits -- the banner hud.c binds by name",
+               "id %u, %u textures in the scene", (unsigned)t, ps.n_tex);
+            for (k = 0; k < n_uploads; k++)
+                if (uploads[k].tex == t && uploads[k].level == 0)
+                    lvl0 = k;
+            /* 256x256 is what the .csi says and what the UV rects at 0x56d328
+               split down the middle -- two 256x128 messages, one per half. A
+               non-square atlas would make the recovered 2:1 cell aspect a lie. */
+            ck(lvl0 >= 0 && uploads[lvl0].w == 256 && uploads[lvl0].h == 256,
+               "and it is the 256x256 atlas the two message slots split in half",
+               "%dx%d", lvl0 >= 0 ? uploads[lvl0].w : -1,
+               lvl0 >= 0 ? uploads[lvl0].h : -1);
+            /* With a real ALPHA channel: it is authored ARGB8888, and drawn over
+               the world it has to be a cut-out banner rather than a grey box. */
+            ck(lvl0 >= 0 && uploads[lvl0].type == GL_UNSIGNED_BYTE,
+               "uploaded through the RGBA path, so its alpha survives",
+               "type 0x%x", lvl0 >= 0 ? uploads[lvl0].type : 0);
+            scene_release(&ps);
+        }
+    }
 }
 
 /* Empty the shared pool without touching any emitter's carry. */

@@ -415,6 +415,25 @@ fi
 
 # ----------------------------------------------------------- 5. the props ---
 # The 13 knockable models, ONE file shared by all ten tracks.
+#
+# --extra-tex carries the game's own ON-SCREEN MESSAGE artwork, and this is the
+# file it belongs in. RCCars.exe loads six message textures by name at
+# 0x004af195 and FUN_004b11e0 draws one of eleven message SLOTS over them, each
+# slot carrying a texture index (0x56d2d0), a size as a (w, h) screen fraction
+# pair (0x56d278) and a UV rect (0x56d328). One of the six is wanted here:
+#
+#   msg_hits      256x256, an atlas of TWO messages -- slot 3 is !HIT! in its
+#                 top half, slot 4 GREAT !HIT! in its bottom. hud.c.
+#
+# It is referenced by no mesh anywhere; it is bound by NAME at runtime through
+# scene_tex.
+#
+# In props.vsc rather than in the ten tracks because props.vsc is the app's one
+# LOAD-ONCE scene: main.c builds it before the first track and never reloads it,
+# so it is resident for the whole session, costs 0.34 MB ONCE rather than ten
+# times, and the binding is never renewed on a track change. It belongs with the
+# props on the merits as well -- it is the thing that says you hit one. Texture
+# quality divides it by four a step.
 
 if wanted props; then
     step "Packing props"
@@ -422,7 +441,8 @@ if wanted props; then
         skip "props.vsc"
     else
         run python3 "$RE/pack_props.py" "$ASSETS/props.vsc" \
-            --src "$DB/stone.sb" --texroot "$EXTRACTED"
+            --src "$DB/stone.sb" --texroot "$EXTRACTED" \
+            --extra-tex msg_hits
     fi
 fi
 

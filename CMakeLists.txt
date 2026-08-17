@@ -26,7 +26,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -ffast-math -mtune=cortex-a9 -mfpu
 # flush-to-zero and not IEEE-conformant. See rccars_re/PHYSICS.md.
 set(PHYSICS_C_FLAGS "-Wall -O2 -fno-fast-math -ffp-contract=off -mtune=cortex-a9")
 
-add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c menu.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c fx.c trace.c envmap.c
+add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c menu.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c fx.c trace.c envmap.c
   prop.c ai.c mix.c audio.c sfx.c rlog.c)
 
 separate_arguments(PHYSICS_FLAGS_LIST UNIX_COMMAND "${PHYSICS_C_FLAGS}")

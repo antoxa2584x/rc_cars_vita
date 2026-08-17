@@ -32,6 +32,17 @@ void  ui_rect(float x, float y, float w, float h,
 void  ui_text(float x, float y, float scale,
               float r, float g, float b, float a, const char *s);
 
+/* One textured quad from an arbitrary texture, with an explicit UV rect so a
+   caller can take one cell out of an atlas -- which is what the game's own
+   on-screen messages are (msg_hits holds two of them, one per half). `tex` is a
+   GLuint; it is spelt unsigned int here so ui.h stays free of the GL headers,
+   the way the rest of this interface is. A tex of 0 draws nothing rather than
+   binding the default texture, because an unbound sampler is undefined on this
+   GPU (see BATCH_NO_TEXTURE in scene.h). */
+void  ui_image(float x, float y, float w, float h, unsigned int tex,
+               float u0, float v0, float u1, float v1,
+               float r, float g, float b, float a);
+
 /* Layout helpers, in the same pixel space. */
 float ui_text_w(float scale, const char *s);
 float ui_text_h(float scale);
