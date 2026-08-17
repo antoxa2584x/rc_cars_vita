@@ -1577,13 +1577,18 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                 }
                 rlog("[rccars] ai: %d cars, %d drawn, player P%d/%d;  nearest"
                              " %s %d m away  lead=%d m  coeff=%d%%  lap %d"
-                             "  spd=%d cm/s%s\n",
+                             "  spd=%d cm/s  bump=%d cm%s\n",
                              ai.n, ai_drawn, ai_player_place(&ai), ai.n + 1,
                              ai.car[best].name, (int)sqrtf(bd),
                              (int)ai.car[best].lead,
                              (int)(ai.car[best].coeff * 100.f),
                              ai.car[best].lap,
                              (int)(ai.car[best].speed * 100.f),
+                             /* How far off its recorded line a shove has this
+                                one -- the only visible half of the bump model,
+                                and without it "the opponents get knocked about
+                                oddly" has nothing behind it. See ai.h. */
+                             (int)(ai.car[best].bump * 100.f),
                              ai.car[best].airborne ? "  airborne" : "");
             }
             if (car.has_rig) {

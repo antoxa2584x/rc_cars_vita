@@ -1,7 +1,7 @@
 /*
  * ai.c -- the AI opponents. See ai.h for the model and for what is NOT here.
  *
- * Every function below names the address it came from. Only three things are the
+ * Every function below names the address it came from. Only four things are the
  * port's and each is marked THE PORT'S at the point of use:
  *
  *   - the wheel-contact flags fed to rb_wheel_spin_update, because the recorded
@@ -12,7 +12,15 @@
  *     checkpoint.c's query answers within a lap, so the lift rebuilds the
  *     quantity the original compares;
  *   - leaving the angular MOMENTUM inconsistent with the angular velocity, which
- *     nothing on this path integrates.
+ *     nothing on this path integrates;
+ *   - THE BUMP OFFSET and the contact solve over it, which is the whole of the
+ *     "ai_bump_" and "ai_pair_" block below. The original has no such mechanism:
+ *     it either replays a car or simulates one, and this is neither. See ai.h.
+ *
+ * The replay itself is untouched by all of that, and deliberately so: the offset
+ * is composed onto the recorded pose at the last moment (ai_bump_apply) and the
+ * recording is what everything upstream -- the cursor, the lead, the speed the
+ * rubber band chases -- continues to be measured on.
  */
 
 #include <math.h>
@@ -36,6 +44,11 @@
  * problem. Fail at compile time instead. */
 typedef char ai_sample_size_check[(sizeof(ai_sample) == AI_SAMPLE_BYTES)
                                   ? 1 : -1];
+
+static void ai_bump_derive(ai_car *a);
+static void ai_bump_clamp(ai_car *a);
+static void ai_bump_apply(ai_car *a);
+static void ai_collide_field(ai_t *ai);
 
 /* ------------------------------------------------------------------ the file */
 
@@ -232,6 +245,9 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
         a->rb.reso_upgrade = a->reson;
         a->rb.boost_upgrade = a->boost;
         rb_boost_reset(&a->rb);
+        /* After rbcar_init, because it measures the proxy this car ended up
+           with rather than reading a table of it. */
+        ai_bump_derive(a);
         ai->n++;
     }
 
@@ -332,7 +348,7 @@ static void unpack_state(const ai_car *a, const ai_sample *s,
 }
 
 /* Write the pose for the current (cursor, u). FUN_00502ea0. */
-static void ai_pose(ai_car *a)
+static void ai_pose_rec(ai_car *a)
 {
     float y[RB_STATE_N];
     int i;
@@ -378,6 +394,276 @@ static void ai_pose(ai_car *a)
     }
 }
 
+/* ------------------------------------------------------------ the bump offset
+ *
+ * THE PORT'S, all of it -- ai.h has the model and every constant's anchor.
+ * Nothing here is a transcription; the original either replays a car or
+ * simulates one, and an opponent that is knocked off a replayed line and steers
+ * back onto it is neither.
+ */
+
+/* The four per-car numbers, built once at load out of the car's OWN data:
+ *
+ *   reach   the furthest its collision proxy gets from its centre of mass. Not
+ *           tabled -- measured off rb_gather_spheres, so a Hummer gets more room
+ *           than a Buggy because it IS bigger, and a change to the proxy (the
+ *           roof stations were added to it recently) carries through by itself.
+ *           Rotation-invariant, so the pose it is measured at does not matter.
+ *   limit   AI_BUMP_LIMIT_REACH times that.
+ *   accel   the car's grip times gravity -- what its tyres can pull with.
+ *   w       fixed BY the other two: sqrt(accel / limit) is the frequency at
+ *           which a fully displaced car returns at exactly that limit.
+ */
+static void ai_bump_derive(ai_car *a)
+{
+    float s[RB_MAX_SPHERES][4];
+    const rb_car_data *d = &RB_CARS[a->car];
+    double reach = 0.0;
+    int n, i;
+
+    n = rb_gather_spheres(&a->rb, s);
+    for (i = 0; i < n; i++) {
+        double dx = (double)s[i][0] - a->rb.body.x[0];
+        double dy = (double)s[i][1] - a->rb.body.x[1];
+        double dz = (double)s[i][2] - a->rb.body.x[2];
+        double r  = sqrt(dx * dx + dy * dy + dz * dz) + s[i][3];
+        if (r > reach)
+            reach = r;
+    }
+    /* A proxy that gathered nothing would give a zero limit, which is a car
+       that cannot be bumped at all -- fall back to a wheel radius rather than
+       to a silently rigid opponent. */
+    if (reach < 1e-3)
+        reach = (double)d->radius;
+
+    a->bump_limit     = (float)(AI_BUMP_LIMIT_REACH * reach);
+    a->bump_accel     = d->tune.coeff_rear_tires * RB_GRAVITY;
+    a->bump_w         = (float)sqrt((double)a->bump_accel / a->bump_limit);
+    a->bump_yaw_limit = (float)(AI_BUMP_YAW_LOCKS * d->steer_max_deg
+                                * (3.14159265358979 / 180.0));
+}
+
+/* THE TERRAIN FOLLOW, which is a SEPARATE term from the offset and not part of
+ * it: the ground under the displaced car minus the ground under the recorded
+ * one. A car shoved sideways up a slope has to climb it, or it ends up buried on
+ * the high side and hanging on the low one -- the recorded height is the height
+ * of the line it is no longer on.
+ *
+ * Kept out of `off` deliberately. `off` is what the contact solve writes and the
+ * spring pulls back to zero, and this is neither: it is a function of where the
+ * car has been put, so feeding it back into the spring would have the terrain
+ * pushing a car along its own line.
+ *
+ * Two probes, and none at all for a car on its line -- or for one that has not
+ * moved AI_BUMP_PROBE_STEP sideways since the last pair, which is what keeps a
+ * car in contact from paying for them once per depenetration pass. */
+static float ai_bump_ground_dy(ai_car *a)
+{
+    const rb_world *w = a->rb.world;
+    float y0, y1, n[3], ceil_y, dy;
+
+    if (!w || !w->ground)
+        return 0.0f;
+    if (fabs((double)a->off[0]) + fabs((double)a->off[2]) < 1e-4) {
+        /* straight up or nowhere: same column, same ground */
+        a->off_gnd_at[0] = a->off_gnd_at[1] = 0.0f;
+        return 0.0f;
+    }
+    if (fabs((double)a->off[0] - a->off_gnd_at[0])
+        + fabs((double)a->off[2] - a->off_gnd_at[1]) < AI_BUMP_PROBE_STEP)
+        return a->off_gnd;                      /* near enough; reuse it */
+    a->off_gnd_at[0] = a->off[0];
+    a->off_gnd_at[1] = a->off[2];
+    ceil_y = a->rec_x[1] + AI_BUMP_CEIL;
+    if (!w->ground(w->ctx, a->rec_x[0], a->rec_x[2], ceil_y, &y0, n))
+        return 0.0f;
+    if (!w->ground(w->ctx, a->rec_x[0] + a->off[0], a->rec_x[2] + a->off[2],
+                   ceil_y, &y1, n))
+        return 0.0f;
+    dy = y1 - y0;
+    if (dy >  AI_BUMP_MAX_LIFT) dy =  AI_BUMP_MAX_LIFT;
+    if (dy < -AI_BUMP_MAX_LIFT) dy = -AI_BUMP_MAX_LIFT;
+    return dy;
+}
+
+/* Compose the offset onto the recorded pose. IDEMPOTENT -- it always rebuilds
+ * from (rec_x, rec_q), never from wherever the body happens to be -- which is
+ * what lets the contact solve push a car and re-pose it several times inside one
+ * tick without the pushes compounding.
+ *
+ * The zero cases are handled by not doing the arithmetic rather than by doing it
+ * with zeroes: an untouched opponent must be BIT-IDENTICAL to one from before
+ * any of this existed, and a quaternion multiply by identity followed by a
+ * renormalise is not bit-identical, it is within an ulp. Every aitest
+ * measurement of the replay depends on that. */
+static void ai_bump_apply(ai_car *a)
+{
+    rb_body *b = &a->rb.body;
+    int moved = (a->off[0] != 0.0f || a->off[2] != 0.0f);
+
+    a->off_gnd = moved ? ai_bump_ground_dy(a) : 0.0f;
+    b->x[0] = a->rec_x[0] + a->off[0];
+    b->x[1] = a->rec_x[1] + a->off[1] + a->off_gnd;
+    b->x[2] = a->rec_x[2] + a->off[2];
+
+    if (a->off_yaw != 0.0f) {
+        /* A world-space rotation about the car's own centre of mass, so it
+           PRE-multiplies: the port's convention is dq/dt = 0.5 (0,w) (x) q with
+           w in world space (PHYSICS.md, and see ai_diff_velocity). */
+        float qy[4], q[4];
+        qy[0] = (float)cos((double)a->off_yaw * 0.5);
+        qy[1] = 0.0f;
+        qy[2] = (float)sin((double)a->off_yaw * 0.5);
+        qy[3] = 0.0f;
+        rb_quat_mul(qy, a->rec_q, q);
+        rb_quat_normalize(q);
+        memcpy(b->q, q, sizeof(b->q));
+        rb_update_inv_inertia_world(b);
+    } else {
+        memcpy(b->q, a->rec_q, sizeof(b->q));
+    }
+    rb_car_update_matrix(&a->rb);
+
+    a->bump = (float)sqrt((double)a->off[0] * a->off[0]
+                          + (double)a->off[1] * a->off[1]
+                          + (double)a->off[2] * a->off[2]);
+}
+
+/* Write the pose for the current (cursor, u), then put the bump back on top of
+   it. Everything upstream keeps reading the recording out of rec_x / rec_q. */
+static void ai_pose(ai_car *a)
+{
+    ai_pose_rec(a);
+    memcpy(a->rec_x, a->rb.body.x, sizeof(a->rec_x));
+    memcpy(a->rec_q, a->rb.body.q, sizeof(a->rec_q));
+    ai_bump_apply(a);
+}
+
+/* Hold the offset inside its limits, and KILL THE OUTWARD VELOCITY WHERE IT
+ * DOES. Both halves are load-bearing and the second is the subtle one: an offset
+ * velocity that keeps growing against a position that cannot move is a car
+ * reporting that it is getting out of the way while standing still, and the
+ * contact solve believes it -- vrel reads as separating, no impulse is applied,
+ * and the player drives on into a car it is already inside. A clamped opponent
+ * has to be RIGID, not merely stationary.
+ *
+ * Called after every push and every impulse as well as from the relax, because
+ * the ten Gauss-Seidel passes can put a car on its limit mid-tick. */
+static void ai_bump_clamp(ai_car *a)
+{
+    double mag;
+
+    /* DOWN IS THE ONE ASYMMETRIC BOUND, and it is the whole of what stops "an
+     * opponent can be lifted" turning into "an opponent can be driven into the
+     * ground". Upward it is bounded only by the offset limit below -- a car hit
+     * hard enough to ride over another one should, and the spring brings it back
+     * -- but there is ground under it, and nothing on this path models the ground
+     * holding it up. */
+    if (a->off[1] < -AI_BUMP_MAX_SINK) {
+        a->off[1] = -AI_BUMP_MAX_SINK;
+        if (a->offv[1] < 0.0f) a->offv[1] = 0.0f;
+    }
+    /* Then ONE budget over all three axes, so `bump_limit` means what it says --
+       how far from its line the car can be, full stop. Bounding the horizontal
+       and the vertical separately would have let the two combine to 1.41 times
+       it, which the ten-track survey duly caught at 0.627 m against 0.617. */
+    mag = sqrt((double)a->off[0] * a->off[0] + (double)a->off[1] * a->off[1]
+               + (double)a->off[2] * a->off[2]);
+    if (mag > (double)a->bump_limit && mag > 1e-9) {
+        double ux = a->off[0] / mag, uy = a->off[1] / mag, uz = a->off[2] / mag;
+        double radial;
+        a->off[0] = (float)(ux * a->bump_limit);
+        a->off[1] = (float)(uy * a->bump_limit);
+        a->off[2] = (float)(uz * a->bump_limit);
+        radial = (double)a->offv[0] * ux + (double)a->offv[1] * uy
+               + (double)a->offv[2] * uz;
+        if (radial > 0.0) {
+            a->offv[0] = (float)((double)a->offv[0] - radial * ux);
+            a->offv[1] = (float)((double)a->offv[1] - radial * uy);
+            a->offv[2] = (float)((double)a->offv[2] - radial * uz);
+        }
+    }
+    if (a->off_yaw > a->bump_yaw_limit) {
+        a->off_yaw = a->bump_yaw_limit;
+        if (a->off_yawv > 0.0f) a->off_yawv = 0.0f;
+    } else if (a->off_yaw < -a->bump_yaw_limit) {
+        a->off_yaw = -a->bump_yaw_limit;
+        if (a->off_yawv < 0.0f) a->off_yawv = 0.0f;
+    }
+}
+
+/* The return to the line: a critically damped spring on the horizontal offset
+ * and on the yaw, capped at what the car's tyres could actually pull with.
+ *
+ * The cap is not decoration. The spring's own peak is at the grip limit only
+ * when the car is at full displacement and stationary relative to its line; a
+ * bump that arrives while it is already moving back can ask for several times
+ * that, and a car that recovers harder than it could corner is the thing that
+ * would read as a rubber band rather than as driving. */
+static void ai_bump_relax(ai_car *a, float dt)
+{
+    double k, c, ax, ay, az, mag, aw, cap_w;
+
+    if (a->off[0] == 0.0f && a->off[1] == 0.0f && a->off[2] == 0.0f
+        && a->offv[0] == 0.0f && a->offv[1] == 0.0f && a->offv[2] == 0.0f
+        && a->off_yaw == 0.0f && a->off_yawv == 0.0f)
+        return;                        /* on its line: exactly the recording */
+
+    k = (double)a->bump_w * a->bump_w;
+    c = 2.0 * a->bump_w;
+
+    ax = -(k * a->off[0] + c * a->offv[0]);
+    ay = -(k * a->off[1] + c * a->offv[1]);
+    az = -(k * a->off[2] + c * a->offv[2]);
+    mag = sqrt(ax * ax + ay * ay + az * az);
+    if (mag > (double)a->bump_accel && mag > 1e-9) {
+        double s = (double)a->bump_accel / mag;
+        ax *= s;
+        ay *= s;
+        az *= s;
+    }
+    a->offv[0] = (float)((double)a->offv[0] + ax * dt);
+    a->offv[1] = (float)((double)a->offv[1] + ay * dt);
+    a->offv[2] = (float)((double)a->offv[2] + az * dt);
+    a->off[0]  = (float)((double)a->off[0] + (double)a->offv[0] * dt);
+    a->off[1]  = (float)((double)a->off[1] + (double)a->offv[1] * dt);
+    a->off[2]  = (float)((double)a->off[2] + (double)a->offv[2] * dt);
+
+    /* ai_bump_clamp holds both limits and, where it has to, kills the outward
+       velocity with them -- leaving that in would store up a shove that is not
+       going anywhere and spend it the moment the car came off the limit, which
+       reads as a car spat sideways a second after the hit. */
+    ai_bump_clamp(a);
+    mag = sqrt((double)a->off[0] * a->off[0] + (double)a->off[1] * a->off[1]
+               + (double)a->off[2] * a->off[2]);
+
+    /* The yaw, on the same spring. Its acceleration budget is the linear one
+       over the proxy's reach -- the same tyre force, applied at the end of the
+       same lever. */
+    cap_w = (double)a->bump_accel / ((double)a->bump_limit * 0.5);
+    aw = -(k * a->off_yaw + c * a->off_yawv);
+    if (aw >  cap_w) aw =  cap_w;
+    if (aw < -cap_w) aw = -cap_w;
+    a->off_yawv = (float)((double)a->off_yawv + aw * dt);
+    a->off_yaw  = (float)((double)a->off_yaw + (double)a->off_yawv * dt);
+    ai_bump_clamp(a);
+
+    /* SNAP TO EXACTLY ZERO. See AI_BUMP_SNAP: a recovered opponent has to become
+       the same car it was before it was touched, or the pose carries a
+       micrometre of displacement for the rest of the race and ai_bump_apply
+       keeps probing the ground for it. */
+    if (mag < AI_BUMP_SNAP
+        && fabs((double)a->offv[0]) < AI_BUMP_SNAP_V
+        && fabs((double)a->offv[1]) < AI_BUMP_SNAP_V
+        && fabs((double)a->offv[2]) < AI_BUMP_SNAP_V) {
+        a->off[0] = a->off[1] = a->off[2] = 0.0f;
+        a->offv[0] = a->offv[1] = a->offv[2] = 0.0f;
+    }
+    if (fabs((double)a->off_yaw) < AI_BUMP_SNAP_YAW
+        && fabs((double)a->off_yawv) < AI_BUMP_SNAP_YAWV)
+        a->off_yaw = a->off_yawv = 0.0f;
+}
+
 /* FUN_005037f0 -> FUN_00474700: the body's velocity on this path is NOT the
  * recorded momentum, it is the FINITE DIFFERENCE of the two poses over the
  * frame -- and then P is rebuilt from it as `mass * v`. That is what makes
@@ -388,31 +674,40 @@ static void ai_pose(ai_car *a)
  * The angular half is the same difference taken on the orientation. L is left
  * where rb_car_set_state put it (zero) rather than rebuilt from w, which would
  * need the world inertia rather than its inverse: THE PORT'S, and it costs
- * nothing because nothing integrates this body. */
+ * nothing because nothing integrates this body.
+ *
+ * IT DIFFERENCES THE RECORDING, not the body -- rec_x and rec_q, not body.x and
+ * body.q, which since the bump offset exists are not the same thing. The speed
+ * this produces is what the rubber band's moveTowards chases, and that has to be
+ * the rate the RECORDING is being played at: fold a shove into it and a bumped
+ * opponent reads as going faster than it is and slows itself down for it. The
+ * bump's own contribution to a contact point's velocity is added where it
+ * belongs, in ai_actor_point_vel. */
 static void ai_diff_velocity(ai_car *a, const float x0[3], const float q0[4],
                              float dt)
 {
     rb_body *b = &a->rb.body;
+    const float *qn = a->rec_q;
     double inv = (dt > AI_EPS) ? 1.0 / (double)dt : 0.0;
     double dq[4], n, ang, k;
     int i;
 
     for (i = 0; i < 3; i++) {
-        b->v[i] = (float)(((double)b->x[i] - x0[i]) * inv);
+        b->v[i] = (float)(((double)a->rec_x[i] - x0[i]) * inv);
         b->P[i] = (float)((double)b->mass * b->v[i]);
     }
 
     /* dq = q_new (x) conj(q_old); the port's convention is
        dq/dt = 0.5 * (0, w) (x) q with w in WORLD space (PHYSICS.md), so
        w = 2 * axis * (angle / dt) read off that delta. */
-    dq[0] =  (double)b->q[0] * q0[0] + (double)b->q[1] * q0[1]
-           + (double)b->q[2] * q0[2] + (double)b->q[3] * q0[3];
-    dq[1] = -(double)b->q[0] * q0[1] + (double)b->q[1] * q0[0]
-           - (double)b->q[2] * q0[3] + (double)b->q[3] * q0[2];
-    dq[2] = -(double)b->q[0] * q0[2] + (double)b->q[2] * q0[0]
-           - (double)b->q[3] * q0[1] + (double)b->q[1] * q0[3];
-    dq[3] = -(double)b->q[0] * q0[3] + (double)b->q[3] * q0[0]
-           - (double)b->q[1] * q0[2] + (double)b->q[2] * q0[1];
+    dq[0] =  (double)qn[0] * q0[0] + (double)qn[1] * q0[1]
+           + (double)qn[2] * q0[2] + (double)qn[3] * q0[3];
+    dq[1] = -(double)qn[0] * q0[1] + (double)qn[1] * q0[0]
+           - (double)qn[2] * q0[3] + (double)qn[3] * q0[2];
+    dq[2] = -(double)qn[0] * q0[2] + (double)qn[2] * q0[0]
+           - (double)qn[3] * q0[1] + (double)qn[1] * q0[3];
+    dq[3] = -(double)qn[0] * q0[3] + (double)qn[3] * q0[0]
+           - (double)qn[1] * q0[2] + (double)qn[2] * q0[1];
     if (dq[0] < 0.0) {                 /* shortest arc */
         dq[0] = -dq[0];
         dq[1] = -dq[1];
@@ -567,6 +862,13 @@ void ai_reset(ai_t *ai)
         a->cp = 0;
         a->coeff = ai->coeff_static;
         a->speed = 0.0f;
+        /* Straight back onto its line. A restart with a car still leaning on an
+           opponent would otherwise put it on the grid carrying the shove. */
+        a->off[0] = a->off[1] = a->off[2] = 0.0f;
+        a->offv[0] = a->offv[1] = a->offv[2] = 0.0f;
+        a->off_yaw = a->off_yawv = 0.0f;
+        a->off_gnd = a->off_gnd_at[0] = a->off_gnd_at[1] = 0.0f;
+        a->bump = 0.0f;
         ai_pose(a);
         a->speed_rec = sample_speed(a, 0);
         rb_boost_reset(&a->rb);
@@ -638,8 +940,9 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
          * pose written again. Reversing it commands this frame's speed off next
          * frame's sample. */
         ai_pose(a);
-        memcpy(x0, a->rb.body.x, sizeof(x0));
-        memcpy(q0, a->rb.body.q, sizeof(q0));
+        /* The RECORDED pose, not the bumped one -- see ai_diff_velocity. */
+        memcpy(x0, a->rec_x, sizeof(x0));
+        memcpy(q0, a->rec_q, sizeof(q0));
         a->speed_rec = sample_speed(a, a->cursor > 0 ? a->cursor - 1 : 0);
 
         /* FUN_004fd5e0: the lead, measured on the same spine as the player.
@@ -647,8 +950,13 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
          * product alone -- which is also what the original does, because
          * FUN_004fd5e0 returns 0 until the checkpoint list is up and
          * FUN_004fd4c0 then returns local_98 by itself. */
+        /* ON THE RECORDED POSITION, not the bumped one. A shove sideways is not
+         * race progress, and measuring the lead where the car has been knocked to
+         * would let a contact reach the rubber band -- which would make "a bump
+         * cannot touch the replay" false by a hair instead of exactly true, and
+         * aitest part 9 checks it exactly. */
         if (have_spine
-            && tr->spine(tr->ctx, a->rb.body.x[0], a->rb.body.x[1], a->rb.body.x[2],
+            && tr->spine(tr->ctx, a->rec_x[0], a->rec_x[1], a->rec_x[2],
                          &adist, &acp)) {
             a->cp = acp;
             /* The distance the original compares is CUMULATIVE across laps:
@@ -697,29 +1005,419 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
                                + (double)a->rb.body.v[2] * a->rb.body.v[2]);
         ai_fake_contacts(a);
         rb_wheel_spin_update(&a->rb, dt);
+
+        /* THE PORT'S: work off whatever the last tick's contacts left in the
+         * offset and put the car back where that says it is. Last, so
+         * everything above -- the cursor, the lead, the recorded speed, the
+         * wheel spin -- is measured on the recording and not on the shove. */
+        ai_bump_relax(a, dt);
+        ai_bump_apply(a);
     }
+
+    /* THE PORT'S, and the field's own business rather than the player's:
+     * opponents are solid to each other too. Same routine, both sides bumpable.
+     * After every car has been posed, because a pair solved against a pose that
+     * is about to be overwritten does nothing at all. */
+    ai_collide_field(ai);
 }
 
 /* ------------------------------------------------------------------ contact */
 
-/* One overlapping sphere pair. `normal` points OUT of the opponent and toward
-   the player, which is rb_coll_contact's own convention -- so an approaching
-   player has a negative relative normal velocity. */
+/* One overlapping sphere pair. `normal` points OUT of body B and toward body A,
+   which is rb_coll_contact's own convention -- so an A approaching B has a
+   negative relative normal velocity. */
 typedef struct {
     float point[3];
     float normal[3];
     float depth;
-    const rb_car *other;
 } ai_touch;
 
 #define AI_MAX_TOUCH 12
 
+/* One side of a contact pair. `ai` is NULL for a body that takes the reaction in
+   its own rigid state -- the player -- and non-NULL for one that takes it in a
+   bump offset. Everything below is written against this so that player-against-
+   opponent and opponent-against-opponent are the same solve. */
+typedef struct {
+    rb_car *car;
+    ai_car *ai;
+} ai_actor;
+
+/* The overlapping pairs between two gathered proxies. */
+static int ai_touch_list(const float as[][4], int na,
+                         const float bs[][4], int nb,
+                         ai_touch *t, int max)
+{
+    int p, o, nt = 0;
+
+    for (p = 0; p < na && nt < max; p++) {
+        for (o = 0; o < nb && nt < max; o++) {
+            double ex = (double)as[p][0] - bs[o][0];
+            double ey = (double)as[p][1] - bs[o][1];
+            double ez = (double)as[p][2] - bs[o][2];
+            double d2 = ex * ex + ey * ey + ez * ez;
+            double sum = (double)as[p][3] + bs[o][3];
+            double len, inv;
+
+            if (d2 >= sum * sum || d2 < 1e-12)
+                continue;
+            len = sqrt(d2);
+            inv = 1.0 / len;
+            t[nt].normal[0] = (float)(ex * inv);
+            t[nt].normal[1] = (float)(ey * inv);
+            t[nt].normal[2] = (float)(ez * inv);
+            /* The contact point on B's surface, which is what both lever arms
+               are measured from. */
+            t[nt].point[0] = (float)(bs[o][0] + t[nt].normal[0] * bs[o][3]);
+            t[nt].point[1] = (float)(bs[o][1] + t[nt].normal[1] * bs[o][3]);
+            t[nt].point[2] = (float)(bs[o][2] + t[nt].normal[2] * bs[o][3]);
+            t[nt].depth = (float)(sum - len);
+            nt++;
+        }
+    }
+    return nt;
+}
+
+/* An opponent's velocity at a world point: the replay's own, plus what the bump
+   offset is doing. rb_point_velocity cannot know about the second -- the offset
+   is not in the body's state, it is composed onto its pose. */
+static void ai_actor_point_vel(const ai_actor *b, const float p[3], float o[3])
+{
+    const ai_car *a = b->ai;
+    float r[3];
+
+    rb_point_velocity(&b->car->body, p, o);
+    if (!a)
+        return;
+    r[0] = p[0] - b->car->body.x[0];
+    r[2] = p[2] - b->car->body.x[2];
+    /* w x r with w = (0, off_yawv, 0) is (w*rz, 0, -w*rx). */
+    o[0] += a->offv[0] + a->off_yawv * r[2];
+    o[1] += a->offv[1];
+    o[2] += a->offv[2] - a->off_yawv * r[0];
+}
+
+/* The contact denominator: the change in the point's velocity along `n` per unit
+ * impulse along `n`. For the player this is the engine's own rb_impulse_denom
+ * (0x004754a0); for an opponent it is THE PORT'S counterpart of it, and it has to
+ * agree with what ai_take_impulse actually does or the solve over- or
+ * under-corrects on every pass. The linear halves are identical; the angular one
+ * keeps only the YAW component of the response, because that is the only one
+ * applied. */
+static double ai_actor_denom(const ai_actor *b, const float point[3],
+                             const float n[3])
+{
+    const rb_body *bd;
+    float r[3], rn[3], t[3];
+    double lin, ang;
+
+    if (!b->ai)
+        return rb_impulse_denom(b->car, point, n);
+
+    bd = &b->car->body;
+    r[0] = point[0] - bd->x[0];
+    r[1] = point[1] - bd->x[1];
+    r[2] = point[2] - bd->x[2];
+    rn[0] = r[1] * n[2] - r[2] * n[1];
+    rn[1] = r[2] * n[0] - r[0] * n[2];
+    rn[2] = r[0] * n[1] - r[1] * n[0];
+    rb_mat3_mul_vec3(bd->iinv, rn, t);
+    /* ((0, t1, 0) x r) . n, the yaw-only form of rb_impulse_denom's tail. */
+    ang = (double)t[1] * r[2] * n[0] - (double)t[1] * r[0] * n[2];
+    lin = bd->inv_mass;
+    return lin + ang;
+}
+
+/* The reaction an opponent takes: into the OFFSET, never into the replay.
+ *
+ * Linear in all three axes -- what bounds the vertical is ai_bump_clamp's
+ * one-centimetre floor and the shared offset budget, not a dropped term -- and
+ * YAW ONLY of the angular, which ai_actor_denom is built to match. See ai.h for
+ * why roll and pitch are dropped. */
+static void ai_take_impulse(ai_car *a, const float point[3], const float j[3])
+{
+    rb_body *bd = &a->rb.body;
+    float r[3], rj[3], dw[3];
+
+    a->offv[0] = (float)((double)a->offv[0] + (double)j[0] * bd->inv_mass);
+    a->offv[1] = (float)((double)a->offv[1] + (double)j[1] * bd->inv_mass);
+    a->offv[2] = (float)((double)a->offv[2] + (double)j[2] * bd->inv_mass);
+
+    r[0] = point[0] - bd->x[0];
+    r[1] = point[1] - bd->x[1];
+    r[2] = point[2] - bd->x[2];
+    rj[0] = r[1] * j[2] - r[2] * j[1];
+    rj[1] = r[2] * j[0] - r[0] * j[2];
+    rj[2] = r[0] * j[1] - r[1] * j[0];
+    rb_mat3_mul_vec3(bd->iinv, rj, dw);
+    a->off_yawv = (float)((double)a->off_yawv + dw[1]);
+
+    /* A car already at its limit must not accumulate velocity it cannot spend --
+       see ai_bump_clamp, and the 11 cm of burial that finding it cost. */
+    ai_bump_clamp(a);
+}
+
+static void ai_actor_impulse(ai_actor *b, const float point[3],
+                             const float j[3])
+{
+    if (b->ai)
+        ai_take_impulse(b->ai, point, j);
+    else
+        rb_apply_impulse(b->car, point, j);
+}
+
+/* Move a body by `dv`, and report in `taken` how much of that it ACTUALLY did.
+ * An opponent moves its offset and re-poses; a real body moves itself and always
+ * takes the lot.
+ *
+ * `taken` is the whole point. An opponent can REFUSE part of a move -- it will
+ * not pass its limit, and it will not be driven into the ground -- and the caller
+ * has to know, because a separation neither body performs is a pair left inside
+ * each other. That one was measured before it was reasoned about: with the
+ * refused share silently dropped, a car ramming an opponent already at its limit
+ * settled 11 cm INSIDE it, which is exactly how far the player travels in one
+ * tick at 6.7 m/s. */
+static void ai_actor_move(ai_actor *b, const float dv[3], float taken[3])
+{
+    ai_car *a = b->ai;
+    float before[3];
+    int k;
+
+    if (!a) {
+        for (k = 0; k < 3; k++) {
+            b->car->body.x[k] += dv[k];
+            taken[k] = dv[k];
+        }
+        rb_car_update_matrix(b->car);
+        return;
+    }
+    memcpy(before, a->off, sizeof(before));
+    for (k = 0; k < 3; k++)
+        a->off[k] += dv[k];
+    ai_bump_clamp(a);
+    ai_bump_apply(a);
+    for (k = 0; k < 3; k++)
+        taken[k] = a->off[k] - before[k];
+}
+
+/* One pair of proxies, already gathered. -> the number of overlapping pairs, and
+ * `impact` (may be NULL) gets the hardest closing speed BEFORE any impulse, which
+ * is what main.c raises car_cdt_car off.
+ *
+ * The law is rb_coll_resolve's (0x004f0750) over two moving bodies -- see ai.h.
+ */
+static int ai_pair_resolve(ai_actor *A, ai_actor *B,
+                           const float as[][4], int na,
+                           const float bs[][4], int nb,
+                           float *impact)
+{
+    ai_touch t[AI_MAX_TOUCH];
+    int nt, i, pass, deep = 0;
+    double wa, wb, ima, imb;
+
+    nt = ai_touch_list(as, na, bs, nb, t, AI_MAX_TOUCH);
+    if (nt <= 0)
+        return 0;
+    for (i = 1; i < nt; i++)
+        if (t[i].depth > t[deep].depth)
+            deep = i;
+
+    /* THE POSITIONAL HALF: THE DEEPEST PAIR, RE-MEASURED, SPLIT BY MASS.
+     *
+     * There is no carSubstepContact bisection on this path to stop the proxies
+     * overlapping in the first place, so something has to undo it, and
+     * RB_PENETRATION_SLACK is the same margin the world contact leaves.
+     *
+     * SPLITTING it is what the one-way version could not do, and it is the whole
+     * of the reported "the Buggy gets stuck in the Hummer": with the opponent
+     * immovable the player was pushed out of one sphere pair per tick while the
+     * opponent's next pose put it straight back in. Now each body carries away
+     * its share -- and the opponent's share PERSISTS, because the offset is state
+     * and the return spring takes a second to spend it, so the pair has time to
+     * come apart.
+     *
+     * ITERATING it is the other half, and that one is measured. A proxy is 13
+     * spheres and they wedge: resolving the deepest pair pushes the car into a
+     * different pair, and with one pass per tick a car bulldozing an opponent
+     * that has reached its limit sat 7.4 cm inside it, alternating between which
+     * pair was worst. Each pass RE-GATHERS both proxies, so it always works on
+     * the overlap that is actually there and cannot over-correct the way pushing
+     * out of every pair in one list does -- which is the rule ai.c used to have a
+     * note against, and the note stands: this is not that.
+     *
+     * AI_DEPEN_PASSES carries the measured table and the reason the window it was
+     * measured over is the arrival rather than a ten-second grind. */
+    ima = A->car->body.inv_mass;
+    imb = B->ai ? B->car->body.inv_mass : 0.0;
+    if (ima + imb < 1e-12) {
+        wa = 1.0;
+        wb = 0.0;
+    } else {
+        wa = ima / (ima + imb);
+        wb = 1.0 - wa;
+    }
+    {
+        float as2[RB_MAX_SPHERES][4], bs2[RB_MAX_SPHERES][4];
+        ai_touch t2[AI_MAX_TOUCH];
+        const ai_touch *cur = t;
+        int n2 = nt, k, deep2 = deep;
+
+        for (k = 0; k < AI_DEPEN_PASSES; k++) {
+            float d, sep[3], mv[3], took[3];
+            int c;
+
+            if (k > 0) {
+                int ga = rb_gather_spheres(A->car, as2);
+                int gb = rb_gather_spheres(B->car, bs2);
+                n2 = ai_touch_list(as2, ga, bs2, gb, t2, AI_MAX_TOUCH);
+                if (n2 <= 0)
+                    break;
+                cur = t2;
+                deep2 = 0;
+                for (c = 1; c < n2; c++)
+                    if (t2[c].depth > t2[deep2].depth)
+                        deep2 = c;
+            }
+            if (cur[deep2].depth <= 0.0f)
+                break;
+            d = cur[deep2].depth + RB_PENETRATION_SLACK;
+            for (c = 0; c < 3; c++)
+                sep[c] = cur[deep2].normal[c] * d;   /* A relative to B */
+
+            /* HORIZONTALLY, split by mass: B takes its share and A covers
+               whatever B refused, so the pair separates by the whole of it
+               however much of the way B could come. */
+            mv[0] = -sep[0] * (float)wb;
+            mv[1] = 0.0f;
+            mv[2] = -sep[2] * (float)wb;
+            ai_actor_move(B, mv, took);
+            mv[0] = sep[0] + took[0];
+            mv[1] = 0.0f;
+            mv[2] = sep[2] + took[2];
+            ai_actor_move(A, mv, took);
+
+            /* VERTICALLY, THE WHOLE OF IT GOES TO WHICHEVER CAR IS ON TOP, and
+             * none of it to the one underneath.
+             *
+             * The reason is that there is GROUND under these cars and this solve
+             * cannot see it. Pushing the lower one down is asking the world to
+             * absorb a separation it was never told about, and if it absorbs
+             * enough of one the car ends up inside terrain -- which col_sphere
+             * cannot report at all once a sphere is buried deeper than its own
+             * radius (rb.h). The car above has open air over it and no such
+             * problem.
+             *
+             * HONESTLY: that failure has not been observed. Splitting the
+             * vertical by mass instead passes every check in aitest, and the
+             * Buggy's ride height after a Hummer drives over it is 0.145 m
+             * against a not-run-over control's 0.146. So this is a guard rather
+             * than a fix, and what it is measurably worth is separation: two
+             * opponents over a minute on each of the ten tracks come 0.070 m
+             * inside each other under the mass split and 0.031 m under this,
+             * and the head-on Buggy-into-Hummer ram goes from 44 contact ticks
+             * to 9 -- the pair comes apart instead of grinding along. */
+            if (sep[1] > 0.0f) {
+                mv[0] = mv[2] = 0.0f;
+                mv[1] = sep[1];
+                ai_actor_move(A, mv, took);
+            } else if (sep[1] < 0.0f) {
+                mv[0] = mv[2] = 0.0f;
+                mv[1] = -sep[1];
+                ai_actor_move(B, mv, took);
+            }
+        }
+    }
+
+    /* THE VELOCITY HALF. Same ten passes, same 0.02 gate, same 0.05 m/s target
+     * as rb_coll_resolve; the denominator is the PAIR's, so the impulse delivers
+     * its dv across both bodies rather than all of it into one. */
+    for (pass = 0; pass < AI_CONTACT_PASSES; pass++) {
+        int any = 0;
+        for (i = 0; i < nt; i++) {
+            float va[3], vb[3], j[3];
+            double vrel, dv, k;
+
+            ai_actor_point_vel(A, t[i].point, va);
+            ai_actor_point_vel(B, t[i].point, vb);
+            vrel = (double)(va[0] - vb[0]) * t[i].normal[0]
+                 + (double)(va[1] - vb[1]) * t[i].normal[1]
+                 + (double)(va[2] - vb[2]) * t[i].normal[2];
+            if (vrel > AI_CONTACT_VREL)
+                continue;
+            if (pass == 0 && impact && -vrel > *impact)
+                *impact = (float)-vrel;   /* the sound, before any impulse */
+            any = 1;
+            dv = AI_CONTACT_SEP - vrel;
+            if (dv < 0.0)
+                dv = 0.0;
+            k = ai_actor_denom(A, t[i].point, t[i].normal)
+              + ai_actor_denom(B, t[i].point, t[i].normal);
+            if (k < 1e-09)
+                continue;
+            j[0] = (float)(t[i].normal[0] * (dv / k));
+            j[1] = (float)(t[i].normal[1] * (dv / k));
+            j[2] = (float)(t[i].normal[2] * (dv / k));
+            ai_actor_impulse(A, t[i].point, j);
+            j[0] = -j[0]; j[1] = -j[1]; j[2] = -j[2];
+            ai_actor_impulse(B, t[i].point, j);
+        }
+        if (!any)
+            break;
+    }
+    return nt;
+}
+
+/* Are these two centres close enough that their proxies could be touching? */
+static int ai_near(const rb_car *a, const rb_car *b)
+{
+    double dx = (double)a->body.x[0] - b->body.x[0];
+    double dy = (double)a->body.x[1] - b->body.x[1];
+    double dz = (double)a->body.x[2] - b->body.x[2];
+    return dx * dx + dy * dy + dz * dz
+           <= (double)AI_COLLIDE_RANGE * AI_COLLIDE_RANGE;
+}
+
+void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3])
+{
+    if (!ai || i < 0 || i >= ai->n)
+        return;
+    ai_take_impulse(&ai->car[i], point, j);
+}
+
+/* THE PORT'S: opponent against opponent, run from ai_step. With both of them
+ * bumpable, two cars sharing a corner passing through each other is the one
+ * remaining way for the field to look like a recording. Same solve, both sides
+ * taking their share into their own offset.
+ *
+ * No sound is raised: car_cdt_car is the PLAYER's collision cue and there is
+ * nothing in the bank for two opponents touching each other out of sight. */
+static void ai_collide_field(ai_t *ai)
+{
+    float as[RB_MAX_SPHERES][4], bs[RB_MAX_SPHERES][4];
+    int i, j;
+
+    for (i = 0; i < ai->n; i++) {
+        for (j = i + 1; j < ai->n; j++) {
+            ai_actor A, B;
+            int na, nb;
+
+            if (!ai_near(&ai->car[i].rb, &ai->car[j].rb))
+                continue;
+            na = rb_gather_spheres(&ai->car[i].rb, as);
+            nb = rb_gather_spheres(&ai->car[j].rb, bs);
+            if (na <= 0 || nb <= 0)
+                continue;
+            A.car = &ai->car[i].rb; A.ai = &ai->car[i];
+            B.car = &ai->car[j].rb; B.ai = &ai->car[j];
+            ai_pair_resolve(&A, &B, as, na, bs, nb, NULL);
+        }
+    }
+}
+
 float ai_collide_player(ai_t *ai, rb_car *player, float dt)
 {
     float ps[RB_MAX_SPHERES][4], os[RB_MAX_SPHERES][4];
-    ai_touch t[AI_MAX_TOUCH];
-    int nt = 0, np, i, pass;
-    int deep = -1;
+    int np, i;
     float impact = 0.0f;
 
     (void)dt;
@@ -731,112 +1429,21 @@ float ai_collide_player(ai_t *ai, rb_car *player, float dt)
 
     for (i = 0; i < ai->n; i++) {
         ai_car *a = &ai->car[i];
-        int no, p, o;
-        double dx = (double)a->rb.body.x[0] - player->body.x[0];
-        double dy = (double)a->rb.body.x[1] - player->body.x[1];
-        double dz = (double)a->rb.body.x[2] - player->body.x[2];
+        ai_actor A, B;
+        int no;
 
-        if (dx * dx + dy * dy + dz * dz
-            > (double)AI_COLLIDE_RANGE * AI_COLLIDE_RANGE)
+        if (!ai_near(player, &a->rb))
             continue;                       /* broad phase, see ai.h */
         no = rb_gather_spheres(&a->rb, os);
-        for (p = 0; p < np; p++) {
-            for (o = 0; o < no; o++) {
-                double ex = (double)ps[p][0] - os[o][0];
-                double ey = (double)ps[p][1] - os[o][1];
-                double ez = (double)ps[p][2] - os[o][2];
-                double d2 = ex * ex + ey * ey + ez * ez;
-                double sum = (double)ps[p][3] + os[o][3];
-                double len, inv;
-
-                if (d2 >= sum * sum || d2 < 1e-12)
-                    continue;
-                len = sqrt(d2);
-                inv = 1.0 / len;
-                if (nt >= AI_MAX_TOUCH)
-                    break;
-                t[nt].normal[0] = (float)(ex * inv);
-                t[nt].normal[1] = (float)(ey * inv);
-                t[nt].normal[2] = (float)(ez * inv);
-                /* The contact point on the OPPONENT's surface, which is what the
-                   lever arm has to be measured from. */
-                t[nt].point[0] = (float)(os[o][0] + t[nt].normal[0] * os[o][3]);
-                t[nt].point[1] = (float)(os[o][1] + t[nt].normal[1] * os[o][3]);
-                t[nt].point[2] = (float)(os[o][2] + t[nt].normal[2] * os[o][3]);
-                t[nt].depth = (float)(sum - len);
-                t[nt].other = &a->rb;
-                if (deep < 0 || t[nt].depth > t[deep].depth)
-                    deep = nt;
-                nt++;
-            }
-            if (nt >= AI_MAX_TOUCH)
-                break;
+        if (no <= 0)
+            continue;
+        A.car = player;  A.ai = NULL;
+        B.car = &a->rb;  B.ai = a;
+        if (ai_pair_resolve(&A, &B, ps, np, os, no, &impact) > 0) {
+            /* The player moved, so its proxy is stale for the next opponent --
+               and being between two of them is exactly when that matters. */
+            np = rb_gather_spheres(player, ps);
         }
-    }
-    if (nt <= 0)
-        return 0.0f;
-
-    /* THE POSITIONAL HALF, the DEEPEST PAIR ONLY. There is no
-     * carSubstepContact bisection on this path to stop the two proxies
-     * overlapping in the first place, so something has to undo it, and
-     * RB_PENETRATION_SLACK is the same margin the world contact leaves.
-     *
-     * Deepest-only mirrors rb_body_depenetrate, whose note says pushing out of
-     * every overlapping sphere accumulates and walks a wedged car out of the
-     * world. **Between two cars that is NOT what happens, and this comment used
-     * to claim it was.** Measured against a build that pushes out of every pair:
-     * the worst overlap left standing goes 0.008 -> 0.009 m, the peak speed does
-     * not move at all, and the air under a glancing hit goes 0.11 -> 0.17 m. What
-     * does change is that a car alongside stays in contact for 373 ticks instead
-     * of 3 -- it is held out rather than glancing off. So this is the
-     * conservative choice and the cheaper one, not a safety property: at most a
-     * handful of pairs overlap at once here, where terrain offers dozens every
-     * tick for as long as the car leans on it. */
-    player->body.x[0] += t[deep].normal[0]
-                       * (t[deep].depth + RB_PENETRATION_SLACK);
-    player->body.x[1] += t[deep].normal[1]
-                       * (t[deep].depth + RB_PENETRATION_SLACK);
-    player->body.x[2] += t[deep].normal[2]
-                       * (t[deep].depth + RB_PENETRATION_SLACK);
-    rb_car_update_matrix(player);
-
-    /* THE VELOCITY HALF -- rb_coll_resolve's law, over a moving second body.
-     *
-     * Same passes, same 0.02 gate and same 0.05 m/s target, same
-     * rb_impulse_denom and rb_apply_impulse. The one extension is `vo`: the
-     * opponent's own velocity AT THE CONTACT POINT is subtracted, because
-     * rb_coll_resolve solves against a world that does not move and this one
-     * does. Its mass does not appear at all -- the opponent is on rails, so it
-     * takes the whole of the impulse's reaction and none of its effect. */
-    for (pass = 0; pass < AI_CONTACT_PASSES; pass++) {
-        int any = 0;
-        for (i = 0; i < nt; i++) {
-            float vp[3], vo[3], j[3];
-            double vrel, dv, k;
-
-            rb_point_velocity(&player->body, t[i].point, vp);
-            rb_point_velocity(&t[i].other->body, t[i].point, vo);
-            vrel = (double)(vp[0] - vo[0]) * t[i].normal[0]
-                 + (double)(vp[1] - vo[1]) * t[i].normal[1]
-                 + (double)(vp[2] - vo[2]) * t[i].normal[2];
-            if (vrel > AI_CONTACT_VREL)
-                continue;
-            if (pass == 0 && -vrel > impact)
-                impact = (float)-vrel;      /* for the sound, before any impulse */
-            any = 1;
-            dv = AI_CONTACT_SEP - vrel;
-            if (dv < 0.0)
-                dv = 0.0;
-            k = rb_impulse_denom(player, t[i].point, t[i].normal);
-            if (k < 1e-09)
-                continue;
-            j[0] = (float)(t[i].normal[0] * (dv / k));
-            j[1] = (float)(t[i].normal[1] * (dv / k));
-            j[2] = (float)(t[i].normal[2] * (dv / k));
-            rb_apply_impulse(player, t[i].point, j);
-        }
-        if (!any)
-            break;
     }
     return impact;
 }

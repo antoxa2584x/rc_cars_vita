@@ -65,13 +65,13 @@
  * FUN_00503880 is, and which for a real lap driven by a real driver is visually the
  * same car.
  *
- * What is lost is interaction: these opponents are on rails, so they do not
- * shove the player and the player does not shove them. `car_cdt_car` is in the
- * sound bank with nothing to raise it, and that stands. Adding it means either
- * the steering controller above or a one-way impulse on the player of the kind
- * prop.c already does -- and prop.c's own note says why that wants its own pass:
- * it pushes on the transcribed handling model, which is the thing this port
- * protects hardest.
+ * What that used to cost was interaction: an opponent on rails could shove the
+ * player and could not be shoved back, so a car that got in its way was driven
+ * over by something infinitely massive. It is BUMPABLE now -- see "the bump
+ * offset" below -- which is not the steering controller and does not pretend to
+ * be: the recorded line is still the line, and a hit displaces the car FROM it
+ * and is pulled back to it. That keeps the cost the replay exists for and buys
+ * the one behaviour the rails could not express.
  *
  * ------------------------------------------------------------------------
  *
@@ -222,6 +222,42 @@ typedef struct {
     /* -- the pose. See the header note: an AI car is an rb_car whose state is
        written rather than integrated. */
     rb_car rb;
+
+    /* -- the recorded pose, BEFORE the bump offset below is composed onto it.
+     *
+     * ai_pose writes this and then ai_bump_apply rebuilds rb.body from
+     * `rec + off`, so applying the offset is IDEMPOTENT: the contact solve can
+     * push a car and re-pose it several times inside one tick without the
+     * pushes compounding. It is also what the finite-difference velocity is
+     * taken on -- the speed the rubber band chases is the speed the RECORDING
+     * is being played at, not the speed a shove happens to be adding. */
+    float rec_x[3];
+    float rec_q[4];
+
+    /* -- THE BUMP OFFSET. See "the bump offset" below for the model. All in
+     * world space; `off_yaw` is radians about world up, applied about the car's
+     * own centre of mass. Zero on an untouched car, and exactly zero, which is
+     * what makes an untouched opponent bit-identical to one packed before this
+     * existed. */
+    float off[3];
+    float offv[3];
+    float off_yaw, off_yawv;
+    /* The terrain follow, which is NOT part of the offset and is not sprung: the
+       ground under the displaced car minus the ground under the recorded one.
+       Written by ai_bump_apply, read by nothing else, and here rather than local
+       so the log and a harness can see a car climbing rather than clipping.
+       `off_gnd_at` is the horizontal offset it was last probed at -- see
+       AI_BUMP_PROBE_STEP. */
+    float off_gnd;
+    float off_gnd_at[2];
+    /* Per-car, derived at load from the car's own data -- see ai_bump_derive.
+     * Kept on the car rather than recomputed because the proxy reach costs a
+     * sphere gather. */
+    float bump_limit;        /* metres the offset may reach */
+    float bump_yaw_limit;    /* radians it may turn */
+    float bump_accel;        /* the return's acceleration budget, m/s^2 */
+    float bump_w;            /* the return spring's natural frequency, rad/s */
+    float bump;              /* |off| right now, for the log */
 } ai_car;
 
 typedef struct {
@@ -308,38 +344,84 @@ int   ai_within(const ai_t *ai, int i, float x, float y, float z, float d);
    ai_step to have run at least once with a non-NULL `tr`. */
 int   ai_player_place(const ai_t *ai);
 
-/* ------------------------------------------------------------------ contact
+/* ------------------------------------------------------------- the bump offset
  *
- * THE OPPONENTS ARE SOLID. They are still on rails -- nothing the player does
- * moves them -- but the player cannot drive through one, and running into one
- * shoves the player the way running into anything else does.
+ * THE OPPONENTS ARE SOLID AND THEY ARE BUMPABLE. Running into one shoves the
+ * player the way running into anything else does -- AND shoves the opponent,
+ * which then steers itself back onto its recorded line.
  *
- * One-way, and that is the same trade prop.c already makes for the same reason:
- * the thing this port protects hardest is the transcribed handling model, and a
- * two-way solve means the opponent has to be able to leave its recorded path,
- * which is the whole basis of the replay. So the opponent is treated as
- * infinitely massive, which for a body being driven along a fixed path is what
- * it is.
+ * The offset is the whole idea. An opponent's position is
+ *
+ *     pose = the recording, interpolated at the cursor   (rec_x, rec_q)
+ *          + a displacement the recording knows nothing about   (off, off_yaw)
+ *
+ * and the second term is the only thing a collision may touch. So the replay is
+ * untouched -- the line, the cornering, the suspension, the jumps and every
+ * measurement in aitest are the recording's own -- while the car can be pushed
+ * off that line, and is pulled back onto it by a spring. Nothing here simulates
+ * the opponent; being knocked aside and recovering is exactly the interaction a
+ * replay cannot express, and it is the whole of what this adds.
+ *
+ * ONE-WAY IS WHAT THIS REPLACES, and it was a bug as well as a limitation. With
+ * the opponent infinitely massive the player took the entire impulse AND the
+ * entire positional push, so a player wedged under a bigger car (a Buggy under
+ * the Hummer, as reported) was pushed out of one sphere pair per tick while the
+ * opponent's next pose put it straight back in -- a car that could not get out
+ * from under one that could not get out of the way. Splitting both halves by
+ * mass means the pair SEPARATES: each body carries away its share and the
+ * opponent's share persists, because the offset is state.
  *
  * The LAW is the engine's own, not an invention. rb_coll_resolve (0x004f0750) is
  * up to ten Gauss-Seidel passes in which every contact whose relative normal
  * velocity is at or below 0.02 m/s gets enough impulse to reach 0.05 m/s of
- * separation, applied through rb_impulse_denom (0x004754a0) and
- * rb_apply_impulse (0x004756c0). All of that is reused verbatim. Two things are
- * extended, both marked at the point of use:
+ * separation, through rb_impulse_denom (0x004754a0) and rb_apply_impulse
+ * (0x004756c0). All of that is reused. Four things are extended, and every one
+ * is marked THE PORT'S at the point of use:
  *
- *   - the relative velocity subtracts the OPPONENT's point velocity, because
- *     the second body is moving. rb_coll_resolve's own version cannot: it solves
- *     a body against the static world.
+ *   - the relative velocity is between two MOVING bodies. rb_coll_resolve's own
+ *     cannot be: it solves a body against a static world.
+ *   - the denominator is the pair's, k = k_player + k_opponent, so the impulse
+ *     delivers its dv across both. An opponent contributes the yaw-only form
+ *     (ai_denom), which is exactly the response ai_take_impulse then applies --
+ *     the two must agree or the solve over- or under-corrects.
+ *   - ROLL AND PITCH ARE DISCARDED from an opponent's angular response. The
+ *     recorded orientation carries the car's attitude on its suspension, and a
+ *     bump has no way to give that back; yaw is the axis a shove actually shows
+ *     on, and it is the one a car recovers from by steering.
  *   - a positional push, because there is no carSubstepContact bisection here to
- *     stop the two proxies overlapping in the first place. Deepest pair only --
- *     the same rule rb_body_depenetrate follows, and for the same reason: all of
- *     them accumulates and walks the car out of the world.
+ *     stop the two proxies overlapping in the first place. The deepest pair PER
+ *     OPPONENT, split by mass -- see ai.c for why it is not the global deepest
+ *     and not every pair.
  *
- * Call once per 1/60 tick, right after ai_step, so the contact sees the pose the
- * step just wrote. -> the closing speed of the hardest contact in m/s, or 0 for
- * no contact, which is what main.c raises `car_cdt_car` off. */
+ * Vertically two separate things happen, and keeping them apart is what makes
+ * the rest simple. The offset itself is an ordinary three-axis spring, so a car
+ * hit hard enough IS lifted and the spring puts it back -- bounded up by the same
+ * limit as sideways and down by a centimetre, because the ground is right there
+ * and nothing on this path models it holding the car up. On top of that, and
+ * outside the spring, sits a TERRAIN FOLLOW: a car shoved sideways up a slope has
+ * to climb it, or it is buried on the high side and hanging on the low one.
+ *
+ * Refusing the vertical outright was tried first and is worse than it sounds. It
+ * looks conservative -- an opponent cannot be launched -- and what it actually
+ * does is make the one case this whole change exists for unresolvable: a player
+ * wedged UNDER a car can only be freed by lifting the car, and with that
+ * forbidden the pair grinds. Measured, the player ended up 12 cm below the
+ * opponent with their centres 4 cm apart, which is the reported bug with the
+ * roles swapped.
+ *
+ * Call ai_collide_player once per 1/60 tick, right after ai_step, so the contact
+ * sees the pose the step just wrote. -> the closing speed of the hardest contact
+ * in m/s, or 0 for no contact, which is what main.c raises `car_cdt_car` off.
+ * OPPONENT AGAINST OPPONENT is solved inside ai_step, by the same routine and
+ * for the same reason -- with both of them bumpable, driving through each other
+ * is the one remaining way for the field to look fake. */
 float ai_collide_player(ai_t *ai, rb_car *player, float dt);
+
+/* Shove opponent `i` with impulse `j` (kg m/s) at world point `point`, through
+ * the same path a contact takes. Exposed so a harness can inject a known
+ * impulse and measure the recovery against it, rather than having to arrange a
+ * collision and then argue about what the collision delivered. */
+void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
 
 /* Broad phase for the above: an opponent further than this from the player
  * cannot be touching it. The proxy reaches about 0.30 m from a centre of mass
@@ -352,6 +434,105 @@ float ai_collide_player(ai_t *ai, rb_car *player, float dt);
 #define AI_CONTACT_VREL  0.02f
 #define AI_CONTACT_SEP   0.05f
 #define AI_CONTACT_PASSES 10
+
+/* How many times the positional half re-measures and pushes again. A car proxy
+ * is 13 spheres and they WEDGE -- clearing the deepest pair moves the car into a
+ * different one -- so one pass per tick is not depenetration, it is one step
+ * toward it. Each pass re-gathers both proxies, so it always works on the
+ * overlap that is really there and cannot over-correct.
+ *
+ * Measured over the SECOND AFTER FIRST CONTACT of aitest part 8's two rams,
+ * worst overlap left standing:
+ *
+ *              3 m run-up      12 m run-up
+ *   1 pass       0.081 m         0.080 m
+ *   2            0.047           0.083
+ *   4            0.016           0.047
+ *   8            0.011           0.022
+ *
+ * The window matters as much as the number. Over the whole 12 s run -- which is
+ * ten seconds of one car bulldozing another that has reached its offset limit --
+ * the same sweep is not monotone in either column and lands anywhere between 2
+ * and 8 cm, because a sustained shove between two 13-sphere proxies is chaotic.
+ * Choosing a pass count against THAT is fitting to noise; this is the arrival,
+ * which is the thing the passes actually govern. Eight, and the cost is a sphere
+ * gather and 169 distance tests per pass per touching pair -- nothing beside the
+ * ~92 world queries a tick the car itself issues. */
+#define AI_DEPEN_PASSES 8
+
+/* ---------------------------------------------------- the bump's own numbers
+ *
+ * THE PORT'S, every one -- the original has no such mechanism to transcribe.
+ * What they are anchored to is the car's own recovered data, so that none of
+ * them is a number somebody liked the look of, and ai_bump_derive builds all
+ * four per car out of these.
+ */
+
+/* HOW FAR a bump may carry an opponent, in multiples of its own collision
+ * proxy's reach (the furthest any of its 13 or 15 spheres gets from the centre
+ * of mass, plus that sphere's radius -- measured at load, so a Hummer gets more
+ * room than a Buggy because it IS bigger). Two reaches is the distance at which
+ * the car that hit it is completely clear of it, which is as far as a bump has
+ * anything to say; past that something is dragging an opponent off the track
+ * rather than knocking it aside. 0.55 m on the Overkill. */
+#define AI_BUMP_LIMIT_REACH 2.0f
+
+/* HOW HARD it pulls itself back: the return acceleration is capped at the car's
+ * own grip times gravity -- coeff_rear_tires * RB_GRAVITY, 7.0 m/s^2 on the
+ * Overkill -- because a car recovering its line is doing it through its tyres,
+ * and carFrictionSolve clamps against the same product.
+ *
+ * That fixes the spring too, and it is why there is no frequency constant here.
+ * A critically damped return from a displacement d peaks at w^2 * d, so
+ * requiring a FULLY displaced car to come back at exactly its grip limit gives
+ *
+ *     w = sqrt(grip * g / limit)
+ *
+ * -- 3.6 rad/s on the Overkill, a 0.28 s time constant and about a second to
+ * settle, which is what a driver correcting a knock looks like. */
+
+/* HOW FAR OFF its heading a bump may turn it, as a fraction of the car's own
+ * steering lock (AngleSteer, 30 degrees on all three). One lock is the angle it
+ * could take out with a single input, so it is the natural bound on a yaw the
+ * car is going to correct by steering. */
+#define AI_BUMP_YAW_LOCKS 1.0f
+
+/* The offset SNAPS to exactly zero below this, so a recovered opponent is
+ * bit-identical to one that was never touched -- otherwise the pose carries a
+ * micrometre of displacement forever and the ground probes below run for the
+ * rest of the race. Half a millimetre and a centimetre a second are both an
+ * order of magnitude under anything visible on a 0.42 m car. */
+#define AI_BUMP_SNAP    0.0005f
+#define AI_BUMP_SNAP_V  0.01f
+#define AI_BUMP_SNAP_YAW   0.0005f   /* radians, 0.03 degrees */
+#define AI_BUMP_SNAP_YAWV  0.01f
+
+/* The vertical follow. `ceil` is how far above the recorded position the ground
+ * probe may look, for the reason rb_world.ground's own note gives -- beach_2's
+ * start is under an overpass -- widened from RBCAR_PLACE_CEIL because a bumped
+ * car may legitimately be shoved up onto a kerb. The lift is clamped so that a
+ * probe that lands on something unexpected cannot teleport a car. */
+#define AI_BUMP_CEIL      0.50f
+#define AI_BUMP_MAX_LIFT  0.35f
+
+/* How far the car has to have moved sideways before the terrain is probed again.
+ *
+ * This is a COST bound, and it is not a small one. Composing the offset onto the
+ * pose is idempotent by design, so the contact solve re-poses a car after every
+ * push -- with AI_DEPEN_PASSES of those plus two poses a tick, an opponent in
+ * contact would re-probe the ground about eighteen times a tick, two queries
+ * each. The car's whole own physics issues about ninety-two world queries a
+ * tick, so that is a 40% sim increase paid exactly when a frame is busiest.
+ * Two centimetres of movement is 3.5 mm of height on a 10-degree slope and the
+ * depenetration passes move millimetres, so this collapses it to one probe pair
+ * per tick and changes nothing visible. */
+#define AI_BUMP_PROBE_STEP 0.02f
+
+/* How far DOWN the offset may go. Upward and sideways it is bounded by
+   bump_limit, which is ONE budget over all three axes. Not zero, because a
+   contact resolved to the last float would otherwise chatter against the clamp;
+   not more, because there is ground under the car. */
+#define AI_BUMP_MAX_SINK  0.01f
 
 /* The rubber-band coefficient, exposed so a harness can bind to it directly:
  * FuncWaitAccel<slot>(lead) * clamp(difficulty * track, 0.5, 2.0). `gap` is how
