@@ -624,16 +624,20 @@ static int load_car(int idx)
  */
 #define AI_DRAW_DIST 80.0f
 static int ai_drawn;
-/* How many opponents were close enough to emit, for the once-a-second log, so
-   "the opponents have no dust" arrives with a number the way the player's own
-   effects do. */
+/* How many opponents were close enough to emit, and how much glance went on the
+   whole field -- both for the once-a-second log, so "the opponents have no dust"
+   arrives with a number the way the player's own effects do. `glance_*` is the
+   PLAYER's, snapshotted before draw_ai reuses the same envmap_t. */
 static int ai_fx_emitted;
+static int ai_glance_batches, ai_glance_tris;
+static int glance_batches, glance_tris;
 
-static void draw_ai(const float eye[3])
+static void draw_ai(const float eye[3], float vpitch, float vyaw)
 {
     int i;
 
     ai_drawn = 0;
+    ai_glance_batches = ai_glance_tris = 0;
     if (ai.n <= 0)
         return;
 
@@ -672,6 +676,33 @@ static void draw_ai(const float eye[3])
         glAlphaFunc(GL_GREATER, 0.f);
         scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
         glAlphaFunc(GL_GREATER, 0.5f);
+        /* THE GLANCE, exactly as for the player and for the same reason: over
+         * the paint AND the exhaust, inside the same matrix push, because it
+         * re-draws that very geometry.
+         *
+         * Reported as an opponent's shell not looking like plastic the way the
+         * player's does, and that is what it was -- the body of an AI car is the
+         * same ENVIR_CAR_BODY mesh with the same env classes and the same packed
+         * normals (car<n>.vsc is one asset; the player and the opponents load
+         * the same file), and nothing was ever calling this on it. Not a data
+         * gap, a missing call.
+         *
+         * `envmap` is per TRACK -- it is the sky the level uses, the engine's
+         * S_SKY slot -- so there is nothing per-car to build and no second
+         * envmap_t. What is per car is the normal matrix, which is why this is
+         * inside the loop with that opponent's own body matrix rather than the
+         * player's.
+         *
+         * envmap_draw RESETS its own counters, so they are accumulated here: the
+         * once-a-second log would otherwise report whichever opponent happened to
+         * be drawn last. */
+        if (show_vis) {
+            float n3[9];
+            env_normal_matrix(ai_matrix(&ai, i), vpitch, vyaw, n3);
+            envmap_draw(&envmap, sc, n3);
+            ai_glance_batches += envmap.n_batches;
+            ai_glance_tris += envmap.n_tris;
+        }
         glPopMatrix();
         ai_drawn++;
     }
@@ -1486,6 +1517,11 @@ unsigned int acc_ticks = 0;
                 float n3[9];
                 env_normal_matrix(rbcar_matrix(&rc), vpitch, vyaw, n3);
                 envmap_draw(&envmap, &car, n3);
+                /* Snapshot: draw_ai runs envmap_draw again per opponent and
+                   envmap_draw resets its own counters, so the log would report
+                   the last opponent's glance as the player's. */
+                glance_batches = envmap.n_batches;
+                glance_tris = envmap.n_tris;
             }
             glPopMatrix();
         }
@@ -1496,7 +1532,7 @@ unsigned int acc_ticks = 0;
         {
             float aeye[3];
             aeye[0] = ex; aeye[1] = ey; aeye[2] = ez;
-            draw_ai(aeye);
+            draw_ai(aeye, vpitch, vyaw);
         }
 
         /* Water last of the world: the sea surface and the stream are opaque,
@@ -1687,18 +1723,20 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                 rlog("[rccars] fx particles=%d  marks=%d quads  "
                               "glance=%d batches %d tris  pipe=%d %d %d mm\n",
                               fx.n_live, traces.n_quads,
-                              envmap.n_batches, envmap.n_tris,
+                              glance_batches, glance_tris,
                               (int)(fx.em.pipe[0] * 1000.f),
                               (int)(fx.em.pipe[1] * 1000.f),
                               (int)(fx.em.pipe[2] * 1000.f));
-                /* The field's own share. A count of the WHOLE field, so with
-                   three opponents in view the glance line above is one car and
-                   this one is three. Without it "the opponents still have no
-                   smoke" is a guess: emitted=0 says they were all outside
-                   FX_EMIT_RANGE, emitted>0 with no visible plume says the
-                   throttle or the surface is the problem. */
-                rlog("[rccars] ai fx emitters=%d/%d in range\n",
-                              ai_fx_emitted, ai.n);
+                /* The field's own share of all that. Both counts are of the
+                   WHOLE field, so with three opponents in view the glance line
+                   above is one car and this one is three. Without it "the
+                   opponents still have no smoke" is a guess: emitted=0 says they
+                   were all outside FX_EMIT_RANGE, emitted>0 with no visible
+                   plume says the throttle or the surface is the problem. */
+                rlog("[rccars] ai fx emitters=%d/%d in range  "
+                              "glance=%d batches %d tris on %d drawn\n",
+                              ai_fx_emitted, ai.n,
+                              ai_glance_batches, ai_glance_tris, ai_drawn);
             }
             t0 = t1;
             frames = 0;
