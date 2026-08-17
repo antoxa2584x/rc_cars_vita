@@ -141,6 +141,7 @@ static struct {
     int hit_snd[SURF_COUNT];
     int ui_snd[5];
     int snd_landing, snd_splash, snd_cp, snd_wrong, snd_prestart, snd_reset;
+    int snd_start;              /* cp_start -- the four countdown beeps */
     int snd_brake, snd_cdt_obj;
     /* The opponents: one positional loop each off the single motorAI wav that
        ships. See sfx.h. */
@@ -259,6 +260,12 @@ int sfx_init(void)
     S.snd_cp       = find_load("cp");
     S.snd_wrong    = find_load("cp_wrongway");
     S.snd_prestart = find_load("prestart");
+    /* THE WHOLE 3-2-1-GO IN ONE FILE. cp_start.wav is 4.44 s holding four beeps
+       whose onsets are at 0.0005, 1.0005, 2.0005 and 3.0005 s -- 1.0000 s apart
+       to the sample, which is exactly the one second per digit the exe's four
+       poster calls ask for. So countdown.c plays this once at t = 0 and the beeps
+       land on 3, 2, 1 and GO by themselves. See countdown.h. */
+    S.snd_start    = find_load("cp_start");
     S.snd_reset    = find_load("cp_reset");
     S.snd_brake    = find_load("car_break");
     S.snd_cdt_obj  = find_load("car_cdt_obj");
@@ -592,6 +599,7 @@ void sfx_ui(sfx_ui_t which)
 SFX_CUE(sfx_checkpoint, snd_cp, 0.9f)
 SFX_CUE(sfx_wrongway, snd_wrong, 0.9f)
 SFX_CUE(sfx_prestart, snd_prestart, 1.0f)
+SFX_CUE(sfx_countdown, snd_start, 1.0f)
 SFX_CUE(sfx_respawn, snd_reset, 0.9f)
 
 void sfx_prop_hit(int model, const float pos[3], float speed)

@@ -387,12 +387,14 @@ leaves the previous binary sitting there to answer for it:
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
-    gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c hud.c -lm -o ui_test
-                            # menu drawing and the !HIT! banner. hud.c is on this
-                            # line because it draws THROUGH ui.c, so the same
-                            # recorder reads back what really went on screen --
-                            # WHICH CELL of the atlas, at the recovered size, in
-                            # the recovered vertical band.
+    gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c hud.c countdown.c \
+        -lm -o ui_test
+                            # menu drawing, the !HIT! banner, and the 3-2-1-GO
+                            # race start. hud.c and countdown.c are on this line
+                            # because they draw THROUGH ui.c, so the same recorder
+                            # reads back what really went on screen -- WHICH CELL
+                            # of each atlas, at the recovered size, in the
+                            # recovered vertical band.
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \

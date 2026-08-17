@@ -77,6 +77,11 @@ void sfx_ui(sfx_ui_t which);
 void sfx_checkpoint(void);      /* cp */
 void sfx_wrongway(void);        /* cp_wrongway */
 void sfx_prestart(void);        /* prestart */
+/* cp_start -- the WHOLE 3-2-1-GO, four beeps 1.0000 s apart in one 4.44 s wav.
+   Raise it ONCE, at the top of the countdown, and the beeps land on 3, 2, 1 and
+   GO by themselves. countdown.h has the measurement and why it agrees with the
+   exe's own message timing to the sample. */
+void sfx_countdown(void);       /* cp_start */
 void sfx_respawn(void);         /* cp_reset */
 
 /* The car knocked a prop over. `model` indexes PROP_MODELS, `pos` is where the

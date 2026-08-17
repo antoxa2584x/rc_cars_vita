@@ -420,20 +420,25 @@ fi
 # file it belongs in. RCCars.exe loads six message textures by name at
 # 0x004af195 and FUN_004b11e0 draws one of eleven message SLOTS over them, each
 # slot carrying a texture index (0x56d2d0), a size as a (w, h) screen fraction
-# pair (0x56d278) and a UV rect (0x56d328). One of the six is wanted here:
+# pair (0x56d278) and a UV rect (0x56d328). Two of the six are wanted here:
 #
 #   msg_hits      256x256, an atlas of TWO messages -- slot 3 is !HIT! in its
 #                 top half, slot 4 GREAT !HIT! in its bottom. hud.c.
+#   msg_321_s_f   512x256, an atlas of FIVE -- slot 5 "3", 6 "2", 7 "1",
+#                 9 "!!Go!!", 8 "FiNiSH", read off the UV rects and confirmed by
+#                 cropping the PNG on them. NOTE the order: the fourth word is
+#                 GO, not START, and it is slot NINE while FINISH is slot eight.
+#                 countdown.c.
 #
-# It is referenced by no mesh anywhere; it is bound by NAME at runtime through
-# scene_tex.
+# Neither is referenced by any mesh anywhere; both are bound by NAME at runtime
+# through scene_tex.
 #
 # In props.vsc rather than in the ten tracks because props.vsc is the app's one
 # LOAD-ONCE scene: main.c builds it before the first track and never reloads it,
-# so it is resident for the whole session, costs 0.34 MB ONCE rather than ten
-# times, and the binding is never renewed on a track change. It belongs with the
-# props on the merits as well -- it is the thing that says you hit one. Texture
-# quality divides it by four a step.
+# so both are resident for the whole session, cost 0.34 and 0.70 MB ONCE rather
+# than ten times each, and neither binding is ever renewed on a track change.
+# msg_hits belongs with the props on the merits as well -- it is the thing that
+# says you hit one. Texture quality divides both by four a step.
 
 if wanted props; then
     step "Packing props"
@@ -442,7 +447,7 @@ if wanted props; then
     else
         run python3 "$RE/pack_props.py" "$ASSETS/props.vsc" \
             --src "$DB/stone.sb" --texroot "$EXTRACTED" \
-            --extra-tex msg_hits
+            --extra-tex msg_hits,msg_321_s_f
     fi
 fi
 

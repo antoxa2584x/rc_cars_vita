@@ -4713,6 +4713,43 @@ static void part12_propdraw(void)
             ck(lvl0 >= 0 && uploads[lvl0].type == GL_UNSIGNED_BYTE,
                "uploaded through the RGBA path, so its alpha survives",
                "type 0x%x", lvl0 >= 0 ? uploads[lvl0].type : 0);
+
+            /* AND THE START LIGHT, which rides in the same file for the same
+             * reasons. msg_321_s_f is the FIFTH of the six message textures, an
+             * atlas of five messages -- 3, 2, 1, GO! and FINISH -- and
+             * countdown.c binds it by name.
+             *
+             * 512x256 is the load-bearing number here, not just a sanity check:
+             * the five recovered UV rects are fractions, so what turns them into
+             * cells is the atlas being twice as wide as it is tall. It is what
+             * makes slot 5's 0.25 x 0.5 rect a 128 x 128 SQUARE, which is in turn
+             * what makes the recovered size pair come out at one uniform 0.8
+             * texels to the pixel across all five. Packed at 256x256 and the "3"
+             * would be drawn at half its own aspect.
+             *
+             * A missing one is a FAILED check and not a skip, for the same reason
+             * as above: countdown.c would silently fall back to the font, and the
+             * start light would be the word "3" in Consolas. */
+            {
+                GLuint c = scene_tex(&ps, "msg_321_s_f");
+                int cl0 = -1;
+                ck(c != 0,
+                   "props.vsc carries msg_321_s_f -- the 3-2-1-GO countdown",
+                   "id %u, %u textures in the scene", (unsigned)c, ps.n_tex);
+                ck(c != 0 && c != t,
+                   "and it is a DIFFERENT texture from msg_hits",
+                   "msg_321_s_f %u, msg_hits %u", (unsigned)c, (unsigned)t);
+                for (k = 0; k < n_uploads; k++)
+                    if (uploads[k].tex == c && uploads[k].level == 0)
+                        cl0 = k;
+                ck(cl0 >= 0 && uploads[cl0].w == 512 && uploads[cl0].h == 256,
+                   "the 512x256 atlas the five message slots tile",
+                   "%dx%d", cl0 >= 0 ? uploads[cl0].w : -1,
+                   cl0 >= 0 ? uploads[cl0].h : -1);
+                ck(cl0 >= 0 && uploads[cl0].type == GL_UNSIGNED_BYTE,
+                   "uploaded through the RGBA path, so its alpha survives too",
+                   "type 0x%x", cl0 >= 0 ? uploads[cl0].type : 0);
+            }
             scene_release(&ps);
         }
     }

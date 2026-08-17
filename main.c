@@ -62,6 +62,7 @@
 #include "tracks.h"
 #include "ui.h"
 #include "hud.h"
+#include "countdown.h"
 #include "menu.h"
 #include "ai.h"
 #include "carparts.h"
@@ -132,6 +133,12 @@ static int show_vis = 1;
    that button turns the port's rendering experiments off, and this is the
    acknowledgement for a collision that really happened. See hud.h. */
 static hud_t hud;
+
+/* The race start: 3, 2, 1, GO! in the game's own msg_321_s_f, and the only thing
+   that holds the car and the field on the line. Not on show_vis either, for a
+   stronger reason than the HIT banner's -- turning it off would hide a message
+   that is currently STOPPING the player from driving. See countdown.h. */
+static countdown_t countdown;
 
 /* The three effects the car itself throws off, all the game's own as well: the
    wheel dust and exhaust smoke (fx.c, car_dustx / exhausted_gas), the tyre marks
@@ -295,7 +302,8 @@ static void env_normal_matrix(const float *carm, float vpitch, float vyaw,
  * reason:
  *
  *   respawn()             the race is STARTING -- the grid, the lap back to
- *                         zero, and the field back on its own grid.
+ *                         zero, the field back on its own grid, and the
+ *                         3-2-1-GO.
  *   respawn_checkpoint()  the car DIED -- back to the last checkpoint it
  *                         actually crossed, with the lap, the opponents and the
  *                         race all left running.
@@ -386,6 +394,13 @@ static void respawn(void)
     ai_reset(&ai);
     sfx_ai_silence();
 
+    /* 3, 2, 1, GO! -- the game's own msg_321_s_f, and the only thing that holds
+       the car and the field on the line. See countdown.h. Started here rather
+       than by the caller so every entry into a race gets one: a track change, a
+       car change, a texture-quality reload and the menu's Restart row. */
+    countdown_start(&countdown);
+    sfx_countdown();
+
     rlog("[rccars] start: %s  (%d,%d,%d) cm  yaw=%d deg  car=%s\n",
                   TRACKS[cur_track].name,
                   (int)(t->x * 100.f), (int)(spawn_ground_y * 100.f),
@@ -397,17 +412,18 @@ static void respawn(void)
  * THE CAR DIED -- drowned, or fell out of the world. Back to the last checkpoint
  * it crossed, and NOT a restart.
  *
- * Two things are deliberately absent against respawn(): no ai_reset, so the
- * opponents carry on from wherever they are; and cp_resync rather than
- * cp_restart, so the lap and the last crossing survive -- a drowning does not
- * un-drive a lap, and checkpoint.h says so at cp_resync.
+ * Three things are deliberately absent against respawn(): no ai_reset, so the
+ * opponents carry on from wherever they are; cp_resync rather than cp_restart, so
+ * the lap and the last crossing survive (a drowning does not un-drive a lap, and
+ * checkpoint.h says so at cp_resync); and no countdown, because the race did not
+ * start again -- the player rejoins a race already in progress.
  *
  * Falls back to the grid when cp_respawn_pose declines, which it does when no
  * checkpoint has been crossed yet. That is the right answer rather than a
  * degraded one: a car that drowns before its first checkpoint has nowhere else to
  * go, and going to the grid is exactly what a race module would do. It comes out
- * as a full respawn(), which is defensible -- the player has driven none of the
- * race -- and it is the one case where dying does restart.
+ * as a full respawn() including the countdown, which is defensible -- the player
+ * has driven none of the race -- and it is the one case where dying does restart.
  */
 static void respawn_checkpoint(void)
 {
@@ -772,6 +788,15 @@ int main(void)
     if (!scene_load("app0:assets/props.vsc", &props_scene))
         rlog("[rccars] no props.vsc -- the track's props will not appear\n");
 
+    /* The start light is bound HERE, before the first respawn(), because
+       respawn() is what starts a countdown -- binding it afterwards would memset
+       the running one away. Its texture comes out of props.vsc for the same
+       reasons the HIT banner's does (load-once scene, belongs to no track and no
+       car, binding never renewed); scene_tex returns 0 on a scene packed without
+       it and countdown.c then falls back to the compiled-in font. It needs no GL
+       of its own, so it can come this early. */
+    countdown_init(&countdown, scene_tex(&props_scene, "msg_321_s_f"));
+
     if (!load_track(0)) {
         sceKernelExitProcess(0);
         return 0;
@@ -789,6 +814,9 @@ int main(void)
     rlog("[rccars] hud: msg_hits %s\n",
          hud.tex ? "bound (the game's own HIT banner)"
                  : "NOT PACKED -- falling back to the built-in font");
+    rlog("[rccars] hud: msg_321_s_f %s\n",
+         countdown.tex ? "bound (the game's own 3-2-1-GO!)"
+                       : "NOT PACKED -- falling back to the built-in font");
 
     if (car.has_rig)
         rlog("[rccars] rig: wheels %d %d %d %d  knuckles %d %d  "
@@ -963,11 +991,31 @@ unsigned int acc_ticks = 0;
                  cps.passed + 1, cps.lap);
         }
         hud_step(&hud, dt);
+        /* The start light. dt is 0 while the menu is up, so it holds where it is
+           along with everything else -- and since it is what gates the physics
+           ticks, the car stays on the line for as long as the menu is open. */
+        countdown_step(&countdown, dt);
+        if (countdown.go)
+            rlog("[rccars] GO\n");
 
         float lx = axis(pad.lx), ly = axis(pad.ly);
         float rx = axis(pad.rx), ry = axis(pad.ry);
         float thr = (pad.buttons & SCE_CTRL_RTRIGGER) ? 1.f : 0.f;
         float brk = (pad.buttons & SCE_CTRL_LTRIGGER) ? 1.f : 0.f;
+        /* HELD ON THE LINE until GO. The controls are zeroed here so nothing
+           downstream -- the physics, the rig, sfx_update's throttle-driven motor
+           layers -- has to know about the countdown, and the physics TICKS are
+           skipped further down, which is what actually keeps the car still: a car
+           on any of the four sloping race starts rolls away under gravity with
+           the throttle shut. Skipping the ticks freezes the opponents and the
+           props with it, by construction, because all three already advance on
+           the same banked time. The stick still moves the FREE CAMERA, which is
+           deliberate -- it is not part of the race. */
+        if (countdown_holding(&countdown) && !free_cam) {
+            thr = 0.f;
+            brk = 0.f;
+            lx = 0.f;
+        }
 
         float ex, ey, ez, vyaw, vpitch;
         if (free_cam) {
@@ -1003,9 +1051,18 @@ unsigned int acc_ticks = 0;
             if (use_rb) {
                 /* The Jump action, before the tick -- see rbcar_jump. The
                    placeholder model has no equivalent and does not get one:
-                   it has no body attitude to right and no momentum to add to. */
+                   it has no body attitude to right and no momentum to add to.
+                 *
+                 * Gated on the countdown as well as on the menu, and for a
+                 * sharper reason than the zeroed controls: rbcar_jump writes the
+                 * body's MOMENTUM directly and does not need a tick to do it, so
+                 * a hop pressed on the line would sit in P, unintegrated, and
+                 * launch the car on GO. The steering and throttle cannot do that
+                 * -- they are read inside the tick that is not being spent. */
                 int jumped = rbcar_jump(&rc, (pad.buttons & SCE_CTRL_CIRCLE)
-                                             && !menu.open, dt);
+                                             && !menu.open
+                                             && !countdown_holding(&countdown),
+                                        dt);
                 /* FIXED TIMESTEP -- not rbcar_step(dt).
                    rb_car_tick can only simulate 8 * 1/240 = 33.3 ms per call,
                    so a measured frame time put the car into slow motion below
@@ -1015,8 +1072,20 @@ unsigned int acc_ticks = 0;
                 SceRtcTick t_p0, t_p1;
                 int ticks;
                 sceRtcGetCurrentTick(&t_p0);
-                ticks = rbcar_step_frame(&rc, &phys_clock, thr, brk, lx,
-                                         vin.boost, dt);
+                /* THE COUNTDOWN HOLDS THE WHOLE WORLD ON THE LINE by spending no
+                   banked time at all, and clearing the bank so the wait is not
+                   paid back as a burst of catch-up ticks the instant it ends --
+                   rbcar_clock_reset is the same call respawn() makes across a
+                   teleport, for the same reason. One gate, and the player, the
+                   opponents and the props are all frozen by it, because they all
+                   advance on `ticks`. */
+                if (countdown_holding(&countdown)) {
+                    rbcar_clock_reset(&phys_clock);
+                    ticks = 0;
+                } else {
+                    ticks = rbcar_step_frame(&rc, &phys_clock, thr, brk, lx,
+                                             vin.boost, dt);
+                }
                 sceRtcGetCurrentTick(&t_p1);
                 acc_phys += (double)(t_p1.tick - t_p0.tick) / hz;
                 if (ticks > 0)
@@ -1587,6 +1656,14 @@ unsigned int acc_ticks = 0;
            behind it, and a word floating over a paused game reads as part of the
            menu. Its own ortho pass, bracketed by hud_draw itself. */
         hud_draw(&hud, SCR_W, SCR_H);
+
+        /* 3, 2, 1, GO! -- likewise over the world and under the menu, and AFTER
+           the HIT banner because the two sit in different vertical bands (band 0
+           against band 1, both the drawer's own) and there is nothing to arbitrate
+           between them. The original has a priority table for exactly that
+           (0x56d2fc, the countdown at 0 and the hit slots at 3) and a queue to
+           apply it to; two messages that cannot overlap need neither. */
+        countdown_draw(&countdown, SCR_W, SCR_H);
 
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)
