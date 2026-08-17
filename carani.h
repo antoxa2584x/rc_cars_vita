@@ -205,22 +205,23 @@ void carani_rest(carani_t *r);
 
 /* How far ABOVE the model origin the mesh's wheel-centre plane sits: the mean
  * rest Y of the bound wheel nodes. 0 if nothing is bound.
- *
- * The renderer needs this because the port's body space is NOT the model space
- * the mesh was authored in. The original reads its wheel mounts straight out of
- * the model (carSetupWheelMounts 0x004f10d0), so its body origin is the model
- * origin and the offset between the two is CenterMassOY. That conversion is
- * unrecovered, so gen_rb_data.py instead puts the centre of mass ON the
- * wheel-centre plane -- mount_y = length - sag makes the rest wheel centre
- * exactly body y = 0. The mesh's wheel centres are not at model y = 0, so
- * drawing the model straight through rbcar_matrix() floats the car by this much:
  * 56.7 mm on the Overkill, 50-72 mm on the Buggy (unevenly, front to rear, so it
- * also sat nose-down) and 71.4 mm on the Hummer, whose wheels are 59 mm in
- * radius -- more than a whole wheel clear of the ground.
+ * also sits nose-down) and 71.4 mm on the Hummer.
  *
- * Measured by rccars_re/meshalign.c, which puts each car on a flat plane, lets
- * it settle, and compares the drawn wheel centre with the physics one through
- * the very matrix main.c multiplies by. */
+ * IT IS NOT THE MODEL-SPACE -> BODY-SPACE SHIFT. It used to be: gen_rb_data.py
+ * parked the centre of mass on this plane because CenterMassOY was unrecovered,
+ * so a renderer that had multiplied by rbcar_matrix() drew the model at
+ * -carani_wheel_plane_y(). CenterMassOY IS recovered now -- the body origin sits
+ * `com_oy` above the MODEL origin, 0.0000 / 0.0323 / 0.0323 m -- so that shift is
+ * rbcar_com_oy(car), a property of the car and not of the rig. See rb_data.h.
+ *
+ * What this is still good for is being the OTHER measurement: mount_y is built as
+ * `wheel_y - com_oy + (len_free - sag)`, which puts a resting wheel centre in body
+ * space exactly on the mesh's own wheel node, so this and com_oy must differ by
+ * whatever the suspension is doing and nothing else. rccars_re/meshalign.c checks
+ * that -- it settles each car on a flat plane and compares the drawn wheel centre
+ * with the physics one through the very matrix main.c multiplies by -- and it is
+ * the only thing tying rb_data.h's mount_y to main.c's draw offset. */
 float carani_wheel_plane_y(const carani_t *r);
 
 /* Dials the whole tyre-width effect without touching the derivation below. 1.0

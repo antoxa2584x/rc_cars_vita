@@ -92,6 +92,18 @@ int rbcar_jump(rb_car *c, int held, float dt);
 const char *rbcar_name(int car);
 float rbcar_speed(const rb_car *c);
 
+/* MODEL SPACE -> BODY SPACE, in one number: the rigid body's origin (its centre
+ * of mass) sits `rbcar_com_oy(car)` metres ABOVE the model origin, so anything
+ * holding a model-space Y converts by subtracting it and a renderer that has
+ * already multiplied by rbcar_matrix() draws the model at
+ * glTranslatef(0, -rbcar_com_oy(car), 0).
+ *
+ * This is the game's own CenterMassOY (cdt[42]) -- 0.0000 m on the Overkill,
+ * 0.0323 on the Buggy and Hummer. See rb_data.h for the recovery. It replaces
+ * carani_wheel_plane_y(), which measured the MESH's wheel-centre plane and was
+ * the right answer only while gen_rb_data.py parked the com on that plane. */
+float rbcar_com_oy(int car);
+
 /* Body-to-world matrix, ready for glMultMatrixf: the engine's row-major
    row-vector layout is bit-identical to OpenGL's column-major column-vector
    layout, so no transpose is needed. */

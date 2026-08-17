@@ -477,7 +477,7 @@ static int load_car(int idx)
     /* The dust sprite and the four tyre marks are packed into the CAR, so both
        follow it. The pipe is the fitted booster's own node. */
     fx_init(&fx, &car);
-    fx_pipe_from_rig(&fx, &car.rig, menu.boost);
+    fx_pipe_from_rig(&fx, &car.rig, menu.boost, rbcar_com_oy(idx));
     trace_init(&traces, &car);
     trace_clear(&traces);
     rlog("[rccars] parts: %d exhausts  %d wheel batches  "
@@ -551,7 +551,9 @@ static void draw_ai(const float eye[3])
 
         glPushMatrix();
         glMultMatrixf(ai_matrix(&ai, i));
-        glTranslatef(0.f, -carani_wheel_plane_y(&sc->rig), 0.f);
+        /* MODEL space -> BODY space, per CAR: rbcar_com_oy, not anything read
+           off `sc->rig` -- two opponents on one model share that rig. */
+        glTranslatef(0.f, -rbcar_com_oy(c), 0.f);
         scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
         /* The pipes and boosters, exactly as for the player: OPAQUE, and only
            the alpha-test reference dropped, because their ARGB4444 alpha sits
@@ -747,7 +749,8 @@ unsigned int acc_ticks = 0;
                 /* A different exhaust is a different pipe, in a different
                    place -- the four booster_<n>_end nodes are up to 18 cm
                    apart on the Overkill. */
-                fx_pipe_from_rig(&fx, &car.rig, menu.boost);
+                fx_pipe_from_rig(&fx, &car.rig, menu.boost,
+                                 rbcar_com_oy(cur_car));
                 shown_tires = menu.tires;
                 shown_boost = menu.boost;
                 shown_skin = want_skin;
@@ -1267,21 +1270,19 @@ unsigned int acc_ticks = 0;
                 glMultMatrixf(rbcar_matrix(&rc));
                 /* ...but model space is NOT body space, and assuming it was
                    floated every car off the ground. The rigid body's origin is
-                   its centre of mass, which gen_rb_data.py parks on the
-                   WHEEL-CENTRE plane (mount_y = length - sag, so a resting wheel
-                   centre is exactly body y = 0) because CenterMassOY's slider
-                   conversion is unrecovered. The mesh's wheel centres are 57 mm
-                   (Overkill), 50-72 mm (Buggy) and 71 mm (Hummer) above ITS
-                   origin, so the drawn wheels hung that far clear of the surface
-                   the physics was standing on -- more than a full wheel radius on
-                   the Hummer, and unevenly front-to-rear on the Buggy, which
-                   drew it nose-down as well.
+                   its centre of mass, and the game says where that is:
+                   CenterMassOY, `com_oy` metres above the MODEL origin -- 0.0000
+                   on the Overkill, 0.0323 on the other two. FUN_00475030 is the
+                   original's own version of this line and negates exactly that
+                   vector; see rb_data.h.
 
-                   Drop the model onto its own wheel-centre plane. Taken from the
-                   rig rather than tabled, so it follows the mesh; a car packed
-                   without --rig has no wheel nodes, reports 0, and draws exactly
-                   as it did before. rccars_re/meshalign.c measures it. */
-                glTranslatef(0.f, -carani_wheel_plane_y(&car.rig), 0.f);
+                   This used to subtract carani_wheel_plane_y(&car.rig) instead,
+                   the mesh's own wheel-centre plane, which was the right number
+                   only while gen_rb_data.py parked the com on that plane. It no
+                   longer does, and the alignment now falls out of mount_y rather
+                   than being arranged here: a resting wheel centre in body space
+                   IS the model's wheel node. rccars_re/meshalign.c measures it. */
+                glTranslatef(0.f, -rbcar_com_oy(cur_car), 0.f);
             } else {
                 glTranslatef(veh.x, veh.y, veh.z);
                 /* The model faces +Z (wheels sit at z=+0.147 front, -0.147 rear)

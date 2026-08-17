@@ -9,6 +9,12 @@ const char *rbcar_name(int car)
     return RB_CARS[car].name;
 }
 
+float rbcar_com_oy(int car)
+{
+    if (car < 0 || car > 2) car = 0;
+    return RB_CARS[car].com_oy;
+}
+
 float rbcar_speed(const rb_car *c)
 {
     return sqrtf(c->body.v[0] * c->body.v[0] + c->body.v[1] * c->body.v[1]
@@ -144,6 +150,17 @@ void rbcar_init(rb_car *c, int car, const rb_world *w,
      * wheels sit at +-half_track, and leaving them out gives about a quarter of
      * the real roll inertia, which makes the car flip on a 10-degree slope. The
      * suspension roll torque is amplified by coeffMomentOZ (1.87) on top.
+     *
+     * The box is placed so that the WHOLE distribution's centroid lands on the
+     * body origin, which is what "the origin is the centre of mass" means. That
+     * used to need no thought: com_oy was not recovered, mount_y was a bare
+     * len_free - sag, so the wheel centres sat at body y = 0 and a box centred
+     * on the origin already balanced them. With the real CenterMassOY the wheel
+     * centres are 57 / 29 / 39 mm ABOVE the origin, so a box left at 0 would
+     * describe a body whose com is half that distance up -- i.e. it would quietly
+     * put back part of the very offset this is meant to remove. One
+     * parallel-axis term fixes it, and it raises pitch and roll inertia by about
+     * 8% and 14%.
      */
     {
         double ex = d->extent[0], ey = d->extent[1], ez = d->extent[2];
@@ -152,6 +169,14 @@ void rbcar_init(rb_car *c, int car, const rb_world *w,
         double ix = mb * (ey * ey + ez * ez) / 12.0;
         double iy = mb * (ex * ex + ez * ez) / 12.0;
         double iz = mb * (ex * ex + ey * ey) / 12.0;
+        double wsum = 0.0, by;
+        for (i = 0; i < c->nwheels; i++)
+            wsum += (double)c->wheel[i].mount[1] - c->wheel[i].len;
+        /* the two halves are equal, so the box centre is minus the mean wheel
+           height whatever nwheels is */
+        by = -wsum / (double)c->nwheels;
+        ix += mb * by * by;
+        iz += mb * by * by;
         for (i = 0; i < c->nwheels; i++) {
             double wx = c->wheel[i].mount[0];
             double wy = (double)c->wheel[i].mount[1] - c->wheel[i].len;

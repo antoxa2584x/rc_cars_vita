@@ -99,8 +99,10 @@ void fx_set_pipe(fx_t *fx, const float p[3]);
    pack_vsc.py names those so they survive the flattening. `booster` is 0..3, the
    menu's level. Returns 0 if this car has no such node, leaving the pipe where
    it was. Converts model space to body space on the way, which is NOT a no-op:
-   see the note in fx.c. */
-int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster);
+   `com_oy` is rbcar_com_oy(car), the recovered CenterMassOY. See the note in
+   fx.c for why it is a parameter rather than something read off the rig. */
+int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
+                     float com_oy);
 
 /* One frame. Emits from every wheel in contact and from the pipe, then moves
    and ages everything. `col` supplies the surface class under each wheel;

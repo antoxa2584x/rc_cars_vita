@@ -1631,12 +1631,13 @@ static void jump_water_checks(void)
 
         /* The probe is answered PER WHEEL, at that wheel's own sphere centre.
          *
-         * Invisible on level ground over level water, and that is the trap:
-         * gen_rb_data puts the centre of mass exactly on the wheel-centre plane
-         * (mount_y = length - sag), so a settled car's wheel centres and its body
-         * origin sit at the same HEIGHT, and all four wheels sit at the same
-         * height as each other. A mutant handing the probe c->body.x instead of
-         * the wheel centre survived every other check in this file.
+         * Invisible on level ground over level water, and that is the trap: all
+         * four wheels sit at the same height as each other, so a mutant handing
+         * the probe c->body.x instead of the wheel centre survived every other
+         * check in this file. It used to be worse -- gen_rb_data parked the com
+         * ON the wheel-centre plane, so body origin and wheel centres were at the
+         * same height too; CenterMassOY puts the com 57 / 29 / 39 mm lower, which
+         * separates them by a constant. This check does not rely on that.
          *
          * A surface that varies across the car separates them. The real grid's
          * does -- that is what a shoreline is. */
@@ -1644,7 +1645,14 @@ static void jump_water_checks(void)
             float g[4], centre[3];
             int k, spread_ok = 1;
             settle(&c, 0);
-            WATER_Y = c.body.x[1];
+            /* At a WHEEL CENTRE, not at c.body.x[1]. Those were the same height
+               while the com was parked on the wheel-centre plane; CenterMassOY
+               puts the body origin 57 mm lower, so using it left every wheel
+               0.086 m clear of the surface, i.e. dry (in_water needs the gap
+               under one radius, 0.072) -- the check then failed on its own
+               precondition rather than on what it is about. */
+            rb_wheel_frame(&c, 0, 0, centre, NULL, NULL, NULL);
+            WATER_Y = centre[1];
             WATER_SLOPE_X = 0.2f;
             refresh_contacts(&c);
             for (k = 0; k < 4; k++) g[k] = c.hit[k].water_gap;

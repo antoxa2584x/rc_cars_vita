@@ -2363,7 +2363,9 @@ static void part6_fx(void)
                 fx_init(&fx, &cs);
                 fx.tex = 1;            /* the fixture scene has no dust sprite */
                 fx.enabled = 1;
-                if (fx_pipe_from_rig(&fx, &cs.rig, 0)) {
+                /* `ci` indexes the three real cars in order, so its com_oy is
+                   the right model->body shift for this scene. */
+                if (fx_pipe_from_rig(&fx, &cs.rig, 0, rbcar_com_oy(ci))) {
                     /* The car at identity, so body space IS world space. It
                        has to be MOVING -- the rate curve gives nothing at rest
                        -- and spawn_gas adds the car's velocity to the ejection,

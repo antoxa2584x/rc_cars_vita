@@ -254,7 +254,8 @@ void fx_set_pipe(fx_t *fx, const float p[3])
     fx->have_pipe = 1;
 }
 
-int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster)
+int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
+                     float com_oy)
 {
     char want[32];
     int i;
@@ -270,14 +271,18 @@ int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster)
         {
             /* MODEL space is not BODY space, and this is the same trap that
                floated every car off the ground: the rigid body's origin is the
-               centre of mass, which gen_rb_data.py parks on the wheel-centre
-               plane, while the model's origin is wherever the artist left it.
-               main.c reconciles them with glTranslatef(0, -wheel_plane_y, 0), so
-               the same shift belongs here -- 57 mm on the Overkill, which is most
-               of the height of the pipe above the road. */
+               centre of mass, which sits `com_oy` above the model origin, while
+               the model's origin is wherever the artist left it. main.c
+               reconciles them with glTranslatef(0, -com_oy, 0), so the same
+               shift belongs here.
+
+               `com_oy` is the caller's because it is a property of the CAR, not
+               of the rig -- rbcar_com_oy(car). It used to be taken off the rig
+               itself, as carani_wheel_plane_y(), which was the same number only
+               while gen_rb_data.py parked the com on the mesh's wheel plane. */
             float p[3], d[3], n;
             p[0] = rig->part[i].rest[12];
-            p[1] = rig->part[i].rest[13] - carani_wheel_plane_y(rig);
+            p[1] = rig->part[i].rest[13] - com_oy;
             p[2] = rig->part[i].rest[14];
             fx_set_pipe(fx, p);
             /* AND WHICH WAY IT POINTS -- the node's own +Z, row 2 of its rest

@@ -28,6 +28,23 @@ typedef struct {
     float half_track;     /* lenAxe */
     float half_base;      /* from the mesh */
     float mount_y;
+    /* CenterMassOY (cdt[42]): how far ABOVE THE MODEL ORIGIN the rigid
+     * body's own origin -- the centre of mass -- sits. It is the
+     * model-space -> body-space shift, so main.c draws the model with
+     * glTranslatef(0, -com_oy, 0) and every body-space constant taken
+     * off the mesh comes down by it.
+     *
+     * RECOVERED. physLoadCdt reads it at
+     * 0x004f9010(0, 0.2, 1.0, 100.0, raw) -- a clamped 1..100 -> 0..0.2 m
+     * remap, and unlike every CdtDelta/CdtRadUp key it takes NO extra
+     * x0.1 -- and stores it at DAT_014c4da8 + car*0x2d*4. FUN_004f1150
+     * hands it out as the vector (0, com_oy, 0). FUN_00474f70 ADDS that
+     * vector, rotated by the model's own basis, to a model transform to
+     * get the body's; FUN_00475030 negates it first (fchs at 0x475078,
+     * 0x475083, 0x47508c) to go back the other way. Those two are the
+     * original's own version of main.c's glTranslatef, and between them
+     * they settle both the meaning and the sign. */
+    float com_oy;
     float steer_max_deg;  /* AngleSteer */
     rb_tuning tune;
     float len_free, len_min, len_max, sag, k_speed, radius;
@@ -40,7 +57,8 @@ static const rb_car_data RB_CARS[3] = {
     /* extent         */ {0.140000f,0.106000f,0.422000f},
     /* half_track     */ 0.141000f,
     /* half_base      */ 0.149000f,
-    /* mount_y        */ 0.098442f,
+    /* mount_y        */ 0.155142f,
+    /* com_oy         */ 0.000000f,
     /* steer_max_deg  */ 30.000000f,
     { /* tune */
       /* moment_ox     */ 1.045455f,
@@ -76,9 +94,9 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.070000f,0.031179f,0.075758f}, 0.051010f, 0.000000f },  /* X clamped */
-        { {0.000000f,0.128540f,-0.160040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 28 mm proud */
-        { {0.000000f,0.128540f,0.181040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 28 mm proud */
+        { {-0.073500f,0.087879f,0.075758f}, 0.051010f, 0.000000f },  /* X clamped */
+        { {0.000000f,0.185240f,-0.160040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 28 mm proud */
+        { {0.000000f,0.185240f,0.181040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 28 mm proud */
       },
     },
     /* len_free */ 0.217879f,
@@ -93,7 +111,8 @@ static const rb_car_data RB_CARS[3] = {
     /* extent         */ {0.216000f,0.157500f,0.532800f},
     /* half_track     */ 0.146700f,
     /* half_base      */ 0.182250f,
-    /* mount_y        */ 0.146679f,
+    /* mount_y        */ 0.176005f,
+    /* com_oy         */ 0.032323f,
     /* steer_max_deg  */ 30.000000f,
     { /* tune */
       /* moment_ox     */ 1.045455f,
@@ -129,9 +148,9 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.108000f,0.012121f,0.184848f}, 0.051010f, 0.000000f },  /* X Y Y>floor clamped */
-        { {0.000000f,0.080840f,-0.246890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft */
-        { {0.000000f,0.080840f,0.183890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore */
+        { {-0.108000f,0.041448f,0.184848f}, 0.051010f, 0.000000f },  /* X Y>floor clamped */
+        { {0.000000f,0.110167f,-0.246890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft */
+        { {0.000000f,0.110167f,0.183890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore */
       },
     },
     /* len_free */ 0.242626f,
@@ -146,7 +165,8 @@ static const rb_car_data RB_CARS[3] = {
     /* extent         */ {0.194220f,0.118170f,0.507780f},
     /* half_track     */ 0.170235f,
     /* half_base      */ 0.182520f,
-    /* mount_y        */ 0.098442f,
+    /* mount_y        */ 0.137488f,
+    /* com_oy         */ 0.032323f,
     /* steer_max_deg  */ 30.000000f,
     { /* tune */
       /* moment_ox     */ 1.045455f,
@@ -182,9 +202,9 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.097110f,0.034691f,0.015152f}, 0.051010f, 0.000000f },  /* X clamped */
-        { {0.000000f,0.138530f,-0.209900f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 4 mm proud */
-        { {0.000000f,0.138530f,0.195860f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 4 mm proud */
+        { {-0.097110f,0.073737f,0.015152f}, 0.051010f, 0.000000f },  /* X clamped */
+        { {0.000000f,0.177577f,-0.209900f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 4 mm proud */
+        { {0.000000f,0.177577f,0.195860f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 4 mm proud */
       },
     },
     /* len_free */ 0.217879f,

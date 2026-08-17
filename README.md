@@ -179,8 +179,9 @@ of it is already sitting in the data, recovered and unused.
 
 - One batch of 77 has no texture, showing as black patches.
 - No wall collision — ground queries only.
-- `CenterMassOY` is still unrecovered, so part of the body collision proxy is
-  fitted rather than read from the game's data.
+- `CenterMassOY` is recovered and used (the com sits 0.0000 / 0.0323 / 0.0323 m
+  above the model origin), but the body collision proxy's roof stations and its X
+  offset are still fitted rather than read from the game's data.
 - RGB565 channel order differs between real hardware and Vita3K. The port carries
   a runtime switch for it ("Texture colours" in the menu), defaulting to the
   hardware-correct packing.
