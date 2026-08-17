@@ -1541,6 +1541,13 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
     sfx_shutdown();
     audio_shutdown();
 
+    /* AND THE LOG NOW NEEDS ONE TOO, for the same reason audio does: a thread owns
+       the file (see rlog.h), so the last lines are still in RAM and the
+       sceKernelExitProcess below would take them with it. Omitting this was safe
+       only while rlog() flushed from the caller. It goes last so it also captures
+       whatever the two shutdowns above had to say. */
+    rlog_shutdown();
+
     /* this vitaGL exposes no teardown entry point; exiting releases the GPU */
     sceKernelExitProcess(0);
     return 0;
