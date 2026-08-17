@@ -898,16 +898,111 @@ void ai_reset(ai_t *ai)
  * which is what a lap with jumps in it should look like. */
 static void ai_fake_contacts(ai_car *a)
 {
+    const rb_world *w = a->rb.world;
     int i, air = 1;
+
     for (i = 0; i < a->rb.nwheels; i++) {
         rb_wheel *wh = &a->rb.wheel[i];
         int loaded = wh->len < wh->len_free - AI_DROOP_TOL;
+        float centre[3], radius = wh->radius;
+
         memset(&a->rb.hit[i], 0, sizeof(a->rb.hit[i]));
         a->rb.hit[i].active = loaded;
         if (loaded)
             air = 0;
+
+        /* WHERE THE PATCH IS, and it is filled whether the wheel is loaded or
+         * not so that a caller which ignores `active` still gets a sane point.
+         *
+         * `active` alone was all this ever wrote, because rb_wheel_spin_update
+         * -- the only reader for as long as it was the only reader -- asks
+         * nothing else. fx.c asks where: it emits dust AT hit[].point, so with
+         * the field left at the memset's zero every opponent raised its dust at
+         * the world origin. Nothing complained, because nothing emitted.
+         *
+         * The centre comes from the recorded suspension through the car's own
+         * rb_wheel_frame -- `use_extra` = 1, the animation proc's variant, since
+         * the recording carries len_extra and this is a VISUAL contact point --
+         * and the patch is one radius down the body's up axis from it.
+         *
+         * DOWN THE STRUT, NOT DOWN THE SURFACE NORMAL, and that is a knowing
+         * approximation rather than an oversight: the exact patch is where
+         * col_sphere puts it, and asking would be a collision query per wheel
+         * per opponent per tick -- the cost the whole replay exists to avoid.
+         * On the flat the two agree exactly; on a slope of t they differ by
+         * radius*(1-cos t), which at the Overkill's 70 mm wheel is 1 mm at 10
+         * degrees and 4 mm at 20. A dust puff is 0.42 m across. */
+        rb_wheel_frame(&a->rb, i, 1, centre, &radius, NULL, NULL);
+        a->rb.hit[i].point[0] = centre[0] - a->rb.m[4] * radius;
+        a->rb.hit[i].point[1] = centre[1] - a->rb.m[5] * radius;
+        a->rb.hit[i].point[2] = centre[2] - a->rb.m[6] * radius;
+
+        /* WET, on the host's own water probe and behind the SAME gate rb_collide
+           applies (collide.c: `water_gap < radius`). Without it an opponent
+           fording beach_1's river throws dust off a submerged tyre. The probe is
+           a per-column grid read, so this is O(1) per wheel and not a query into
+           the triangles. */
+        if (w && w->water
+            && w->water(w->ctx, i, centre, &a->rb.hit[i].water_gap))
+            a->rb.hit[i].in_water = a->rb.hit[i].water_gap < radius;
     }
     a->airborne = air;
+}
+
+/*
+ * THE PORT'S, and the derivation is stated here because the QUANTITY is the
+ * engine's and only the SOURCE is invented.
+ *
+ * The exhaust reads one bit: FUN_005303c0 asks the car whether the throttle is
+ * down (phys+0x576c, rb_input.accel) and emits nothing at all when it is not --
+ * `gas_rate` returns 0 through its last branch. So a car with no driver makes no
+ * smoke, which is exactly what an opponent is: ai_step writes its pose and never
+ * touches its inputs, so `in` stays as ai_reset left it, all zero, forever.
+ * That is the whole of "AI cars have no exhaust smoke" -- not a missing emitter,
+ * a missing throttle.
+ *
+ * The engine has the same seam and fills it from the other mode: FUN_004fddd0,
+ * the steering controller, writes action bit 3 (Forw) into that very field, so
+ * an opponent's smoke there comes from its own throttle. The port does not run
+ * that controller (see ai.h), so the bit has to come off the replay instead.
+ *
+ * A REPLAY DOES NOT RECORD THE THROTTLE. The 32-float ODE state is (x, q, P, L)
+ * plus the suspension and the steer angle; there is no driver input in it, and
+ * .aip packs less than that again. What the replay does carry is the speed the
+ * recording is being asked for -- `speed_rec * coeff`, the rubber-banded command
+ * ai_step already computes -- against the speed the car is actually doing. A
+ * command at or above the current speed is a car being driven; a command below
+ * it is a car being slowed. That is the same shape as the controller's own rule
+ * (throttle 1.0 below the target, ramping to 0 at it), read off the one signal
+ * this path has.
+ *
+ * The tolerance is what keeps a CRUISING car smoking. In the steady state
+ * rb_move_towards returns the command exactly and the car converges onto it, so
+ * command and speed sit on top of each other and a strict test flickers on float
+ * noise. AI_THROTTLE_COAST is the margin below which "not being slowed" still
+ * counts as throttle -- a real car holding a speed is holding it ON the engine.
+ *
+ * Deliberately NOT set: in.brake, which would need a second invented threshold
+ * and whose only effect here would be to let a decelerating opponent count as
+ * "spinning" in gas_rate and fx_dust_rate. An opponent's wheels never spin: the
+ * recorded suspension drives rb_wheel_spin_update and the slip it produces is
+ * the road's, not a driver's.
+ *
+ * INERT FOR THE REPLAY, and that is checkable rather than argued. The only other
+ * reader of in.accel on this path is rb_wheel_spin_update's wheelspin branch,
+ * which multiplies tune.speed_ang_max_rel -- SpeedAngMaxREL, 0 in the retail
+ * game for all three cars (rb.h). aitest part 4 compares a driven lap against a
+ * reference build with this whole function removed and reports it bit-identical.
+ */
+static void ai_throttle(ai_car *a)
+{
+    float command = a->speed_rec * a->coeff;
+
+    a->rb.in.accel = (command >= a->speed - AI_THROTTLE_COAST);
+    /* The analogue value beside the bit, as FUN_004fddd0 writes phys+0x5770
+       beside phys+0x576c. Nothing on the replay path reads it -- it is here so
+       that a car handed to a consumer expecting both is not half-driven. */
+    a->rb.in.throttle = a->rb.in.accel ? 1.0f : 0.0f;
 }
 
 void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
@@ -1004,6 +1099,11 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
                                + (double)a->rb.body.v[1] * a->rb.body.v[1]
                                + (double)a->rb.body.v[2] * a->rb.body.v[2]);
         ai_fake_contacts(a);
+        /* After a->speed, because the throttle is a comparison against it, and
+           before rb_wheel_spin_update, which is the one transcribed reader of
+           in.accel -- so an opponent reaches it in the same state a driven car
+           would. See ai_throttle for why that read is inert here. */
+        ai_throttle(a);
         rb_wheel_spin_update(&a->rb, dt);
 
         /* THE PORT'S: work off whatever the last tick's contacts left in the

@@ -364,7 +364,16 @@ leaves the previous binary sitting there to answer for it:
         -lm -o rb_test                                             # physics + rig
     gcc -I. -Itestgl -O2 vis_test.c scene.c shadow.c water.c checkpoint.c \
         col.c carani.c rb.c contact.c collide.c antenna.c envmap.c trace.c fx.c \
-        rbcar.c rlog.c -lm -o vis_test                             # rendering
+        ai.c rbcar.c rlog.c -lm -o vis_test                         # rendering
+                            # ai.c is on this line for part 14, the OPPONENTS'
+                            # dust and smoke. The two fields fx reads off a car
+                            # and the replay does not record -- the wheel contact
+                            # points and the throttle -- are ai.c's, and a
+                            # hand-built ai_car would only assert that
+                            # ai_fake_contacts agrees with a copy of itself. So
+                            # that fixture drives a REAL recorded lap on a REAL
+                            # .col grid and reads the particles back through
+                            # testgl, the same recorder the rest of the file uses.
     gcc -I. -Itestgl -O2 ../rccars_re/carparts_test.c carparts.c scene.c \
         carani.c rb.c contact.c collide.c rlog.c -o carparts_test -lm  # upgrade parts
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \

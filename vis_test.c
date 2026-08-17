@@ -35,6 +35,8 @@
 #include "rbcar.h"        /* rbcar_init, to bind a real car's rig to its mesh */
 #include "envmap.h"
 #include "sfx.h"          /* SURF_*, the material classes the grid carries */
+#include "ai.h"           /* a REAL opponent, for part 14 */
+#include "ai_data.h"      /* AI_RACES[].track -- which grid to load */
 
 #include <math.h>
 #include <stdio.h>
@@ -2520,8 +2522,8 @@ static int emit_once(fx_t *fx, rb_car *c, col_t *col, float dt, int frames)
 
     for (i = 0; i < FX_MAX_PARTICLES; i++)
         fx->p[i].used = 0;
-    memset(fx->carry_dust, 0, sizeof(fx->carry_dust));
-    fx->carry_gas = 0.f;
+    memset(fx->em.carry_dust, 0, sizeof(fx->em.carry_dust));
+    fx->em.carry_gas = 0.f;
     for (i = 0; i < frames; i++)
         fx_step(fx, c, col, eye, dt);
     return fx->n_live;
@@ -2732,7 +2734,7 @@ static void part6_fx(void)
         dust_chase = glcap.n_draws;
 
         plane_material(&plane, SURF_ASPHALT, SURF_ASPHALT);   /* no dust */
-        fx_set_pipe(&fx, pipe);
+        fx_set_pipe(&fx.em, pipe);
         fake_car(&c, 5.f, 0.f);
         c.in.accel = 1;
         c.in.throttle = 1.f;
@@ -2806,7 +2808,7 @@ static void part6_fx(void)
 
         /* asphalt, so nothing that follows can be dust */
         plane_material(&plane, SURF_ASPHALT, SURF_ASPHALT);
-        fx_set_pipe(&fx, pipe);
+        fx_set_pipe(&fx.em, pipe);
         fake_car(&c, 5.f, 0.f);
         n_off = emit_once(&fx, &c, &plane, 1.f / 60.f, 30);
         c.in.accel = 1;
@@ -2898,7 +2900,7 @@ static void part6_fx(void)
                 fx.enabled = 1;
                 /* `ci` indexes the three real cars in order, so its com_oy is
                    the right model->body shift for this scene. */
-                if (fx_pipe_from_rig(&fx, &cs.rig, 0, rbcar_com_oy(ci))) {
+                if (fx_pipe_from_rig(&fx.em, &cs.rig, 0, rbcar_com_oy(ci))) {
                     /* The car at identity, so body space IS world space. It
                        has to be MOVING -- the rate curve gives nothing at rest
                        -- and spawn_gas adds the car's velocity to the ejection,
@@ -2926,13 +2928,13 @@ static void part6_fx(void)
                             }
                         n = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
                         if (found && n > 1e-6f) {
-                            float dot = (d[0]*fx.pipe_dir[0] + d[1]*fx.pipe_dir[1]
-                                         + d[2]*fx.pipe_dir[2]) / n;
+                            float dot = (d[0]*fx.em.pipe_dir[0] + d[1]*fx.em.pipe_dir[1]
+                                         + d[2]*fx.em.pipe_dir[2]) / n;
                             if (dot > 1.f) dot = 1.f;
                             if (dot < -1.f) dot = -1.f;
                             ang = acosf(dot) * 57.29578f;
-                            back = acosf(-fx.pipe_dir[2] > 1.f ? 1.f
-                                         : -fx.pipe_dir[2]) * 57.29578f;
+                            back = acosf(-fx.em.pipe_dir[2] > 1.f ? 1.f
+                                         : -fx.em.pipe_dir[2]) * 57.29578f;
                             if (ang > worst_deg) { worst_deg = ang; worst_ci = ci; }
                             if (back > spread) spread = back;
                         }
@@ -4674,6 +4676,488 @@ static void part12_propdraw(void)
     free(s);
 }
 
+/* Empty the shared pool without touching any emitter's carry. */
+static void clear_pool(fx_t *fx)
+{
+    int i;
+    for (i = 0; i < FX_MAX_PARTICLES; i++)
+        fx->p[i].used = 0;
+    fx->n_live = 0;
+}
+
+/* ============================================================= part 14 ==== */
+/*
+ * THE OPPONENTS' OWN DUST AND SMOKE.
+ *
+ * Reported as AI cars having neither, plus a shell that does not read as
+ * plastic. Three separate gaps, and none of them was in the AI model or in the
+ * assets -- car<n>.vsc is ONE file that the player and every opponent load, so
+ * the meshes, the env classes, the packed normals and the `dust` sprite were all
+ * there the whole time. What was missing was three calls and two fields.
+ *
+ * This part owns the two that can be read back without a renderer:
+ *
+ *   - fx.c's SHARED POOL. One pool, N emitters, which is what makes a field of
+ *     four cars affordable at all. The thing that can go wrong is the ageing:
+ *     fx_step is fx_emit + fx_age, so a caller that runs the whole of it per car
+ *     ages every particle once per car.
+ *   - ai.c's CONTACT POINTS and THROTTLE, the two fields fx reads off a car and
+ *     the replay does not record. Both are exercised against a REAL recorded lap
+ *     on a REAL grid, because a hand-built ai_car would be asserting that
+ *     ai_fake_contacts agrees with a copy of ai_fake_contacts.
+ *
+ * The glance is NOT here: envmap_draw is already covered by part 8, it is
+ * stateless with respect to which car it is handed, and what was wrong was a
+ * missing call in main.c -- which nothing compiles. That is said at the call
+ * site rather than pretended about here.
+ */
+static void part14_aifx(void)
+{
+    static const char *tex[] = {"dust"};
+    scene_t *s = make_scene(tex, 1);
+    static const float eye[3] = {0.f, 0.f, 0.f};
+    col_t plane;
+    fx_t fx;
+    fx_emitter emA, emB;
+    rb_car c;
+    int i, n1, n2, nA;
+
+    printf("\npart 14: the opponents' dust, smoke and contact points\n");
+
+    make_plane(&plane, 8.f, 8, 0.f);
+    plane_material(&plane, SURF_SAND, SURF_SAND);
+    plane_eng_surface(&plane, 1);          /* engine class 1 = sand, dust rises */
+    fx_init(&fx, s);
+    clear_pool(&fx);
+
+    /* ---- the shared pool ages exactly once, however many cars emit ---- */
+    fake_car(&c, 6.f, 0.f);
+    c.in.accel = 1;
+    fx_emitter_init(&emA);
+    fx_emitter_init(&emB);
+
+    /* One emitter, one frame: every particle is exactly one dt old. */
+    clear_pool(&fx);
+    fx_emit(&fx, &emA, &c, &plane, eye, 1.f / 60.f);
+    fx_age(&fx, 1.f / 60.f);
+    {
+        float amax = 0.f;
+        int live = 0;
+        for (i = 0; i < FX_MAX_PARTICLES; i++)
+            if (fx.p[i].used) { live++; if (fx.p[i].age > amax) amax = fx.p[i].age; }
+        n1 = live;
+        ck(live > 0 && fabsf(amax - 1.f / 60.f) < 1e-6f,
+           "one emitter, one fx_age: a particle is one dt old",
+           "%d live, oldest %.5f s against dt %.5f", live, amax, 1.f / 60.f);
+    }
+
+    /* THREE emitters and still ONE fx_age -- the field's shape. The oldest
+       particle must STILL be one dt old. Run the whole fx_step per car instead
+       and this reads 3 dt, which at a wetsand life of 0.05 s is most of a
+       particle's life burnt before it has moved. */
+    clear_pool(&fx);
+    fx_emitter_init(&emA);
+    fx_emitter_init(&emB);
+    {
+        fx_emitter emC;
+        float amax = 0.f;
+        int live = 0;
+        fx_emitter_init(&emC);
+        fx_emit(&fx, &emA, &c, &plane, eye, 1.f / 60.f);
+        fx_emit(&fx, &emB, &c, &plane, eye, 1.f / 60.f);
+        fx_emit(&fx, &emC, &c, &plane, eye, 1.f / 60.f);
+        fx_age(&fx, 1.f / 60.f);
+        for (i = 0; i < FX_MAX_PARTICLES; i++)
+            if (fx.p[i].used) { live++; if (fx.p[i].age > amax) amax = fx.p[i].age; }
+        n2 = live;
+        ck(fabsf(amax - 1.f / 60.f) < 1e-6f,
+           "three emitters, one fx_age: still one dt old",
+           "oldest %.5f s, %d live", amax, live);
+        /* And they really are three cars' worth, not one car counted thrice:
+           the pool is shared but the carries are not. Bounded as a RATIO so it
+           cannot be satisfied by moving an emission rate. */
+        ck(live >= 3 * n1 - 3 && live <= 3 * n1 + 3,
+           "and three emitters spawn three emitters' worth",
+           "%d against 3 x %d", live, n1);
+    }
+
+    /* ---- and the carries are PER CAR ------------------------------------
+     *
+     * A shared pool is fine; a shared CARRY is not, and the difference is
+     * invisible in a total. FUN_00530b70 keeps the fractional part of rate*dt
+     * per system object, so two cars emitting at different rates each keep their
+     * own remainder. Point them both at one carry and the totals still come out
+     * right -- which is why the three-emitter check above cannot see it -- while
+     * the SPLIT collapses: at 0.9 and 0.1 particles per frame the second call
+     * finds the first call's 0.9 already banked, takes the whole particle every
+     * frame, and the car that was raising nine tenths of the dust raises none.
+     *
+     * Attributed by POSITION, because a particle does not record which emitter
+     * made it and the two cars are 20 m apart. The eye sits midway so both are
+     * inside the 12 m emit radius and neither is culled -- the thing under test
+     * is the carry, not the cull.
+     */
+    {
+        rb_car cA, cB;
+        fx_emitter eA, eB;
+        col_t wide;
+        float mid[3];
+        float rA, rB;
+        int nearA = 0, nearB = 0, f;
+
+        /* ITS OWN GRID, wide enough to hold both cars. The shared 8 m plane
+           above does not reach the second car, and a car standing off the grid
+           gets surface class 0 -- whose IntScale is 0, so it raises nothing and
+           this check fails for a reason that has nothing to do with carries.
+           It did exactly that first time round. */
+        make_plane(&wide, 40.f, 8, 0.f);
+        plane_material(&wide, SURF_SAND, SURF_SAND);
+        plane_eng_surface(&wide, 1);
+
+        /* BOTH RATES BELOW ONE PARTICLE PER FRAME, which is the regime the
+           carry exists for -- fx.c's own note says dropping it "loses every rate
+           below 1/dt". Measured on this curve, 2.0 m/s asks for 0.105 particles
+           a frame and 4.0 m/s for 0.652. Pick a car above 1/frame and the whole
+           particles arrive on their own, the remainder barely matters, and a
+           shared carry survives the check -- which is what the first version of
+           this did at 2.5 and 8.0 m/s. */
+        fake_car(&cA, 2.0f, 0.f);
+        fake_car(&cB, 4.0f, 0.f);
+        cA.in.accel = cB.in.accel = 1;
+        /* Move B 20 m along +X, body and contacts together. */
+        cB.m[12] += 20.f;
+        for (i = 0; i < cB.nwheels; i++)
+            cB.hit[i].point[0] += 20.f;
+        mid[0] = 10.f; mid[1] = 0.f; mid[2] = 0.f;
+
+        rA = fx_dust_rate(&fx, &cA, 2, 1, 2.0f * 3.6f);
+        rB = fx_dust_rate(&fx, &cB, 2, 1, 4.0f * 3.6f);
+
+        fx_emitter_init(&eA);
+        fx_emitter_init(&eB);
+        clear_pool(&fx);
+        for (f = 0; f < 120; f++) {
+            fx_emit(&fx, &eA, &cA, &wide, mid, 1.f / 60.f);
+            fx_emit(&fx, &eB, &cB, &wide, mid, 1.f / 60.f);
+            fx_age(&fx, 1.f / 60.f);
+            for (i = 0; i < FX_MAX_PARTICLES; i++) {
+                if (!fx.p[i].used || fx.p[i].sys != FX_SYS_DUST)
+                    continue;
+                if (fx.p[i].age >= 1.5f / 60.f)
+                    continue;                    /* newly born only */
+                if (fx.p[i].x < 10.f) nearA++; else nearB++;
+            }
+        }
+        /* Both must be raising dust, and in the ratio their own rates ask for.
+           Bounded as a RATIO against the rates, so it cannot be met by moving an
+           emission rate -- and both ends matter: a shared carry starves one car
+           and feeds the other, in whichever order the caller happens to run. */
+        ck(nearA > 0 && nearB > 0,
+           "two cars at different rates BOTH raise dust",
+           "%d and %d puffs at %.1f and %.1f /s", nearA, nearB, rA, rB);
+        ck(nearA > 0 && nearB > 0 && rA > 0.f && rB > 0.f
+           && fabsf((float)nearB / (float)nearA - rB / rA) < 0.25f * (rB / rA),
+           "and in the ratio their own emission rates ask for",
+           "%.2f measured against %.2f expected",
+           nearA ? (float)nearB / (float)nearA : 0.f, rB / rA);
+    }
+
+    /* ---- one car's backfire must not darken another car's smoke ---- */
+    clear_pool(&fx);
+    fx_emitter_init(&emA);
+    fx_emitter_init(&emB);
+    {
+        float lumA = 0.f, lumB = 0.f;
+        int na = 0, nb = 0;
+        /* A backfires: the rising edge of Jump above 10 km/h. */
+        c.in.jump = 1;
+        emA.prev_jump = 0;
+        fx_emit(&fx, &emA, &c, &plane, eye, 1.f / 60.f);
+        for (i = 0; i < FX_MAX_PARTICLES; i++)
+            if (fx.p[i].used && fx.p[i].sys == FX_SYS_GAS) {
+                lumA += fx.p[i].r; na++;
+            }
+        clear_pool(&fx);
+        /* B does not: same car state, but B has not seen the edge, so its own
+           explode_t is still zero. */
+        c.in.jump = 0;
+        fx_emit(&fx, &emB, &c, &plane, eye, 1.f / 60.f);
+        for (i = 0; i < FX_MAX_PARTICLES; i++)
+            if (fx.p[i].used && fx.p[i].sys == FX_SYS_GAS) {
+                lumB += fx.p[i].b; nb++;
+            }
+        if (na) lumA /= na;
+        if (nb) lumB /= nb;
+        ck(na > 0 && nb > 0 && lumA < lumB - 1.f,
+           "a backfire darkens ITS OWN smoke and no one else's",
+           "backfiring %.0f/255, neighbour %.0f/255", lumA, lumB);
+        c.in.jump = 0;
+    }
+
+    /* ---- and now a REAL opponent on a REAL grid ---- */
+    {
+        ai_t ai;
+        ai_track tr;
+        col_t rc;
+        char cp[128];
+        int have;
+
+        memset(&ai, 0, sizeof(ai));
+        memset(&tr, 0, sizeof(tr));
+        memset(&rc, 0, sizeof(rc));
+        snprintf(cp, sizeof(cp), "assets/%s.col", AI_RACES[0].track);
+        have = col_load(cp, &rc);
+        if (!have || ai_init(&ai, 0, "assets", col_rb_world(&rc), 1, 0) < 1) {
+            ck(0, "beach_1 grid and roster loaded", "col=%d", have);
+        } else {
+            ai_car *a = &ai.car[0];
+            float far_[3] = { 1e6f, 0.f, 1e6f };
+            int t, worst_far = 0;
+            float maxd = 0.f, span_x = 0.f, span_z = 0.f;
+            int origin_hits = 0, ever_wet = 0;
+            int dry_wet = 0;
+            int gnd_n = 0, gnd_bad = 0;
+            double gnd_sum = 0.0;
+            int throttle_on = 0, throttle_off = 0, ticks = 0;
+            int dust = 0, gas = 0, dust_far = 0, dust_born = 0;
+            double dv_on = 0.0, dv_off = 0.0;
+            float prev_speed = -1.f;
+
+            fx_emitter_init(&emA);
+            clear_pool(&fx);
+
+            for (t = 0; t < 60 * 30; t++) {
+                float lo[3], hi[3];
+                int w;
+                ai_step(&ai, &tr, far_[0], far_[1], far_[2], 0, 1.f / 60.f);
+                ticks++;
+                /* Accumulate the speed CHANGE on throttle-on ticks against
+                   throttle-off ticks. This is the semantic the bit is supposed
+                   to carry, and unlike a count it cannot be satisfied by a
+                   constant: a hardcoded 1 leaves dv_off at zero, a hardcoded 0
+                   leaves dv_on at zero, and either fails the sign test below. */
+                if (prev_speed >= 0.f) {
+                    double dv = (double)a->speed - prev_speed;
+                    if (a->rb.in.accel) dv_on += dv; else dv_off += dv;
+                }
+                prev_speed = a->speed;
+                if (a->rb.in.accel) throttle_on++; else throttle_off++;
+
+                lo[0] = lo[2] = 1e30f; hi[0] = hi[2] = -1e30f;
+                for (w = 0; w < a->rb.nwheels; w++) {
+                    const float *p = a->rb.hit[w].point;
+                    float dx = p[0] - a->rb.body.x[0];
+                    float dy = p[1] - a->rb.body.x[1];
+                    float dz = p[2] - a->rb.body.x[2];
+                    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (d > maxd) maxd = d;
+                    if (p[0] == 0.f && p[1] == 0.f && p[2] == 0.f)
+                        origin_hits++;
+                    if (a->rb.hit[w].in_water) ever_wet++;
+                    /* THE PATCH IS AT GROUND LEVEL, checked against the grid
+                       itself rather than against the arithmetic that produced
+                       it. col_ground_at is an independent oracle: it is the
+                       downward query, it knows nothing about wheels, and it says
+                       where the floor under this point is. A patch taken at the
+                       WHEEL CENTRE instead of one radius below it sits 72 mm up
+                       -- a whole wheel radius -- and only this can see that; the
+                       distance and span bounds above are metres wide and let it
+                       through. Loaded wheels only: a hanging wheel is not on the
+                       ground and has no business matching it. */
+                    if (a->rb.hit[w].active) {
+                        float gy, gnx, gny, gnz;
+                        if (col_ground_at(&rc, p[0], p[2], p[1] + 0.30f,
+                                          &gy, &gnx, &gny, &gnz)) {
+                            double d = fabs((double)p[1] - gy);
+                            gnd_sum += d;
+                            gnd_n++;
+                            if (d > 0.05) gnd_bad++;
+                        }
+                    }
+                    if (p[0] < lo[0]) lo[0] = p[0];
+                    if (p[0] > hi[0]) hi[0] = p[0];
+                    if (p[2] < lo[2]) lo[2] = p[2];
+                    if (p[2] > hi[2]) hi[2] = p[2];
+                }
+                if (hi[0] - lo[0] > span_x) span_x = hi[0] - lo[0];
+                if (hi[2] - lo[2] > span_z) span_z = hi[2] - lo[2];
+
+                /* Emit from where the opponent IS, so the 12 m cull cannot be
+                   what decides this. */
+                fx_emit(&fx, &emA, &a->rb, &rc, a->rb.body.x, 1.f / 60.f);
+                fx_age(&fx, 1.f / 60.f);
+
+                /* SAMPLED EVERY TICK, in particle-ticks, and not once at the
+                   end. The exhaust's recovered EG_LIFE is 0.06 s -- 3.6 frames
+                   -- so at any single instant the pool holds a handful of smoke
+                   or none at all, and reading it once turns "does this car make
+                   smoke" into a coin flip. It duly came up tails. */
+                for (i = 0; i < FX_MAX_PARTICLES; i++) {
+                    if (!fx.p[i].used)
+                        continue;
+                    if (fx.p[i].sys == FX_SYS_DUST) {
+                        /* WHERE it was RAISED, not merely that it exists. With
+                           hit[].point left at the memset's zero the dust spawns
+                           at the world ORIGIN and beach_1's racing line is tens
+                           of metres from it -- so this is the check that fails
+                           on the bug, rather than a floor any nonzero count
+                           meets.
+                
+                           MEASURED AT BIRTH, which is why the age test is here.
+                           A dust particle lives up to 1.25 s and this car covers
+                           about 8 m in that time, so an older puff is legitimately
+                           metres behind and a distance bound over the whole pool
+                           measures the CAR'S MOTION instead of the spawn point.
+                           After fx_age a particle born this tick is exactly one
+                           dt old; half a dt of slack keeps that a comparison and
+                           not a float equality. 1 m bounds it to the car and its
+                           own first frame of travel. */
+                        if (fx.p[i].age < 1.5f / 60.f) {
+                            float dx = fx.p[i].x - a->rb.body.x[0];
+                            float dz = fx.p[i].z - a->rb.body.x[2];
+                            if (dx * dx + dz * dz > 1.f)
+                                dust_far++;
+                            dust_born++;
+                        }
+                        dust++;
+                    } else {
+                        gas++;
+                    }
+                }
+            }
+            (void)worst_far;
+
+            /* THE BUG, stated as what it did: hit[].point was left at the
+               memset's zero, so every opponent raised its dust at the world
+               origin -- hundreds of metres from the car, on beach_1's own
+               coordinates. Bound to the CAR's size, not to anything ai.c
+               computes. */
+            ck(origin_hits == 0,
+               "an opponent's contact points are not at the world origin",
+               "%d of %d samples at (0,0,0)", origin_hits, ticks * a->rb.nwheels);
+            ck(maxd > 0.02f && maxd < 0.5f,
+               "they sit on the car, within half a car length of its centre",
+               "worst %.3f m over %d ticks", maxd, ticks);
+            /* And they are a RECTANGLE the size of this car's own track and
+               wheelbase -- numbers from the mesh (rb_data.h), not from ai.c.
+               The Overkill is 0.282 m across the wheels and 0.298 m along. */
+            ck(span_x > 0.10f && span_x < 0.60f && span_z > 0.10f && span_z < 0.60f,
+               "and they span the car's own track and wheelbase",
+               "%.3f x %.3f m", span_x, span_z);
+
+            /* The throttle. Both states must occur -- all-on means the
+               derivation is a constant, all-off means the exhaust is still
+               dead -- AND the off ticks must be the ones where the car is
+               slowing down. The second clause is the real one: it is what says
+               the bit MEANS something, and it is what caught AI_THROTTLE_COAST
+               being set three times larger than the acceleration limit, at
+               which the bit was on for 1796 of 1800 ticks and this file was
+               happily reporting "neither always on nor always off". */
+            ck(throttle_on > 0 && throttle_off > 0,
+               "the derived throttle is neither always on nor always off",
+               "%d on / %d off of %d ticks", throttle_on, throttle_off, ticks);
+            ck(throttle_off > ticks / 100 && throttle_off < ticks / 2,
+               "and it is off for a corner's worth of the lap, not a rounding",
+               "%.1f%% of %d ticks", 100.0 * throttle_off / ticks, ticks);
+            ck(dv_off < 0.0 && dv_on > 0.0,
+               "throttle OFF is where the car slows and ON where it gains",
+               "off %+.2f m/s total, on %+.2f", dv_off, dv_on);
+
+            /* What the whole thing is FOR. */
+            /* THE MEAN, not every sample: the outliers are kerbs, jumps and
+               the moments col_ground_at's downward ray picks a different face
+               from the one the wheel is on. What the mean measures is the known
+               BODY-FRAME RESIDUAL -- pack_ai.py lifts every recorded sample by a
+               per-car constant because the engine's wheel mounts are not the
+               port's, and CLAUDE.md records that residual as 27.8 mm on the
+               Overkill. This reads 23.8 mm, which is that number and not a
+               coincidence.
+               50 mm is the bound because it sits between that and the failure it
+               has to catch: taking the patch at the WHEEL CENTRE instead of one
+               radius below moves it 71.8 mm (CdtRadWheel), and the same mean
+               then reads 81.8 mm with 6007 of 6858 samples beyond 50 mm rather
+               than 534. The bound has better than 2x clearance on one side and
+               1.6x on the other. */
+            ck(gnd_n > 0 && gnd_sum / gnd_n < 0.05,
+               "a loaded wheel's patch is ON the grid's own surface",
+               "mean %.1f mm off over %d samples (%d beyond 50 mm)",
+               gnd_n ? 1000.0 * gnd_sum / gnd_n : 0.0, gnd_n, gnd_bad);
+
+            ck(dust > 0, "a real opponent on a real lap raises DUST",
+               "%d dust particle-ticks over %d ticks", dust, ticks);
+            ck(dust_born > 0 && dust_far == 0,
+               "and it raises it AT THE CAR, not at the world origin",
+               "%d of %d newly-born further than 1 m away", dust_far, dust_born);
+            ck(gas > 0, "and its exhaust makes SMOKE",
+               "%d smoke particle-ticks over %d ticks", gas, ticks);
+
+            /* THE WATER GATE. fx skips a wet wheel -- FUN_00531b10 raises spray
+               there, not dust -- so an opponent fording beach_1's river must
+               report wet wheels or that branch is dead code on this path. Bound
+               at BOTH ends, and the second end is the one that means something:
+               CLAUDE.md records that six of the ten tracks have water and that
+               country_2, country_4, urban_1 and urban_2 have none. That is a
+               fact about the SHIPPED GRIDS, established long before this code,
+               so a dry track reporting a wet wheel is this code being wrong and
+               not the check being circular. */
+            /* BOTH ENDS, and the upper one is the point. The flag alone is
+               satisfied by a gate pointing the wrong way -- CLAUDE.md records
+               exactly that for col.c, where a flipped gap sign survived a suite
+               that only asserted in_water. Measured here: the gate as written
+               reports 3.8% of beach_1's wheel-samples wet, and the same gate
+               with its comparison reversed reports 27.2%, because it then means
+               "there is water somewhere in this column and the wheel is well
+               clear of it" -- which is true of every pier and every bank. A
+               recorded racing line crosses water at a ford, not for a quarter of
+               the lap. 15% sits an order of magnitude clear of one and well
+               clear of the other. */
+            ck(ever_wet > 0
+               && ever_wet < ticks * a->rb.nwheels * 15 / 100,
+               "an opponent fording beach_1 reports WET wheels, and only there",
+               "%d of %d wheel-samples (%.1f%%)", ever_wet,
+               ticks * a->rb.nwheels,
+               100.0 * ever_wet / (ticks * a->rb.nwheels));
+            {
+                ai_t dry;
+                col_t dc;
+                char dp[128];
+                int dt2, dn = 0;
+                memset(&dry, 0, sizeof(dry));
+                memset(&dc, 0, sizeof(dc));
+                /* urban_2, which CLAUDE.md lists among the four tracks with no
+                   water at all. AI_RACES is indexed in the port's track order,
+                   not the championship's, so urban_2 is 9 -- index 3 is
+                   beach_4, which has water and duly reported some. */
+                snprintf(dp, sizeof(dp), "assets/%s.col", AI_RACES[9].track);
+                if (col_load(dp, &dc)
+                    && ai_init(&dry, 9, "assets", col_rb_world(&dc), 1, 0) >= 1) {
+                    for (dt2 = 0; dt2 < 60 * 20; dt2++) {
+                        int k, w;
+                        ai_step(&dry, &tr, far_[0], far_[1], far_[2], 0,
+                                1.f / 60.f);
+                        for (k = 0; k < dry.n; k++)
+                            for (w = 0; w < dry.car[k].rb.nwheels; w++) {
+                                dn++;
+                                if (dry.car[k].rb.hit[w].in_water)
+                                    dry_wet++;
+                            }
+                    }
+                    ck(dn > 0 && dry_wet == 0,
+                       "and NO wheel is wet on a track with no water in it",
+                       "%s: %d of %d wheel-samples", AI_RACES[9].track,
+                       dry_wet, dn);
+                    ai_free(&dry);
+                }
+                col_free(&dc);
+            }
+
+            col_free(&rc);
+            ai_free(&ai);
+        }
+    }
+
+}
+
 int main(void)
 {
     printf("RC Cars -- visual subsystem harness\n");
@@ -4689,6 +5173,7 @@ int main(void)
     part10_culling();
     part11_vertexbuffers();
     part12_propdraw();
+    part14_aifx();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

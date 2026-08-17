@@ -59,12 +59,24 @@ typedef struct {
     unsigned char sys;      /* FX_SYS_*, the port's: the engine has two pools */
 } fx_particle;
 
+/*
+ * ONE EMITTER'S OWN STATE -- everything in the engine's system descriptor that
+ * belongs to the CAR rather than to the pool of particles.
+ *
+ * It is split out of fx_t so that SEVERAL CARS can throw dust and smoke into one
+ * shared pool. The engine has no such problem: it creates a whole particle system
+ * per car, each with its own 2048 particles. Doing that here would be 123 KB and
+ * a second draw call for every opponent, for a field of at most four cars whose
+ * plumes composite into the same frame anyway -- so the port keeps ONE pool and N
+ * emitters, which is the same trade it already makes between the dust and the
+ * exhaust (see FX_SYS_*).
+ *
+ * Nothing in here may be shared between cars, and that is the whole point: the
+ * carry fractions, the backfire hold and the smoke's colour ramp are per-system
+ * in the original too. Sharing them makes two cars' emission rates beat against
+ * each other and lets one car's backfire darken another car's smoke.
+ */
 typedef struct {
-    fx_particle p[FX_MAX_PARTICLES];
-    int n_live;             /* for telemetry */
-    GLuint tex;
-    int enabled;
-
     /* One carry per emitter, exactly as FUN_00530b70 keeps one per system
        object: dropping it makes any rate below 1/dt emit nothing at all. */
     float carry_dust[RB_MAX_WHEELS];
@@ -74,7 +86,6 @@ typedef struct {
     float explode_t;        /* +0x34  backfire hold, counts down */
     float gas_alpha;        /* +0x20  0..255, ramps at 256/s */
     int prev_jump;          /* +0x28  last frame's Jump bit, for the edge */
-    unsigned int seed;
 
     /* Where the pipe is, in body space. Taken from the car's own
        `booster_<n>_end` node -- see fx_set_pipe. */
@@ -86,14 +97,39 @@ typedef struct {
        and what a car with no rig gets. */
     float pipe_dir[3];
     int have_pipe;
+} fx_emitter;
+
+typedef struct {
+    fx_particle p[FX_MAX_PARTICLES];
+    int n_live;             /* for telemetry */
+    GLuint tex;
+    int enabled;
+    unsigned int seed;
+
+    /* THE PLAYER'S emitter, so the common case needs no second object and every
+       caller that had one fx_t per car is unchanged. An opponent brings its own
+       and hands it to fx_emit. */
+    fx_emitter em;
 } fx_t;
 
-/* `src` is the scene the `dust` texture was packed into (the car's). */
+/* FUN_0052e320 walks the cameras and gives up if none is within 12 m of the
+   wheel. Public because main.c applies the same radius to a whole OPPONENT
+   before it looks at that car's wheels at all -- the per-wheel test inside
+   fx_emit would reject them one by one, having already posed the pose. */
+#define FX_EMIT_RANGE 12.0f
+
+/* `src` is the scene the `dust` texture was packed into (the car's). Also
+   resets the built-in player emitter. */
 void fx_init(fx_t *fx, const scene_t *src);
+
+/* A fresh emitter: no carry, no backfire running, smoke at full white, pipe at
+   the body origin pointing out the back. fx_init does this for fx->em; an
+   opponent's emitter is initialised with it directly. */
+void fx_emitter_init(fx_emitter *em);
 
 /* The exhaust tip, in BODY space. Without it the smoke comes out of the body
    origin, which is the centre of mass. */
-void fx_set_pipe(fx_t *fx, const float p[3]);
+void fx_set_pipe(fx_emitter *em, const float p[3]);
 
 /* The same, taken from the fitted booster's own `booster_<n>_end` node --
    pack_vsc.py names those so they survive the flattening. `booster` is 0..3, the
@@ -101,12 +137,25 @@ void fx_set_pipe(fx_t *fx, const float p[3]);
    it was. Converts model space to body space on the way, which is NOT a no-op:
    `com_oy` is rbcar_com_oy(car), the recovered CenterMassOY. See the note in
    fx.c for why it is a parameter rather than something read off the rig. */
-int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
+int fx_pipe_from_rig(fx_emitter *em, const carani_t *rig, int booster,
                      float com_oy);
 
-/* One frame. Emits from every wheel in contact and from the pipe, then moves
-   and ages everything. `col` supplies the surface class under each wheel;
-   `eye` is the camera, for the 12 m emit cull. */
+/* SPAWN ONLY, for one car. `col` supplies the surface class under each wheel;
+   `eye` is the camera, for the 12 m emit cull.
+ *
+ * Split from the ageing half BECAUSE THE POOL IS SHARED: ageing it once per
+ * emitter would run every particle's life at N times the rate, so a field of
+ * four cars would give the player a quarter of the dust it had. Call this for
+ * every car that emits, then fx_age exactly once. */
+void fx_emit(fx_t *fx, fx_emitter *em, const rb_car *c, const col_t *col,
+             const float eye[3], float dt);
+
+/* Move and age the whole pool. ONCE per frame, whatever the field size. */
+void fx_age(fx_t *fx, float dt);
+
+/* One frame for the player: fx_emit through the built-in emitter, then fx_age.
+   Opponents are emitted BEFORE this call, so their particles age on the same
+   tick the player's do. */
 void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
              const float eye[3], float dt);
 

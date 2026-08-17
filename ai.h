@@ -298,6 +298,36 @@ typedef struct {
  * PORT'S, and see ai_fake_contacts for why it is len_free and NOT len_max. */
 #define AI_DROOP_TOL 0.002f
 
+/* How far BELOW the rubber-banded command an opponent's actual speed may sit and
+ * still count as throttle-down. THE PORT'S, and it is a NOISE FLOOR, not a
+ * judgement about driving: in the steady state rb_move_towards returns the
+ * command exactly and the car converges onto it, so a strict `command >= speed`
+ * flickers on float noise and a cruising opponent's exhaust strobes.
+ *
+ * MEASURED rather than picked, because the first value here was picked and was
+ * wrong by two orders of magnitude. Over 80 s of every opponent on beach_1,
+ * beach_2 and beach_3 -- 14,400 car-ticks each -- the distribution of
+ * (command - speed) where it is negative has a hole in it:
+ *
+ *     under 1 mm/s   4008 / 4299 / 4061 ticks     <- cruise, the noise floor
+ *     1 to 5 mm/s      16 /  104 /    6
+ *     5 to 10 mm/s     20 /   83 /    7
+ *     10 to 20 mm/s    28 /  109 /   13
+ *     ...to a worst of -1.20 / -1.18 / -0.45 m/s  <- real braking
+ *
+ * so the cruise samples all sit under 1 mm/s and everything real is above about
+ * 5. 0.01 m/s is an order of magnitude clear of the noise on one side and an
+ * order clear of one tick of the 5 m/s^2 acceleration limit (83 mm/s) on the
+ * other, and it leaves the throttle off for 2-3% of a lap -- the corners.
+ *
+ * THE FIRST VALUE WAS 0.25 m/s, "well inside one tick of the acceleration
+ * limit", which is exactly backwards: 0.25 is three times that limit, so it
+ * swallowed every deceleration the car can physically express and the bit was on
+ * for 1796 of 1800 ticks. A derived signal that is 99.8% constant is not a
+ * derived signal, and the check that caught it is the one in vis_test part 14
+ * that ties throttle-off to the speed actually FALLING. See ai_throttle. */
+#define AI_THROTTLE_COAST 0.01f
+
 /* ---------------------------------------------------------------------- API */
 
 /* Load assets/<base>.aip and build one rb_car per opponent that races at this

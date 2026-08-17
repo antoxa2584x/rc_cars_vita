@@ -154,6 +154,21 @@ static shadow_t ai_shadow[3];
 static int      ai_model[3];        /* 1 once loaded and rig-bound */
 static ai_track ai_tr;
 
+/* ONE EMITTER PER OPPONENT, into the player's shared particle pool.
+ *
+ * Not one fx_t per car: that is 123 KB of particles and a second fx_draw each,
+ * and the plumes all composite into the same frame anyway. What must NOT be
+ * shared is the emitter state -- the carry fractions, the backfire hold and the
+ * smoke's colour ramp are per-system in the engine too, and sharing them makes
+ * two cars' emission rates beat against each other. See fx.h.
+ *
+ * Indexed by opponent, NOT by model: two Buggies on one scene are still two cars
+ * with two pipes in two places. The pipe itself is read off the shared rig's
+ * REST matrices, which no animation touches, so reading it per car off a scene
+ * several cars share is safe -- unlike carani_update, which draw_ai has to
+ * sequence for exactly that reason. */
+static fx_emitter ai_em[AI_MAX_OPPONENTS];
+
 /* ------------------------------------------------------------------ state */
 
 /* car pose: heading in degrees, forward = (sin h, 0, -cos h) */
@@ -464,6 +479,23 @@ static void load_ai(int idx)
         shadow_init(&ai_shadow[c], &ai_scene[c], c);
         ai_model[c] = 1;
     }
+
+    /* The exhaust emitters, AFTER the scene loop, because the pipe comes off a
+       rig that loop may only just have bound -- and per OPPONENT, not per model,
+       since the roster gives each driver its own booster level and the four
+       levels are four different pipes in four different places (carparts.h). */
+    for (i = 0; i < ai.n; i++) {
+        int c = ai.car[i].car;
+        fx_emitter_init(&ai_em[i]);
+        if (c < 0 || c > 2 || !ai_model[c] || !ai_scene[c].has_rig)
+            continue;
+        /* rbcar_com_oy(c), the same MODEL -> BODY shift the player's pipe takes
+           and the same one draw_ai translates by. Nothing here reads the rig's
+           animated matrices, only its rest ones, so a shared scene is fine. */
+        fx_pipe_from_rig(&ai_em[i], &ai_scene[c].rig, ai.car[i].boost,
+                         rbcar_com_oy(c));
+    }
+
     rlog("[rccars] ai: %d opponent(s) on %d model(s)\n", ai.n,
          ai_model[0] + ai_model[1] + ai_model[2]);
 }
@@ -552,7 +584,7 @@ static int load_car(int idx)
     /* The dust sprite and the four tyre marks are packed into the CAR, so both
        follow it. The pipe is the fitted booster's own node. */
     fx_init(&fx, &car);
-    fx_pipe_from_rig(&fx, &car.rig, menu.boost, rbcar_com_oy(idx));
+    fx_pipe_from_rig(&fx.em, &car.rig, menu.boost, rbcar_com_oy(idx));
     trace_init(&traces, &car);
     trace_clear(&traces);
     rlog("[rccars] parts: %d exhausts  %d wheel batches  "
@@ -592,6 +624,10 @@ static int load_car(int idx)
  */
 #define AI_DRAW_DIST 80.0f
 static int ai_drawn;
+/* How many opponents were close enough to emit, for the once-a-second log, so
+   "the opponents have no dust" arrives with a number the way the player's own
+   effects do. */
+static int ai_fx_emitted;
 
 static void draw_ai(const float eye[3])
 {
@@ -824,7 +860,7 @@ unsigned int acc_ticks = 0;
                 /* A different exhaust is a different pipe, in a different
                    place -- the four booster_<n>_end nodes are up to 18 cm
                    apart on the Overkill. */
-                fx_pipe_from_rig(&fx, &car.rig, menu.boost,
+                fx_pipe_from_rig(&fx.em, &car.rig, menu.boost,
                                  rbcar_com_oy(cur_car));
                 shown_tires = menu.tires;
                 shown_boost = menu.boost;
@@ -1211,7 +1247,37 @@ unsigned int acc_ticks = 0;
            emission beyond 12 m, not drawing. */
         if (show_vis && use_rb) {
             float eye[3];
+            int k;
             eye[0] = ex; eye[1] = ey; eye[2] = ez;
+
+            /* THE OPPONENTS EMIT FIRST, and the order is load-bearing rather
+             * than a preference: fx_step is fx_emit + fx_age, the pool is
+             * shared, and fx_age must run ONCE. Anything emitting after it
+             * spawns particles that skip a tick of ageing; anything calling the
+             * full fx_step twice ages every particle twice. So every extra
+             * emitter goes here, above, and the player's fx_step closes the
+             * frame.
+             *
+             * The distance gate is the dust's own recovered radius applied a
+             * level up. fx_emit tests it per WHEEL (FUN_0052e320 walks the
+             * cameras and gives up past 12 m), which is correct and would reject
+             * these anyway -- but only after paying for the surface query and
+             * the per-wheel arithmetic on a car that cannot be seen. The
+             * exhaust has no such rule of its own in the original, so without
+             * this a car 80 m away would still be filling the shared pool with
+             * smoke nobody can see. Squared, and horizontal: the same shape
+             * draw_ai's own cap uses. */
+            ai_fx_emitted = 0;
+            for (k = 0; k < ai.n && k < AI_MAX_OPPONENTS; k++) {
+                const ai_car *a = &ai.car[k];
+                float dx = a->rb.body.x[0] - ex;
+                float dz = a->rb.body.x[2] - ez;
+                if (dx * dx + dz * dz > FX_EMIT_RANGE * FX_EMIT_RANGE)
+                    continue;
+                fx_emit(&fx, &ai_em[k], &a->rb, &col, eye, dt);
+                ai_fx_emitted++;
+            }
+
             fx_step(&fx, &rc, &col, eye, dt);
             trace_step(&traces, &rc, &col, dt);
         }
@@ -1622,9 +1688,17 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                               "glance=%d batches %d tris  pipe=%d %d %d mm\n",
                               fx.n_live, traces.n_quads,
                               envmap.n_batches, envmap.n_tris,
-                              (int)(fx.pipe[0] * 1000.f),
-                              (int)(fx.pipe[1] * 1000.f),
-                              (int)(fx.pipe[2] * 1000.f));
+                              (int)(fx.em.pipe[0] * 1000.f),
+                              (int)(fx.em.pipe[1] * 1000.f),
+                              (int)(fx.em.pipe[2] * 1000.f));
+                /* The field's own share. A count of the WHOLE field, so with
+                   three opponents in view the glance line above is one car and
+                   this one is three. Without it "the opponents still have no
+                   smoke" is a guess: emitted=0 says they were all outside
+                   FX_EMIT_RANGE, emitted>0 with no visible plume says the
+                   throttle or the surface is the problem. */
+                rlog("[rccars] ai fx emitters=%d/%d in range\n",
+                              ai_fx_emitted, ai.n);
             }
             t0 = t1;
             frames = 0;

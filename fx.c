@@ -74,9 +74,9 @@
  */
 #define FX_DUST_SPRITE_SCALE 0.43f
 
-/* FUN_0052e320 walks the cameras and gives up if none is within 12 m of the
-   wheel. One camera here. */
-#define FX_EMIT_RANGE 12.0f
+/* FX_EMIT_RANGE -- FUN_0052e320 walks the cameras and gives up if none is within
+   12 m of the wheel. One camera here. It lives in fx.h, because main.c applies
+   the same radius to a whole OPPONENT before it looks at that car's wheels. */
 
 /*
  * THE PORT'S, and the one place here that knowingly departs from a recovered
@@ -231,30 +231,46 @@ static fx_particle *fx_alloc(fx_t *fx)
     return NULL;           /* 2048 is the engine's own cap; drop past it */
 }
 
+void fx_emitter_init(fx_emitter *em)
+{
+    float origin[3] = { 0.0f, 0.0f, 0.0f };
+
+    memset(em, 0, sizeof(*em));
+    /* White smoke until a backfire darkens it -- the ramp only ever counts back
+       UP to 255, so a zeroed emitter would spend its first second going from
+       black to white for no reason. */
+    em->gas_alpha = 255.0f;
+    /* The pipe defaults to the body origin pointing out the back, which is what
+       fx_set_pipe leaves; `have_pipe` stays 0 so a caller can tell it apart from
+       a car whose pipe really is there. */
+    fx_set_pipe(em, origin);
+    em->have_pipe = 0;
+}
+
 void fx_init(fx_t *fx, const scene_t *src)
 {
     memset(fx, 0, sizeof(*fx));
     fx->seed = 0x1234567u;
     fx->tex = src ? scene_tex(src, FX_DUST_TEX) : 0;
     fx->enabled = (fx->tex != 0);
-    fx->gas_alpha = 255.0f;
+    fx_emitter_init(&fx->em);
 }
 
-void fx_set_pipe(fx_t *fx, const float p[3])
+void fx_set_pipe(fx_emitter *em, const float p[3])
 {
-    fx->pipe[0] = p[0];
-    fx->pipe[1] = p[1];
-    fx->pipe[2] = p[2];
+    em->pipe[0] = p[0];
+    em->pipe[1] = p[1];
+    em->pipe[2] = p[2];
     /* Straight out the back until something says otherwise. That is what a car
        with no rig gets, and it is what this port assumed for every car until the
        pipe nodes were read -- see fx_pipe_from_rig. */
-    fx->pipe_dir[0] = 0.0f;
-    fx->pipe_dir[1] = 0.0f;
-    fx->pipe_dir[2] = -1.0f;
-    fx->have_pipe = 1;
+    em->pipe_dir[0] = 0.0f;
+    em->pipe_dir[1] = 0.0f;
+    em->pipe_dir[2] = -1.0f;
+    em->have_pipe = 1;
 }
 
-int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
+int fx_pipe_from_rig(fx_emitter *em, const carani_t *rig, int booster,
                      float com_oy)
 {
     char want[32];
@@ -284,7 +300,7 @@ int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
             p[0] = rig->part[i].rest[12];
             p[1] = rig->part[i].rest[13] - com_oy;
             p[2] = rig->part[i].rest[14];
-            fx_set_pipe(fx, p);
+            fx_set_pipe(em, p);
             /* AND WHICH WAY IT POINTS -- the node's own +Z, row 2 of its rest
                matrix.
              *
@@ -312,9 +328,9 @@ int fx_pipe_from_rig(fx_t *fx, const carani_t *rig, int booster,
             d[2] = rig->part[i].rest[10];
             n = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
             if (n > 1e-6f) {
-                fx->pipe_dir[0] = d[0] / n;
-                fx->pipe_dir[1] = d[1] / n;
-                fx->pipe_dir[2] = d[2] / n;
+                em->pipe_dir[0] = d[0] / n;
+                em->pipe_dir[1] = d[1] / n;
+                em->pipe_dir[2] = d[2] / n;
             }
         }
         return 1;
@@ -442,14 +458,14 @@ static void spawn_dust(fx_t *fx, const float pos[3], const float vel[3],
  * as long, and the smoke darkens to ExplodeColor*255 (41 of 255, nearly black)
  * before ramping back to white at 256 per second.
  */
-static float gas_rate(fx_t *fx, const rb_car *c, float kmh,
+static float gas_rate(fx_emitter *em, const rb_car *c, float kmh,
                       int *spinning, int *loaded, float dt)
 {
     float in = kmh, v;
 
     *spinning = 0;
     *loaded = 0;
-    if (fx->explode_t <= 0.0f) {
+    if (em->explode_t <= 0.0f) {
         /* The rear pair, wheels 2 and 3 -- the wheels FUN_005303c0 asks about,
            and the driven ones (carDriveForces puts the engine force at the two
            rear contacts). The louder of the two wins. */
@@ -459,22 +475,22 @@ static float gas_rate(fx_t *fx, const rb_car *c, float kmh,
         float slip = slip2 >= slip3 ? slip2 : slip3;
         rate = slip2 >= slip3 ? r2 : r3;
 
-        if (!fx->prev_jump && c->in.jump && kmh > 10.0f) {
-            fx->explode_t = EG_EXPLODE_TIME;
+        if (!em->prev_jump && c->in.jump && kmh > 10.0f) {
+            em->explode_t = EG_EXPLODE_TIME;
         } else if ((c->in.accel || c->in.brake) && slip > EG_SPIN_THRESH) {
             in = fabsf(rate) + fabsf(rate);
             *spinning = 1;
         } else if (c->in.boost && kmh > 5.0f) {
             *loaded = 1;
         }
-        fx->prev_jump = c->in.jump ? 1 : 0;
+        em->prev_jump = c->in.jump ? 1 : 0;
     } else {
         in = 50.0f;
-        fx->explode_t -= dt;
+        em->explode_t -= dt;
     }
 
     v = curve_at(fx_eg_int, FX_EG_INT_N, in);
-    if (fx->explode_t > 0.0f)
+    if (em->explode_t > 0.0f)
         return v + v;
     if (*spinning)
         return v;
@@ -489,27 +505,28 @@ static float gas_rate(fx_t *fx, const rb_car *c, float kmh,
 
 /* FUN_005303c0's tail: white at 255, darkening to ExplodeColor*255 while the
    backfire holds. Ramps are 256/s up and 512/s down. */
-static void gas_colour(fx_t *fx, float dt)
+static void gas_colour(fx_emitter *em, float dt)
 {
-    if (fx->explode_t <= 0.0f) {
-        if (fx->gas_alpha < 255.0f) {
-            fx->gas_alpha += dt * 256.0f;
-            if (fx->gas_alpha > 255.0f)
-                fx->gas_alpha = 255.0f;
+    if (em->explode_t <= 0.0f) {
+        if (em->gas_alpha < 255.0f) {
+            em->gas_alpha += dt * 256.0f;
+            if (em->gas_alpha > 255.0f)
+                em->gas_alpha = 255.0f;
         }
     } else {
         float floor_ = EG_EXPLODE_COLOR * 255.0f;
-        if (fx->gas_alpha > floor_) {
-            fx->gas_alpha -= dt * 512.0f;
-            if (fx->gas_alpha < floor_)
-                fx->gas_alpha = floor_;
+        if (em->gas_alpha > floor_) {
+            em->gas_alpha -= dt * 512.0f;
+            if (em->gas_alpha < floor_)
+                em->gas_alpha = floor_;
         }
     }
 }
 
 /* FUN_005306d0 message 5. */
-static void spawn_gas(fx_t *fx, const float pos[3], const float dir[3],
-                      const float carv[3], int spinning, int loaded)
+static void spawn_gas(fx_t *fx, const fx_emitter *em, const float pos[3],
+                      const float dir[3], const float carv[3],
+                      int spinning, int loaded)
 {
     fx_particle *p = fx_alloc(fx);
     unsigned char lum;
@@ -520,7 +537,7 @@ static void spawn_gas(fx_t *fx, const float pos[3], const float dir[3],
     p->used = 1;
     p->sys = FX_SYS_GAS;
     p->life = rnd_sym(fx) * EG_LIFE_DISP + EG_LIFE;
-    if (fx->explode_t > 0.0f)
+    if (em->explode_t > 0.0f)
         p->life *= 3.0f;
     else if (spinning)
         p->life *= 2.5f;
@@ -541,7 +558,7 @@ static void spawn_gas(fx_t *fx, const float pos[3], const float dir[3],
     p->sx = (EG_SCALE_X + rnd_sym(fx) * EG_SCALE_X_DISP) * FX_SPRITE_UNIT;
     p->sy = (EG_SCALE_Y + rnd_sym(fx) * EG_SCALE_Y_DISP) * FX_SPRITE_UNIT;
     p->grow = EG_DYN_SCALE;
-    lum = (unsigned char)fx->gas_alpha;
+    lum = (unsigned char)em->gas_alpha;
     p->r = p->g = p->b = lum;
     p->a = 255;
 }
@@ -588,10 +605,10 @@ static void move(fx_particle *p, float grav_y, float att, float dt)
     p->vy += dt * grav_y;
 }
 
-void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
+void fx_emit(fx_t *fx, fx_emitter *em, const rb_car *c, const col_t *col,
              const float eye[3], float dt)
 {
-    int i, w, n;
+    int w, n;
 
     if (!fx->enabled || dt <= 0.0f)
         return;
@@ -614,7 +631,7 @@ void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
 
         sid = surf_id(col, h->point);
         rate = fx_dust_rate(fx, c, w, sid, speed_kmh(c));
-        n = emit_count(rate, dt, &fx->carry_dust[w]);
+        n = emit_count(rate, dt, &em->carry_dust[w]);
         if (!n)
             continue;
 
@@ -656,34 +673,43 @@ void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
     /* ---- exhaust, one emitter at the pipe ---- */
     {
         int spinning, loaded;
-        float rate = gas_rate(fx, c, speed_kmh(c), &spinning, &loaded, dt);
+        float rate = gas_rate(em, c, speed_kmh(c), &spinning, &loaded, dt);
         float pos[3], dir[3];
 
-        gas_colour(fx, dt);
+        gas_colour(em, dt);
         /* FUN_0050bcc0 transforms a body-space point AND a vector by the car
            matrix -- it is handed esi+0x8 and esi+0x14, two separate vec3s off
            the emitter (0x00530422, 0x00530438), which is why the direction is
            carried rather than assumed. The point is the fitted booster's own
            `_end` node and the direction is that node's own axis; see
            fx_pipe_from_rig for why it is not simply the body's -Z. */
-        pos[0] = fx->pipe[0] * c->m[0] + fx->pipe[1] * c->m[4]
-                 + fx->pipe[2] * c->m[8] + c->m[12];
-        pos[1] = fx->pipe[0] * c->m[1] + fx->pipe[1] * c->m[5]
-                 + fx->pipe[2] * c->m[9] + c->m[13];
-        pos[2] = fx->pipe[0] * c->m[2] + fx->pipe[1] * c->m[6]
-                 + fx->pipe[2] * c->m[10] + c->m[14];
-        dir[0] = fx->pipe_dir[0] * c->m[0] + fx->pipe_dir[1] * c->m[4]
-                 + fx->pipe_dir[2] * c->m[8];
-        dir[1] = fx->pipe_dir[0] * c->m[1] + fx->pipe_dir[1] * c->m[5]
-                 + fx->pipe_dir[2] * c->m[9];
-        dir[2] = fx->pipe_dir[0] * c->m[2] + fx->pipe_dir[1] * c->m[6]
-                 + fx->pipe_dir[2] * c->m[10];
-        n = emit_count(rate, dt, &fx->carry_gas);
+        pos[0] = em->pipe[0] * c->m[0] + em->pipe[1] * c->m[4]
+                 + em->pipe[2] * c->m[8] + c->m[12];
+        pos[1] = em->pipe[0] * c->m[1] + em->pipe[1] * c->m[5]
+                 + em->pipe[2] * c->m[9] + c->m[13];
+        pos[2] = em->pipe[0] * c->m[2] + em->pipe[1] * c->m[6]
+                 + em->pipe[2] * c->m[10] + c->m[14];
+        dir[0] = em->pipe_dir[0] * c->m[0] + em->pipe_dir[1] * c->m[4]
+                 + em->pipe_dir[2] * c->m[8];
+        dir[1] = em->pipe_dir[0] * c->m[1] + em->pipe_dir[1] * c->m[5]
+                 + em->pipe_dir[2] * c->m[9];
+        dir[2] = em->pipe_dir[0] * c->m[2] + em->pipe_dir[1] * c->m[6]
+                 + em->pipe_dir[2] * c->m[10];
+        n = emit_count(rate, dt, &em->carry_gas);
         while (n-- > 0)
-            spawn_gas(fx, pos, dir, c->body.v, spinning, loaded);
+            spawn_gas(fx, em, pos, dir, c->body.v, spinning, loaded);
     }
+}
 
-    /* ---- move and age everything ---- */
+/* Move and age the pool. ONCE a frame, after every emitter has spawned -- see
+   fx_emit. Running it per emitter would age the whole pool N times over. */
+void fx_age(fx_t *fx, float dt)
+{
+    int i;
+
+    if (!fx->enabled || dt <= 0.0f)
+        return;
+
     fx->n_live = 0;
     for (i = 0; i < FX_MAX_PARTICLES; i++) {
         fx_particle *p = &fx->p[i];
@@ -703,6 +729,13 @@ void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
         move(p, DUSTX_GRAVITY_Y, DUSTX_SPEED_ATT, dt);
         fx->n_live++;
     }
+}
+
+void fx_step(fx_t *fx, const rb_car *c, const col_t *col,
+             const float eye[3], float dt)
+{
+    fx_emit(fx, &fx->em, c, col, eye, dt);
+    fx_age(fx, dt);
 }
 
 /* ------------------------------------------------------------------ draw */
