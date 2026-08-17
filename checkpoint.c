@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Spelt out rather than taken from M_PI, which is not in ANSI C's math.h and is
+   how cam.c does it too. */
+#define CP_RAD2DEG 57.29577951308232
+
 static void cp_add_point(cp_t *c, const marker_t *m)
 {
     if (c->n >= CP_MAX_POINTS)
@@ -107,6 +111,13 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
     }
     c->enabled = (c->n > 0 && c->tex_common[0] != 0 && c->tex_custom[0] != 0);
     c->next = 0;
+    /* -1, not the 0 the memset left: 0 is a real checkpoint index, and a host
+       that reads `passed` before the first cp_step would hear the start line.
+       `last` for the same reason and a sharper one -- 0 would tell the respawn
+       path that the start/finish line has been crossed before the race began. */
+    c->passed = -1;
+    c->last = -1;
+    c->have_s = 0;
 }
 
 static float dist2_xz(const float *p, float x, float z)
@@ -115,44 +126,273 @@ static float dist2_xz(const float *p, float x, float z)
     return dx * dx + dz * dz;
 }
 
+int cp_progress(const checkpoints_t *c, float x, float z, float *out_s)
+{
+    float best2 = 1e30f, best_s = 0.f;
+    const float *a = NULL;
+    float arc_a = 0.f;
+    int k, j, found = 0;
+
+    if (!c || c->n <= 0)
+        return 0;
+
+    /* Walk the stitched polyline in the loader's own order and one leg further,
+       back to cp_0: the spine is CLOSED, and the leg that carries the start line
+       is exactly the one a lap has to be able to cross. */
+    for (k = 0; k <= c->n; k++) {
+        int kk = (k == c->n) ? 0 : k;
+        int nj = (k == c->n) ? 1 : c->cp[kk].n;
+        for (j = 0; j < nj; j++) {
+            const float *b = c->cp[kk].p[j];
+            float arc_b = (k == c->n) ? c->spine_len : c->cum[kk][j];
+            if (a) {
+                /* Nearest point on the segment, in XZ -- the same plane
+                   cp_step and cp_spine_dist measure in, because a car that is a
+                   metre above or below the marker line is still abreast of it. */
+                float dx = b[0] - a[0], dz = b[2] - a[2];
+                float l2 = dx * dx + dz * dz;
+                float u = 0.f, px, pz, d2;
+                if (l2 > 1e-12f) {
+                    u = ((x - a[0]) * dx + (z - a[2]) * dz) / l2;
+                    if (u < 0.f) u = 0.f;
+                    else if (u > 1.f) u = 1.f;
+                }
+                px = a[0] + dx * u;
+                pz = a[2] + dz * u;
+                d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+                if (d2 < best2) {
+                    best2 = d2;
+                    /* The arc runs along the 3D leg while u was solved in XZ, so
+                       a steep leg is interpolated slightly short. Immaterial
+                       here -- these are near-flat waypoint legs, and the
+                       quantity is only ever differenced against itself. */
+                    best_s = arc_a + (arc_b - arc_a) * u;
+                    found = 1;
+                }
+            }
+            a = b;
+            arc_a = arc_b;
+        }
+    }
+    if (!found) {                       /* one point, so no leg at all */
+        best_s = 0.f;
+        found = 1;
+    }
+    if (out_s)
+        *out_s = best_s;
+    return found;
+}
+
+/* Every checkpoint's arc-length STATION: where on the spine it sits. cp_0's is
+   0, which is also spine_len -- the start line is the seam. */
+static float cp_station(const checkpoints_t *c, int k)
+{
+    if (k <= 0 || k >= c->n)
+        return 0.f;
+    return c->cum[k][0];
+}
+
+/*
+ * The first checkpoint whose station is strictly ahead of `s`, wrapping to 0 --
+ * what the arrow should point at for a car that has just been put down.
+ *
+ * THE BOUNDARY, because the death respawn stands the car EXACTLY on a station and
+ * that is the one input where `>` could go either way. It does not, and the reason
+ * is exact rather than lucky: cp_progress builds its answer as
+ * `arc_a + (arc_b - arc_a) * u`, a marker is always a segment ENDPOINT, so u comes
+ * out 0 or 1 and `s` is bit-identical to the stored cum value. `station > s` is
+ * then false for the station the car is standing on, and the next one is returned.
+ *
+ * The case that would cost something is checkpoint 0, whose station is BOTH 0 and
+ * spine_len: if the projection preferred the closing leg (u = 1, s = spine_len)
+ * over the outgoing one (u = 0, s = 0), no station would be greater and this would
+ * hand back 0 -- the line the car has just crossed -- so the next metre driven
+ * would cross it again and count a phantom LAP, which is a whole spine of error in
+ * the opponents' lead. It cannot: cp_progress keeps a STRICTLY better d2 and visits
+ * the outgoing leg first, so the tie goes to u = 0. Measured over every checkpoint
+ * of all ten shipped tracks -- 0 of 50 aim back at themselves.
+ *
+ * There WAS a guard here forcing `next != last`, and it came out again. It is
+ * unnecessary given the above, and it is actively WRONG for the other way of
+ * arriving on that arc: a car teleported to just before the line, having crossed
+ * it a lap ago, genuinely is heading for checkpoint 0, and the guard would send it
+ * to 1. The property is asserted in vis_test against the real spines instead, so a
+ * change to cp_progress's tie-break shows up as a failure rather than being
+ * papered over here.
+ */
+static int cp_ahead(const checkpoints_t *c, float s)
+{
+    int k;
+    for (k = 1; k < c->n; k++)
+        if (cp_station(c, k) > s)
+            return k;
+    return 0;
+}
+
+void cp_resync(checkpoints_t *c, float x, float y, float z)
+{
+    float s;
+
+    (void)y;
+    if (!c)
+        return;
+    c->passed = -1;
+    c->have_s = 0;
+    if (c->n <= 0 || !cp_progress(c, x, z, &s))
+        return;
+    c->s = s;
+    c->have_s = 1;
+    c->next = cp_ahead(c, s);
+}
+
+void cp_restart(checkpoints_t *c, float x, float y, float z)
+{
+    if (!c)
+        return;
+    /* BEFORE the resync, not after: cp_resync recomputes `next` and must be the
+       last word on the cursor. Neither of these is derived from a position. */
+    c->lap = 0;
+    c->last = -1;
+    cp_resync(c, x, y, z);
+}
+
+int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
+{
+    const cp_t *k;
+    const float *a, *b = NULL;
+    float dx, dz, len;
+    int j, step, at;
+
+    if (!c || c->n <= 0 || c->last < 0 || c->last >= c->n)
+        return 0;
+
+    k = &c->cp[c->last];
+    if (k->n <= 0)
+        return 0;
+    a = k->p[0];
+
+    /* Aim along the spine, which means the NEXT point in the loader's own
+     * stitching order -- this checkpoint's first refining point if it has one,
+     * otherwise the next checkpoint. Walked rather than read directly, because a
+     * marker duplicated at the same coordinates (or a checkpoint whose refining
+     * point sits on top of it) gives no direction at all, and the answer is then
+     * the point after that rather than a yaw of zero. Bounded by the whole spine,
+     * so a track of coincident markers falls out with 0 and the caller uses the
+     * grid. */
+    at = c->last;
+    j = 1;
+    for (step = 0; step < c->n * CP_MAX_POINTS; step++) {
+        const float *p;
+        if (j >= c->cp[at].n) {
+            at = (at + 1) % c->n;
+            j = 0;
+            if (at == c->last)                 /* all the way round */
+                break;
+        }
+        p = c->cp[at].p[j];
+        j++;
+        dx = p[0] - a[0];
+        dz = p[2] - a[2];
+        if (dx * dx + dz * dz > 1e-4f) {       /* 1 cm of separation is plenty */
+            b = p;
+            break;
+        }
+    }
+    if (!b)
+        return 0;
+
+    dx = b[0] - a[0];
+    dz = b[2] - a[2];
+    len = (float)sqrt((double)dx * dx + (double)dz * dz);
+    if (!(len > 1e-6f))
+        return 0;
+
+    if (pos) {
+        pos[0] = a[0];
+        /* cp_t.ground, not the marker's own y: the markers float. The caller
+           re-probes anyway, and this is the fallback if that probe misses. */
+        pos[1] = k->ground;
+        pos[2] = a[2];
+    }
+    if (yaw_deg) {
+        /* rbcar_init's convention: local +Z on (sin yaw, 0, cos yaw), so the yaw
+           of a direction is atan2(x, z). Checked against tracks.h's own race
+           start headings, which cross into rbcar_init unchanged. */
+        *yaw_deg = (float)(atan2((double)dx, (double)dz) * CP_RAD2DEG);
+    }
+    return 1;
+}
+
 void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
 {
-    float near2 = 1e30f;
-    int owner = -1;
-    int k, j, prev;
+    float s, ds, cur, len;
+    int guard;
 
     (void)y;
     c->t += dt;
+    c->passed = -1;                    /* written every call: it is an EDGE */
     if (!c->enabled)
         return;
-
-    /* NOT the game's rule -- see checkpoint.h. But it is the game's DATA used
-       the way the game uses it: the checkpoints stitch into one closed spine,
-       and the race module measures progress as distance along it. So find the
-       spine point the car is nearest to; the checkpoint that owns it is the one
-       just passed, and the next one is what the arrow marks.
-     *
-     * Proximity to the checkpoint itself would be the obvious rule and is
-     * wrong: the waypoints sit 30 to 90 m apart on these tracks, and a car that
-     * takes a wide line past one never comes inside any sensible radius of it,
-     * so the arrow sticks on a checkpoint already behind the player. */
-    for (k = 0; k < c->n; k++) {
-        for (j = 0; j < c->cp[k].n; j++) {
-            float d2 = dist2_xz(c->cp[k].p[j], x, z);
-            if (d2 < near2) {
-                near2 = d2;
-                owner = k;
-            }
-        }
-    }
-    if (owner < 0)
+    if (!cp_progress(c, x, z, &s))
         return;
 
-    prev = c->next;
-    c->next = (owner + 1) % c->n;
-    /* one lap per wrap past the last checkpoint back to the start line */
-    if (prev == c->n - 1 && c->next == 0)
-        c->lap++;
+    /* First step after a load: nothing to compare against, so sync and aim the
+       arrow rather than inventing a crossing at the start line. */
+    if (!c->have_s) {
+        c->s = s;
+        c->have_s = 1;
+        c->next = cp_ahead(c, s);
+        return;
+    }
+
+    len = c->spine_len;
+    ds = s - c->s;
+    cur = c->s;
+    c->s = s;
+    if (len <= 1e-6f)
+        return;
+
+    /* Forward travel, taken the short way round the loop so crossing the seam at
+       the start line reads as a small step forward rather than a lap backwards. */
+    while (ds < -0.5f * len) ds += len;
+    while (ds >  0.5f * len) ds -= len;
+
+    if (ds < 0.f) {
+        /* Driving backwards. Nothing is un-passed -- the original's own distance
+           is monotonic across laps and a race module does not hand a checkpoint
+           back -- so the arrow holds and re-crossing the station fires again.
+           Deleting this changes NOTHING today, and it is written out anyway: the
+           loop below would break on `ds < gap` for any negative ds, so the
+           statement is here to say what the file means to do rather than to
+           carry the arithmetic. */
+        return;
+    }
+    if (ds > CP_MAX_STEP) {
+        cp_resync(c, x, y, z);         /* a teleport, or a leg swap: see the .h */
+        return;
+    }
+
+    /* Spend the travel along the spine, firing at each station it sweeps past.
+       Bounded by the checkpoint count: at 30 m between stations and a 10 m cap
+       this can only ever be one, and the loop is here so it cannot silently drop
+       the second if a track ever packs two close together. */
+    for (guard = 0; guard < c->n; guard++) {
+        float gap = cp_station(c, c->next) - cur;
+        while (gap < 0.f) gap += len;
+        if (ds < gap)
+            break;
+        ds -= gap;
+        cur = cp_station(c, c->next);
+        c->passed = c->next;
+        /* Latched, for the respawn point. See checkpoints_t.last. */
+        c->last = c->next;
+        /* Checkpoint 0 IS the start/finish line, so crossing its station is the
+           lap. Not "next wrapped to 0", which is the same event only while the
+           two rules agree about where the wrap happens. */
+        if (c->next == 0)
+            c->lap++;
+        c->next = (c->next + 1) % c->n;
+    }
 }
 
 int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,

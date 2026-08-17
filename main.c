@@ -268,31 +268,50 @@ static void env_normal_matrix(const float *carm, float vpitch, float vyaw,
 
 /* ------------------------------------------------- loading and respawning */
 
-/* Put the car on the current track's race start.
+/*
+ * PUT THE CAR DOWN. There are TWO reasons to now, and they are not the same
+ * reason:
  *
- * The ground probe is CEILED at the marker height plus a metre. Probing the
+ *   respawn()             the race is STARTING -- the grid, the lap back to
+ *                         zero, and the field back on its own grid.
+ *   respawn_checkpoint()  the car DIED -- back to the last checkpoint it
+ *                         actually crossed, with the lap, the opponents and the
+ *                         race all left running.
+ *
+ * The second is the change. Drowning and falling out of the world used to call
+ * respawn(), which is a whole race restart: ai_reset drops every opponent's
+ * cursor back to its own grid, so going in the sea on the last corner un-drove
+ * the race for the entire field as well as for the player. place_car is the part
+ * both share.
+ *
+ * The ground probe is CEILED at the reference height plus a metre. Probing the
  * whole column picks the highest surface anywhere above (x,z), and beach_2's
  * race start is under an overpass -- ground 3.19, roof 10.08 -- so the car
- * spawned seven metres up, rolled off the roof and fell out of the world. */
-static void respawn(void)
+ * spawned seven metres up, rolled off the roof and fell out of the world. The
+ * checkpoint markers want it just as much: they sit on the racing line, and on
+ * these tracks the racing line runs under things.
+ */
+static void place_car(float x, float z, float ref_y, float yaw)
 {
-    const track_info *t = &TRACKS[cur_track];
-    float gy = t->y, n0, n1, n2;
+    float gy = ref_y, n0, n1, n2;
 
-    if (!col_ground_at(&col, t->x, t->z, t->y + 1.0f, &gy, &n0, &n1, &n2))
-        gy = t->y;
+    if (!col_ground_at(&col, x, z, ref_y + 1.0f, &gy, &n0, &n1, &n2))
+        gy = ref_y;
     spawn_ground_y = gy;
 
     /* The heading goes across unchanged: the .sb Euler Y and rbcar_init's pose
        quaternion both map the car's local +Z to (sin yaw, 0, cos yaw). Checked
        numerically, not assumed -- four bugs in this port have come from
-       inheriting a convention unverified. */
-    rbcar_init(&rc, cur_car, col_rb_world(&col), t->x, gy, t->z, t->yaw);
+       inheriting a convention unverified. cp_respawn_pose builds its yaw in that
+       same convention, atan2(dx, dz) along the spine. */
+    rbcar_init(&rc, cur_car, col_rb_world(&col), x, gy, z, yaw);
     rc.tire_upgrade = menu.tires;
     rc.reso_upgrade = menu.reso;
     rc.boost_upgrade = menu.boost;
-    /* On the grid with a full meter, at whatever capacity this booster level
-       buys. AFTER the line above, not before -- the capacity reads it. */
+    /* With a full meter, at whatever capacity this booster level buys. AFTER the
+       line above, not before -- the capacity reads it. The original's own reset
+       path (0x004f27e6) fills the meter too, and it is the reset path for
+       drowning as much as for the grid. */
     rb_boost_reset(&rc);
     /* Throw away time banked across the load or the teleport: the world did not
        experience it, and spending it would run several ticks on the first frame
@@ -300,12 +319,12 @@ static void respawn(void)
     rbcar_clock_reset(&phys_clock);
     cam_init(&rcam, &rc);
     /* A respawn is a teleport, and a mark that survives one is drawn as a single
-       quad stretching from wherever the car was to the start line. The wheels
+       quad stretching from wherever the car was to where it landed. The wheels
        stay in contact across it, so nothing else would break the strip. */
     trace_clear(&traces);
 
     /* the pose mirror the HUD and the free-fly camera read */
-    vehicle_init(&veh, cur_car, t->x, gy + 0.06f, t->z, t->yaw);
+    vehicle_init(&veh, cur_car, x, gy + 0.06f, z, yaw);
 
     if (car.has_rig)
         carani_bind(&car.rig, &rc);
@@ -317,6 +336,27 @@ static void respawn(void)
     /* The engine's own reset cue. Also the one place the loops are guaranteed
        to be re-evaluated against a car that has just teleported. */
     sfx_respawn();
+}
+
+/* The race is starting: the grid, and everything that only a start resets. */
+static void respawn(void)
+{
+    const track_info *t = &TRACKS[cur_track];
+
+    place_car(t->x, t->z, t->y, t->yaw);
+
+    /* The spine cursor: the jump from wherever the car was back to the grid would
+       otherwise sweep past every checkpoint station in between and fire a cue for
+       each. cp_step's own CP_MAX_STEP guard would catch it a frame later; this
+       catches it on the frame it happens.
+     *
+     * cp_restart, not cp_resync: a START also puts the lap back to zero and
+     * forgets the last checkpoint crossed, so the first death of the new race
+     * sends the car to the grid and not to a checkpoint left over from the
+     * previous one. cp_resync deliberately keeps both, which is what the
+     * drowning path wants. */
+    cp_restart(&cps, t->x, spawn_ground_y, t->z);
+
     /* A restart puts the field back on its own grid. ai_reset also drops every
        cursor, so an opponent does not keep the lap it was on. */
     ai_reset(&ai);
@@ -324,8 +364,43 @@ static void respawn(void)
 
     rlog("[rccars] start: %s  (%d,%d,%d) cm  yaw=%d deg  car=%s\n",
                   TRACKS[cur_track].name,
-                  (int)(t->x * 100.f), (int)(gy * 100.f), (int)(t->z * 100.f),
+                  (int)(t->x * 100.f), (int)(spawn_ground_y * 100.f),
+                  (int)(t->z * 100.f),
                   (int)t->yaw, rbcar_name(cur_car));
+}
+
+/*
+ * THE CAR DIED -- drowned, or fell out of the world. Back to the last checkpoint
+ * it crossed, and NOT a restart.
+ *
+ * Two things are deliberately absent against respawn(): no ai_reset, so the
+ * opponents carry on from wherever they are; and cp_resync rather than
+ * cp_restart, so the lap and the last crossing survive -- a drowning does not
+ * un-drive a lap, and checkpoint.h says so at cp_resync.
+ *
+ * Falls back to the grid when cp_respawn_pose declines, which it does when no
+ * checkpoint has been crossed yet. That is the right answer rather than a
+ * degraded one: a car that drowns before its first checkpoint has nowhere else to
+ * go, and going to the grid is exactly what a race module would do. It comes out
+ * as a full respawn(), which is defensible -- the player has driven none of the
+ * race -- and it is the one case where dying does restart.
+ */
+static void respawn_checkpoint(void)
+{
+    float p[3], yaw;
+
+    if (!cp_respawn_pose(&cps, p, &yaw)) {
+        respawn();
+        return;
+    }
+
+    place_car(p[0], p[2], p[1], yaw);
+    cp_resync(&cps, p[0], spawn_ground_y, p[2]);
+
+    rlog("[rccars] respawn at checkpoint %d  (%d,%d,%d) cm  yaw=%d deg  "
+         "lap %d, race running\n",
+         cps.last + 1, (int)(p[0] * 100.f), (int)(spawn_ground_y * 100.f),
+         (int)(p[2] * 100.f), (int)yaw, cps.lap);
 }
 
 /* ai_track.spine, bound to checkpoint.c's own spine. The original asks the same
@@ -776,9 +851,31 @@ unsigned int acc_ticks = 0;
 
         /* The water clock and the wave sprites run whether or not the player is
            driving, so they step outside the free-cam branch. */
-        if (show_vis) {
+        if (show_vis)
             water_step(&water, dt);
-            cp_step(&cps, veh.x, veh.y, veh.z, dt);
+        /* NOT on show_vis. That button is for turning the port's own visual
+           subsystems off while looking for a rendering bug, and checkpoint
+           progression stopped being one of those when the crossing became the
+           thing that counts a lap and raises the cue -- cps.lap feeds the
+           opponents' rubber band. Only the ARROWS ride on show_vis now. */
+        cp_step(&cps, veh.x, veh.y, veh.z, dt);
+        /* `veh` is the pose MIRROR, written after the physics further down, so
+           this reads last frame's position. Deliberate: cps.lap is an input to
+           ai_step inside that same physics block, so the progression has to be
+           settled before it. It costs one frame of lag on top of the crossing
+           test's own one -- about 22 cm at this car's top speed -- and is worth
+           writing down only because the rule it replaced was out by tens of
+           metres. */
+        /* One cue per crossing. cps.passed is an EDGE (checkpoint.h), written by
+           every cp_step call, so this needs no previous-value bookkeeping of its
+           own -- which is what it used to have, hung off `next` changing, and
+           `next` changed at the midpoint between two checkpoints rather than at
+           one of them. That was "the sound triggers somewhere in different
+           places". */
+        if (cps.passed >= 0) {
+            sfx_checkpoint();
+            rlog("[rccars] checkpoint %d passed (lap %d)\n",
+                 cps.passed + 1, cps.lap);
         }
 
         float lx = axis(pad.lx), ly = axis(pad.ly);
@@ -963,8 +1060,8 @@ unsigned int acc_ticks = 0;
                the car was last placed on, not a constant: the tracks sit at very
                different heights (urban_2 starts at -0.45 m, beach_3 at 8.56). */
             if (veh.y < spawn_ground_y - 30.f) {
-                respawn();
-                rlog("[rccars] respawn (fell out of the world)\n");
+                rlog("[rccars] died: fell out of the world\n");
+                respawn_checkpoint();
             }
             /* Drowned. The original puts reset volumes over its water -- the
                track scripts named `car_reset`, loaded at 0x004f27a0, with the
@@ -979,9 +1076,9 @@ unsigned int acc_ticks = 0;
                 float wy;
                 if (col_water_at(&col, veh.x, veh.z, &wy)
                     && veh.y < wy - DROWN_DEPTH) {
-                    respawn();
-                    rlog("[rccars] respawn (drowned: %d cm under)\n",
+                    rlog("[rccars] died: drowned (%d cm under)\n",
                                   (int)((wy - veh.y) * 100.f));
+                    respawn_checkpoint();
                 }
             }
             /* The orbit offsets used to accumulate forever, so any stick nudge
@@ -1040,7 +1137,6 @@ unsigned int acc_ticks = 0;
            they see. vyaw is the renderer's yaw, which is what mix_pan expects
            -- see "The renderer's yaw convention is MIRRORED" in CLAUDE.md. */
         {
-            static int prev_cp = -1;
             float eye3[3];
             eye3[0] = ex; eye3[1] = ey; eye3[2] = ez;
 
@@ -1103,15 +1199,9 @@ unsigned int acc_ticks = 0;
                 }
             }
 
-            /* The port owns lap progression (the race module was never
-               transcribed), so the cue hangs off cp_step's own `next`. */
-            if (show_vis && cps.n > 0) {
-                if (prev_cp >= 0 && cps.next != prev_cp)
-                    sfx_checkpoint();
-                prev_cp = cps.next;
-            } else {
-                prev_cp = -1;
-            }
+            /* The checkpoint cue used to live here, once a second inside the
+               audio block, hung off `next` having changed since the last frame.
+               It is up beside cp_step now, on the crossing edge cp_step raises. */
         }
 
         /* The dust, the smoke and the tyre marks. All three read the wheel

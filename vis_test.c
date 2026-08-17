@@ -823,6 +823,78 @@ static int cp_find_draw(float cx, float cz)
     return -1;
 }
 
+/* --- the checkpoint spine, driven -----------------------------------------
+ *
+ * Flatten the stitched CLOSED spine into a polyline, then drive along it. Shared
+ * by the synthetic fixture below and by the ten real tracks after it, so the two
+ * measure the same thing and cannot drift apart.
+ */
+static int cp_flatten(const checkpoints_t *c, float path[][3])
+{
+    int np = 0, k, j;
+    for (k = 0; k < c->n; k++)
+        for (j = 0; j < c->cp[k].n; j++, np++)
+            memcpy(path[np], c->cp[k].p[j], sizeof(path[0]));
+    memcpy(path[np++], c->cp[0].p[0], sizeof(path[0]));   /* close it */
+    return np;
+}
+
+/* Two laps of it, in `step` metre increments. Reports what the crossings did:
+ * the count, the furthest any of them landed from the marker it claimed to have
+ * passed, whether they arrived in the spine's own order, and whether the lap
+ * counter ever moved on anything but checkpoint 0.
+ *
+ * Driven rather than jumped between waypoints on purpose: a crossing is an event
+ * in a continuous quantity, and teleporting from one waypoint to the next cannot
+ * see WHERE it happened -- which is the entire property under test.
+ */
+static int cp_drive(checkpoints_t *c, const float path[][3], int np, int laps,
+                    float step, float *worst, int *order, int *lap_bad)
+{
+    int fires = 0, seg, lap;
+
+    *worst = -1.f;
+    *order = 1;
+    *lap_bad = 0;
+
+    cp_step(c, path[0][0], path[0][1], path[0][2], 0.016f);
+    {
+        int want = c->next;
+        for (lap = 0; lap < laps; lap++)
+        for (seg = 0; seg + 1 < np; seg++) {
+            float ax = path[seg][0], az = path[seg][2];
+            float bx = path[seg + 1][0], bz = path[seg + 1][2];
+            float len = sqrtf((bx - ax) * (bx - ax) + (bz - az) * (bz - az));
+            int n = (int)(len / step) + 1, i;
+            for (i = 1; i <= n; i++) {
+                float u = (float)i / (float)n;
+                float x = ax + (bx - ax) * u, z = az + (bz - az) * u;
+                int lap_was = c->lap;
+                cp_step(c, x, 0.f, z, 0.016f);
+                /* THE LAP HAS TO TICK OVER ON THE START LINE and nowhere else.
+                   Counting it one station early passes any check on the TOTAL --
+                   there is still exactly one per lap -- and it is a real error,
+                   because the opponents' lead is spine_len*(lap - 1) + distance
+                   along the spine, so a lap counted at the last checkpoint puts a
+                   whole lap of it into the stretch before the line. A mutant that
+                   did exactly that survived everything here until this line. */
+                if ((c->lap != lap_was) != (c->passed == 0))
+                    *lap_bad = 1;
+                if (c->passed >= 0) {
+                    const float *m = c->cp[c->passed].p[0];
+                    float e = sqrtf((x - m[0]) * (x - m[0])
+                                    + (z - m[2]) * (z - m[2]));
+                    if (e > *worst) *worst = e;
+                    if (c->passed != want) *order = 0;
+                    want = (want + 1) % c->n;
+                    fires++;
+                }
+            }
+        }
+    }
+    return fires;
+}
+
 /* ============================================================== part 2 ==== */
 
 static void part2_checkpoints(void)
@@ -859,18 +931,311 @@ static void part2_checkpoints(void)
     ck(c.enabled, "enabled once both arrow sets resolve", "tex %u / %u",
        c.tex_common[0], c.tex_custom[0]);
 
-    /* --- progression: the nearest spine point names the checkpoint just
-           passed, so the arrow is on the one after it -------------------- */
-    cp_step(&c, 1.f, 0.f, 0.f, 0.016f);      /* sitting on cp_1 */
-    ck(c.next == 1, "at cp_1, the arrow is on cp_2", "next = %d", c.next);
-    cp_step(&c, 20.f, 1.f, 2.f, 0.016f);     /* past cp_2, on its chain */
-    ck(c.next == 2, "past cp_2, the arrow is on cp_3", "next = %d", c.next);
-    cp_step(&c, 20.f, 2.f, 19.f, 0.016f);    /* on cp_3 */
-    ck(c.next == 0 && c.lap == 1, "past the last one wraps and counts a lap",
-       "next = %d, lap = %d", c.next, c.lap);
-    cp_step(&c, 11.f, 0.f, 0.f, 0.016f);     /* back on cp_1's chain */
-    ck(c.next == 1 && c.lap == 1, "a wide line does not lose the arrow",
-       "next = %d, lap = %d", c.next, c.lap);
+    /* --- progression: a checkpoint is passed AT the checkpoint -----------
+     *
+     * The property, and the one this used to get wrong: the crossing has to
+     * happen where the checkpoint IS. `next` used to advance the moment the
+     * nearest spine SAMPLE changed owner, which on this fixture is the midpoint
+     * between cp_1_1 and cp_2 -- five metres early -- and on a real track is
+     * wherever the artist stopped adding refining points. That is the reported
+     * "the sound triggers somewhere in different places", and every check here
+     * before this one asked only which checkpoint the arrow had moved to, never
+     * WHERE the move happened. So the measurement is the distance from the car
+     * to the marker it just claimed to pass. Two laps, so the seam at the start
+     * line is crossed by driving and not by cp_init. */
+    {
+        float path[CP_MAX * CP_MAX_POINTS + 1][3];
+        int np = cp_flatten(&c, path);
+
+        /* Walk it at 0.25 m, which is twice the 0.125 m a car at top speed
+           covers in a 1/60 frame, so a check that bounds the error by the step
+           is not being generous to itself. */
+        {
+            const float STEP = 0.25f;
+            float worst;
+            int fires, order_ok, lap_bad;
+
+            cp_step(&c, path[0][0], path[0][1], path[0][2], 0.016f);
+            ck(c.next == 1 && c.passed < 0,
+               "the first step aims the arrow and passes nothing",
+               "next = %d, passed = %d", c.next, c.passed);
+
+            fires = cp_drive(&c, path, np, 2, STEP, &worst, &order_ok, &lap_bad);
+            ck(fires == 2 * c.n, "one crossing per checkpoint per lap, no more",
+               "%d crossings over 2 laps of %d checkpoints", fires, c.n);
+            ck(order_ok, "and they arrive in the spine's own order", "");
+            ck(!lap_bad, "the lap ticks over on the START LINE, and only there",
+               "%d crossings checked", fires);
+            /* Bound it by the STEP, not by a round number and not by anything
+               checkpoint.c owns: the car cannot be told it passed a marker it is
+               still driving at. Two steps of slack for the corner cases where a
+               station sits on a bend. The old rule fires 5 m out here and dies
+               on this. */
+            ck(worst >= 0.f && worst < 2.f * STEP,
+               "and each fires AT its own marker, not between two of them",
+               "worst %.3f m from the marker (step %.2f m)", worst, STEP);
+            ck(c.lap == 2, "and the start line is what counts a lap",
+               "lap = %d after 2 laps", c.lap);
+        }
+
+        /* A WIDE LINE. The rule that would be obvious here -- a radius around
+           the marker -- fails exactly this case, which is why checkpoint.h
+           argues against it: these waypoints are 30 to 90 m apart on a real
+           track, and a car cutting a corner never comes inside any sensible
+           radius of one. Same lap, driven 3 m OUTSIDE every leg -- outside
+           because the offset has to stay on one side of the loop, and a fixed
+           vector on this fixture would put part of the path straight down the
+           middle of the closing leg. */
+        {
+            float cx = 0.f, cz = 0.f;
+            int fires = 0, seg, i3;
+            for (i3 = 0; i3 + 1 < np; i3++) {  /* centroid, minus the repeat */
+                cx += path[i3][0] / (float)(np - 1);
+                cz += path[i3][2] / (float)(np - 1);
+            }
+            cp_resync(&c, path[0][0], path[0][1], path[0][2] - 3.f);
+            for (seg = 0; seg + 1 < np; seg++) {
+                float ax = path[seg][0], az = path[seg][2];
+                float bx = path[seg + 1][0], bz = path[seg + 1][2];
+                float dx = bx - ax, dz = bz - az;
+                float len = sqrtf(dx * dx + dz * dz);
+                float nx, nz, i2, n;
+                if (len < 1e-6f)
+                    continue;
+                nx = -dz / len; nz = dx / len;         /* a leg normal */
+                if (nx * (0.5f * (ax + bx) - cx)        /* the OUTWARD one */
+                    + nz * (0.5f * (az + bz) - cz) < 0.f) {
+                    nx = -nx; nz = -nz;
+                }
+                n = (float)((int)(len / 0.25f) + 1);
+                for (i2 = 1.f; i2 <= n; i2 += 1.f) {
+                    float u = i2 / n;
+                    cp_step(&c, ax + dx * u + nx * 3.f, 0.f,
+                            az + dz * u + nz * 3.f, 0.016f);
+                    if (c.passed >= 0)
+                        fires++;
+                }
+            }
+            ck(fires == c.n, "a wide line still passes every checkpoint",
+               "%d of %d, 3 m off the line", fires, c.n);
+        }
+
+        /* A TELEPORT is not a lap. Respawning across the far side of the spine
+           sweeps past every station in between, and cp_resync is what stops that
+           being a burst of cues. */
+        {
+            int lap0 = c.lap;
+            cp_resync(&c, c.cp[2].p[0][0], c.cp[2].p[0][1], c.cp[2].p[0][2]);
+            /* Aim the arrow at a checkpoint already behind the car, on purpose.
+               Without this the previous lap has ALREADY left it on 1 and the
+               re-aim check passes on the value it happened to hold -- which is
+               how a mutant that dropped the re-aim entirely survived it. */
+            c.next = 2;
+            cp_step(&c, c.cp[0].p[0][0], 0.f, c.cp[0].p[0][2], 0.016f);
+            ck(c.passed < 0 && c.lap == lap0,
+               "a teleport back to the start line passes nothing",
+               "passed = %d, lap %d -> %d", c.passed, lap0, c.lap);
+            ck(c.next == 1, "and re-aims the arrow at the checkpoint ahead of it",
+               "next = %d (was pointed at 2 before the teleport)", c.next);
+        }
+
+        /* And DRIVING BACKWARDS does not hand a checkpoint back. */
+        {
+            int lap0 = c.lap;
+            cp_resync(&c, 5.f, 0.f, 0.f);
+            cp_step(&c, 4.f, 0.f, 0.f, 0.016f);
+            cp_step(&c, 3.f, 0.f, 0.f, 0.016f);
+            ck(c.passed < 0 && c.next == 1 && c.lap == lap0,
+               "driving backwards passes nothing and holds the arrow",
+               "passed = %d, next = %d, lap %d", c.passed, c.next, c.lap);
+        }
+
+        /* --- WHERE A DEAD CAR GOES BACK TO -----------------------------------
+         *
+         * cp_respawn_pose, and the three things around it. This is what stops a
+         * drowning being a race restart: main.c used to call respawn(), which puts
+         * the whole FIELD back on its own grid, so going in the sea on the last
+         * corner un-drove the race for everybody.
+         *
+         * The pose comes off `last` -- the crossing the car really made -- and NOT
+         * off `next - 1`, and the fixture drives to it rather than assigning it,
+         * because `last` being latched by a real crossing is half the property.
+         */
+        {
+            checkpoints_t r;
+            float pos[3], yaw;
+
+            /* NOTHING CROSSED YET: no pose, so main.c falls back to the grid. A
+               car that drowns before its first checkpoint has nowhere else to go,
+               and the alternative -- deriving the answer from `next` -- sends it
+               HALF A LAP BACKWARDS at the start line, because cp_0's station is
+               both 0 and spine_len and which side the grid falls on is an accident
+               of the track. */
+            cp_init(&r, s, NULL);
+            ck(r.last < 0, "a fresh spine has crossed nothing",
+               "last = %d", r.last);
+            ck(!cp_respawn_pose(&r, pos, &yaw),
+               "so there is no respawn point and the caller uses the grid", "");
+
+            /* DRIVE a full closed lap. The flattened path ends back at cp_0, so the
+               last crossing it makes is the start line -- which is the case that
+               can cost a lap, and the one worth landing on. Driven, not assigned:
+               `last` being latched by a real crossing is half the property. */
+            {
+                int np2 = cp_flatten(&r, path);
+                float w2; int o2, lb2;
+                r.enabled = 1;
+                cp_drive(&r, path, np2, 1, 0.25f, &w2, &o2, &lb2);
+                ck(r.last == 0,
+                   "driving a closed lap latches the crossing of the start line",
+                   "last = %d, lap %d", r.last, r.lap);
+            }
+
+            if (r.last == 0) {
+                int lap0 = r.lap;
+                ck(cp_respawn_pose(&r, pos, &yaw),
+                   "after crossing the start line there IS a respawn point", "");
+                /* AT the marker, in XZ. The y is cp_t.ground rather than the
+                   marker's own height -- the markers float 0.18 to 0.49 m -- and
+                   main.c re-probes it anyway. */
+                ck(near(pos[0], c.cp[0].p[0][0], 1e-3f)
+                   && near(pos[2], c.cp[0].p[0][2], 1e-3f),
+                   "and it is the checkpoint's own position",
+                   "(%.2f, %.2f) vs marker (%.2f, %.2f)", pos[0], pos[2],
+                   c.cp[0].p[0][0], c.cp[0].p[0][2]);
+                /* ALONG THE SPINE. The fixture's first leg runs from the origin
+                   10 m along +X, and rbcar_init's convention puts local +Z on
+                   (sin yaw, 0, cos yaw), so a heading down +X is yaw +90 degrees.
+                   Spelled out from the geometry, not from what checkpoint.c
+                   computed -- a car dropped back facing the way it came is worse
+                   than not respawning it. */
+                ck(near(sinf(yaw * (float)(M_PI / 180.0)), 1.f, 1e-3f)
+                   && near(cosf(yaw * (float)(M_PI / 180.0)), 0.f, 1e-3f),
+                   "aimed along the spine -- +X here, i.e. yaw +90",
+                   "yaw = %.2f deg", yaw);
+
+                /* THE BOUNDARY. Standing the car exactly ON the station it just
+                   crossed puts cp_progress ON that station, and `station > s`
+                   landing on the wrong side would aim the arrow back at the
+                   checkpoint the car is sitting on. At checkpoint 0 that costs a
+                   LAP, because the start line's station is both 0 and spine_len, so
+                   the very next metre driven sweeps past it again -- and the
+                   opponents' lead is spine_len*(lap - 1) + distance, so a phantom
+                   lap is a whole spine of error in the rubber band.
+                 *
+                 * It comes out right from cp_progress's own tie-break rather than
+                 * from a guard in cp_ahead (there was one; it came out again -- see
+                 * the comment there). Which is exactly why this has to be asserted:
+                 * it is a property of another function, and nothing in the respawn
+                 * path enforces it. */
+                cp_resync(&r, pos[0], pos[1], pos[2]);
+                ck(r.next != r.last,
+                   "respawning ON a station does not aim the arrow back at it",
+                   "next = %d, last = %d", r.next, r.last);
+                ck(r.lap == lap0, "and the respawn itself counts no lap",
+                   "lap %d -> %d", lap0, r.lap);
+                /* Then DRIVE away from it, which is where the phantom lap would
+                   actually land. */
+                {
+                    int i2, phantom = 0;
+                    for (i2 = 1; i2 <= 40; i2++) {
+                        cp_step(&r, pos[0] + (float)i2 * 0.25f, 0.f, pos[2],
+                                0.016f);
+                        if (r.passed == 0) phantom = 1;
+                    }
+                    ck(!phantom && r.lap == lap0,
+                       "and driving off it does not cross the line a second time",
+                       "lap %d -> %d", lap0, r.lap);
+                }
+            } else {
+                ck(0, "the fixture reached a crossing of checkpoint 0", "");
+            }
+
+            /* cp_resync KEEPS what a death must not undo; cp_restart clears it.
+               These are the two calls main.c's two respawn paths take, and getting
+               them the wrong way round is the whole bug in either direction: a
+               death that restarts the race, or a restart that inherits the
+               previous run's lap and checkpoint. */
+            r.lap = 3;
+            r.last = 1;
+            cp_resync(&r, c.cp[1].p[0][0], c.cp[1].p[0][1], c.cp[1].p[0][2]);
+            ck(r.lap == 3 && r.last == 1,
+               "a DEATH resync keeps the lap and the last checkpoint",
+               "lap %d, last %d", r.lap, r.last);
+            cp_restart(&r, path[0][0], path[0][1], path[0][2]);
+            ck(r.lap == 0 && r.last == -1,
+               "and a RESTART clears both, so the next death goes to the grid",
+               "lap %d, last %d", r.lap, r.last);
+            ck(!cp_respawn_pose(&r, pos, &yaw),
+               "which is exactly what cp_respawn_pose then reports", "");
+        }
+
+        /* A CHECKPOINT WITH ITS FIRST REFINING POINT ON TOP OF IT gives no
+         * direction at all, so cp_respawn_pose walks on down the spine instead of
+         * handing back a yaw of zero. None of the ten shipped tracks does this --
+         * which is precisely why it needs a fixture: a defensive branch no data
+         * reaches is a branch nobody has ever run, and a mutant that deleted the
+         * separation test survived every check above.
+         *
+         * Its own scene, because the markers are the scene's and this one is
+         * deliberately malformed. */
+        {
+            static const char *tx[] = {
+                "cp_ar_2_f1", "cp_ar_2_f2", "cp_ar_2_f3",
+                "cp_ar_3_f1", "cp_ar_3_f2", "cp_ar_3_f3"
+            };
+            scene_t *s2 = make_scene(tx, 6);
+            checkpoints_t d;
+            float pos[3], yaw;
+
+            add_marker(s2, "cp_1", 0.f, 0.f, 0.f, 0.f);
+            add_marker(s2, "cp_1_1", 0.f, 0.f, 0.f, 0.f);      /* on top of it */
+            add_marker(s2, "cp_1_2", 0.f, 0.f, -10.f, 0.f);    /* the real way on */
+            add_marker(s2, "cp_2", 10.f, 0.f, -10.f, 0.f);
+
+            cp_init(&d, s2, NULL);
+            d.last = 0;
+            ck(cp_respawn_pose(&d, pos, &yaw),
+               "a coincident refining point does not defeat the respawn pose", "");
+            /* cp_1_2 is 10 m along -Z, and local +Z on (sin yaw, 0, cos yaw) puts
+               a heading down -Z at yaw 180. Read off the fixture's geometry. */
+            ck(near(sinf(yaw * (float)(M_PI / 180.0)), 0.f, 1e-3f)
+               && near(cosf(yaw * (float)(M_PI / 180.0)), -1.f, 1e-3f),
+               "it walks past it to the next real point -- yaw 180, down -Z",
+               "yaw = %.2f deg", yaw);
+        }
+    }
+
+    /* cp_progress is continuous where cp_spine_dist snaps to a sample -- that is
+       the whole reason the crossing can be located to a frame of travel. Measured
+       against the fixture's own geometry: the first leg runs 10 m along +X from
+       the origin, so 4 m along it is 4 m of arc, and the nearest spine SAMPLE is
+       still cp_1 at the origin. */
+    {
+        float s4 = -1.f, s_snap = -1.f;
+        cp_progress(&c, 4.f, 0.f, &s4);
+        cp_spine_dist(&c, 4.f, 0.f, 0.f, &s_snap, NULL);
+        ck(near(s4, 4.f, 1e-3f), "cp_progress interpolates along a leg",
+           "%.3f m of arc, 4 m along a 10 m leg", s4);
+        ck(near(s_snap, 0.f, 1e-3f),
+           "while cp_spine_dist still snaps -- the AI's measure, left alone",
+           "%.3f m", s_snap);
+    }
+
+    /* The lateral offset must not move the arc position: a car three metres wide
+       of a straight leg is exactly as far along it. */
+    {
+        float on = -1.f, off = -1.f;
+        cp_progress(&c, 4.f, 0.f, &on);
+        cp_progress(&c, 4.f, -3.f, &off);
+        ck(near(on, off, 1e-3f), "and a lateral offset does not move it",
+           "%.3f vs %.3f m", on, off);
+    }
+
+    /* Reset what the driving left behind: the placement checks below pick their
+       own `next` and their own clock. */
+    c.lap = 0;
+    c.passed = -1;
 
     /* --- placement and the distance fade -------------------------------- */
     c.next = 1;                              /* cp_2, at (20, 1, 0) */
@@ -1043,6 +1408,174 @@ static void part2_checkpoints(void)
         gl_cap_reset();
         cp_draw(&c, eye);
         ck_state_restored("cp_draw");
+    }
+
+    /* --- and now the SAME drive on all TEN REAL SPINES -------------------
+     *
+     * A synthetic square and a real track find different bugs, and this is the
+     * bit the square cannot speak for: the real spines carry 14 to 39 points over
+     * 640 to 955 m, they bend, and several of them run back close alongside
+     * themselves -- which is exactly where a nearest-segment projection can jump
+     * legs and lose a crossing. Cheap enough to be unconditional: about a second
+     * for all ten.
+     *
+     * `enabled` is forced, because it gates on the two arrow textures resolving
+     * and that is a question about the ATLAS, not about the spine. Everything
+     * else here is the shipped data.
+     *
+     * The number this replaces: measured over these same ten files, the old rule
+     * -- advance when the nearest spine SAMPLE changes owner -- fires between
+     * 7.3 m and 75.6 m before the checkpoint, mean 24 to 45 m per track. That is
+     * the reported "the sound triggers somewhere in different places", quantified.
+     */
+    {
+        static const char *const TRK[10] = {
+            "beach_1", "beach_2", "beach_3", "beach_4", "country_1",
+            "country_2", "country_3", "country_4", "urban_1", "urban_2"
+        };
+        int t, bad_fires = 0, bad_order = 0, bad_lap = 0, loaded = 0;
+        float worst_all = -1.f;
+        /* The respawn point, on the real spines: how many checkpoints across all
+           ten tracks failed to give one, landed away from their own marker, or were
+           aimed anywhere but forward along the spine. */
+        int rsp_total = 0, rsp_none = 0, rsp_far = 0, rsp_backwards = 0;
+        int rsp_aim_back = 0, rsp_refire = 0, rsp_phantom = 0;
+        float rsp_worst_dot = 2.f;
+
+        for (t = 0; t < 10; t++) {
+            char p[64];
+            scene_t ts;
+            col_t tc;
+            checkpoints_t rc;
+            float path[CP_MAX * CP_MAX_POINTS + 1][3];
+            float worst;
+            int np, fires, order_ok, lap_bad;
+
+            snprintf(p, sizeof(p), "assets/%s.vsc", TRK[t]);
+            if (!scene_load(p, &ts))
+                continue;                    /* counted below, not skipped */
+            loaded++;
+            snprintf(p, sizeof(p), "assets/%s.col", TRK[t]);
+            memset(&tc, 0, sizeof(tc));
+            col_load(p, &tc);
+            cp_init(&rc, &ts, &tc);
+            rc.enabled = (rc.n > 0);
+
+            np = cp_flatten(&rc, path);
+            /* 0.125 m: one 1/60 frame at this car's 7.5 m/s top speed, so the
+               error bound below is bounded by a real frame and not by a step
+               chosen to make it pass. */
+            fires = cp_drive(&rc, path, np, 2, 0.125f, &worst, &order_ok,
+                             &lap_bad);
+            if (fires != 2 * rc.n || rc.lap != 2) bad_fires++;
+            if (!order_ok) bad_order++;
+            if (lap_bad) bad_lap++;
+            if (worst > worst_all) worst_all = worst;
+
+            /* THE RESPAWN POINT, for EVERY checkpoint on every real track. The
+             * synthetic square has one leg shape; the real spines bend, and the
+             * point after a checkpoint can be a refining point 2 m away or the next
+             * checkpoint 90 m away, which is precisely what the walk in
+             * cp_respawn_pose is for.
+             *
+             * `last` is set directly here rather than driven to, because driving to
+             * each of up to eight checkpoints on each of ten tracks is the same
+             * crossing test cp_drive already ran; what is under test here is the
+             * POSE, and part 2's synthetic block above is where the latch is
+             * checked against a real drive.
+             */
+            {
+                int k;
+                for (k = 0; k < rc.n; k++) {
+                    float pos[3], yaw, fx, fz, dx, dz, len, dot;
+                    const float *m = rc.cp[k].p[0];
+                    rc.last = k;
+                    rsp_total++;
+                    if (!cp_respawn_pose(&rc, pos, &yaw)) { rsp_none++; continue; }
+                    /* On its own marker. */
+                    if (fabsf(pos[0] - m[0]) > 1e-3f
+                        || fabsf(pos[2] - m[2]) > 1e-3f) rsp_far++;
+                    /* AIMED FORWARD. The heading rbcar_init would build from this
+                       yaw, dotted with the direction to the next point on the
+                       spine -- which for a bend is not the same vector, so the
+                       bound is "the right side of sideways" and not "identical".
+                       A negative dot is a car dropped back facing the way it
+                       came. */
+                    fx = sinf(yaw * (float)(M_PI / 180.0));
+                    fz = cosf(yaw * (float)(M_PI / 180.0));
+                    if (rc.cp[k].n > 1) {
+                        dx = rc.cp[k].p[1][0] - m[0];
+                        dz = rc.cp[k].p[1][2] - m[2];
+                    } else {
+                        const float *nx2 = rc.cp[(k + 1) % rc.n].p[0];
+                        dx = nx2[0] - m[0];
+                        dz = nx2[2] - m[2];
+                    }
+                    len = sqrtf(dx * dx + dz * dz);
+                    if (len < 1e-4f) continue;
+                    dot = (fx * dx + fz * dz) / len;
+                    if (dot < 0.99f) rsp_backwards++;
+                    if (dot < rsp_worst_dot) rsp_worst_dot = dot;
+
+                    /* AND THE BOUNDARY, on real geometry: standing the car on the
+                       station it just crossed must not aim the arrow back at it,
+                       and driving off it must not re-cross it. cp_ahead has no
+                       guard for this -- it falls out of cp_progress putting a
+                       marker exactly on its own stored arc length -- so this is the
+                       only thing holding the property, and a phantom lap at
+                       checkpoint 0 is the expensive failure. */
+                    {
+                        int lap0 = rc.lap, i2;
+                        cp_resync(&rc, pos[0], pos[1], pos[2]);
+                        if (rc.next == k) rsp_aim_back++;
+                        for (i2 = 1; i2 <= 24; i2++) {
+                            cp_step(&rc, pos[0] + fx * (float)i2 * 0.125f, 0.f,
+                                    pos[2] + fz * (float)i2 * 0.125f, 0.016f);
+                            if (rc.passed == k) rsp_refire++;
+                        }
+                        if (rc.lap != lap0) rsp_phantom++;
+                        rc.lap = lap0;
+                    }
+                }
+            }
+
+            free(tc.tris); free(tc.start); free(tc.idx);
+            scene_release(&ts);
+        }
+
+        ck(loaded == 10, "all ten packed tracks load (run from rccars_vita/)",
+           "%d of 10", loaded);
+        ck(loaded == 10 && bad_fires == 0,
+           "every real spine passes each checkpoint once a lap, and counts the lap",
+           "%d of %d tracks disagree", bad_fires, loaded);
+        ck(bad_order == 0, "in the spine's own order on every one of them",
+           "%d tracks out of order", bad_order);
+        ck(bad_lap == 0, "and the lap only ever ticks over on the start line",
+           "%d tracks tick it elsewhere", bad_lap);
+        ck(loaded == 10 && worst_all >= 0.f && worst_all < 0.25f,
+           "and no crossing on any real track fires away from its own marker",
+           "worst %.3f m over ten tracks (the OLD rule: 7.3 to 75.6 m early)",
+           worst_all);
+
+        /* The respawn point, over every checkpoint the ten shipped tracks carry. */
+        ck(loaded == 10 && rsp_total >= 30,
+           "every real track's checkpoints are available as respawn points",
+           "%d checkpoints over %d tracks", rsp_total, loaded);
+        ck(rsp_none == 0, "and each one yields a respawn pose",
+           "%d of %d declined", rsp_none, rsp_total);
+        ck(rsp_far == 0, "on its own marker",
+           "%d of %d landed elsewhere", rsp_far, rsp_total);
+        ck(rsp_backwards == 0,
+           "and aimed FORWARD along the spine, not back the way the car came",
+           "%d of %d wrong-way; worst heading dot %.4f", rsp_backwards,
+           rsp_total, rsp_worst_dot);
+        ck(rsp_aim_back == 0,
+           "respawning ON a station never aims the arrow back at it",
+           "%d of %d on the real spines", rsp_aim_back, rsp_total);
+        ck(rsp_refire == 0 && rsp_phantom == 0,
+           "and driving off it re-crosses nothing -- no phantom lap at the line",
+           "%d re-fires, %d phantom laps of %d", rsp_refire, rsp_phantom,
+           rsp_total);
     }
 }
 
