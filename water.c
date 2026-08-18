@@ -12,26 +12,19 @@
 #define TWO_PI 6.2831853f
 #define DEG (float)(M_PI / 180.0)
 
-/* Water this deep heaves at full amplitude; shallower fades to flat. The
-   engine's own equivalent is the magnet/clampY block, which is not
-   transcribed. This is the port's stand-in and the one number in this file that
-   is not the game's. Chosen as amp + amp2 rounded up: a swell that would
-   otherwise reach the seabed is exactly the one that has to be damped. */
-#define WATER_DEPTH_FADE 0.5f
+/* Everything the sea surface is shaped by now comes out of WSURF[track] in
+   vis_data.h, which is generated from the track's OWN config section and cites
+   FUN_00521540 for every conversion. Three constants used to live here instead:
 
-/* WSURF_OFFSET is `offset` out of the level's WaterLOD section, raw*0.01 - 0.5,
-   which is -0.37 m for beach_1. The CONSTANT is recovered; that it is the
-   surface's vertical offset is INFERRED -- the loader stashes it at param_2[0x1d]
-   and the code that consumes it is not transcribed. It is applied because the
-   authored `sea` tiles sit at y = 0, the waterline that puts on the beach is
-   visibly too far up it, and this is the one recovered value left with the right
-   sign and magnitude to explain that. If it turns out to mean something else,
-   this line is where to look. */
-
-/* WATER_SWELL_AMP lives in water.h -- small on purpose: the reference
-   screenshots show an essentially flat ocean whose motion is in the texture and
-   the foam, and anything larger reads as a storm next to a 0.42 m car. */
-
+     WATER_DEPTH_FADE 0.5f    the depth the swell fades out over. It is
+                              cfg->magnet_radius, and the shipped value is
+                              2.55 m -- magnetRadius converts as raw*0.05.
+     WSURF_OFFSET             the surface's vertical offset. It is cfg->offset,
+                              it is per track, and the port compiled beach_1's
+                              -0.37 m into all ten. It is now also what
+                              pack_col.py bakes into the .col water grid, so the
+                              waterline the car feels is the one it can see.
+     WATER_SWELL_AMP 0.02f    the swell height. See water.h. */
 
 /* ------------------------------------------------------------------ sine LUT
  *
@@ -77,59 +70,67 @@ static float rnd01(water_t *w) { return (float)(rnd(w) & 0xffffff) / 16777216.f;
 
 /* ------------------------------------------------------------ the two waves
  *
- * WSURF_* give the two wave trains' DIRECTIONS and RATES. They do not give
- * amplitudes -- FUN_00521540 never reads `amp` at all, and it stores 1/amp2 and
- * 1/length2, which is what you precompute for a divisor rather than for a
- * height. So this returns a normalised -1..+1 signal and the callers scale it.
+ * FUN_005240c0, the sea's own vertex animator, with the projections
+ * FUN_0051c000 precomputes at load folded back in. Two trains:
  *
- * The first version of this file scaled it by `amp` + `amp2` = 0.41 m and
- * displaced the sea surface with it. On a beach whose car is 0.42 m long that is
- * a storm, and `amp` is a key the engine does not even read. The retail game's
- * ocean is visually flat and animated by its texture; see CLAUDE.md.
+ *   1  directional, along (cos angle, sin angle), wavelength 2*pi/period and
+ *      phase speed `speed`; its amplitude term is 0.25 + 0.75*sin, which spans
+ *      -0.5..+1.0, so crests stand twice as far above the mean as troughs fall
+ *      below it. That asymmetry is the engine's, not a simplification.
+ *   2  RADIAL about (posX, posZ), wavelength 2*pi*length2, angular rate period2.
+ *      angle2 and speed2 are loaded and this function never reads them.
  *
- * `stretch` divides the whole phase, which scales wavelength and period by the
- * same factor and so leaves the wave SPEED alone. The surface passes 1; the
- * shoreline foam passes COAST_WAVE_STRETCH, because the coast bands are coarser
- * than the recovered wavelength and sampling it per vertex aliases -- see
- * water.h.
+ * The first version of this file summed two DIRECTIONAL sines at 1.24 m and
+ * 1.61 m and scaled them by 0.02 m, having read `period` as a time and `amp` as
+ * a key the loader ignores. It reads it: the string at 0x5756e0 is "amp" and it
+ * lands in param_2[8].
  */
-static float surf_signal(float x, float z, float t, float stretch)
-{
-    static int ready;
-    static float d1x, d1z, k1, d2x, d2z, k2;
-    float is = (stretch > 1e-4f) ? 1.f / stretch : 1.f;
-    float h;
 
-    if (!ready) {
-        float a1 = WSURF_ANGLE_DEG * DEG, a2 = WSURF_ANGLE2_DEG * DEG;
-        float l1 = WSURF_SPEED * WSURF_PERIOD;
-        d1x = sinf(a1); d1z = cosf(a1);
-        d2x = sinf(a2); d2z = cosf(a2);
-        k1 = (l1 > 1e-4f) ? 1.f / l1 : 0.f;
-        k2 = (WSURF_LENGTH2 > 1e-4f) ? 1.f / WSURF_LENGTH2 : 0.f;
-        ready = 1;
-    }
-    h = 0.5f * fsin(((x * d1x + z * d1z) * k1 - t / WSURF_PERIOD) * is);
-    h += 0.5f * fsin(((x * d2x + z * d2z) * k2 - t / WSURF_PERIOD2) * is);
-    return h;
+/* fsin takes turns; the engine's phases are radians. */
+static float fsinr(float rad) { return fsin(rad * (1.f / TWO_PI)); }
+
+/* The radial train's phase, radians. Shared with the shoreline foam, which
+   FUN_0051c690 drives off this same sine and nothing else. Zero length2 means
+   the section shipped none and there is no wave. */
+static float radial_phase(const wsurf_t *c, float x, float z, float t)
+{
+    float dx = x - c->pos_x, dz = z - c->pos_z;
+    if (c->length2 < 1e-4f)
+        return 0.f;
+    return t * c->period2 + sqrtf(dx * dx + dz * dz) / c->length2;
+}
+
+/* The sea's vertical displacement at (x, z), metres, BEFORE the depth damping
+   and before the track's own vertical offset. */
+static float surf_disp(const water_t *w, float x, float z, float t)
+{
+    const wsurf_t *c = w->cfg;
+    float s1 = fsinr((t * c->speed + x * w->d1x + z * w->d1z) * c->period);
+    float s2 = fsinr(radial_phase(c, x, z, t));
+    return c->amp * (0.25f + 0.75f * s1) + c->amp2 * s2;
 }
 
 /*
- * The height the SHORELINE FOAM keys on. This one is pinned down: WaterLOD_Coast
- * ships HeightOn and HeightOff, the surface heights at which the foam is fully
- * on and fully off, so a signal spanning exactly that range is the one the two
- * constants were written for.
+ * The height the SHORELINE FOAM keys on. FUN_0051c690 reads the RADIAL train
+ * alone, at unit amplitude -- 0x51c71d multiplies the sine by amp2 and then by
+ * the 1/amp2 the loader precomputed beside it, which is what that reciprocal
+ * was for. WaterLOD_Coast's HeightOn and HeightOff are the surface heights at
+ * which the foam is fully on and fully off, so a signal spanning exactly that
+ * range is the one the two constants were written for.
+ *
+ * The engine's remap of the signal to an alpha is asymmetric and is not
+ * transcribed -- see water.h.
  */
-static float shore_height(float x, float z, float t)
+static float shore_height(const water_t *w, float x, float z, float t)
 {
     const float mid = 0.5f * (COAST_HEIGHT_ON + COAST_HEIGHT_OFF);
     const float half = 0.5f * (COAST_HEIGHT_ON - COAST_HEIGHT_OFF);
-    return mid + half * surf_signal(x, z, t, COAST_WAVE_STRETCH);
+    return mid + half * fsinr(radial_phase(w->cfg, x, z, t));
 }
 
 float water_height(const water_t *w, float x, float z)
 {
-    return WATER_SWELL_AMP * surf_signal(x, z, w->t, 1.f);
+    return surf_disp(w, x, z, w->t);
 }
 
 /* ------------------------------------------------------------------- setup */
@@ -147,6 +148,7 @@ static float depth_at(const col_t *col, const vtx_t *v)
 static void build_damping(water_t *w, const col_t *col)
 {
     scene_t *s = w->scene;
+    const wsurf_t *c = w->cfg;
     unsigned int i, j;
 
     for (i = 0; i < s->n_batches; i++) {
@@ -157,11 +159,16 @@ static void build_damping(water_t *w, const col_t *col)
         if (!w->damp[i])
             continue;
         for (j = 0; j < b->nverts; j++) {
-            float d = depth_at(col, &b->verts[j]) / WATER_DEPTH_FADE;
+            /* LINEAR, and over cfg->magnet_radius. Both used to be guesses --
+               a smoothstep over 0.5 m -- and both are FUN_0051c000's: it
+               divides by magnetRadius and clamps, with no shaping. The 2.55 m
+               it clamps over is five times the guess, so the swell now settles
+               out over a real shelf rather than snapping flat at the last
+               half-metre. */
+            float d = depth_at(col, &b->verts[j]) / c->magnet_radius;
             if (d < 0.f) d = 0.f;
             if (d > 1.f) d = 1.f;
-            /* smoothstep, so the seam has no visible crease */
-            w->damp[i][j] = d * d * (3.f - 2.f * d);
+            w->damp[i][j] = d;
         }
     }
 }
@@ -195,7 +202,7 @@ void water_free(water_t *w)
     memset(w, 0, sizeof(*w));
 }
 
-void water_init(water_t *w, scene_t *scene, const col_t *col)
+void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
 {
     unsigned int i;
 
@@ -208,6 +215,15 @@ void water_init(water_t *w, scene_t *scene, const col_t *col)
     w->n_alloc = scene->n_batches;
     w->rng = 0x1234567u;
     sin_init();
+
+    /* The track's own water surface section. Clamped rather than asserted: a
+       fixture with no track of its own gets beach_1's, which is what the whole
+       port used to get. */
+    if (track < 0 || track >= WSURF_N_TRACKS)
+        track = 0;
+    w->cfg = &WSURF[track];
+    w->d1x = cosf(w->cfg->angle_deg * DEG);
+    w->d1z = sinf(w->cfg->angle_deg * DEG);
 
     w->damp = calloc(scene->n_batches, sizeof(float *));
     w->coast_rgba = calloc(scene->n_batches, sizeof(unsigned char *));
@@ -244,8 +260,9 @@ void water_init(water_t *w, scene_t *scene, const col_t *col)
             unsigned char *p;
             if (d < 0.f) d = 0.f;
             if (d > 1.f) d = 1.f;
-            k = powf(d, WSURF_ALPHA_POW);
-            av = WSURF_ALPHA_MIN + (WSURF_ALPHA_MAX - WSURF_ALPHA_MIN) * k;
+            k = powf(d, WATER_ALPHA_POW);
+            av = w->cfg->alpha_min
+               + (w->cfg->alpha_max - w->cfg->alpha_min) * k;
             p = &w->surf_rgba[i][j * 4];
             p[0] = p[1] = p[2] = 255;
             p[3] = (unsigned char)(av * 255.f + 0.5f);
@@ -411,11 +428,22 @@ static void wave_draw(water_t *w, const wave_t *v, const float eye[3])
 
 /* ------------------------------------------------------------------- draw  */
 
+/* A vertex's three draws out of the texRad/texSpeed ranges, from its index.
+   Cheap, stateless and stable across a reload -- see water.h for why the draw
+   is the port's and the ranges are the game's. Three 8-bit slices of one
+   xorshift-mixed index, so radius, rate and starting phase are independent. */
+static unsigned int vhash(unsigned int i)
+{
+    i ^= i << 13; i ^= i >> 17; i ^= i << 5;
+    return i * 2654435761u;
+}
+static float slice(unsigned int h, int n) { return (float)((h >> (n * 8)) & 0xff) / 255.f; }
+
 static void animate_surface(water_t *w, unsigned int bi)
 {
     batch_t *b = &w->scene->batches[bi];
+    const wsurf_t *c = w->cfg;
     const float *damp = w->damp[bi];
-    float su = w->t * WSURF_TEX_SPEED_MIN, sv = w->t * WSURF_TEX_SPEED_MAX;
     unsigned int j;
 
     if (!b->rest)
@@ -423,12 +451,23 @@ static void animate_surface(water_t *w, unsigned int bi)
     for (j = 0; j < b->nverts; j++) {
         const vtx_t *r = &b->rest[j];
         float k = damp ? damp[j] : 1.f;
-        b->verts[j].y = r->y + WSURF_OFFSET
-                      + WATER_SWELL_AMP * surf_signal(r->x, r->z, w->t, 1.f) * k;
-        /* The engine scrolls the surface texture rather than the vertices; the
-           tiles' own UVs stay put and texScaleX/Z set the world-to-UV rate. */
-        b->verts[j].u = r->u + su * WSURF_TEX_SCALE_X;
-        b->verts[j].v = r->v + sv * WSURF_TEX_SCALE_Z;
+        unsigned int h = vhash(j + 1u);
+        /* FUN_005240c0 does NOT scroll the sea's UVs along a line. It advances
+           a phase per vertex by rate*dt and puts the UV on a circle of radius
+           texRad about its rest value -- a shimmer, not a current. The port had
+           a linear scroll built on texScaleX/Z, whose real conversion is raw*0.1
+           (not raw*0.01) and which is the world-to-UV rate for the grid the
+           engine tessellates itself; the port's tiles carry authored UVs, so it
+           has nothing to scale. */
+        float rad  = c->tex_rad_min
+                   + (c->tex_rad_max - c->tex_rad_min) * slice(h, 0);
+        float rate = c->tex_speed_min
+                   + (c->tex_speed_max - c->tex_speed_min) * slice(h, 1);
+        float ph   = slice(h, 2) + w->t * rate * (1.f / 360.f);  /* turns */
+        b->verts[j].y = r->y + c->offset + (1.f - k) * c->magnet_offset
+                      + k * surf_disp(w, r->x, r->z, w->t);
+        b->verts[j].u = r->u + rad * fsin(ph + 0.25f);
+        b->verts[j].v = r->v + rad * fsin(ph);
     }
 }
 
@@ -465,7 +504,7 @@ static void animate_coast(water_t *w, unsigned int bi)
         /* WaterLOD_Coast's two heights, used as what they say they are: the
            surface height at which the foam is fully on, and the one at which
            it is fully off. */
-        float h = shore_height(b->rest[j].x, b->rest[j].z, w->t);
+        float h = shore_height(w, b->rest[j].x, b->rest[j].z, w->t);
         float k = (span > 1e-4f) ? (h - COAST_HEIGHT_OFF) / span : 1.f;
         float a;
         if (k < 0.f) k = 0.f;
@@ -521,13 +560,37 @@ void water_draw(water_t *w, const float eye[3])
     glDisable(GL_ALPHA_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glColor4f(1.f, 1.f, 1.f, WATER_STREAM_ALPHA);
     for (i = 0; i < s->n_batches; i++) {
         batch_t *b = &s->batches[i];
-        if (b->flags & (BATCH_STREAM | BATCH_FALL)) {
-            animate_scroll(w, i, 0.f, w->t * STREAM_SCROLL_VEL);
-            draw_batch(b);
+        /* Each kind's OWN alpha and its own scroll flag, both straight out of
+           the engine's node table -- see the 0x575710 block in vis_data.h. The
+           three differ, and one number for all of them was a guess.
+
+           A pool does not scroll (POOL_SCROLLS is 0): its table entry asks for a
+           noise jitter of the U coordinate instead, amplitude
+           STREAM_POOL_NOISE_LEN = 0.01 UV, and that noise field is the one part
+           of the entry NOT transcribed. animate_scroll with a zero delta is
+           still the right call -- it is what applies WATER_DECAL_LIFT, and a
+           pool needs it: measured against each track's own geometry the puddles
+           are flat plates 0-23 cm above the pit floor whose RIM is coplanar with
+           the sand to 0.00 cm, so without a bias the edge z-fights. */
+        float alpha;
+        int scrolls;
+        if (b->flags & BATCH_STREAM) {
+            alpha = STREAM_VERTEX_ALPHA;
+            scrolls = STREAM_SCROLLS;
+        } else if (b->flags & BATCH_FALL) {
+            alpha = FALL_VERTEX_ALPHA;
+            scrolls = FALL_SCROLLS;
+        } else if (b->flags & BATCH_POOL) {
+            alpha = POOL_VERTEX_ALPHA;
+            scrolls = POOL_SCROLLS;
+        } else {
+            continue;
         }
+        glColor4f(1.f, 1.f, 1.f, alpha);
+        animate_scroll(w, i, 0.f, scrolls ? w->t * STREAM_SCROLL_VEL : 0.f);
+        draw_batch(b);
     }
     glColor4f(1.f, 1.f, 1.f, 1.f);
     glDisable(GL_BLEND);

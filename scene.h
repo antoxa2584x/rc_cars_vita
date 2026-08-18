@@ -21,6 +21,8 @@
 #ifndef SCENE_H
 #define SCENE_H
 
+#include <stdio.h>
+
 #include <vitaGL.h>
 
 #include "carani.h"
@@ -67,7 +69,21 @@ typedef struct { float x, y, z, u, v, lu, lv; } vtx_t;
    for the sky. */
 #define BATCH_TRANSP 64u
 
-#define BATCH_ANY_WATER (BATCH_WATER | BATCH_COAST | BATCH_STREAM | BATCH_FALL)
+/* A standing puddle: `pool<n>`, the third entry of the engine's own
+   stream-family table at 0x575710. Kept apart from BATCH_STREAM because the
+   table's flags differ in both of the two ways that matter -- the pool carries
+   its own vertex alpha (110, against the stream's 120) and it does NOT scroll
+   its UVs; what it does instead is jitter them by a noise field, which is the
+   one part of the entry the port does not transcribe. See POOL_VERTEX_ALPHA in
+   vis_data.h and water_draw.
+
+   These are country_1's seven ponds and beach_4's two. Missing from the port's
+   name rule entirely, they were drawn as opaque `sea`-textured slabs -- flat
+   teal plates lying on the ground, which is exactly what was reported. */
+#define BATCH_POOL  128u
+
+#define BATCH_ANY_WATER (BATCH_WATER | BATCH_COAST | BATCH_STREAM \
+                         | BATCH_FALL | BATCH_POOL)
 
 /*
  * Set at RUNTIME, never packed -- deliberately well clear of pack_vsc.py's bit
@@ -283,6 +299,15 @@ typedef struct {
  * new animator does not have to be added to a list here -- it has to call
  * scene_keep_rest, which it needs anyway to have a rest pose to work from.
  *
+ * AND THE TWO VERTEX ARRAYS ARE APP-WIDE: main.c enables GL_VERTEX_ARRAY and
+ * GL_TEXTURE_COORD_ARRAY once before the frame loop and NOTHING may disable
+ * them. scene.c, water.c, trace.c, fx.c and ui.c only ever toggle
+ * GL_COLOR_ARRAY, and lm_bind only touches unit 1's copy. char.c disabled both
+ * on the way out once, and everything drawn after it -- the water, the effects,
+ * the sun, the arrows and the whole menu -- silently stopped submitting
+ * geometry. A new drawing module inherits this contract; it is written here
+ * because it was not written anywhere.
+ *
  * THE UNBIND AT THE END OF scene_draw IS LOAD-BEARING. In GL a bound
  * GL_ARRAY_BUFFER turns every subsequent gl*Pointer argument into an OFFSET, and
  * fx.c, trace.c, ui.c, shadow.c, water.c and envmap.c all still pass real
@@ -357,6 +382,23 @@ void scene_set_tex_swap_rb(int on);
 int  scene_tex_swap_rb(void);
 
 int scene_load(const char *path, scene_t *s);
+
+/*
+ * Read one packed texture off an open file and upload it into `id`.
+ *
+ * VSC and CHR2 encode a texture identically -- u16 name length, name, u16 w,
+ * u16 h, u8 format (1 = RGBA8888, else RGB565), u8 mip count, then the levels
+ * largest first -- and everything that has ever gone wrong in here is a
+ * property of the UPLOADER, not the format: the 565 byte order, the quality
+ * skip, and the one-upload-plus-glGenerateMipmap rule that stopped the load
+ * being quadratic. char.c calls this rather than keeping a second copy, so the
+ * two formats cannot drift apart.
+ *
+ * `keyed` reports whether any level-0 texel would fail the alpha test and
+ * `has_px` whether anything was uploaded at all; either may be NULL.
+ */
+void scene_read_texture(FILE *f, GLuint id, char *name_out, size_t cap,
+                        int *keyed, int *has_px);
 
 /* Free everything scene_load allocated, and the GL textures it made. */
 void scene_release(scene_t *s);

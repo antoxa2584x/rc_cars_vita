@@ -37,6 +37,7 @@
 #include "envmap.h"
 #include "sfx.h"          /* SURF_*, the material classes the grid carries */
 #include "ai.h"           /* a REAL opponent, for part 14 */
+#include "tracks.h"       /* the ten race starts, for part 2 */
 #include "ai_data.h"      /* AI_RACES[].track -- which grid to load */
 
 #include <math.h>
@@ -863,12 +864,25 @@ static int cp_drive(checkpoints_t *c, const float path[][3], int np, int laps,
     cp_step(c, path[0][0], path[0][1], path[0][2], 0.016f);
     {
         int want = c->next;
-        for (lap = 0; lap < laps; lap++)
+        /* laps + a RUN-OUT. The pass fires just after the closest approach, so a
+           path that ENDS on a marker never finishes passing it -- and the closed
+           path ends on cp_0, which is the crossing that counts the lap. A real car
+           drives on; the fixture has to as well or the last lap is one crossing
+           short. Two metres of the first leg is enough and is nowhere near the next
+           checkpoint. */
+        for (lap = 0; lap <= laps; lap++)
         for (seg = 0; seg + 1 < np; seg++) {
+            if (lap == laps && seg > 0)
+                break;                       /* the run-out is the first leg only */
             float ax = path[seg][0], az = path[seg][2];
             float bx = path[seg + 1][0], bz = path[seg + 1][2];
             float len = sqrtf((bx - ax) * (bx - ax) + (bz - az) * (bz - az));
             int n = (int)(len / step) + 1, i;
+            if (lap == laps) {
+                n = (int)(2.f / step) + 1;   /* 2 m of run-out, not the whole leg */
+                if (len > 1e-6f) { bx = ax + (bx - ax) * (2.f / len);
+                                   bz = az + (bz - az) * (2.f / len); }
+            }
             for (i = 1; i <= n; i++) {
                 float u = (float)i / (float)n;
                 float x = ax + (bx - ax) * u, z = az + (bz - az) * u;
@@ -958,14 +972,26 @@ static void part2_checkpoints(void)
             float worst;
             int fires, order_ok, lap_bad;
 
+            /* On the grid -- and path[0] IS the start/finish marker -- nothing
+               has been passed, so the arrow is on CHECKPOINT 0 and stays there.
+               That identity (next == last + 1, last == -1) is what replaced
+               projecting the grid onto the spine, which pointed five of the ten
+               real tracks at the wrong checkpoint. */
             cp_step(&c, path[0][0], path[0][1], path[0][2], 0.016f);
-            ck(c.next == 1 && c.passed < 0,
-               "the first step aims the arrow and passes nothing",
+            ck(c.next == 0 && c.passed < 0,
+               "a fresh cursor heads for the START LINE and passes nothing",
                "next = %d, passed = %d", c.next, c.passed);
 
             fires = cp_drive(&c, path, np, 2, STEP, &worst, &order_ok, &lap_bad);
-            ck(fires == 2 * c.n, "one crossing per checkpoint per lap, no more",
-               "%d crossings over 2 laps of %d checkpoints", fires, c.n);
+            /* L*n + 1, and the +1 is the point. The path starts ON the start line
+               with a fresh cursor, so the FIRST thing the car does is cross it --
+               which is what a race start is, and what five of the ten real tracks
+               never did before this. Then n-1 more per lap and the line again at
+               the end of each. */
+            ck(fires == 2 * c.n + 1,
+               "one crossing per checkpoint per lap, plus the start line at t=0",
+               "%d crossings over 2 laps of %d checkpoints (want %d)",
+               fires, c.n, 2 * c.n + 1);
             ck(order_ok, "and they arrive in the spine's own order", "");
             ck(!lap_bad, "the lap ticks over on the START LINE, and only there",
                "%d crossings checked", fires);
@@ -977,15 +1003,15 @@ static void part2_checkpoints(void)
             ck(worst >= 0.f && worst < 2.f * STEP,
                "and each fires AT its own marker, not between two of them",
                "worst %.3f m from the marker (step %.2f m)", worst, STEP);
-            ck(c.lap == 2, "and the start line is what counts a lap",
-               "lap = %d after 2 laps", c.lap);
+            ck(c.lap == 3, "and the start line is what counts a lap",
+               "lap = %d after 2 laps from the line (1 at the start + 2)", c.lap);
         }
 
-        /* A WIDE LINE. The rule that would be obvious here -- a radius around
-           the marker -- fails exactly this case, which is why checkpoint.h
-           argues against it: these waypoints are 30 to 90 m apart on a real
-           track, and a car cutting a corner never comes inside any sensible
-           radius of one. Same lap, driven 3 m OUTSIDE every leg -- outside
+        /* A WIDE LINE, 3 m off. This used to be here as the case a radius rule
+           could not do, and the radius rule is what ships now -- so it stays as
+           the case that says the radius is wide enough for a line that is not the
+           racing line. 3 m is inside CP_TRIGGER_RAD's 5 m by design; the measured
+           worst real pass is 1.58 m. Same lap, driven 3 m OUTSIDE every leg -- outside
            because the offset has to stay on one side of the loop, and a fixed
            vector on this fixture would put part of the path straight down the
            middle of the closing leg. */
@@ -996,7 +1022,9 @@ static void part2_checkpoints(void)
                 cx += path[i3][0] / (float)(np - 1);
                 cz += path[i3][2] / (float)(np - 1);
             }
-            cp_resync(&c, path[0][0], path[0][1], path[0][2] - 3.f);
+            int hit[CP_MAX];
+            memset(hit, 0, sizeof(hit));
+            cp_restart(&c, path[0][0], path[0][1], path[0][2] - 3.f);
             for (seg = 0; seg + 1 < np; seg++) {
                 float ax = path[seg][0], az = path[seg][2];
                 float bx = path[seg + 1][0], bz = path[seg + 1][2];
@@ -1015,12 +1043,13 @@ static void part2_checkpoints(void)
                     float u = i2 / n;
                     cp_step(&c, ax + dx * u + nx * 3.f, 0.f,
                             az + dz * u + nz * 3.f, 0.016f);
-                    if (c.passed >= 0)
-                        fires++;
+                    if (c.passed >= 0) { hit[c.passed] = 1; fires++; }
                 }
             }
-            ck(fires == c.n, "a wide line still passes every checkpoint",
-               "%d of %d, 3 m off the line", fires, c.n);
+            for (i3 = 0; i3 < c.n; i3++) if (!hit[i3]) fires = -1;
+            ck(fires > 0, "a wide line still passes every checkpoint",
+               "%d crossings, 3 m off the line, and %s", fires,
+               fires > 0 ? "every checkpoint among them" : "one was MISSED");
         }
 
         /* A TELEPORT is not a lap. Respawning across the far side of the spine
@@ -1028,29 +1057,49 @@ static void part2_checkpoints(void)
            being a burst of cues. */
         {
             int lap0 = c.lap;
+            /* Aim the arrow somewhere it does not belong FIRST, so this tests
+               the re-aim and not the value it happened to hold -- which is how a
+               mutant that dropped the re-aim entirely once survived it. */
+            c.next = (c.last + 2) % c.n;
             cp_resync(&c, c.cp[2].p[0][0], c.cp[2].p[0][1], c.cp[2].p[0][2]);
-            /* Aim the arrow at a checkpoint already behind the car, on purpose.
-               Without this the previous lap has ALREADY left it on 1 and the
-               re-aim check passes on the value it happened to hold -- which is
-               how a mutant that dropped the re-aim entirely survived it. */
-            c.next = 2;
             cp_step(&c, c.cp[0].p[0][0], 0.f, c.cp[0].p[0][2], 0.016f);
             ck(c.passed < 0 && c.lap == lap0,
                "a teleport back to the start line passes nothing",
                "passed = %d, lap %d -> %d", c.passed, lap0, c.lap);
-            ck(c.next == 1, "and re-aims the arrow at the checkpoint ahead of it",
-               "next = %d (was pointed at 2 before the teleport)", c.next);
+            /* The arrow comes off `last`, not off the car's position: whatever
+               `next` was forced to, a resync puts it back on (last + 1). Forcing
+               it to 2 above is what makes this a test of the re-aim rather than of
+               the value it happened to hold. */
+            ck(c.next == (c.last + 1) % c.n,
+               "and re-aims the arrow at the one after the last it really passed",
+               "next = %d, last = %d (aimed elsewhere before the teleport)",
+               c.next, c.last);
         }
 
-        /* And DRIVING BACKWARDS does not hand a checkpoint back. */
+        /* And DRIVING BACKWARDS does not hand a checkpoint back. The radius rule
+           has no notion of direction -- it fires on the closest approach to
+           whatever `next` is -- so what has to hold is the weaker and more useful
+           statement: reversing back over a checkpoint already BEHIND the car fires
+           nothing, because that checkpoint is not what the cursor is looking at.
+           Drive forward past cp_1 first so there is something behind to reverse
+           over, then reverse over it. */
         {
-            int lap0 = c.lap;
-            cp_resync(&c, 5.f, 0.f, 0.f);
-            cp_step(&c, 4.f, 0.f, 0.f, 0.016f);
-            cp_step(&c, 3.f, 0.f, 0.f, 0.016f);
-            ck(c.passed < 0 && c.next == 1 && c.lap == lap0,
-               "driving backwards passes nothing and holds the arrow",
-               "passed = %d, next = %d, lap %d", c.passed, c.next, c.lap);
+            int lap0, i4, refired = 0, last0;
+            cp_restart(&c, c.cp[0].p[0][0], c.cp[0].p[0][1], c.cp[0].p[0][2]);
+            /* Out to 30 m: CLEAR of cp_2 at x = 20 by 10 m, i.e. twice
+               CP_TRIGGER_RAD, so its pass has definitely completed before the
+               reverse starts. Stopping ON it instead would have the reverse
+               complete the pass rather than hand one back, which is a different
+               statement. */
+            for (i4 = 0; i4 <= 60; i4++)
+                cp_step(&c, (float)i4 * 0.5f, 0.f, 0.f, 0.016f);
+            lap0 = c.lap; last0 = c.last;
+            for (i4 = 60; i4 >= 0; i4--)          /* and back over it */
+                if (cp_step(&c, (float)i4 * 0.5f, 0.f, 0.f, 0.016f), c.passed >= 0)
+                    refired = 1;
+            ck(!refired && c.lap == lap0 && c.last == last0,
+               "reversing back over a passed checkpoint hands nothing back",
+               "lap %d, last %d (was %d, %d)", c.lap, c.last, lap0, last0);
         }
 
         /* --- WHERE A DEAD CAR GOES BACK TO -----------------------------------
@@ -1470,7 +1519,9 @@ static void part2_checkpoints(void)
                chosen to make it pass. */
             fires = cp_drive(&rc, path, np, 2, 0.125f, &worst, &order_ok,
                              &lap_bad);
-            if (fires != 2 * rc.n || rc.lap != 2) bad_fires++;
+            /* 2*n + 1 and lap 3: the spine path starts ON the start line, so the
+               race opens by crossing it. See the fixture above. */
+            if (fires != 2 * rc.n + 1 || rc.lap != 3) bad_fires++;
             if (!order_ok) bad_order++;
             if (lap_bad) bad_lap++;
             if (worst > worst_all) worst_all = worst;
@@ -1555,10 +1606,17 @@ static void part2_checkpoints(void)
            "%d tracks out of order", bad_order);
         ck(bad_lap == 0, "and the lap only ever ticks over on the start line",
            "%d tracks tick it elsewhere", bad_lap);
-        ck(loaded == 10 && worst_all >= 0.f && worst_all < 0.25f,
-           "and no crossing on any real track fires away from its own marker",
-           "worst %.3f m over ten tracks (the OLD rule: 7.3 to 75.6 m early)",
-           worst_all);
+        /* Bounded STRUCTURALLY, by the rule's own radius: a pass can only fire
+           from inside CP_TRIGGER_RAD, so no cue can ever land further out than
+           that however the spine wanders. The old arc rule had no such bound and
+           fired 7.3 to 75.6 m early. Note these paths are the SPINE, which is not
+           the road (see checkpoint.h) -- the honest measurement of this number is
+           over the recorded laps below, where it is 4.24 m worst. */
+        ck(loaded == 10 && worst_all >= 0.f
+           && worst_all <= CP_TRIGGER_RAD + CP_PASS_EPS,
+           "and no crossing on any real track fires from outside its own radius",
+           "worst %.3f m over ten tracks, radius %.1f m (the OLD rule: 7.3 to "
+           "75.6 m early)", worst_all, CP_TRIGGER_RAD);
 
         /* The respawn point, over every checkpoint the ten shipped tracks carry. */
         ck(loaded == 10 && rsp_total >= 30,
@@ -1580,6 +1638,124 @@ static void part2_checkpoints(void)
            "%d re-fires, %d phantom laps of %d", rsp_refire, rsp_phantom,
            rsp_total);
     }
+
+    /* --- REAL DRIVEN LAPS, from the real grids ---------------------------
+     *
+     * Everything above drives the SPINE, and the spine is not the road -- that is
+     * the whole finding behind the current rule (checkpoint.h). So the rule is
+     * also held to the only path data in the project that IS the road: the ten
+     * shipped .aip recordings, three recorded laps each, 404 to 555 m at 5 to
+     * 25 cm per sample.
+     *
+     * Two things are asserted, and they are the two that were reported broken:
+     *
+     *   from the PLAYER's own grid, held there for the three-second countdown and
+     *   then driven, the FIRST checkpoint to fire is the start/finish -- on all
+     *   ten. Under the old rule it was checkpoint 2 on country_1, country_3,
+     *   country_4 and urban_1 and checkpoint 5 on urban_2, and the start/finish
+     *   never fired at all on the first lap of any of the five.
+     *
+     *   nothing fires while the car is HELD on the grid. Five of the ten grids sit
+     *   inside cp_1's radius already, so firing on entry would sound the cue
+     *   before GO on all five -- which is what CP_PASS_EPS is for.
+     *
+     * Then every checkpoint, once per lap, in order, over all 30 recordings.
+     */
+    {
+        static const char *const TRK2[10] = {
+            "beach_1", "beach_2", "beach_3", "beach_4", "country_1",
+            "country_2", "country_3", "country_4", "urban_1", "urban_2"
+        };
+        int t, loaded = 0, first_wrong = 0, held_fired = 0;
+        int miss = 0, ooo = 0, runs = 0;
+        float worst = -1.f;
+
+        for (t = 0; t < 10; t++) {
+            char pp[64];
+            scene_t ts;
+            col_t tc;
+            checkpoints_t base;
+            ai_t ai;
+            int i;
+
+            snprintf(pp, sizeof(pp), "assets/%s.vsc", TRK2[t]);
+            if (!scene_load(pp, &ts))
+                continue;
+            snprintf(pp, sizeof(pp), "assets/%s.col", TRK2[t]);
+            memset(&tc, 0, sizeof(tc));
+            col_load(pp, &tc);
+            cp_init(&base, &ts, &tc);
+            base.enabled = (base.n > 0);
+            memset(&ai, 0, sizeof(ai));
+            if (!ai_init(&ai, t, "assets", NULL, 1, 0) || base.n <= 0) {
+                free(tc.tris); free(tc.start); free(tc.idx);
+                scene_release(&ts);
+                continue;
+            }
+            loaded++;
+
+            for (i = 0; i < ai.n; i++) {
+                const ai_car *a = &ai.car[i];
+                checkpoints_t rc = base;
+                int j, lap, seen[CP_MAX], want, first = -1;
+                memset(seen, 0, sizeof(seen));
+                /* the PLAYER's grid, not the opponent's slot: that is where the
+                   arrow has to be right. */
+                cp_restart(&rc, TRACKS[t].x, TRACKS[t].y, TRACKS[t].z);
+                for (j = 0; j < 180; j++) {          /* 3 s of countdown, held */
+                    cp_step(&rc, TRACKS[t].x, TRACKS[t].y, TRACKS[t].z, 1.f / 60.f);
+                    if (rc.passed >= 0) held_fired++;
+                }
+                want = rc.next;
+                for (lap = 0; lap < 2; lap++)
+                    for (j = lap ? a->cycle_start : 0; j < a->n; j++) {
+                        cp_step(&rc, a->s[j].p[0], a->s[j].p[1], a->s[j].p[2],
+                                1.f / 60.f);
+                        if (rc.passed < 0)
+                            continue;
+                        if (first < 0) first = rc.passed;
+                        if (rc.passed != want) ooo++;
+                        want = (rc.passed + 1) % rc.n;
+                        seen[rc.passed]++;
+                        {
+                            const float *m = rc.cp[rc.passed].p[0];
+                            float dx = m[0] - a->s[j].p[0];
+                            float dz = m[2] - a->s[j].p[2];
+                            float d = sqrtf(dx * dx + dz * dz);
+                            if (d > worst) worst = d;
+                        }
+                    }
+                if (first != 0) first_wrong++;
+                /* Two laps of the recording plus the crossing that starts it: the
+                   line three times, everything else twice. */
+                for (j = 0; j < rc.n; j++)
+                    if (seen[j] < (j == 0 ? 3 : 2)) miss++;
+                runs++;
+            }
+            ai_free(&ai);
+            free(tc.tris); free(tc.start); free(tc.idx);
+            scene_release(&ts);
+        }
+
+        ck(loaded == 10 && runs == 30,
+           "all ten tracks' recorded laps load (three opponents each)",
+           "%d tracks, %d recordings", loaded, runs);
+        ck(runs == 30 && first_wrong == 0,
+           "the START/FINISH is the first checkpoint to fire, on every track",
+           "%d of %d recordings started on the wrong one", first_wrong, runs);
+        ck(held_fired == 0,
+           "and nothing fires while the car is held on the grid for the countdown",
+           "%d cues during 3 s x %d grids", held_fired, runs);
+        ck(runs == 30 && miss == 0,
+           "every checkpoint fires on every recorded lap, none missed",
+           "%d missing over %d recordings", miss, runs);
+        ck(ooo == 0, "and always in cp_1, cp_2, ... cp_n order",
+           "%d out of order", ooo);
+        ck(worst >= 0.f && worst <= CP_TRIGGER_RAD + CP_PASS_EPS,
+           "each fires within the trigger radius of its own marker",
+           "worst %.2f m of %.1f m (the OLD rule missed 174 of these 300 "
+           "crossings outright)", worst, CP_TRIGGER_RAD);
+    }
 }
 
 /* ============================================================== part 3 ==== */
@@ -1589,7 +1765,7 @@ static void part3_water(void)
     static const char *tex[] = {"water_wave", "water_wave_alpha"};
     scene_t *s = make_scene(tex, 2);
     water_t w;
-    batch_t *sea, *coast, *stream;
+    batch_t *sea, *coast, *stream, *pool;
     col_t bed;
     float eye[3] = {0.f, 5.f, -20.f};
     unsigned int i;
@@ -1614,15 +1790,20 @@ static void part3_water(void)
        seabed against the map's real 2.2 m. */
     add_grid2(s, BATCH_COAST, -20.f, -0.5f, 40.f, 0.5f, 22, -0.2f);
     add_grid2(s, BATCH_STREAM, -30.f, -10.f, 4.f, 20.f, 4, -0.1f);
+    /* A pool: country_1's are 3-11 m across and sit 0-23 cm above the pit
+       floor, so a small flat patch is the right stand-in. */
+    add_grid2(s, BATCH_POOL, 10.f, -14.f, 18.f, -6.f, 4, -0.1f);
     sea = &s->batches[0];
     coast = &s->batches[1];
     stream = &s->batches[2];
-    /* distinct textures so the recorder can tell the three apart: they all
+    pool = &s->batches[3];
+    /* distinct textures so the recorder can tell the four apart: they all
        submit per-vertex colour or their own alpha, and a check that cannot
        separate them ends up asserting the loosest bound on all of them */
     sea->gl_tex = s->tex_ids[0];
     coast->gl_tex = s->tex_ids[1];
     stream->gl_tex = next_tex_id++;
+    pool->gl_tex = next_tex_id++;
     add_marker(s, "water_wave_1", 0.f, 0.f, 30.f, 180.f);
     (void)coast;
     /* Depth matched to the real map: beach_1's sea bottoms out at 2.22 m. A
@@ -1635,38 +1816,81 @@ static void part3_water(void)
        row did when the two were the same size. */
     make_shelf(&bed, 60.f, 30, 3.75f, -3.75f);
 
-    water_init(&w, s, &bed);
+    water_init(&w, s, &bed, 0);   /* beach_1's water surface section */
     ck(w.n_spawn == 1, "one spawner per water_wave_N marker", "%d", w.n_spawn);
     ck(sea->rest != NULL, "the surface keeps a rest copy", "%p",
        (void *)sea->rest);
 
     /* --- shallow-water damping ------------------------------------------ */
     {
-        float near_shore = -1.f, far_shore = -1.f;
+        float near_shore = -1.f, far_shore = -1.f, quarter = -1.f;
         for (i = 0; i < sea->nverts; i++) {
             if (near(sea->verts[i].x, 0.f, 0.6f)) {
                 if (near(sea->verts[i].z, 0.f, 0.6f)) near_shore = w.damp[0][i];
+                if (near(sea->verts[i].z, 10.f, 0.6f)) quarter = w.damp[0][i];
                 if (near(sea->verts[i].z, 40.f, 0.6f)) far_shore = w.damp[0][i];
             }
         }
+        /* The ramp is LINEAR over cfg->magnet_radius -- FUN_0051c000 divides by
+           magnetRadius and clamps, with no shaping -- and magnetRadius converts
+           as raw*0.05, so the shipped value is 2.55 m and not the 0.5 m the port
+           used to guess. The fixture's shelf only reaches 2.5 m under the far
+           edge of the sea, which is beach_1's own 2.2 m rounded up, so the far
+           row does NOT saturate: it comes out at depth/magnet_radius. Predict
+           that from the fixture's geometry rather than asserting 1.0, which is
+           what the old bound did and which a 2.55 m radius fails. */
+        float deep = 40.f / 16.f;               /* the shelf is y = -z/16 */
+        float want = deep / w.cfg->magnet_radius;
+        if (want > 1.f) want = 1.f;
         ck(near(near_shore, 0.f, 0.05f),
            "damping is 0 where the seabed reaches the surface",
            "%.3f at the waterline", near_shore);
-        ck(near(far_shore, 1.f, 1e-4f), "and 1 in deep water", "%.3f", far_shore);
+        /* Tight, because the point of it is that the far row does NOT reach
+           1.0: a ramp over the old 0.5 m saturates here and 0.02 of slack was
+           enough to let that through. */
+        ck(near(far_shore, want, 0.005f),
+           "and rises with depth over magnetRadius, without saturating",
+           "%.3f at %.2f m of depth, expected %.3f over a %.2f m ramp",
+           far_shore, deep, want, w.cfg->magnet_radius);
+        /* And it is LINEAR. A quarter of the way up the ramp is where the
+           shapes separate -- linear gives 0.25 where a smoothstep gives 0.16 --
+           and at the halfway point the two agree exactly, which is why one
+           sample cannot tell them apart. */
+        {
+            float shallow_d = 10.f / 16.f;
+            float want_q = shallow_d / w.cfg->magnet_radius;
+            float smooth = want_q * want_q * (3.f - 2.f * want_q);
+            ck(near(quarter, want_q, 0.01f) && fabsf(quarter - smooth) > 0.05f,
+               "and the ramp is LINEAR, not shaped",
+               "%.3f at %.2f m: linear says %.3f, a smoothstep would say %.3f",
+               quarter, shallow_d, want_q, smooth);
+        }
     }
 
     /* --- the surface moves, and moves less near the shore ---------------- */
     {
         /* PEAK TO PEAK over time, not distance from rest. The surface carries a
-           constant vertical offset (WSURF_OFFSET), and measuring against rest
+           constant vertical offset (cfg->offset), and measuring against rest
            reports that offset as if it were wave height -- which it did, and
            read 0.39 m for a 0.02 m swell. Amplitude is immune to any static
            shift; "distance from rest" is not. */
         static float lo[8192], hi[8192];
         float amp_near = 0.f, amp_far = 0.f;
+        const wsurf_t *wc = w.cfg;
+        /* Peak to peak, undamped, straight out of the track's config: the amp
+           term spans -0.5..+1.0 of `amp` and the amp2 term spans +-amp2. */
+        float pp_cfg = 1.5f * wc->amp + 2.f * wc->amp2;
+        float lam1 = 6.2831853f / wc->period;
+        float damp_far = (40.f / 16.f) / wc->magnet_radius;
         unsigned int nv = sea->nverts < 8192 ? sea->nverts : 8192;
+        if (damp_far > 1.f) damp_far = 1.f;
         for (i = 0; i < nv; i++) { lo[i] = 1e30f; hi[i] = -1e30f; }
-        for (int step = 0; step < 120; step++) {
+        /* Twelve seconds. Both trains are slow -- 2*pi/(speed*period) is 5.1 s
+           and 2*pi/period2 is 3.5 s on beach_1 -- and the old two-second window
+           was sized for a 0.6 s ripple that only existed because `period` was
+           being read as a time. A window shorter than a period reports a
+           fraction of the swell and calls it the swell. */
+        for (int step = 0; step < 12 * 60; step++) {
             water_step(&w, 1.f / 60.f);
             gl_cap_reset();
             water_draw(&w, eye);
@@ -1681,36 +1905,163 @@ static void part3_water(void)
             if (sea->rest[i].z < 0.5f && d > amp_near) amp_near = d;
             if (sea->rest[i].z > 30.f && d > amp_far) amp_far = d;
         }
-        ck(amp_far > 0.4f * WATER_SWELL_AMP, "the open sea moves", "peak %.4f m "
-           "over 2 s (swell amp %.3f)", amp_far, WATER_SWELL_AMP);
+        /* Against the TRACK'S OWN CONFIG, not against a constant in water.c.
+           The bound the old build carried was `> 0.4 * WATER_SWELL_AMP`, and
+           WATER_SWELL_AMP was the very number the displacement was multiplied
+           by -- it passed at 0.02 m and it would have passed at 0.002 m. The
+           config is data the port does not get to choose. */
+        ck(amp_far > 0.35f * pp_cfg * damp_far,
+           "the open sea moves, and by the height its own config asks for",
+           "peak to peak %.3f m over 12 s against the config's %.3f m "
+           "(damped to %.3f by a %.2f m shelf)",
+           2.f * amp_far, pp_cfg, pp_cfg * damp_far, 40.f / 16.f);
+        ck(2.f * amp_far <= pp_cfg * damp_far + 1e-3f,
+           "and never by more than it",
+           "%.3f m <= %.3f m", 2.f * amp_far, pp_cfg * damp_far);
         ck(amp_near < amp_far * 0.25f, "the shoreline barely moves",
            "%.4f m against %.3f m", amp_near, amp_far);
-        /* The first build summed `amp` + `amp2` here for 0.41 m of swell on a
-           beach whose car is 0.42 m long, and `amp` is a key FUN_00521540 does
-           not even read.
+        /* STEEPNESS, which is the bound that actually holds this together.
          *
-         * Bound it against the CAR, not against WATER_SWELL_AMP. Checking the
-           code's own constant is self-referential -- raising the constant raises
-           the bound, and a mutation putting 0.41 m back survived exactly that
-           way. A swell taller than a tenth of the car is wrong however the
-           constant is spelled. */
-        ck(amp_far <= 0.1f * 0.42f,
-           "and never by more than a tenth of the car's length",
-           "%.4f m <= %.4f m", amp_far, 0.1f * 0.42f);
+         * The check that used to sit here was "no taller than a tenth of the
+         * car's length", written when 0.41 m of swell had just been rejected as
+         * a storm. It was the wrong quantity: 0.41 m is very close to what the
+         * engine really does on this track, and what made it look like a storm
+         * was the WAVELENGTH -- `period` read as a time gave 1.24 m, so the sea
+         * was 0.41 m tall over 1.24 m, a 60% slope. Water cannot hold more than
+         * about 14%; past that a wave breaks. A height bound alone passes a
+         * flat-calm sea and fails a real one. A steepness bound fails exactly
+         * the units bug and nothing else -- all five tracks with a sea land
+         * between 2% and 9%.
+         *
+         * Read off the config, so it also fails if gen_vis_data.py's conversion
+         * is what regresses; the amplitude checks above are what tie water.c to
+         * the same numbers. */
+        /* --- and the WAVELENGTHS water.c actually evaluates ---------------
+         *
+         * The steepness bound below reads the config, so it guards
+         * gen_vis_data.py's conversion; this one guards water.c, by counting
+         * how many times the surface turns over along a line. Sample
+         * water_height through the radial train's centre in the directional
+         * train's own direction, so both phases advance at their full rate --
+         * one turn per half wavelength each.
+         *
+         * At the engine's 10.5 m and 10.1 m that is about 39 turns over 100 m.
+         * Reading `period` as a time puts the wavelengths at 1.24 m and 1.61 m
+         * and the same line turns over some 300 times: an ocean of ripples, and
+         * the thing that made 0.41 m of swell look like a storm. Sampled at
+         * 0.1 m, which resolves even the wrong answer -- a check that cannot
+         * see the failure it is looking for reports the failure as a pass. */
+        {
+            const float L = 100.f, ds = 0.1f;
+            float lam2 = 6.2831853f * wc->length2;
+            /* Two trains this close in wavelength BEAT rather than add turns:
+               the weaker one (0.75*amp = 0.12 m against amp2's 0.25 m) mostly
+               fails to make extrema of its own, so the count lands on the
+               dominant train's 2L/lambda and not on the sum. Bound both ends
+               from the config -- the sum is the ceiling, the longer train alone
+               is the floor. */
+            float lo = 0.7f * 2.f * L / (lam1 > lam2 ? lam1 : lam2);
+            float hi = 1.5f * 2.f * L * (1.f / lam1 + 1.f / lam2);
+            float expect = 2.f * L * (1.f / lam1 + 1.f / lam2);
+            int turns = 0, k;
+            float prev_d = 0.f;
+            for (k = 0; k < (int)(L / ds); k++) {
+                float s0 = (float)k * ds, s1 = s0 + ds;
+                float h0 = water_height(&w, wc->pos_x + w.d1x * s0,
+                                            wc->pos_z + w.d1z * s0);
+                float h1 = water_height(&w, wc->pos_x + w.d1x * s1,
+                                            wc->pos_z + w.d1z * s1);
+                float d = h1 - h0;
+                if (k && ((d > 0.f) != (prev_d > 0.f))) turns++;
+                prev_d = d;
+            }
+            ck((float)turns > lo && (float)turns < hi,
+               "the surface turns over as often as its own wavelengths say",
+               "%d turns over %.0f m, want %.0f..%.0f for %.1f m and %.1f m "
+               "(the two trains together would be %.0f)",
+               turns, L, lo, hi, lam1, lam2, expect);
+        }
+        /* --- WHERE the surface sits, which is the other half of the bug -----
+         *
+         * The swell rides on rest + offset + (1-damp)*magnetOffset, and that
+         * base is what pack_col.py bakes into the .col water grid, so the
+         * waterline the car feels is the one it can see. Subtract the swell
+         * back off a drawn vertex and the remainder has to BE that base.
+         *
+         * This is the check that was missing. `offset` is per track, the port
+         * compiled beach_1's -0.37 m into all ten, and the grid carried none of
+         * it at all -- which put 234 m2 of beach_1 and 459 m2 of beach_4 under
+         * water the drawn sea was nowhere near. Nothing in this part could see
+         * that: every other bound here measures the surface's MOTION, and a
+         * static shift is invisible to all of them. */
+        {
+            float worst_base = 0.f;
+            unsigned int j;
+            gl_cap_reset();
+            water_draw(&w, eye);
+            for (j = 0; j < sea->nverts; j++) {
+                float k = w.damp[0][j];
+                float base = sea->verts[j].y
+                           - k * water_height(&w, sea->rest[j].x, sea->rest[j].z);
+                float want = sea->rest[j].y + wc->offset
+                           + (1.f - k) * wc->magnet_offset;
+                if (fabsf(base - want) > worst_base) worst_base = fabsf(base - want);
+            }
+            ck(worst_base < 1e-4f,
+               "and it rides on rest + the TRACK'S OWN vertical offset, which "
+               "is what the .col grid is packed with",
+               "off by at most %.5f m over %u vertices (offset %+.3f m, "
+               "magnet %+.3f m)", worst_base, sea->nverts, wc->offset,
+               wc->magnet_offset);
+        }
+        ck(pp_cfg / lam1 < 1.f / 7.f,
+           "and the swell is not steeper than water can stand",
+           "%.3f m over a %.1f m wavelength = %.1f%%, breaking is about 14%%",
+           pp_cfg, lam1, 100.f * pp_cfg / lam1);
     }
 
-    /* --- the UVs scroll and never leave the rest values behind ----------- */
+    /* --- the surface's UVs ORBIT, and never leave the rest values behind --
+     *
+     * FUN_005240c0 advances a per-vertex phase and puts the UV on a circle of
+     * radius texRad about its rest value. It does not scroll along a line: the
+     * port did, on texScaleX/Z, whose conversion is raw*0.1 rather than the
+     * raw*0.01 that was used and which is the world-to-UV rate for the grid the
+     * engine tessellates for itself -- the port's tiles carry authored UVs.
+     *
+     * So the invariant is the RADIUS, which a linear scroll cannot hold: check
+     * that every vertex stays on its own circle, that the circle is inside the
+     * texRad range, and that it comes back round. */
     {
-        float u0 = sea->verts[0].u;
-        water_step(&w, 1.0f);
-        gl_cap_reset();
-        water_draw(&w, eye);
-        ck(sea->verts[0].u > u0, "the surface texture scrolls",
-           "u %.4f -> %.4f", u0, sea->verts[0].u);
-        ck(near(sea->verts[0].u - sea->rest[0].u,
-                w.t * WSURF_TEX_SPEED_MIN * WSURF_TEX_SCALE_X, 1e-3f),
-           "scroll is computed from rest, not accumulated",
-           "%.4f", sea->verts[0].u - sea->rest[0].u);
+        const wsurf_t *wc = w.cfg;
+        float worst = 0.f, biggest = 0.f;
+        int outside = 0, moved = 0;
+        float first[3];
+        unsigned int j;
+        for (int step = 0; step < 3; step++) {
+            water_step(&w, 1.5f);
+            gl_cap_reset();
+            water_draw(&w, eye);
+            for (j = 0; j < sea->nverts; j++) {
+                float du = sea->verts[j].u - sea->rest[j].u;
+                float dv = sea->verts[j].v - sea->rest[j].v;
+                float r = sqrtf(du * du + dv * dv);
+                if (step == 0 && j < 3) first[j] = r;
+                if (j < 3 && fabsf(r - first[j]) > worst) worst = fabsf(r - first[j]);
+                if (r > biggest) biggest = r;
+                if (r > wc->tex_rad_max + 1e-4f) outside++;
+                if (r > 1e-6f) moved++;
+            }
+        }
+        ck(moved > 0 && outside == 0,
+           "every surface UV stays on a circle inside texRadMin..texRadMax",
+           "largest radius %.4f UV against texRadMax %.4f, %d outside",
+           biggest, wc->tex_rad_max, outside);
+        /* A constant radius over 4.5 s is also what says the UV is rebuilt from
+           rest every frame rather than accumulated -- an accumulating one drifts
+           off its circle. That is the property the old linear check tested. */
+        ck(worst < 1e-4f,
+           "and the radius holds -- an orbit rebuilt from rest, not a scroll",
+           "radius drifted by %.6f UV over 4.5 s", worst);
     }
 
     /* --- the scroll on the COAST path, which is a different function from the
@@ -1805,10 +2156,11 @@ static void part3_water(void)
            phases it happens to catch need not include a trough.
            The window is 30 s, and FIXED. It was two seconds, which was long
            enough for the 0.6 s ripple the foam used to run at and stopped being
-           long enough the moment it became a 7.2 s swell. Scaling the window by
-           COAST_WAVE_STRETCH would have fixed that and quietly given up the
-           other half of the check: with a fixed window this also fails if the
-           foam is slowed down so far it stops moving at all. */
+           long enough the moment it became a swell. It is fixed on purpose: a
+           window scaled by whatever sets the foam's rate would follow that rate
+           anywhere and quietly give up the other half of the check, which is
+           that the foam has not been slowed until it stops moving at all. The
+           foam's own period is 2*pi/period2 -- 3.5 s on beach_1. */
         for (int step = 0; step < 30 * 60; step++) {
             water_step(&w, 1.f / 60.f);
             gl_cap_reset();
@@ -1845,14 +2197,17 @@ static void part3_water(void)
 
     /* --- and it has to swing SLOWLY, and coherently along the band ---------
      *
-     * The foam alpha is shore_height sampled once per band vertex. The two
-     * recovered wave trains work out at 1.24 m / 0.60 s and 1.61 m / 1.80 s --
-     * ripples, not a swell -- and read on a band whose triangles are 1.8 m that
-     * is below Nyquist in space and three full cycles a second in time. The
-     * result is a white band that strobes, which is what "the foam flickers a
-     * lot" was, along with the z-fighting above.
+     * The foam alpha is shore_height sampled once per band vertex, and
+     * shore_height is FUN_0051c690's radial train: 2*pi*length2 is 10.1 m of
+     * wavelength on a band whose triangles are 1.8 m, about six samples a
+     * wavelength. It used to be 1.24 m and 1.61 m -- below Nyquist, three full
+     * cycles a second -- because `period` was read as a time, and the band
+     * strobed. That is what "the foam flickers a lot" was, along with the
+     * z-fighting above, and the port's answer was a stretch factor of 12 that
+     * this check was written to keep honest. The factor is gone; the check is
+     * not, because it is what catches the units bug coming back.
      *
-     * Both bounds are written against things COAST_WAVE_STRETCH cannot move:
+     * Both bounds are written against things no constant in water.c can move:
      * how long a human reads as a pulse rather than a flash, and how much of
      * the band's own alpha range one triangle edge is allowed to cross. A check
      * that compares against the constant it guards passes any value of it.
@@ -1901,9 +2256,55 @@ static void part3_water(void)
             ck(swing >= 0.5f,
                "the foam pulses rather than strobes",
                "a full swing takes at least %.2f s (want >= 0.50)", swing);
-            ck(nb < range / 6.f,
-               "and one triangle of band crosses a small part of the range",
-               "%.0f of %.0f over 1.8 m (want < %.0f)", nb, range, range / 6.f);
+            /* What one triangle edge of band SHOULD cross.
+             *
+             * shore_height is one sine of the radial train, so between two
+             * vertices whose phases differ by dphi the alpha step is
+             * (range/2) * 2*sin(dphi/2)*cos(...), and averaged over the phase
+             * that is (range/2) * 2*sin(dphi/2) * 2/pi. dphi comes from the
+             * band's own geometry -- the difference in distance to the wave's
+             * centre, over length2 -- so this is the fixture and the config
+             * against the rendered band, with nothing from water.c in it.
+             *
+             * A bound of "less than a sixth of the range" used to sit here. It
+             * was calibrated against a stretch factor of 12 that no longer
+             * exists, and the honest figure at the engine's own 10.1 m
+             * wavelength is a third: 74 of 219. That is a gradient along the
+             * shore, not a strobe -- and the way to say so is to check it
+             * against the resolved sine's own answer, because an ALIASED band
+             * has a different one. Neighbouring vertices on unrelated phases
+             * average (range/2)*4/pi, which is 139 here, and no value of dphi
+             * produces that unless the wave is under-sampled. */
+            float dphi = 0.f;
+            int np = 0;
+            for (i = 0; i + 1 < row; i++) {
+                float ax = coast->rest[i].x - w.cfg->pos_x;
+                float az = coast->rest[i].z - w.cfg->pos_z;
+                float bx = coast->rest[i + 1].x - w.cfg->pos_x;
+                float bz = coast->rest[i + 1].z - w.cfg->pos_z;
+                dphi += fabsf(sqrtf(bx * bx + bz * bz) - sqrtf(ax * ax + az * az))
+                      / w.cfg->length2;
+                np++;
+            }
+            dphi /= (float)np;
+            {
+                float want = range * sinf(0.5f * dphi) * (2.f / 3.14159265f);
+                float alias = range * (2.f / 3.14159265f);
+                ck(nb > 0.f && fabsf(nb - want) < 0.15f * want,
+                   "and one band edge crosses exactly what a RESOLVED sine "
+                   "crosses there",
+                   "%.0f of %.0f, expected %.0f at %.0f deg of phase per edge "
+                   "(an aliased band would average %.0f)",
+                   nb, range, want, dphi * 57.2958f, alias);
+                /* And the reason it is resolved: the band's triangles are well
+                   inside Nyquist for the engine's wavelength. At the 1.61 m the
+                   port used to read out of length2 they were not -- one edge was
+                   longer than the whole wave. Config against fixture. */
+                ck(6.2831853f * w.cfg->length2 > 4.f * (40.f / 22.f),
+                   "because the wave is four band edges long or more",
+                   "%.1f m of wavelength over a %.2f m edge",
+                   6.2831853f * w.cfg->length2, 40.f / 22.f);
+            }
         }
     }
 
@@ -1932,9 +2333,9 @@ static void part3_water(void)
         }
         ck(shallow >= 0 && deep >= 0, "the sea submits a per-vertex alpha",
            "shallow %d, deep %d", shallow, deep);
-        ck(shallow >= 0 && near((float)shallow / 255.f, WSURF_ALPHA_MIN, 0.02f),
+        ck(shallow >= 0 && near((float)shallow / 255.f, w.cfg->alpha_min, 0.02f),
            "transparent at the waterline, so the sand reads through",
-           "alpha %d against alphaMin %.0f", shallow, WSURF_ALPHA_MIN * 255.f);
+           "alpha %d against alphaMin %.0f", shallow, w.cfg->alpha_min * 255.f);
         /* Deeper water is more opaque -- but it is still WATER. The whole
            point of the reported bug is that you can see through it; a surface
            that reaches alphaMax over the deepest part of a 2.2 m shelf is a
@@ -1965,6 +2366,58 @@ static void part3_water(void)
            "and is blended and see-through",
            "blend=%d alpha=%.2f", found >= 0 ? glcap.draws[found].blend : -1,
            found >= 0 ? glcap.draws[found].color[3] : -1.f);
+    }
+
+    /* --- and so is a POOL, at its OWN alpha, and it does not flow ---------
+     *
+     * This is the reported bug in three parts. country_1's seven ponds and
+     * beach_4's two were not classified at all, so they drew as opaque
+     * `sea`-textured plates; and the family's one invented alpha would have
+     * given them the WATERFALL's value even once they were.
+     *
+     * The three assertions are the three fields of the engine's own table entry
+     * that differ from the stream's -- see the 0x575710 block in vis_data.h --
+     * and the alpha one is deliberately a comparison BETWEEN the two kinds
+     * rather than against either constant, which is a check a regression cannot
+     * move along with the code it guards.
+     */
+    {
+        int dp = -1, ds = -1;
+        float u_rest, u_later;
+        gl_cap_reset();
+        water_draw(&w, eye);
+        for (int d = 0; d < glcap.n_draws; d++) {
+            if (glcap.draws[d].mode != GL_TRIANGLES)
+                continue;
+            if (glcap.draws[d].tex == pool->gl_tex)   dp = d;
+            if (glcap.draws[d].tex == stream->gl_tex) ds = d;
+        }
+        ck(dp >= 0, "a pool draws", "draw %d", dp);
+        ck(dp >= 0 && glcap.draws[dp].blend
+           && glcap.draws[dp].color[3] < 0.95f,
+           "and is blended and see-through -- an opaque one is a teal plate",
+           "blend=%d alpha=%.2f", dp >= 0 ? glcap.draws[dp].blend : -1,
+           dp >= 0 ? glcap.draws[dp].color[3] : -1.f);
+        ck(dp >= 0 && ds >= 0
+           && glcap.draws[dp].color[3] < glcap.draws[ds].color[3],
+           "at its OWN alpha, thinner than the stream's, not one shared guess",
+           "pool %.3f against stream %.3f (110/255 and 120/255)",
+           dp >= 0 ? glcap.draws[dp].color[3] : -1.f,
+           ds >= 0 ? glcap.draws[ds].color[3] : -1.f);
+        /* +0x20 is clear for `pool`: it shimmers in place. The stream on the
+           same frames has to be moving, or this passes on a dead animator. */
+        u_rest = pool->verts[0].v;
+        {
+            float s_rest = stream->verts[0].v;
+            for (int step = 0; step < 60; step++)
+                water_step(&w, 1.f / 60.f);
+            water_draw(&w, eye);
+            u_later = pool->verts[0].v;
+            ck(u_later == u_rest && stream->verts[0].v != s_rest,
+               "and it does not scroll, while the stream on the same frames does",
+               "pool %.4f -> %.4f, stream moved %.4f",
+               u_rest, u_later, stream->verts[0].v - s_rest);
+        }
     }
 
     /* --- waves spawn, travel toward shore, and expire -------------------- */
@@ -2074,6 +2527,123 @@ static void part3_water(void)
                WAVE_INC_TIME, WAVE_DEC_TIME);
             ck(a_death >= 0.f && a_death < 0.02f, "and fades back out at the end",
                "alpha %.4f", a_death);
+        }
+    }
+
+    /* --- and none of it is beach_1's -------------------------------------
+     *
+     * Everything above runs on track 0, so everything above would also pass on
+     * a build that had beach_1's numbers compiled in for all ten tracks -- which
+     * is the build this replaced. Re-init on another track and check the two
+     * things that differ most: the surface's vertical offset (-0.37 m against
+     * -0.02 m) and its height. Both come off WSURF[track] and nothing else. */
+    {
+        int t;
+        for (t = 1; t < WSURF_N_TRACKS; t++) {
+            const wsurf_t *c = &WSURF[t];
+            float worst = 0.f;
+            unsigned int j;
+            if (c->offset == WSURF[0].offset && c->amp == WSURF[0].amp)
+                continue;                      /* nothing to tell apart */
+            water_free(&w);
+            water_init(&w, s, &bed, t);
+            water_step(&w, 0.37f);
+            gl_cap_reset();
+            water_draw(&w, eye);
+            for (j = 0; j < sea->nverts; j++) {
+                float k = w.damp[0][j];
+                float base = sea->verts[j].y
+                           - k * water_height(&w, sea->rest[j].x, sea->rest[j].z);
+                float want = sea->rest[j].y + c->offset
+                           + (1.f - k) * c->magnet_offset;
+                if (fabsf(base - want) > worst) worst = fabsf(base - want);
+            }
+            /* By NAME, not by pointer: WSURF is a `static const` in a header,
+               so water.c's copy and this file's copy are different objects with
+               the same contents. Comparing the addresses compares translation
+               units, which is not the question. */
+            ck(!strcmp(w.cfg->track, c->track) && worst < 1e-4f,
+               "the surface reads its OWN track's row, not beach_1's",
+               "%s (%s): offset %+.3f m against beach_1's %+.3f, worst %.5f m",
+               c->track, c->section, c->offset, WSURF[0].offset, worst);
+        }
+        /* and the table is indexed the way tracks.h is -- the two lists are
+           generated apart and load_track hands this one tracks.h's number */
+        {
+            int bad = 0;
+            for (t = 0; t < WSURF_N_TRACKS && t < N_TRACKS; t++)
+                if (strcmp(WSURF[t].track, TRACKS[t].base))
+                    bad++;
+            ck(WSURF_N_TRACKS == N_TRACKS && !bad,
+               "and WSURF[] is in tracks.h's own order",
+               "%d rows, %d disagree", WSURF_N_TRACKS, bad);
+        }
+        water_free(&w);
+    }
+
+    /* --- the packed grid and the drawn surface, over the REAL ten ---------
+     *
+     * The reported bug: "collision should be at the same place as the water,
+     * not on the sand". water.c draws every sea vertex at rest + offset;
+     * pack_col.py used to bake rest and nothing else, so rb_world.water put the
+     * waterline 0.37 m above where it was drawn and the drag and the water sound
+     * fired across a strip of dry beach -- 234 m2 of beach_1, 459 m2 of beach_4.
+     *
+     * Nothing above can see it: the fixture's col_t carries no water layer at
+     * all, and every other bound in this part measures the surface's MOTION.
+     * This is the two shipped files against each other.
+     *
+     * The MEDIAN of (grid height - authored height) over the sea's own vertices,
+     * because the grid answers per CELL, sampled at the cell's centre, and takes
+     * the highest surface covering it -- so an individual vertex can disagree
+     * where a tile is not flat or where a coast decal wins its cell. Half the
+     * sea's vertices cannot. */
+    {
+        static float d[65536];
+        int t;
+        for (t = 0; t < N_TRACKS; t++) {
+            char path[64];
+            scene_t ts;
+            col_t tc;
+            const wsurf_t *c = &WSURF[t];
+            unsigned int bi, j;
+            int n = 0, k;
+            float med;
+
+            snprintf(path, sizeof(path), "assets/%s.vsc", TRACKS[t].base);
+            if (!scene_load(path, &ts))
+                continue;
+            snprintf(path, sizeof(path), "assets/%s.col", TRACKS[t].base);
+            memset(&tc, 0, sizeof(tc));
+            if (!col_load(path, &tc)) { scene_release(&ts); continue; }
+
+            for (bi = 0; bi < ts.n_batches && n < (int)(sizeof d / sizeof *d); bi++) {
+                batch_t *b = &ts.batches[bi];
+                if (!(b->flags & BATCH_WATER))
+                    continue;
+                for (j = 0; j < b->nverts && n < (int)(sizeof d / sizeof *d); j++) {
+                    float wy;
+                    if (!col_water_at(&tc, b->verts[j].x, b->verts[j].z, &wy))
+                        continue;
+                    d[n++] = wy - b->verts[j].y;
+                }
+            }
+            if (n) {
+                for (k = 1; k < n; k++) {       /* insertion sort, n is small */
+                    float v = d[k];
+                    int q = k - 1;
+                    while (q >= 0 && d[q] > v) { d[q + 1] = d[q]; q--; }
+                    d[q + 1] = v;
+                }
+                med = d[n / 2];
+                ck(fabsf(med - c->offset) < 0.02f,
+                   "the .col water grid stands where the sea is DRAWN",
+                   "%s: grid is %+.3f m off the authored surface, and it is "
+                   "drawn %+.3f m off it (%d vertices)",
+                   TRACKS[t].base, med, c->offset, n);
+            }
+            col_free(&tc);
+            scene_release(&ts);
         }
     }
 }

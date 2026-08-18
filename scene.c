@@ -58,6 +58,120 @@ static void copy_name(char *dst, size_t cap, const char *src)
     dst[n] = 0;
 }
 
+
+/*
+ * Read one packed texture off `f` and upload it into `id`.
+ *
+ * Split out of scene_load so char.c can read the CHR2 texture table with the
+ * same code. The two formats encode a texture identically -- u16 name length,
+ * name, u16 w, u16 h, u8 format, u8 mip count, then the levels largest first --
+ * and everything that has ever gone wrong here (the 565 byte order, the quality
+ * skip, the one-upload-plus-glGenerateMipmap rule) is a property of the
+ * uploader rather than of the format. Two copies would eventually disagree.
+ *
+ * `name_out` gets the packed name, `keyed` whether any level-0 texel would fail
+ * the alpha test, `has_px` whether anything was uploaded at all. Sets
+ * tex_up_bytes to what this call put on the GPU.
+ */
+static size_t tex_up_bytes;
+
+void scene_read_texture(FILE *f, GLuint id, char *name_out, size_t cap,
+                        int *keyed, int *has_px)
+{
+    unsigned short nlen;
+    char name[256];
+    unsigned short w, h;
+    unsigned char fmt, mips;
+
+    tex_up_bytes = 0;
+    if (keyed) *keyed = 0;
+    if (has_px) *has_px = 0;
+
+    rd(f, &nlen, 2);
+    if (nlen > 255) nlen = 255;
+    rd(f, name, nlen);
+    name[nlen] = 0;
+    if (name_out) copy_name(name_out, cap, name);
+
+    rd(f, &w, 2); rd(f, &h, 2); rd(f, &fmt, 1); rd(f, &mips, 1);
+    glBindTexture(GL_TEXTURE_2D, id);
+    {
+        unsigned int bpp = (fmt == 1) ? 4 : 2;
+        void *px = malloc((size_t)w * h * bpp);      /* level 0 is largest */
+
+        /* Texture quality: drop this many levels off the TOP of the chain, so
+           the 256 px or 128 px copy becomes GL level 0. See scene.h. Never drop
+           the whole chain -- a texture with fewer levels keeps its smallest. */
+        unsigned int skip = (unsigned int)tex_skip;
+        if (skip > mips - 1u)
+            skip = mips - 1u;
+
+        /*
+         * Ship the .csi's own mip chain; without it distant terrain aliases.
+         *
+         * ONLY LEVEL `skip` IS ACTUALLY UPLOADED, and that is not a shortcut --
+         * it is what vitaGL does with the rest. glTexImage2D with level != 0 on
+         * an uncompressed format ignores its pixel pointer entirely and calls
+         * gpu_alloc_mipmaps(level), which box-downscales the chain out of level 0
+         * with sceGxmTransferDownscale (textures.c:922). So the authored mips
+         * were never reaching the GPU on hardware. Worse, that call regenerates
+         * levels 0..n EVERY time, so handing it ten levels one at a time is ~45
+         * downscales per texture instead of 9 -- pure load time, paid again on
+         * every track change and every quality change.
+         *
+         * glGenerateMipmap does the same generation in one pass, so the result is
+         * byte-identical and the load is not quadratic. The remaining levels are
+         * still READ, because the file offsets depend on it.
+         */
+        for (unsigned int lvl = 0; lvl < mips; lvl++) {
+            unsigned int lw = w >> lvl, lh = h >> lvl;
+            if (!lw) lw = 1;
+            if (!lh) lh = 1;
+            /* The skipped levels still have to be READ, or the stream goes out
+               of step and every batch after this texture is garbage. */
+            rd(f, px, (size_t)lw * lh * bpp);
+            /* Judged on level 0, which is the one the alpha-keyed art is authored
+               at; a mip of a cut-out keeps its transparent region. */
+            if (lvl == 0 && fmt == 1) {
+                const unsigned char *a = (const unsigned char *)px;
+                for (unsigned int t = 0; t < lw * lh; t++)
+                    if (a[t * 4 + 3] <= 127) { if (keyed) *keyed = 1; break; }
+            }
+            if (lvl != skip)
+                continue;
+            tex_up_bytes += (size_t)lw * lh * bpp;
+            if (has_px) *has_px = 1;
+            /* Only the 565 path: the RGBA one uploads byte-order r,g,b,a, which
+               GXM's U8U8U8U8_ABGR reads correctly on both hardware and Vita3K. */
+            if (fmt != 1 && tex_swap_rb)
+                swap_rb565(px, lw * lh);
+            if (fmt == 1)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lw, lh, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, px);
+            else
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, lw, lh, 0,
+                             GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
+        }
+        /* The chain, in one call -- see the comment on the loop. Same condition
+           as the filter choice below, so a single-level texture (the lightmap
+           atlases ship that way) still gets neither. */
+        if ((mips - skip) > 1)
+            glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        (mips - skip) > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        /* The sprite textures (shadow, foam, checkpoint arrows) are drawn well
+           outside [0,1] by design, and their border is transparent -- REPEAT
+           would tile a second car shadow next to the first. */
+        int wrap = (name[0] == '_' || !strncmp(name, "cp_ar", 5)
+                    || !strncmp(name, "water_wave", 10))
+                   ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+        free(px);
+    }
+}
+
 int scene_load(const char *path, scene_t *s)
 {
     FILE *f = fopen(path, "rb");
@@ -118,93 +232,16 @@ int scene_load(const char *path, scene_t *s)
     glGenTextures(s->n_tex, s->tex_ids);
 
     for (unsigned int i = 0; i < s->n_tex; i++) {
-        unsigned short nlen;
-        rd(f, &nlen, 2);
         char name[256];
-        if (nlen > 255) nlen = 255;
-        rd(f, name, nlen);
-        name[nlen] = 0;
+        int is_keyed = 0, got_px = 0;
+        scene_read_texture(f, s->tex_ids[i], name, sizeof name,
+                           &is_keyed, &got_px);
         copy_name(s->tex_names[i], SCENE_TEX_NAME, name);
-
-        unsigned short w, h;
-        unsigned char fmt, mips;
-        rd(f, &w, 2); rd(f, &h, 2); rd(f, &fmt, 1); rd(f, &mips, 1);
-
-        unsigned int bpp = (fmt == 1) ? 4 : 2;
-        void *px = malloc((size_t)w * h * bpp);      /* level 0 is largest */
-        glBindTexture(GL_TEXTURE_2D, s->tex_ids[i]);
-
-        /* Texture quality: drop this many levels off the TOP of the chain, so
-           the 256 px or 128 px copy becomes GL level 0. See scene.h. Never drop
-           the whole chain -- a texture with fewer levels keeps its smallest. */
-        unsigned int skip = (unsigned int)tex_skip;
-        if (skip > mips - 1u)
-            skip = mips - 1u;
-
-        /*
-         * Ship the .csi's own mip chain; without it distant terrain aliases.
-         *
-         * ONLY LEVEL `skip` IS ACTUALLY UPLOADED, and that is not a shortcut --
-         * it is what vitaGL does with the rest. glTexImage2D with level != 0 on
-         * an uncompressed format ignores its pixel pointer entirely and calls
-         * gpu_alloc_mipmaps(level), which box-downscales the chain out of level 0
-         * with sceGxmTransferDownscale (textures.c:922). So the authored mips
-         * were never reaching the GPU on hardware. Worse, that call regenerates
-         * levels 0..n EVERY time, so handing it ten levels one at a time is ~45
-         * downscales per texture instead of 9 -- pure load time, paid again on
-         * every track change and every quality change.
-         *
-         * glGenerateMipmap does the same generation in one pass, so the result is
-         * byte-identical and the load is not quadratic. The remaining levels are
-         * still READ, because the file offsets depend on it.
-         */
-        for (unsigned int lvl = 0; lvl < mips; lvl++) {
-            unsigned int lw = w >> lvl, lh = h >> lvl;
-            if (!lw) lw = 1;
-            if (!lh) lh = 1;
-            /* The skipped levels still have to be READ, or the stream goes out
-               of step and every batch after this texture is garbage. */
-            rd(f, px, (size_t)lw * lh * bpp);
-            /* Judged on level 0, which is the one the alpha-keyed art is authored
-               at; a mip of a cut-out keeps its transparent region. */
-            if (lvl == 0 && fmt == 1) {
-                const unsigned char *a = (const unsigned char *)px;
-                for (unsigned int t = 0; t < lw * lh; t++)
-                    if (a[t * 4 + 3] <= 127) { keyed[i] = 1; break; }
-            }
-            if (lvl != skip)
-                continue;
-            up_bytes += (size_t)lw * lh * bpp;
-            has_px[i] = 1;
-            /* Only the 565 path: the RGBA one uploads byte-order r,g,b,a, which
-               GXM's U8U8U8U8_ABGR reads correctly on both hardware and Vita3K. */
-            if (fmt != 1 && tex_swap_rb)
-                swap_rb565(px, lw * lh);
-            if (fmt == 1)
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lw, lh, 0,
-                             GL_RGBA, GL_UNSIGNED_BYTE, px);
-            else
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, lw, lh, 0,
-                             GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
-        }
-        /* The chain, in one call -- see the comment on the loop. Same condition
-           as the filter choice below, so a single-level texture (the lightmap
-           atlases ship that way) still gets neither. */
-        if ((mips - skip) > 1)
-            glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        (mips - skip) > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        /* The sprite textures (shadow, foam, checkpoint arrows) are drawn well
-           outside [0,1] by design, and their border is transparent -- REPEAT
-           would tile a second car shadow next to the first. */
-        int wrap = (name[0] == '_' || !strncmp(name, "cp_ar", 5)
-                    || !strncmp(name, "water_wave", 10))
-                   ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
-        free(px);
+        keyed[i] = (unsigned char)is_keyed;
+        has_px[i] = (unsigned char)got_px;
+        up_bytes += (size_t)tex_up_bytes;
     }
+
 
     /* The rig sits between the textures and the batches. Reading it here keeps
        the stream in step even if there are more parts than carani can hold. */

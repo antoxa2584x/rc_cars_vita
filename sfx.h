@@ -95,6 +95,40 @@ void sfx_respawn(void);         /* cp_reset */
    -- PROP_MIN_SPEED and friends in sfx.c. */
 void sfx_prop_hit(int model, const float pos[3], float speed);
 
+/*
+ * A CHARACTER'S OWN VOICE, and every one of these is named by the model itself.
+ *
+ * Each MOD_MODEL in AIChars.sb and people.sb carries a MOD_SNDCHANNEL naming a
+ * wav and its two radii -- the same structure gen_prop_data.py reads a prop's
+ * knock out of, and the same one gen_tracks.py reads a track's ambient bed out
+ * of. Four wavs cover the six models that have a channel:
+ *
+ *     Dog        dog_attack        rmin 15.0  rmax 5.0
+ *     Seagull    seagull_vzliot    rmin 50.0  rmax 5.0   (vzlyot = takeoff)
+ *     Man        man_voice         rmin 20.0  rmax 0.0
+ *     Woman      woman_voice       rmin 20.0  rmax 0.0
+ *     RepairMan  man_voice
+ *     Guard      man_voice
+ *
+ * The Crab and the Spider have no channel and make no noise, which is the
+ * data's answer rather than an omission.
+ *
+ * rmin > rmax on all of them, exactly as the props' 30/8 does, and it is passed
+ * through as authored for the same reason: under mix_pan's law the pair means
+ * full volume out to rmax and silence past it, which is a well-defined answer.
+ * WHAT RAISES EACH ONE IS THE PORT'S -- char.c calls this on the edge of a Dog
+ * starting an attack, a Seagull taking off, and a character being run over.
+ */
+typedef enum {
+    SFX_VOICE_DOG,
+    SFX_VOICE_SEAGULL,
+    SFX_VOICE_MAN,
+    SFX_VOICE_WOMAN,
+    SFX_VOICE_COUNT
+} sfx_voice_t;
+
+void sfx_char_voice(sfx_voice_t which, const float pos[3], float gain);
+
 /* ------------------------------------------------------------- the opponents
  *
  * One positional engine loop per AI car, because that is all the shipped data

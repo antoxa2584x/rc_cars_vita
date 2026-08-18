@@ -355,13 +355,25 @@ it -- and the height grid is what lets `carSurfaceDrag`'s water term fire at all
 See the WATER note at the top of `pack_col.py`, and `rccars_re/wetcheck.c`, which
 checks the packed grids and prints every race start's depth.
 
+**The `sea` cells are stored where the sea is DRAWN**, not where the artists
+authored it: `pack_col.py` adds the track's own `WLOD_<track>_more1` `offset`
+(and the `magnet` ramp, which is zero on every shipped track) to them, exactly as
+`water.c` does when it displaces the surface. So `pack_col.py` reads
+`Settings/` -- `--settings`, defaulting to the same directory `gen_vis_data.py`
+uses, and through the same `wsurf_values()` so the two cannot be typed
+differently. **Regenerate `vis_data.h` and repack all ten together**; a grid
+packed against one `offset` and a header carrying another puts the waterline the
+car feels somewhere the waterline it can see is not, which is a car that wades
+through dry sand. `vis_test` part 3 checks the two shipped files against each
+other on all ten tracks.
+
 Host harnesses, none of which needs the Vita toolchain. **`rm` the binary first**
 -- two of these lines had gone stale and did not link at all, and a failed link
 leaves the previous binary sitting there to answer for it:
 
     rm -f rb_test vis_test carparts_test menu_test ui_test meshalign \
-          rockroll allstarts track wetcheck proptest ceiling audio_test colprof \
-          flipped antheight aitest
+          rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
+          colprof flipped antheight aitest
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -383,6 +395,19 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         ../rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c rlog.c -lm -o proptest                # the knockable props
+    gcc -I. -Itestgl -O2 ../rccars_re/chartest.c char.c scene.c col.c \
+        carani.c rb.c contact.c collide.c rbcar.c rlog.c -lm -o chartest
+                            # the tracks' people, animals and road cars. scene.c
+                            # is on this line for scene_read_texture, which the
+                            # .chr texture table goes through so that quality,
+                            # the 565 byte order and the mip rule cannot drift
+                            # between the two formats. rbcar.c is on it for part
+                            # 12, which drives a REAL car at a character to check
+                            # that the character stops it. The GL stub lives in
+                            # chartest.c and keeps a REAL MATRIX STACK -- a
+                            # character is placed entirely through glTranslatef /
+                            # glRotatef / glScalef, and a stub that discarded
+                            # them could see the vertices and not where they went.
     gcc -I. -O2 ../rccars_re/menu_test.c menu.c contact.c rb.c collide.c \
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu

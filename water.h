@@ -3,42 +3,75 @@
  * the waterfall, and the breaking-wave sprites.
  *
  * The game's water is the WaterLOD module (wlodInit and friends, 0x00521540
- * for its config, 0x00525000-0x0052a600 for the rest). Four of its five parts
- * map cleanly onto a flattened scene:
+ * for its config, 0x00525000-0x0052a600 for the rest). Its parts map cleanly
+ * onto a flattened scene:
  *
  *   surface   the `sea`-textured LOD tiles, displaced and UV-scrolled
  *   coast     the foam band, scrolled, with alpha driven by the water height
  *             (WaterLOD_Coast's HeightOn / HeightOff are exactly that: the
  *             surface heights at which the foam is fully on and fully off)
  *   stream    scrolled at WaterLOD_Stream's ScrollVel
- *   fall      scrolled downward
+ *   fall      scrolled downward, and the only one of the family with a sound
+ *   pool      a standing puddle: no scroll, a noise jitter instead. country_1's
+ *             seven ponds and beach_4's two, and the port had no such kind at
+ *             all until they were reported showing as opaque teal plates
  *   waves     sprites spawned at the water_wave_N markers, one on a TimeLong
  *             timer and one on a TimeShort timer, exactly as FUN_00525700
  *             steps its two per-marker counters
+ *
+ * stream, fall and pool are ONE scanner and one three-entry table in the exe
+ * (0x575710, walked by 0x523760); the coast is a second scanner of the same
+ * shape (0x51c950). Both test the node name with strstr -- a SUBSTRING -- which
+ * is what pack_vsc.py's SURFACE_NEEDLES now mirrors.
  *
  * What is transcribed and what is not:
  *
  *   TRANSCRIBED  every constant (vis_data.h cites the loader each came from),
  *                the two-timer wave spawner, the wave sprite's geometry and
  *                life envelope (FUN_0052a030 / FUN_00529c60), the coast's
- *                height-driven alpha.
- *   NOT          the surface displacement FUNCTION. The engine tessellates its
- *                own grid over the water_box volume and evaluates it there;
- *                the port has authored tiles and sums two directional sines
- *                from the recovered angle/speed/period/amp pairs. The numbers
- *                are the game's, the curve is ours.
- *   NOT          the shallow-water damping. The engine has magnetOffset /
- *                magnetRadius / clampYImmediate / clampYScale for it; those are
- *                not read out yet, so water.c fades the displacement out where
- *                the seabed comes up to meet the surface. Without SOMETHING
- *                there a 0.41 m swell tears open the seam where the sea meets
- *                the sand.
+ *                height-driven alpha, and -- since the sea was found to be
+ *                displaced by a tenth of what the engine does it by -- the
+ *                surface displacement FUNCTION itself, FUN_005240c0. The engine
+ *                tessellates its own grid over the water_box volume and the
+ *                port has authored tiles, so the port folds FUN_0051c000's
+ *                per-vertex precompute back into the evaluator; the arithmetic
+ *                is the same. See vis_data.h's WSURF block for the formula and
+ *                for the four config conversions that are not raw*0.01.
+ *   NOT          the per-vertex UV orbit's DRAW. FUN_005240c0 reads a radius
+ *                and a rate out of each vertex's own record; texRadMin/Max and
+ *                texSpeedMin/Max being pairs is what says the record was filled
+ *                by drawing from the range, but the draw itself is at
+ *                tessellation time and is not transcribed. water.c hashes the
+ *                vertex index, which needs no storage and survives a reload.
+ *   NOT          the pool's UV noise. Its table entry sets the noise flag at
+ *                +0x24 and clears the scroll flag at +0x20, so a pool shimmers
+ *                in place rather than flowing: 0x523555 jitters each U by
+ *                noise * STREAM_POOL_NOISE_LEN (0.01 UV) off a 256-entry noise
+ *                object. The amplitude is recovered, the noise function is not,
+ *                so water_draw holds a pool still and lifts it as a decal.
+ *   TRANSCRIBED  the shallow-water damping, which used to be in this list as a
+ *                guess. It is magnetOffset / magnetRadius, and the reason it
+ *                read as unrecoverable is that neither converts as raw*0.01:
+ *                magnetOffset is raw*0.01 - 0.5, which makes the shipped raw 50
+ *                exactly ZERO on every track, and magnetRadius is raw*0.05,
+ *                which makes the shipped raw 51 into 2.55 m. So the swell fades
+ *                out linearly over the last 2.55 m of DEPTH and the surface is
+ *                not lifted at the shore at all. The port had guessed 0.5 m and
+ *                a smoothstep. clampYImmediate / clampYScale are still not read
+ *                out; they are zero on every track that has a sea.
  *
- *                Depth, and not distance to the `coast` meshes, because five of
- *                the ten tracks have water and no coast mesh at all, and
- *                because the water surface ships as one merged batch whose
- *                per-tile vertices are not shared -- so its own mesh boundary
- *                is every tile edge, not the shoreline.
+ *                Depth, and not distance to the `coast` meshes. Four of the
+ *                six tracks with any water at all ship no coast mesh --
+ *                country_1 (pools only), and beach_1's stream and country_3's
+ *                stream and falls all run inland -- and the water surface ships
+ *                as one merged batch whose per-tile vertices are not shared, so
+ *                its own mesh boundary is every tile edge, not the shoreline.
+ *
+ *                (The count used to read "five of the ten tracks have water and
+ *                no coast mesh". That was measured through the packer's old
+ *                `^coast\d*$` rule, which missed beach_2's `LM0_NOSHDW_coast1`
+ *                -- the only coast mesh on that track. Every track with a SEA
+ *                surface does in fact have a coast band.)
  */
 
 #ifndef WATER_H
@@ -46,12 +79,21 @@
 
 #include "col.h"
 #include "scene.h"
+#include "vis_data.h"
 
-/* How far the sea surface itself moves, metres. NOT a recovered value -- see
-   water.c's surf_signal. Here rather than in the .c so vis_test can bound
-   against it: the first build displaced by 0.41 m, built half out of a key the
-   engine never reads. */
-#define WATER_SWELL_AMP 0.02f
+/* There is no swell-amplitude constant here any more. The height is
+   WSURF[track].amp and .amp2 out of vis_data.h, straight from the track's own
+   config section, and it runs from 0.42 m peak to peak on beach_4 to 1.12 m on
+   beach_2 -- not the 0.02 m that used to live here.
+
+   That 0.02 m was chosen because the first build's 0.41 m "read as a storm next
+   to a 0.42 m car". It did, but the fault was never the height: the same build
+   had the wavelength at 1.24 m, because it read `period` as a time when the
+   engine uses it as a spatial frequency. 0.41 m of swell on a 1.24 m wave is
+   60% steepness, which no water can hold. On the engine's own 10.5 m it is 2%.
+   Steepness is what the packer prints for each track now, and it is the number
+   that says whether the units have been read right -- a height on its own says
+   nothing at all. */
 
 /* Depth over which the surface ramps from alphaMin to alphaMax.
  *
@@ -68,11 +110,25 @@
  * the edge, which is not what water looks like. */
 #define WATER_ALPHA_DEPTH 6.0f
 
-/* The stream and the waterfall are translucent too, at a flat value: they are
-   uniformly shallow (beach_1's stream runs 2 to 13 cm over its bed), so the
-   depth ramp the sea uses would take them to nearly clear. NOT recovered --
-   WaterLOD_Stream ships ScrollVel and noise terms and no alpha at all. */
-#define WATER_STREAM_ALPHA 0.55f
+/* The exponent on that ramp. ALSO the port's, and it used to be spelled
+   WSURF_ALPHA_POW as though it were the game's. The engine does ship an
+   `alphaPow` and its conversion is now read out -- raw*0.2 - 10, stored as
+   -1/that, so the shipped raw 60 is -0.5 -- but -0.5 is not an exponent this
+   ramp could use, and the code that consumes it is not transcribed. The 0.6
+   here is the number the port has always used; only its NAME was wrong. */
+#define WATER_ALPHA_POW 0.6f
+
+/* The stream, the waterfall and the pools are translucent too, at a flat value
+   each -- RECOVERED, and they do not agree: STREAM_VERTEX_ALPHA 120/255,
+   FALL_VERTEX_ALPHA 140/255, POOL_VERTEX_ALPHA 110/255, in vis_data.h. They come
+   off +0x34 of the engine's own node table, which 0x523866 writes into every
+   vertex colour of the matched surface. Flat rather than depth-ramped like the
+   sea, which is also what the engine does and suits surfaces this shallow
+   (beach_1's stream runs 2 to 13 cm over its bed).
+
+   This used to be one invented 0.55 for the whole family. That is the
+   WATERFALL'S value -- and the pools never saw it, because `pool` was not in the
+   packer's name rule at all. */
 
 /* --- the foam band is a DECAL, and the art puts it EXACTLY on the sand -----
  *
@@ -102,31 +158,25 @@
 #define WATER_DECAL_OFFSET_FACTOR (-1.f)
 #define WATER_DECAL_OFFSET_UNITS  (-16.f)
 
-/* --- how far the foam's on/off signal is stretched -------------------------
+/* --- the foam's on/off signal ----------------------------------------------
  *
- * shore_height reads the two recovered wave trains, whose wavelengths work out
- * at 1.24 m (WSURF_SPEED * WSURF_PERIOD) and 1.61 m (WSURF_LENGTH2). The coast
- * band's own median triangle edge is 1.77 m on beach_1 (p90 2.60 m), so
- * evaluating that signal per vertex samples it BELOW Nyquist: neighbouring
- * vertices land on unrelated phases and the band flashes at the faster train's
- * 1.67 Hz instead of breathing with a swell. vis_test already had to work
- * around it -- its alpha check samples over time because "a single frame is a
- * snapshot of a 1.2 m wave read on a grid whose spacing is several metres".
+ * There is no stretch factor here any more either. It existed because
+ * shore_height read the two wave trains at 1.24 m and 1.61 m -- ripples, on a
+ * coast band whose median triangle edge is 1.77 m, which is below Nyquist -- and
+ * dividing the phase by 12 was the only thing keeping the band from strobing.
+ * The wavelengths were the units bug; the engine's own are 10.5 m and 10.1 m and
+ * the band samples them at about six vertices a wavelength with nothing added.
  *
- * Dividing the whole PHASE by one factor stretches wavelength and period
- * together, so WSURF_SPEED comes out unchanged at 2.06 m/s: it is the same wave
- * train read at swell scale rather than at ripple scale. 12x puts the two
- * trains at 14.8 m / 7.2 s and 19.3 m / 21.6 s -- about seven band vertices per
- * wavelength, which is a curve rather than a sampling artefact, and shore-swell
- * timing rather than a strobe.
+ * And the signal is not a sum of the two trains at all. FUN_0051c690 reads only
+ * the SECOND, radial one -- sin(period2*t + r/length2) -- at unit amplitude,
+ * which is what the loader's 1/amp2 was precomputed for: 0x51c71d multiplies by
+ * amp2 and then straight back by 1/amp2.
  *
- * The value is set by the coarsest thing that samples it, so anything under
- * about 9 is visibly aliased and vis_test bounds it from below on both counts.
- *
- * The port's number. The engine never had this to solve -- it tessellates its
- * own surface grid far finer than the authored coast strips and reads the foam
- * height off that. */
-#define COAST_WAVE_STRETCH 12.0f
+ * NOT transcribed: the engine's remap of that signal to an alpha is asymmetric.
+ * It branches on the sign of the cosine, so the foam comes ON over a shorter
+ * span of phase than it goes OFF over, and the three constants it interpolates
+ * between are runtime globals at 0x14ef3d4/e0/e4 rather than anything in a
+ * config file. water.c keeps the port's symmetric HeightOn..HeightOff map. */
 
 #define WATER_MAX_WAVES 32
 #define WATER_MAX_SPAWN 8
@@ -149,6 +199,16 @@ typedef struct {
     scene_t *scene;
     float t;                /* seconds since the level loaded */
     unsigned int rng;
+
+    /* This track's row of vis_data.h's WSURF[]. Never NULL: water_init clamps
+       the index, so a caller with no track (vis_test's fixture) gets beach_1's.
+       The surface config is PER TRACK and the port used to compile beach_1's
+       into every one of the ten. */
+    const wsurf_t *cfg;
+
+    /* cos/sin of cfg->angle_deg, so the directional train's projection is a
+       dot product rather than two trig calls per vertex per frame. */
+    float d1x, d1z;
 
     /* per-vertex swell damping for the surface batches, 0 where the seabed
        reaches the surface and 1 in deep water; parallel to each batch's vertex
@@ -178,9 +238,13 @@ typedef struct {
    test fixture, visibly wrong on a real beach. One ground query per surface
    vertex, at load.
 
+   `track` indexes vis_data.h's WSURF[] -- and tracks.h's TRACKS[], which is
+   the same order; out of range clamps to 0. The sea's height, wavelength and
+   vertical offset all come out of that row and all three differ per track.
+
    Accepts an UNINITIALISED struct -- it memsets first. So call water_free
    yourself before re-initialising one that has already been built. */
-void water_init(water_t *w, scene_t *scene, const col_t *col);
+void water_init(water_t *w, scene_t *scene, const col_t *col, int track);
 
 /* Release everything water_init allocated and zero the struct. Safe on a
    zeroed or an already-freed one; not safe on an uninitialised one. */
@@ -194,8 +258,14 @@ void water_step(water_t *w, float dt);
    the wave sprites billboard about their crest towards. */
 void water_draw(water_t *w, const float eye[3]);
 
-/* The surface height at (x, z) -- the same sum the surface batches use. Handy
-   for anything that wants to sit on the water. */
+/* The surface's displacement at (x, z) -- the same sum the surface batches
+   use, before the depth damping and before the track's vertical offset. Handy
+   for anything that wants to sit on the water.
+
+   NOT what the physics reads. rb_world.water answers out of the .col grid,
+   which pack_col.py bakes at rest height PLUS the same cfg->offset the surface
+   is drawn with, so the two agree on where the waterline is; feeding this in
+   as well would modulate the drag with a wave the engine's probe never had. */
 float water_height(const water_t *w, float x, float z);
 
 #endif

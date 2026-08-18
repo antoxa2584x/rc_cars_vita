@@ -6,7 +6,8 @@
  *     python3 rccars_re/gen_vis_data.py
  *
  * Every conversion is the one the matching loader performs; see the script's
- * docstring for the function each came from. Water surface section: WLOD_beach_1_more1.
+ * docstring for the function each came from. The sea surface is per track --
+ * see WSURF[] below.
  */
 
 #ifndef VIS_DATA_H
@@ -53,6 +54,31 @@
 #define STREAM_POOL_NOISE_LEN      0.010000f   /*  */
 #define STREAM_POOL_NOISE_FREQ     1.550000f   /*  */
 
+/* ---- stream / waterfall / pool: the node table at 0x575710 -------------
+ *
+ * NOT a config section -- a static table of three entries in the exe, scanned
+ * per node by 0x523760. read_surface_table cites the instruction behind every
+ * field; what matters here is +0x34, which 0x523866 writes into EVERY vertex
+ * colour of the matched surface as `0xffffff | (alpha << 24)`. White at a flat
+ * opacity: that single byte is the whole of what makes one of these three a
+ * body of water rather than a textured slab, and the three do not agree.
+ *
+ * The port used to have one number, 0.55, for all of them, marked "NOT
+ * recovered" -- which turns out to be the WATERFALL'S value, and it was never
+ * applied to a pool at all because pools were not classified. */
+
+#define STREAM_VERTEX_ALPHA        0.470588f   /* `stream`, raw 120/255 at +0x34 */
+#define FALL_VERTEX_ALPHA          0.549020f   /* `wtr_fall`, raw 140/255 at +0x34 */
+#define POOL_VERTEX_ALPHA          0.431373f   /* `pool`, raw 110/255 at +0x34 */
+
+/* Does this kind scroll its UVs (+0x20)? A pool does not: its
+   entry sets the NOISE flag at +0x24 instead, so it shimmers in
+   place. The noise field itself is the one part of the entry the
+   port does not transcribe -- see water_draw. */
+#define STREAM_SCROLLS             1   /* +0x20 */
+#define FALL_SCROLLS               1   /* +0x20 */
+#define POOL_SCROLLS               0   /* +0x20 */
+
 /* ---- shore wave spawner: FUN_00525c10 (WaterLOD_Wave) ---- */
 
 #define WAVE_TIME_LONG             2.000000f   /* seconds between long-lived waves */
@@ -76,33 +102,172 @@
 #define WAVE_DEC_TIME              0.670000f   /* fraction of life spent fading out */
 #define WAVE_INC_TIME              0.330000f   /* fraction of life spent fading in */
 
-/* ---- water surface: FUN_00521540, section WLOD_beach_1_more1.
-   The evaluator that consumes these (the WaterLOD tessellator) is NOT
-   transcribed, and neither are the surface's AMPLITUDES: the loader
-   reads angle/speed/period and their `2` counterparts plus length2, and
-   stores 1/amp2 and 1/length2 -- reciprocals, which is what you
-   precompute for a divisor. So these give the DIRECTIONS and RATES of
-   the two wave trains and nothing about how tall they are. water.c
-   therefore uses them for the shoreline foam's on/off signal, whose
-   range HeightOn/HeightOff DO pin down, and keeps the surface itself
-   nearly flat -- which is what the retail game looks like. ---- */
+/* ---- the sea surface: FUN_00521540 loads it, FUN_005240c0 evaluates it -----
+ *
+ * Per surface vertex, with the projections FUN_0051c000 precomputes at load:
+ *
+ *     phi1 = (t*speed + x*cos(angle) + z*sin(angle)) * period
+ *     phi2 =  t*period2 + |(x,z) - (posX,posZ)| / length2
+ *     damp = clamp01(depth / magnetRadius)
+ *     y    = restY + offset + (1 - damp)*magnetOffset
+ *                  + damp * ( amp*(0.25 + 0.75*sin phi1) + amp2*sin phi2 )
+ *
+ * So `period` is a SPATIAL frequency in rad/m -- wavelength 2*pi/period -- and
+ * the time term rides on speed*period, which leaves speed as the phase speed in
+ * m/s. Wave two is RADIAL about (posX, posZ) with wavelength 2*pi*length2.
+ * `speed2` and `angle2` are loaded and FUN_005240c0 never reads them; angle2's
+ * projection is precomputed all the same, so both are carried here.
+ *
+ * `amp` and `amp2` are HEIGHTS, in metres, and both are read: the key string at
+ * 0x5756e0 is "amp" and the loader puts it in param_2[8], "amp2" at 0x5756c0
+ * goes to param_2[9]. The 1/amp2 stored beside it is not a sign that amp2 is a
+ * divisor -- it is used at 0x51c71d to normalise the coast foam's signal back
+ * to unit amplitude. The amp term is deliberately asymmetric: 0.25 + 0.75*sin
+ * spans -0.5..+1.0, so crests stand twice as far above the mean as troughs fall
+ * below it, which is what a swell does.
+ *
+ * The steepness these produce is the check that the units are read right: every
+ * track lands between 2 and 9 per cent, and real swell breaks past about 14.
+ * Reading `period` as a time instead put two of the five past breaking.
+ *
+ * magnetOffset/magnetRadius are the shallow-water block. Both conversions are
+ * unobvious and neither is raw*0.01: magnetOffset is raw*0.01 - 0.5, so the
+ * shipped raw 50 is exactly ZERO on every track and there is no shore lift at
+ * all; magnetRadius is raw*0.05, so the shipped raw 51 is 2.55 m of DEPTH over
+ * which the swell fades to flat -- five times the 0.5 m the port had guessed.
+ *
+ * NOT here, and each for its own reason:
+ *   texScaleX/Z  the world-to-UV rate the engine tessellates its own grid with
+ *                (raw*0.1). The port ships authored tiles that carry their own
+ *                UVs, so there is nothing for it to scale.
+ *   alphaPow     conversion known -- raw*0.2 - 10, stored as -1/that, so the
+ *                shipped raw 60 is -0.5 -- but the code that consumes it is not
+ *                transcribed, and -0.5 is not an exponent water.c could use.
+ *                The port's own depth ramp keeps its own constant, in water.h.
+ *
+ * The section is PER TRACK (WLOD_<track>_more1); the ones that ship one are the
+ * four beaches and country_3, and beach_2 also ships a .crs override. A track
+ * without one falls back to WaterLOD, whose amp and amp2 are both 0 -- and
+ * every track that falls back has no sea surface at all. ---- */
 
-#define WSURF_ANGLE_DEG            60.000000f   /* raw*10 */
-#define WSURF_SPEED                2.060000f   /*  */
-#define WSURF_PERIOD               0.600000f   /* seconds */
-#define WSURF_ANGLE2_DEG           40.000000f   /* raw*10 */
-#define WSURF_SPEED2               1.970000f   /*  */
-#define WSURF_PERIOD2              1.800000f   /* seconds */
-#define WSURF_LENGTH2              1.610000f   /* metres */
-#define WSURF_AMP2                 0.250000f   /* metres */
-#define WSURF_OFFSET               -0.370000f   /*  */
-#define WSURF_TEX_SCALE_X          0.040000f   /*  */
-#define WSURF_TEX_SCALE_Z          0.040000f   /*  */
-#define WSURF_TEX_SPEED_MIN        0.130000f   /*  */
-#define WSURF_TEX_SPEED_MAX        0.280000f   /*  */
-#define WSURF_ALPHA_POW            0.600000f   /* exponent on the depth ramp */
-#define WSURF_ALPHA_MIN            0.101961f   /* 0..1 */
-#define WSURF_ALPHA_MAX            1.000000f   /* 0..1 */
+#define WSURF_N_TRACKS 10
+
+typedef struct {
+    const char *track;         /* tracks.h's base name, for the index check */
+    const char *section;       /* the config section this row was read from */
+    float angle_deg, speed, period;              /* wave 1, directional */
+    float angle2_deg, speed2, period2, length2;  /* wave 2, radial */
+    float amp, amp2;                             /* metres */
+    float offset, magnet_offset, magnet_radius;  /* metres */
+    float pos_x, pos_z;                          /* the radial wave's centre */
+    float tex_rad_min, tex_rad_max;              /* UV, the orbit's radius */
+    float tex_speed_min, tex_speed_max;          /* degrees per second */
+    float alpha_min, alpha_max;                  /* 0..1 */
+} wsurf_t;
+
+static const wsurf_t WSURF[WSURF_N_TRACKS] = {
+    { "beach_1", "WLOD_beach_1_more1",
+      60.000000f, 2.060000f, 0.600000f,
+      40.000000f, 1.970000f, 1.800000f, 1.610000f,
+      0.160000f, 0.250000f,
+      -0.370000f, 0.000000f, 2.550000f,
+      -47.000000f, 3.000000f,
+      0.000000f, 0.030000f,
+      46.800000f, 100.800000f,
+      0.101961f, 1.000000f },
+      /* swell 0.740 m peak to peak; wavelengths 10.5 m and 10.1 m, steepness 0.023 and 0.049 */
+    { "beach_2", "WLOD_beach_2_more1",
+      60.000000f, 2.060000f, 0.900000f,
+      40.000000f, 1.970000f, 1.500000f, 1.610000f,
+      0.370000f, 0.280000f,
+      0.000000f, 0.000000f, 2.550000f,
+      -473.000000f, -419.000000f,
+      0.000000f, 0.030000f,
+      46.800000f, 100.800000f,
+      0.101961f, 1.000000f },
+      /* swell 1.115 m peak to peak; wavelengths 7.0 m and 10.1 m, steepness 0.079 and 0.055 */
+    { "beach_3", "WLOD_beach_3_more1",
+      90.000000f, 1.920000f, 1.400000f,
+      40.000000f, 4.090000f, 1.200000f, 1.240000f,
+      0.250000f, 0.200000f,
+      -0.070000f, 0.000000f, 2.550000f,
+      -26.000000f, -73.000000f,
+      0.000000f, 0.030000f,
+      46.800000f, 100.800000f,
+      0.101961f, 1.000000f },
+      /* swell 0.775 m peak to peak; wavelengths 4.5 m and 7.8 m, steepness 0.084 and 0.051 */
+    { "beach_4", "WLOD_beach_4_more1",
+      170.000000f, 2.060000f, 1.200000f,
+      40.000000f, 1.970000f, 1.800000f, 1.610000f,
+      0.120000f, 0.120000f,
+      -0.020000f, 0.000000f, 2.550000f,
+      23.000000f, 36.000000f,
+      0.000000f, 0.030000f,
+      46.800000f, 100.800000f,
+      0.101961f, 1.000000f },
+      /* swell 0.420 m peak to peak; wavelengths 5.2 m and 10.1 m, steepness 0.034 and 0.024 */
+    { "country_1", "WaterLOD",
+      60.000000f, 3.150000f, 0.100000f,
+      40.000000f, 2.670000f, 0.300000f, 1.610000f,
+      0.000000f, 0.000000f,
+      -0.500000f, 0.000000f, 2.550000f,
+      0.000000f, 0.000000f,
+      0.010000f, 0.030000f,
+      90.000000f, 270.000000f,
+      0.101961f, 1.000000f },
+      /* swell 0.000 m peak to peak; wavelengths 62.8 m and 10.1 m, steepness 0.000 and 0.000 */
+    { "country_2", "WaterLOD",
+      60.000000f, 3.150000f, 0.100000f,
+      40.000000f, 2.670000f, 0.300000f, 1.610000f,
+      0.000000f, 0.000000f,
+      -0.500000f, 0.000000f, 2.550000f,
+      0.000000f, 0.000000f,
+      0.010000f, 0.030000f,
+      90.000000f, 270.000000f,
+      0.101961f, 1.000000f },
+      /* swell 0.000 m peak to peak; wavelengths 62.8 m and 10.1 m, steepness 0.000 and 0.000 */
+    { "country_3", "WLOD_country_3_more1",
+      60.000000f, 1.800000f, 1.900000f,
+      40.000000f, 1.970000f, 1.800000f, 1.610000f,
+      0.200000f, 0.290000f,
+      -0.080000f, 0.000000f, 2.550000f,
+      -73.000000f, -17.000000f,
+      0.000000f, 0.030000f,
+      46.800000f, 100.800000f,
+      0.101961f, 1.000000f },
+      /* swell 0.880 m peak to peak; wavelengths 3.3 m and 10.1 m, steepness 0.091 and 0.057 */
+    { "country_4", "WaterLOD",
+      60.000000f, 3.150000f, 0.100000f,
+      40.000000f, 2.670000f, 0.300000f, 1.610000f,
+      0.000000f, 0.000000f,
+      -0.500000f, 0.000000f, 2.550000f,
+      0.000000f, 0.000000f,
+      0.010000f, 0.030000f,
+      90.000000f, 270.000000f,
+      0.101961f, 1.000000f },
+      /* swell 0.000 m peak to peak; wavelengths 62.8 m and 10.1 m, steepness 0.000 and 0.000 */
+    { "urban_1", "WaterLOD",
+      60.000000f, 3.150000f, 0.100000f,
+      40.000000f, 2.670000f, 0.300000f, 1.610000f,
+      0.000000f, 0.000000f,
+      -0.500000f, 0.000000f, 2.550000f,
+      0.000000f, 0.000000f,
+      0.010000f, 0.030000f,
+      90.000000f, 270.000000f,
+      0.101961f, 1.000000f },
+      /* swell 0.000 m peak to peak; wavelengths 62.8 m and 10.1 m, steepness 0.000 and 0.000 */
+    { "urban_2", "WaterLOD",
+      60.000000f, 3.150000f, 0.100000f,
+      40.000000f, 2.670000f, 0.300000f, 1.610000f,
+      0.000000f, 0.000000f,
+      -0.500000f, 0.000000f, 2.550000f,
+      0.000000f, 0.000000f,
+      0.010000f, 0.030000f,
+      90.000000f, 270.000000f,
+      0.101961f, 1.000000f },
+      /* swell 0.000 m peak to peak; wavelengths 62.8 m and 10.1 m, steepness 0.000 and 0.000 */
+};
+
 
 /* ---- the whip antenna: FUN_00500230 (Antenna_Car<n>).
    A chain of nPoints masses, chainLength long in TOTAL -- the loader

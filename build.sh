@@ -29,6 +29,7 @@
 #   2. lightmap each .sb's embedded lightmap images                (sb2obj.py)
 #   3. tracks   ten .vsc scenes and their .col collision grids     (pack_vsc/pack_col)
 #   4. cars     three rigged cars with shadow, env-map and effects (pack_vsc.py)
+#   5b. chars   the 59 people, animals and road cars, per track     (pack_chars.py)
 #   5. props    the 13 knockable props, one file for all tracks    (pack_props.py)
 #   6. sound    the sound bank and the music                       (pack_snd.py)
 #   7. tables   tracks.h, the menu font, the bubble and LiveArea   (gen_*.py)
@@ -56,7 +57,7 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 
 JOBS="$(nproc 2>/dev/null || echo 4)"
 FORCE=0
-STAGES="unpack lightmap tracks cars props sound tables ai check build"
+STAGES="unpack lightmap tracks cars props chars sound tables ai check build"
 WANT=""
 NO_MUSIC=0
 CLEAN=0
@@ -328,6 +329,10 @@ fi
 # water surface height per cell. Water is deliberately NOT in the collision
 # triangles — the car fords the river — but its height is what makes the water
 # drag fire, so repack all ten after touching SURF_RE or anything about water.
+#
+# The `sea` cells are stored where the sea is DRAWN: pack_col adds the track's
+# own WLOD_<track>_more1 offset, the same one water.c displaces the surface
+# with. Regenerate vis_data.h and repack together.
 
 if wanted tracks; then
     step "Packing tracks"
@@ -342,7 +347,13 @@ if wanted tracks; then
                 --csidir "$EXTRACTED" --embdir "$EMB"
         fi
 
-        if current "$ASSETS/$t.col" "$src" "$RE/pack_col.py"; then
+        # gen_vis_data.py is an input: pack_col.py takes the sea's vertical
+        # offset from it (wsurf_values), so that the grid and vis_data.h's
+        # WSURF[] cannot end up with two different waterlines. Both read the
+        # SAME Settings directory by default -- do not point one of them
+        # somewhere else without pointing the other there too.
+        if current "$ASSETS/$t.col" "$src" "$RE/pack_col.py" \
+                   "$RE/gen_vis_data.py"; then
             skip "$t.col"
         else
             run python3 "$RE/pack_col.py" "$src" "$ASSETS/$t.col"
@@ -451,6 +462,34 @@ if wanted props; then
     fi
 fi
 
+# ------------------------------------------------------- 5b. the characters ---
+# The 59 people, animals and road cars: geometry, skeletons, SKINS, animation
+# clips and the recorded paths their instances name, one <track>.chr per track.
+#
+# PER TRACK, unlike props.vsc, and that is the whole difference between the two
+# halves of the dynamic layer. A prop is 130 triangles; a Man is 1,524 with
+# 112,560 animation keys behind him. A track needs between two and eight of the
+# thirteen models, so packing per track keeps ONE track's characters resident
+# (0.8 to 8.7 MB) instead of every model on every track.
+#
+# char_data.h -- the placements, their markers, their volumes, their script keys
+# and the nine behaviour loaders' constants -- comes out of the `tables` stage,
+# because it is a generated header rather than an asset.
+
+if wanted chars; then
+    step "Packing characters"
+    for t in "${TRACKS[@]}"; do
+        src="$DB/$t.sb"
+        [ -f "$src" ] || continue
+        if current "$ASSETS/$t.chr" "$src" "$RE/pack_chars.py" "$RE/sbchar.py"; then
+            skip "$t.chr"
+        else
+            run python3 "$RE/pack_chars.py" "$t" "$ASSETS/$t.chr" \
+                --texroot "$EXTRACTED"
+        fi
+    done
+fi
+
 # ----------------------------------------------------------- 6. the sound ---
 # Reads the game's own wavs, its snd.dat volumes and Autoexec.gm's playlist:
 # 118 sounds at 22050 Hz mono, plus the 18 MP3s copied verbatim and streamed
@@ -485,6 +524,15 @@ if wanted tables; then
         skip "tracks.h"
     else
         run python3 "$RE/gen_tracks.py" "$DB" "$VITA/tracks.h" --assets "$ASSETS"
+    fi
+
+    # The characters' placements, markers, volumes and script keys, and the
+    # nine behaviour loaders' constants out of the exe. A generated header, not
+    # an asset -- the geometry and the recorded paths are the `chars` stage.
+    if current "$VITA/char_data.h" "$DB" "$RE/gen_char_data.py"; then
+        skip "char_data.h"
+    else
+        run python3 "$RE/gen_char_data.py" "$VITA/char_data.h"
     fi
 
     if [ -f "$VITA/font.h" ] && [ "$FORCE" = 0 ]; then

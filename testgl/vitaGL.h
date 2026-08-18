@@ -132,6 +132,18 @@ void glPushMatrix(void);
 void glPopMatrix(void);
 void glMultMatrixf(const float *m);
 
+/*
+ * Added for char.c, which places a character with the ordinary transform calls
+ * rather than by building a matrix itself. A harness that stubs these out can
+ * see a character's vertices but not WHERE THEY WENT, which is most of what
+ * there is to get wrong about an instanced model -- so chartest.c implements a
+ * real matrix stack over them and reads a vertex back in world space. Same
+ * lesson as glTexImage2D, glMultMatrixf and glBlendFunc before them.
+ */
+void glTranslatef(float x, float y, float z);
+void glRotatef(float a, float x, float y, float z);
+void glScalef(float x, float y, float z);
+
 /* Added for ui.c, the app's only HAND-BUILT projection: it loads its own ortho
    matrix rather than going through glFrustum, and saves/restores the enables
    around the menu. ui_test.c puts a point through the matrix ui.c actually

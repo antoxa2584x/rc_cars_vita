@@ -51,18 +51,50 @@
  * refining, which is why the cue "triggers somewhere in different places". The
  * arrow flipped to the checkpoint AFTER the one the player was still driving at.
  *
- * It advances on a CROSSING now: the spine gives every checkpoint an arc-length
- * station (cum[k][0]), the car's own progress along the spine is projected onto
- * the nearest spine SEGMENT so it is continuous rather than snapped to a sample,
- * and `passed` is raised on the step where that progress sweeps past the station
- * of the checkpoint being headed for. So the event happens AT the checkpoint,
- * to within one frame of travel.
+ * Then it advanced on an arc-length CROSSING: the spine gives every checkpoint a
+ * station (cum[k][0]), the car's progress along the spine was projected onto the
+ * nearest spine segment, and `passed` was raised where that progress swept past
+ * the station being headed for. That is a sound rule on a spine that follows the
+ * road. THIS SPINE DOES NOT.
  *
- * Deliberately NOT a radius around the marker, which is the obvious rule and is
- * the one this file's own comment below warns about: the waypoints sit 30 to
- * 90 m apart and a car taking a wide line never comes inside any sensible
- * radius of one, so the arrow would stick on a checkpoint already behind the
- * player. An arc-length station has no width to miss.
+ * THE REFINING POINTS ARE NOT ON THE ROAD, and this is the measurement that
+ * settles it -- taken against the shipped .aip recordings, which are real driven
+ * laps and the only path data the project has that is not the spine itself:
+ *
+ *   the cp_N CHECKPOINTS are on the racing line and in road order. Over the ten
+ *   tracks and three opponents each -- 150 (checkpoint, lap) pairs -- every
+ *   recorded lap passes within 1.58 m of every cp_N marker, worst case, and it
+ *   visits them cp_1, cp_2, ... cp_n, ascending, on all ten.
+ *
+ *   the cp_N_M REFINING POINTS are up to 51 m off it, and out of order. On
+ *   country_1, cp_1_1..cp_1_5 sit 33-51 m from the nearest point of the lap, out
+ *   in a corner of the map the road never enters, and the closest-approach sample
+ *   indices of the 39 spine points run 3206, 238, 243, 247, 245, 237, 225, 536,
+ *   1719, 1678, 539, ... -- 14 of them going backwards along the lap. All ten
+ *   tracks are like this: worst off-line 43 to 63 m, 3 to 14 points out of order,
+ *   and the stitched spine comes out 1.6x to 2.1x the length of the lap it is
+ *   supposed to measure (827-955 m of spine against 404-555 m of road).
+ *
+ * The stitching itself is right -- FUN_004e9560 is disassembled and it builds
+ * exactly this chain, cp_N -> cp_N_1 -> ... -> cp_N_M -> cp_(N+1) closed back to
+ * cp_1, one 0x44-byte segment record each with its own length at +0x30 (0x4e9980)
+ * -- so the ENGINE's polyline wanders too. It is not a racing line and was never
+ * one; what the engine's own race module makes of it is not recovered. Using it
+ * as a progress measure was the port's invention, and the invention is what was
+ * wrong. Replaying all 30 shipped recordings through the arc-length rule misses
+ * 174 of the 300 crossings, fires 9 spurious ones and gets 54 out of order.
+ *
+ * SO THE TRIGGER IS A RADIUS AROUND THE MARKER AFTER ALL -- ordered, and fired at
+ * the CLOSEST APPROACH rather than on entry. See CP_TRIGGER_RAD for the two-sided
+ * bound the radius is chosen inside. The file used to argue against exactly this
+ * ("a car taking a wide line never comes inside any sensible radius"); the 1.58 m
+ * measurement is what retires the argument, and the ORDER is what makes it safe
+ * where a bare radius is not -- country_2's road comes back within 1.17 m of cp_6
+ * at a different point in the lap, and `next` is why that does not fire it twice.
+ *
+ * The arc-length spine is still built and still exported: cp_spine_dist is the
+ * AI's rubber-band input and cp_dist_to_next feeds the vis telemetry line, and neither is touched
+ * here. What it no longer does is decide when a checkpoint is passed.
  */
 
 #ifndef CHECKPOINT_H
@@ -101,15 +133,69 @@
 #define CP_SIZE_SCALE 0.5f
 #define CP_GROUND 1
 
-/* The most spine metres one cp_step call may plausibly cover. Past that it is a
-   teleport -- a respawn, a drowning, a jump-reset -- or the projection swapping
-   legs where the track runs back alongside itself; neither is a crossing, so the
-   cursor RESYNCS instead of firing. Generous by a factor of five against
-   driving (main.c clamps a frame at 0.1 s and the momentum clamp caps the car
-   at 20 m/s, so 2 m is the worst real step) and still far short of the 30 to
-   90 m between two checkpoints on these tracks, so a real crossing can never be
-   mistaken for a jump. */
-#define CP_MAX_STEP 10.f
+/* How close to a checkpoint marker counts as reaching it, metres, in XZ.
+ *
+ * Bounded on BOTH sides by measurement against the shipped .aip recordings, and
+ * the two bounds are nearly an order of magnitude apart, which is what makes the
+ * number safe rather than tuned:
+ *
+ *   ABOVE 1.58 m, the worst distance at which any of the 30 recorded laps passes
+ *   any of its checkpoints. A radius under that misses real passes.
+ *   BELOW 5.45 m, half the closest two checkpoint markers on any track
+ *   (country_1's cp_3 and cp_4, 10.91 m apart). Staying under half keeps two
+ *   checkpoints' zones from ever overlapping, so the car cannot be inside two at
+ *   once and the order can never be ambiguous.
+ *
+ * 5 m sits 3.2x above the first and just inside the second. The recordings are
+ * racing lines and a player wanders more than one, which is the argument for the
+ * top of the band rather than the middle.
+ *
+ * NOT recovered. The engine has a race module that owns this and the port does
+ * not have it; see the header comment for what the engine's own checkpoint data
+ * turned out to be and why none of it answers this. */
+#define CP_TRIGGER_RAD 5.f
+
+/* How far past its closest approach the car has to get before the pass fires,
+   metres. The event is the MINIMUM of the distance, so something has to say the
+   minimum is behind us; this is that something.
+ *
+ * It exists to keep a STATIONARY car from firing. Five of the ten grids sit
+ * inside cp_1's radius already (beach_1 2.34 m, beach_2 4.41, beach_3 3.28,
+ * country_2 3.68, country_3 2.74), the car is held there for the whole 3-second
+ * countdown, and firing on ENTRY would sound the cue before GO on all five. A
+ * car that never moves never gets 5 cm past anything.
+ *
+ * 5 cm is under half a frame of travel at this car's 7.5 m/s top speed (12.5 cm
+ * at 60 Hz) so it costs nothing at speed, and it is orders of magnitude above the
+ * sub-millimetre jitter a sleeping body has. */
+#define CP_PASS_EPS 0.05f
+
+/* A RADIUS CAN BE MISSED, AND THE CURSOR DOES NOT STEP OVER IT. Stated here
+ * because it is a decision with a cost either way, and both costs are measured.
+ *
+ * The drivable ground at a checkpoint is far wider than the racing line through
+ * it. Measured off each track's own collision grid, perpendicular to the recorded
+ * lap's travel direction and stopping at the first hole, 1.5 m step or wall, the
+ * half-width runs from 0.50 m (beach_3 cp_3, a bridge) to the 20 m probe cap
+ * (beach_2 cp_3, open sand); 27 of the 50 checkpoints have ground wider than
+ * CP_TRIGGER_RAD on at least one side. So a player who takes a beach wide can
+ * miss one, and with a strictly ordered cursor the arrow then keeps pointing back
+ * at it until they go and get it.
+ *
+ * A "step over one if you reach the next" escape hatch was built and REMOVED,
+ * because on the shipped data it costs more than it buys: country_2's road passes
+ * within 2.18-2.89 m of cp_3 early in the lap -- about 130 m before the real pass
+ * -- so the hatch stepped over cp_2 on every single one of that track's recorded
+ * laps, silently, cue and all. Distance alone cannot separate that fly-by from a
+ * pass (the worst real pass is 1.58 m and the fly-by minimum is 2.18 m, a band too
+ * narrow to sit a threshold in), and country_2's road also comes back within
+ * 1.17 m of cp_6 elsewhere in the same lap.
+ *
+ * Strict order is therefore what ships: 0 missed and 0 out of order on all 30
+ * recorded laps, against 6 silent skips with the hatch in. A stalled arrow points
+ * at the thing to go back for, which is what an arrow is for, and the port does not
+ * yet enforce a lap limit for it to spoil (see known-issues.md).
+ */
 
 #define CP_MAX 8
 #define CP_MAX_POINTS 33          /* cp_N plus up to 32 edges, per the loader */
@@ -139,13 +225,14 @@ typedef struct {
     int next;                     /* the checkpoint being headed for */
     int lap;
 
-    /* Where the car is along the spine, in metres from cp_0, and whether that
-       is a usable previous value yet. Continuous -- projected onto the nearest
-       spine SEGMENT -- because a crossing test needs sub-sample resolution.
-       `have_s` is cleared by cp_init and by cp_resync so the first step after a
-       load or a teleport syncs instead of firing. */
-    float s;
-    int have_s;
+    /* THE APPROACH TO `next`: whether the car is inside its trigger radius, and
+       the closest it has come while inside. The pass fires when the distance
+       climbs CP_PASS_EPS back off that minimum, or when the car leaves the radius
+       having been in it -- so the cue lands at the checkpoint, not at the edge of
+       a circle around it. Cleared on every fire, by cp_init and by cp_resync: a
+       car that has been PUT somewhere is not mid-approach to anything. */
+    int   in_zone;
+    float zone_min;
 
     /* THE CAR JUST PASSED A CHECKPOINT: its index, or -1 on every other step.
        An EDGE, the way prop_t.hit is one, and for the same reason -- the host
@@ -160,23 +247,30 @@ typedef struct {
      * are not the same question and the difference bites exactly where it
      * matters.
      *
-     * `next` is "the first station ahead of where the car IS", which cp_resync
-     * recomputes from a position. At the grid that answer depends on which side
-     * of cp_0's seam the start marker happens to fall -- the seam is at arc
-     * length 0 == spine_len -- so `next - 1` is checkpoint 0 on one side and the
-     * LAST checkpoint on the other, half a lap away. A car that has driven
-     * nothing must not be sent half a lap backwards on its first drowning, so
-     * the respawn point is the crossing the car really made, latched here, and
-     * -1 says "none yet, use the grid".
+     * `next` IS now (last + 1) % n, always, with -1 meaning "nothing crossed yet,
+     * so head for checkpoint 0". That identity is the whole state machine and it
+     * is why neither cp_restart nor cp_resync projects a position any more.
      *
-     * cp_resync deliberately does NOT clear it: a teleport does not un-pass a
+     * It used to be derived instead from where the car IS -- the first arc-length
+     * station ahead of it -- and at the grid that answer depended on which side of
+     * cp_0's seam the start marker happened to fall on. Measured over the ten
+     * shipped tracks, FIVE fell on the wrong side: country_1 came out pointing at
+     * cp_2 with cp_1 six metres in front of the car, country_3 and urban_1 at cp_2
+     * with cp_1 three and six metres ahead, country_4 at cp_2, and urban_2 at cp_5
+     * with the whole first half of the lap skipped -- because urban_2's spine
+     * passes 8 m overhead of the grid and the projection is in XZ. On all five the
+     * START/FINISH LINE never fired on the first lap, which is what got reported.
+     *
+     * The identity makes it exact instead: at the grid nothing has been crossed,
+     * so the car is heading for checkpoint 0, on every track, and cp_1 is the
+     * nearest checkpoint to the race-start marker on all ten (2.3 to 20.5 m, and
+     * 1.4x to 49x clear of the next nearest checkpoint) -- i.e. the race really
+     * does start at the start/finish line, which is the thing the old rule could
+     * not see.
+     *
+     * cp_resync deliberately does NOT clear `last`: a teleport does not un-pass a
      * checkpoint, which is the same reason cp_resync keeps the lap. cp_restart
-     * clears both.
-     *
-     * `next` is never `last` after a respawn ONTO a station, and that falls out of
-     * cp_progress's arithmetic rather than being enforced -- see the comment on
-     * cp_ahead, which also records the guard that used to be there and why it came
-     * out. Measured 0 of 50 on the shipped tracks and asserted in vis_test. */
+     * clears both. */
     int last;
 
     float t;
@@ -191,15 +285,22 @@ typedef struct {
 void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col);
 
 /* Advance the progression from the car's position, and raise `passed` on the
-   step the car crosses the checkpoint it was headed for. Call once per frame,
-   with that frame's dt. */
+   step the car finishes passing the checkpoint it was headed for -- the step its
+   distance to that marker starts climbing again, having been inside
+   CP_TRIGGER_RAD. Call once per frame, with that frame's dt. */
 void cp_step(checkpoints_t *c, float x, float y, float z, float dt);
 
-/* Re-sync the cursor to (x, y, z) without raising anything: the car has been
-   put somewhere rather than driven there. Points the arrow at the first
-   checkpoint ahead of the new position. KEEPS the lap count and `last` --
-   main.c respawns for drowning and for falling out of the world as well as for
-   a restart, and neither of those un-drives a lap or un-passes a checkpoint. */
+/* Re-sync without raising anything: the car has been PUT somewhere rather than
+   driven there. Aims the arrow at (last + 1), drops any approach in progress, and
+   KEEPS the lap count and `last` -- main.c respawns for drowning and for falling
+   out of the world as well as for a restart, and neither of those un-drives a lap
+   or un-passes a checkpoint.
+
+   The position arguments are no longer read; they are kept so the call reads at
+   the site as what it is and so a future rule that needs them does not have to
+   change every caller. Every caller puts the car either on the grid or on the
+   marker of `last` (cp_respawn_pose), and (last + 1) is the exact answer for
+   both -- which is why guessing it from a projection could stop. */
 void cp_resync(checkpoints_t *c, float x, float y, float z);
 
 /* THE RACE IS STARTING OVER. cp_resync, plus the two things a resync must not

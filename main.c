@@ -52,6 +52,7 @@
 #include "cam.h"
 #include "carani.h"
 #include "prop.h"
+#include "char.h"
 #include "scene.h"
 #include "shadow.h"
 #include "water.h"
@@ -98,6 +99,12 @@ static scene_t track, car;
    loads ONCE at init and is never released with the track. See prop.h. */
 static scene_t props_scene;
 static props_t props;
+/*
+ * The track's people, animals and road cars. Per track, unlike props.vsc: a
+ * character is 450-1,900 triangles with up to 120,000 animation keys behind it,
+ * so one shared scene would carry every model on every track. See char.h.
+ */
+static chr_t chars;
 
 /* What is loaded right now. The menu changes these; load_track/load_car act. */
 static int cur_track = 0, cur_car = 0;
@@ -379,10 +386,11 @@ static void respawn(void)
 
     place_car(t->x, t->z, t->y, t->yaw);
 
-    /* The spine cursor: the jump from wherever the car was back to the grid would
-       otherwise sweep past every checkpoint station in between and fire a cue for
-       each. cp_step's own CP_MAX_STEP guard would catch it a frame later; this
-       catches it on the frame it happens.
+    /* The spine cursor. cp_restart is what puts the arrow on CHECKPOINT 0 -- the
+       start/finish -- which is the first thing a race crosses; it no longer
+       derives that from the car's position, because on five of the ten tracks the
+       projection pointed somewhere else and the start/finish never fired on the
+       first lap. See checkpoints_t.last.
      *
      * cp_restart, not cp_resync: a START also puts the lap back to zero and
      * forgets the last checkpoint crossed, so the first death of the new race
@@ -394,6 +402,9 @@ static void respawn(void)
     /* A restart puts the field back on its own grid. ai_reset also drops every
        cursor, so an opponent does not keep the lap it was on. */
     ai_reset(&ai);
+    /* And the characters, for the reason ai_reset exists: a Dog left chasing
+       across the finish line is state from the previous run. */
+    char_reset(&chars);
     sfx_ai_silence();
 
     /* 3, 2, 1, GO! -- the game's own msg_321_s_f, and the only thing that holds
@@ -553,7 +564,10 @@ static int load_track(int idx)
        That leaked on every track change and on every texture-quality change --
        out of the same newlib heap vitaGL's RAM pool draws from. */
     water_free(&water);
-    water_init(&water, &track, &col);
+    /* idx, not cur_track: same value here, but the sea's height and its
+       vertical offset are now per track and reading them off the wrong row is
+       exactly the bug this replaced. */
+    water_init(&water, &track, &col, idx);
     cp_init(&cps, &track, &col);
     /* The sun: the SUN_AF marker out of this track's own .sb, plus the five
        flare textures --markers packed beside it. urban_1 and urban_2 carry no
@@ -570,6 +584,13 @@ static int load_track(int idx)
     sfx_set_track(idx, &col);
     /* The props belong to this track and this grid -- both were just rebuilt. */
     prop_init(&props, props_scene.n_batches ? &props_scene : NULL, &col, idx);
+    /* The characters are per-track as well, and they take the grid: they stand
+       on it, and the Dog and the Seagull walk about on it. A track with no
+       .chr, or one with no characters at all, leaves an empty chr_t and
+       nothing further happens. */
+    char_free(&chars);
+    snprintf(path, sizeof(path), "app0:assets/%s.chr", TRACKS[idx].base);
+    char_init(&chars, path, TRACKS[idx].base, &col);
     /* The opponents are per-track too: their recorded laps ARE this track. After
        cp_init, because the rubber band reads that spine. */
     load_ai(idx);
@@ -1104,6 +1125,59 @@ unsigned int acc_ticks = 0;
                 if (ticks > 0) {
                     int pi;
                     prop_step(&props, &rc, ticks * RBCAR_TICK_DT);
+                    /* The characters advance on the same banked time, and for
+                       the same reason. What they read of the car is where it is
+                       and how fast: the Dog's vision cone, the Guard's volume
+                       and the run-over test. The eye is not needed here -- it
+                       is not even known yet at this point in the frame -- and
+                       char_draw takes it separately, the way prop_draw does. */
+                    {
+                        const float *cm = rbcar_matrix(&rc);
+                        float cpos[3] = { cm[12], cm[13], cm[14] };
+                        float cfwd[3] = { cm[8], cm[9], cm[10] };
+                        char_step(&chars, ticks * RBCAR_TICK_DT, cpos, cfwd,
+                                  rbcar_speed(&rc));
+                        /* AND THE CHARACTERS ARE SOLID. Immediately after the
+                           step, so the contact sees the positions it just wrote,
+                           and once per FRAME rather than once per tick because
+                           that is where the engine's own collision layer sits
+                           (0x4fc685 steps it with dt) -- see char.h on
+                           char_car_solid. One-way: the car is pushed out and the
+                           character does not move, which is the same one-body
+                           form the world contact uses, so nothing about the
+                           transcribed handling model changes.
+
+                           No sound is raised off it. The character's own
+                           reaction -- its Hurt clip and its voice -- comes out of
+                           char_step's proximity test above, which is what the
+                           engine's own resolver does too; there is no cue in the
+                           bank for a car hitting a person and inventing one is
+                           not this change's business. */
+                        char_car_solid(&chars, &rc, NULL);
+                        /* char.c raises a cue and this decides what it sounds
+                           like -- the same split menu.c keeps from sfx.c. Each
+                           is an edge, so a dog barking at a parked car barks
+                           once per attack rather than once per frame. */
+                        {
+                            unsigned int ci;
+                            for (ci = 0; ci < chars.n_inst; ci++) {
+                                float p[3];
+                                int ev = chars.inst[ci].event;
+                                if (ev == CHR_EV_NONE) continue;
+                                if (!char_pos(&chars, ci, p)) continue;
+                                if (ev == CHR_EV_BARK)
+                                    sfx_char_voice(SFX_VOICE_DOG, p, 1.f);
+                                else if (ev == CHR_EV_TAKEOFF)
+                                    sfx_char_voice(SFX_VOICE_SEAGULL, p, 1.f);
+                                else if (ev == CHR_EV_HURT)
+                                    sfx_char_voice(
+                                        strcmp(chars.inst[ci].place->model,
+                                               "Woman") == 0
+                                            ? SFX_VOICE_WOMAN : SFX_VOICE_MAN,
+                                        p, 1.f);
+                            }
+                        }
+                    }
                     /* The opponents advance on the same banked ticks, but ONE AT
                        A TIME rather than on ticks*dt in one go: ai_step's
                        acceleration limit and cursor walk are written for a 1/60
@@ -1648,6 +1722,10 @@ unsigned int acc_ticks = 0;
             /* Before the water: the props are opaque and the foam blends
                over them. After the track, so they are not drawn through it. */
             prop_draw(&props, eye);
+            /* The characters with the props and for the same reasons: opaque,
+               after the track so they are not drawn through it, before the
+               water so the foam blends over them. */
+            char_draw(&chars, eye);
             water_draw(&water, eye);
             /* Dust and smoke over the water as well as the land, and before the
                checkpoint arrows, which are meant to read through everything. */
@@ -1824,6 +1902,36 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                                 oddly" has nothing behind it. See ai.h. */
                              (int)(ai.car[best].bump * 100.f),
                              ai.car[best].airborne ? "  airborne" : "");
+            }
+            if (chars.n_inst) {
+                /* The characters, once a second, for the reason the AI line
+                   exists: "the dog never does anything" and "they are all
+                   standing still" should not need a guess. Reports the nearest
+                   one -- what it is, what state its machine is in, which clip is
+                   playing and how far off it is -- plus how many of the track's
+                   are being stepped and drawn at all, which is the first thing
+                   to look at when nothing is moving. */
+                unsigned int i, best = 0;
+                float bd = 1e30f;
+                for (i = 0; i < chars.n_inst; i++)
+                    if (chars.inst[i].dist2 < bd) {
+                        bd = chars.inst[i].dist2;
+                        best = i;
+                    }
+                {
+                    const chr_inst_t *in = &chars.inst[best];
+                    const chr_model_t *cm = &chars.model[in->model];
+                    const char *clip = (in->clip >= 0
+                                        && (unsigned)in->clip < cm->n_clips)
+                                           ? cm->clip[in->clip].name : "-";
+                    rlog("[rccars] chars: %u placed, %u stepped, %u drawn;"
+                         "  nearest %s '%s' %d m  state=%d clip=%s"
+                         "  spd=%d cm/s\n",
+                         chars.n_inst, chars.n_stepped, chars.n_drawn,
+                         in->place->model, in->place->name,
+                         (int)sqrtf(bd), in->state, clip,
+                         (int)(in->speed * 100.f));
+                }
             }
             if (car.has_rig) {
                 /* Rig telemetry, for the same reason: "the wheels look wrong"

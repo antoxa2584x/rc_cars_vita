@@ -153,6 +153,8 @@ static struct {
     /* One bank index per PROP_MODELS entry. Several share a wav, so several
        entries share an index -- mix_load refcounts, so that is free. */
     int prop_snd[PROP_N_MODELS];
+    int voice_snd[SFX_VOICE_COUNT];
+    float voice_cool[SFX_VOICE_COUNT];
     float prop_cool[PROP_N_MODELS];
     float cdt_cool;
 
@@ -287,6 +289,13 @@ int sfx_init(void)
        at the hit is an array index and not a string search. */
     for (i = 0; i < PROP_N_MODELS; i++)
         S.prop_snd[i] = find_load(PROP_MODELS[i].sound);
+    /* The characters' four voices, resident like the props' thirteen: they are
+       one-shots of a second or two and the working set is already the car's
+       motor family. Named by the models themselves -- see sfx.h. */
+    S.voice_snd[SFX_VOICE_DOG]     = find_load("dog_attack");
+    S.voice_snd[SFX_VOICE_SEAGULL] = find_load("seagull_vzliot");
+    S.voice_snd[SFX_VOICE_MAN]     = find_load("man_voice");
+    S.voice_snd[SFX_VOICE_WOMAN]   = find_load("woman_voice");
 
     audio_lock();
     mix_master(audio_mix(), S.vol_sfx, S.vol_music);
@@ -548,6 +557,8 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
     if (S.car_cool > 0.f) S.car_cool -= dt;
     for (i = 0; i < PROP_N_MODELS; i++)
         if (S.prop_cool[i] > 0.f) S.prop_cool[i] -= dt;
+    for (i = 0; i < SFX_VOICE_COUNT; i++)
+        if (S.voice_cool[i] > 0.f) S.voice_cool[i] -= dt;
 
     /* landing: contact regained, scaled by how hard it came down */
     if (S.was_airborne && !airborne && S.hit_cool <= 0.f) {
@@ -635,6 +646,36 @@ void sfx_prop_hit(int model, const float pos[3], float speed)
         one_shot(S.snd_cdt_obj, 0.55f + 0.45f * g, 1.f);
         S.cdt_cool = PROP_CDT_COOL;
     }
+    audio_unlock();
+}
+
+/* The radii the models themselves declare -- see sfx.h. Kept here rather than
+   in char_data.h because they are an AUDIO property and this is the audio
+   layer, the same split col_material_at keeps from the surface classifier. */
+static const struct { float rmin, rmax; } VOICE_R[SFX_VOICE_COUNT] = {
+    { 15.0f, 5.0f },        /* Dog       */
+    { 50.0f, 5.0f },        /* Seagull   */
+    { 20.0f, 0.0f },        /* Man       */
+    { 20.0f, 0.0f }         /* Woman     */
+};
+
+#define VOICE_COOL 0.35f    /* THE PORT'S: a dog re-triggering its own bark */
+
+void sfx_char_voice(sfx_voice_t which, const float pos[3], float gain)
+{
+    if (!S.ok || S.paused || !pos)
+        return;
+    if ((int)which < 0 || (int)which >= SFX_VOICE_COUNT)
+        return;
+    if (S.voice_snd[which] < 0 || S.voice_cool[which] > 0.f)
+        return;
+    if (gain < 0.f) gain = 0.f;
+    if (gain > 1.f) gain = 1.f;
+    S.voice_cool[which] = VOICE_COOL;
+    audio_lock();
+    mix_play_3d(audio_mix(), S.voice_snd[which], pos[0], pos[1], pos[2],
+                VOICE_R[which].rmin, VOICE_R[which].rmax, gain, 1.f, 0,
+                PRIO_ONESHOT);
     audio_unlock();
 }
 
