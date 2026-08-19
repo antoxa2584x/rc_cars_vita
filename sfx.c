@@ -55,6 +55,17 @@ static const char *const SURF_LABEL[SURF_COUNT] = {
     "wood", "water"
 };
 
+/* The four resident character voices, IN SFX_VOICE_* ORDER and named by the
+   models themselves (each model's own MOD_SNDCHANNEL -- see sfx.h). sfx_init
+   loads them through this and sfx_char_wav resolves a model's declared wav
+   against it, so the enum, the loader and the lookup cannot drift apart. */
+static const char *const VOICE_WAV[SFX_VOICE_COUNT] = {
+    "dog_attack",           /* Dog                     */
+    "seagull_vzliot",       /* Seagull                 */
+    "man_voice",            /* Man, RepairMan, Guard   */
+    "woman_voice"           /* Woman                   */
+};
+
 static const char *const UI_SND[5] = {
     "arrowfocus", "arrowpress", "buttonpress", "buttonfocus", "msgboxerror"
 };
@@ -292,10 +303,8 @@ int sfx_init(void)
     /* The characters' four voices, resident like the props' thirteen: they are
        one-shots of a second or two and the working set is already the car's
        motor family. Named by the models themselves -- see sfx.h. */
-    S.voice_snd[SFX_VOICE_DOG]     = find_load("dog_attack");
-    S.voice_snd[SFX_VOICE_SEAGULL] = find_load("seagull_vzliot");
-    S.voice_snd[SFX_VOICE_MAN]     = find_load("man_voice");
-    S.voice_snd[SFX_VOICE_WOMAN]   = find_load("woman_voice");
+    for (i = 0; i < SFX_VOICE_COUNT; i++)
+        S.voice_snd[i] = find_load(VOICE_WAV[i]);
 
     audio_lock();
     mix_master(audio_mix(), S.vol_sfx, S.vol_music);
@@ -677,6 +686,28 @@ void sfx_char_voice(sfx_voice_t which, const float pos[3], float gain)
                 VOICE_R[which].rmin, VOICE_R[which].rmax, gain, 1.f, 0,
                 PRIO_ONESHOT);
     audio_unlock();
+}
+
+/*
+ * The same one-shot, ASKED FOR BY THE WAV NAME THE MODEL ITSELF DECLARES.
+ *
+ * The four resident voices are named by the models (see sfx.h), so a caller that
+ * has read a model's own MOD_SNDCHANNEL can hand the name straight over and never
+ * decide anything: a model with no channel hands over NULL and a model naming a
+ * wav the bank has no voice for is silent too, which is the data's answer in both
+ * cases. This exists because the caller's own answer -- "everything that is not a
+ * Woman is a Man" -- gave a squashed CRAB a man's voice, and the Crab has no
+ * channel at all.
+ */
+void sfx_char_wav(const char *wav, const float pos[3], float gain)
+{
+    int i;
+    if (!wav) return;
+    for (i = 0; i < SFX_VOICE_COUNT; i++)
+        if (VOICE_WAV[i] && !strcmp(VOICE_WAV[i], wav)) {
+            sfx_char_voice((sfx_voice_t)i, pos, gain);
+            return;
+        }
 }
 
 void sfx_ai_motor(int slot, const float pos[3], float speed_ratio, int active)

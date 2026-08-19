@@ -4,9 +4,16 @@
  * one coverage byte per texel. Uploaded as GL_ALPHA and drawn as
  * textured quads -- see ui.c.
  *
- * The game ships no reusable font: Faces/ and FacesSys/ are avatar
- * portraits and Interface.sb holds only dialog skins. Baking one in
- * keeps the menu independent of the asset pipeline. */
+ * BAKED IN so the START menu cannot fail to draw: font.h is in the
+ * binary and needs no asset to come up.
+ *
+ * This header used to claim the game ships no reusable font. It has
+ * TWO -- Language/English/Smash20.csi and Smash26.csi, 90 glyphs each
+ * on a 10 x 9 atlas, with their character order in a .dat beside them
+ * and their metrics in Settings/smash20.ini / smash26.ini. The old
+ * claim was made over Textures.1/2/3 and Interface.sb and never
+ * re-checked against the one directory that had them; see traps.md.
+ * race_ui.c draws the in-race HUD in the engine's own letters. */
 #ifndef FONT_H
 #define FONT_H
 

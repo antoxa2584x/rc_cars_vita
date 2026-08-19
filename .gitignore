@@ -19,12 +19,17 @@ sce_sys/livearea/contents/startup.png
 aitest
 allstarts
 antheight
+atstart
 audio_test
 carparts_test
 ceiling
+chartest
+chrfloat
 colprof
 curb
 flipped
+hudshot
+inv
 menu_test
 meshalign
 proptest
@@ -32,6 +37,7 @@ rb_test
 rockroll
 ui_test
 vis_test
+wading
 wetcheck
 
 # Logs from the Vita and from the build

@@ -65,6 +65,7 @@
 #include "ui.h"
 #include "hud.h"
 #include "countdown.h"
+#include "race_ui.h"
 #include "menu.h"
 #include "ai.h"
 #include "carparts.h"
@@ -105,6 +106,26 @@ static props_t props;
  * so one shared scene would carry every model on every track. See char.h.
  */
 static chr_t chars;
+/* TRIANGLE latches this; the frame serves it once the eye is known. */
+static int want_inventory;
+/*
+ * THE ISOLATION LADDER. Each TRIANGLE press dumps the inventory and then stops
+ * drawing one more class of object, logging which -- so "what IS that white box"
+ * is answered by watching which press makes it vanish. Three rounds of
+ * screenshots could not answer it and neither could the inventory alone: on
+ * beach_2 a Truck, a Trailer and three opponents were all within 30 m of the eye
+ * at once.
+ */
+static int dbg_isolate;
+static int ai_hidden;
+static const char *const DBG_ISOLATE[] = {
+    "everything shown",
+    "ROAD CARS + vultures hidden",
+    "ALL characters hidden",
+    "PROPS hidden",
+    "OPPONENTS hidden",
+};
+#define DBG_ISOLATE_N 5
 
 /* What is loaded right now. The menu changes these; load_track/load_car act. */
 static int cur_track = 0, cur_car = 0;
@@ -148,6 +169,13 @@ static hud_t hud;
    stronger reason than the HIT banner's -- turning it off would hide a message
    that is currently STOPPING the player from driving. See countdown.h. */
 static countdown_t countdown;
+
+/* THE IN-RACE HUD: the minimap, the place, the two clocks and the two gauges,
+   all on the game's own artwork and at the game's own 800x600 layout. Not on
+   show_vis, for the same reason as the two above -- this is the race telling the
+   player where they are in it, not a rendering experiment. See race_ui.h, and
+   hud_data.h for where every number in it came from. */
+static race_ui_t race_ui;
 
 /* The three effects the car itself throws off, all the game's own as well: the
    wheel dust and exhaust smoke (fx.c, car_dustx / exhausted_gas), the tyre marks
@@ -413,6 +441,11 @@ static void respawn(void)
        car change, a texture-quality reload and the menu's Restart row. */
     countdown_start(&countdown);
     sfx_countdown();
+    /* Both clocks back to zero. They tick on the same dt the physics banks, so
+       the three seconds the countdown holds the car for are NOT on the race
+       clock: main.c spends no ticks while countdown_holding() is true, and this
+       is stepped in the same block. */
+    race_ui_start(&race_ui);
 
     rlog("[rccars] start: %s  (%d,%d,%d) cm  yaw=%d deg  car=%s\n",
                   TRACKS[cur_track].name,
@@ -594,6 +627,17 @@ static int load_track(int idx)
     /* The opponents are per-track too: their recorded laps ARE this track. After
        cp_init, because the rubber band reads that spine. */
     load_ai(idx);
+    /* THE MINIMAP'S ART IS PER TRACK, so it rides in the track's own .vsc and is
+       rebound here rather than in props.vsc beside the message art: ten 512x512
+       maps would be 10 MB resident to show one. race_ui_set_track also solves
+       this track's world -> art transform out of MAP_CALIB; a track packed
+       without --extra-tex trackmap_<n> gets 0 back and simply has no minimap,
+       with the rest of the HUD unaffected. */
+    snprintf(path, sizeof(path), "trackmap_%d", idx + 1);
+    race_ui_set_track(&race_ui, idx, scene_tex(&track, path));
+    rlog("[rccars] hud: %s %s\n", path,
+         race_ui.have_map ? "bound (the game's own painted map)"
+                          : "NOT PACKED -- no minimap");
     return 1;
 }
 
@@ -690,7 +734,7 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
 
     ai_drawn = 0;
     ai_glance_batches = ai_glance_tris = 0;
-    if (ai.n <= 0)
+    if (ai.n <= 0 || ai_hidden)      /* the isolation ladder -- see dbg_isolate */
         return;
 
     /* A rigged scene is drawn under its own body matrix, so a model-space box
@@ -823,6 +867,41 @@ int main(void)
        it and countdown.c then falls back to the compiled-in font. It needs no GL
        of its own, so it can come this early. */
     countdown_init(&countdown, scene_tex(&props_scene, "msg_321_s_f"));
+
+    /* THE IN-RACE HUD, and it has to be built HERE for the same reason the start
+       light does, one stronger: load_track() calls race_ui_set_track, so the
+       struct has to exist before the first track, and race_ui_init memsets.
+     *
+       Everything except the map rides in props.vsc -- the load-once scene -- so
+       none of these bindings is ever renewed: two 128x128 marker sheets, the six
+       place badges, the word `Lap', the two dial textures and BOTH of the
+       engine's own font atlases. Each is 0 on a scene packed without it, and
+       race_ui.c then leaves that element out or falls back to font.h. */
+    {
+        race_ui_tex t;
+        int i;
+        memset(&t, 0, sizeof t);
+        t.arrow = scene_tex(&props_scene, "map_arrow");
+        t.cp = scene_tex(&props_scene, "map_cp");
+        for (i = 0; i < 6; i++) {
+            char nm[16];
+            snprintf(nm, sizeof nm, "place%d", i + 1);
+            t.place[i] = scene_tex(&props_scene, nm);
+        }
+        t.lap = scene_tex(&props_scene, "lap");
+        t.dial = scene_tex(&props_scene, "cockpit_sp1");
+        t.dial_arc = scene_tex(&props_scene, "cockpit_sp2");
+        /* SF_BIG_TEX / SF_SMALL_TEX are the names gen_hud_data.py read the
+           metrics out of, so the header and the packer cannot name two different
+           files. */
+        t.font_big = scene_tex(&props_scene, SF_BIG_TEX);
+        t.font_small = scene_tex(&props_scene, SF_SMALL_TEX);
+        race_ui_init(&race_ui, &t);
+        rlog("[rccars] hud: arrow %d cp %d place1 %d lap %d dial %d/%d "
+             "font %s %d / %s %d\n",
+             !!t.arrow, !!t.cp, !!t.place[0], !!t.lap, !!t.dial, !!t.dial_arc,
+             SF_BIG_TEX, !!t.font_big, SF_SMALL_TEX, !!t.font_small);
+    }
 
     if (!load_track(0)) {
         sceKernelExitProcess(0);
@@ -987,6 +1066,27 @@ unsigned int acc_ticks = 0;
             show_vis = !show_vis;
             rlog("[rccars] visuals: %s\n", show_vis ? "on" : "off");
         }
+        /*
+         * TRIANGLE: WHAT AM I LOOKING AT. An inventory of everything the dynamic
+         * layer has near the eye, to the log -- every character with the texture
+         * ids its variant resolves to, every prop within 30 m, and every
+         * opponent. This exists because three rounds of screenshots could not
+         * settle whether a white box on screen was a road car, a person, a prop
+         * or a piece of the track, and a screenshot cannot name geometry. Park
+         * facing the thing, press TRIANGLE, read the log. TRIANGLE was the one
+         * button with nothing on it.
+         */
+        if ((pad.buttons & SCE_CTRL_TRIANGLE)
+            && !(prev_buttons & SCE_CTRL_TRIANGLE)) {
+            want_inventory = 1;      /* served below, where the EYE is known */
+            dbg_isolate = (dbg_isolate + 1) % DBG_ISOLATE_N;
+        }
+        /* Applied every frame, so a track change cannot quietly restore a class
+           the tester is in the middle of ruling out. */
+        chars.hide = (dbg_isolate == 1) ? CHR_HIDE_PATH
+                   : (dbg_isolate == 2) ? CHR_HIDE_ALL : CHR_HIDE_NONE;
+        props.enabled = (dbg_isolate != 3);
+        ai_hidden = (dbg_isolate == 4);
         prev_buttons = pad.buttons;
 
         /* The water clock and the wave sprites run whether or not the player is
@@ -1018,6 +1118,12 @@ unsigned int acc_ticks = 0;
                  cps.passed + 1, cps.lap);
         }
         hud_step(&hud, dt);
+        /* Checkpoint 0 IS the start/finish line (checkpoint.c), so its crossing
+           is the lap -- the same edge cps.lap counts on. The lap clock's reading
+           is held and blinked for the shipped timeLapBlinkInSec and restarts. */
+        if (cps.passed == 0)
+            race_ui_lap(&race_ui);
+        race_ui_step(&race_ui, dt);
         /* The start light. dt is 0 while the menu is up, so it holds where it is
            along with everything else -- and since it is what gates the physics
            ticks, the car stays on the line for as long as the menu is open. */
@@ -1165,16 +1271,19 @@ unsigned int acc_ticks = 0;
                                 int ev = chars.inst[ci].event;
                                 if (ev == CHR_EV_NONE) continue;
                                 if (!char_pos(&chars, ci, p)) continue;
-                                if (ev == CHR_EV_BARK)
-                                    sfx_char_voice(SFX_VOICE_DOG, p, 1.f);
-                                else if (ev == CHR_EV_TAKEOFF)
-                                    sfx_char_voice(SFX_VOICE_SEAGULL, p, 1.f);
-                                else if (ev == CHR_EV_HURT)
-                                    sfx_char_voice(
-                                        strcmp(chars.inst[ci].place->model,
-                                               "Woman") == 0
-                                            ? SFX_VOICE_WOMAN : SFX_VOICE_MAN,
-                                        p, 1.f);
+                                /* WHAT IT SOUNDS LIKE IS THE MODEL'S OWN
+                                   MOD_SNDCHANNEL, whichever cue it was: the Dog
+                                   has dog_attack, the Seagull seagull_vzliot, the
+                                   Man, the RepairMan and the Guard man_voice and
+                                   the Woman woman_voice -- and the Crab, the
+                                   Spider, the Vulture and the four road cars have
+                                   no channel at all, so they are silent. This
+                                   used to read "a Woman sounds like a woman and
+                                   everything else sounds like a man", which gave
+                                   a squashed CRAB a man's voice -- the crab has
+                                   an animation for being hit and no sound to go
+                                   with it. See char.c's chr_model_wav. */
+                                sfx_char_wav(chr_model_wav(&chars, ci), p, 1.f);
                             }
                         }
                     }
@@ -1383,6 +1492,45 @@ unsigned int acc_ticks = 0;
         {
             float eye3[3];
             eye3[0] = ex; eye3[1] = ey; eye3[2] = ez;
+
+            /* TRIANGLE, served here because this is where the eye is known.
+               Everything the dynamic layer has near it, by name, with the
+               texture ids each character's variant resolves to -- which is what
+               separates "that white box is an untextured road car" from "that
+               white box is a prop" or "it is part of the track". A screenshot
+               cannot name geometry; three rounds of them did not settle it. */
+            if (want_inventory) {
+                int ai_i;
+                want_inventory = 0;
+                rlog("[rccars] ---- inventory, eye at (%.1f %.1f %.1f); "
+                     "NOW DRAWING WITH: %s ----\n", ex, ey, ez,
+                     DBG_ISOLATE[dbg_isolate]);
+                char_dump(&chars, eye3);
+                prop_dump(&props, eye3, 30.f);
+                rlog("[rccars] opponents: %d, %d drawn last frame\n", ai.n,
+                     ai_drawn);
+                for (ai_i = 0; ai_i < ai.n; ai_i++) {
+                    const float *m = ai_matrix(&ai, ai_i);
+                    float dx = m[12] - ex, dy = m[13] - ey, dz = m[14] - ez;
+                    int c = ai.car[ai_i].car;
+                    const scene_t *sc = (c >= 0 && c < 3) ? &ai_scene[c] : NULL;
+                    /* The scene's own state as well as the position: an opponent
+                       is drawn out of a SEPARATE scene_t from the player's, off
+                       the same car<n>.vsc, and "the player's car is textured and
+                       the opponents are white boxes" is a question about that
+                       second load. tex[0] of 0, or n_tex of 0, is the answer. */
+                    rlog("[rccars]   slot %d car %d at (%.1f %.1f %.1f) %.1f m  "
+                         "model=%s tex=%u first_id=%u batches=%u rig=%d\n",
+                         ai_i, c, m[12], m[13], m[14],
+                         sqrtf(dx * dx + dy * dy + dz * dz),
+                         (c >= 0 && c < 3 && ai_model[c]) ? "loaded" : "MISSING",
+                         sc ? sc->n_tex : 0u,
+                         (sc && sc->tex_ids && sc->n_tex) ? sc->tex_ids[0] : 0u,
+                         sc ? sc->n_batches : 0u,
+                         (sc && sc->has_rig) ? 1 : 0);
+                }
+                rlog("[rccars] ---- end of inventory ----\n");
+            }
 
             /* The menu freezes the world (dt = 0) but not the sound thread, so
                the loops are stopped explicitly rather than left droning on a
@@ -1750,6 +1898,71 @@ unsigned int acc_ticks = 0;
             sun_draw(&sun, eye, right, up, 65.f,
                      (float)SCR_W / (float)SCR_H, 1.f);
             cp_draw(&cps, eye);
+        }
+
+        /* THE IN-RACE HUD: the minimap, the place, the two clocks and the two
+           gauges. First of the three 2D passes, so the HIT banner and the start
+           light -- both centred, both transient -- sit over it rather than under
+           it. Its own ortho pass, bracketed by race_ui_draw itself. */
+        {
+            race_ui_state st;
+            int i;
+            memset(&st, 0, sizeof st);
+            st.car_x = veh.x;
+            st.car_z = veh.z;
+            /* veh.yaw is degrees in the rig's convention (0 faces world +Z);
+               race_ui.c takes radians in that same convention and derives the
+               marker's screen angle from it. */
+            st.car_yaw = veh.yaw * 0.017453292519943295f;
+
+            for (i = 0; i < ai.n && i < RUI_MAX_OTHERS; i++) {
+                st.other_x[st.n_others] = ai.car[i].rb.body.x[0];
+                st.other_z[st.n_others] = ai.car[i].rb.body.x[2];
+                st.n_others++;
+            }
+            /* cp[i].p[0] is the checkpoint marker itself -- the cp_N node -- and
+               the cp_N_M refining points are not on the road (checkpoint.h says
+               so), so only the marker goes on the map. */
+            for (i = 0; i < cps.n && i < RUI_MAX_CP; i++) {
+                st.cp_x[st.n_cp] = cps.cp[i].p[0][0];
+                st.cp_z[st.n_cp] = cps.cp[i].p[0][2];
+                st.n_cp++;
+            }
+            st.cp_next = cps.next;
+
+            /* ai_player_place ranks by cumulative spine distance and needs
+               ai_step to have run; with no opponents loaded it is 1, which is
+               the truth. */
+            st.place = ai_player_place(&ai);
+            st.n_racers = ai.n + 1;
+
+            /* cps.lap counts laps COMPLETED, so the lap being driven is one
+               more. n_laps stays 0: the lap limit is a race-setup value and this
+               port has no race setup -- nothing in the shipped data carries a
+               per-track count (championship.ini has cash and placings and no
+               laps), so the HUD shows `3' rather than inventing `3/6'. See
+               known-issues.md. */
+            st.lap = cps.lap + 1;
+            st.n_laps = 0;
+
+            st.speed = rbcar_speed(&rc);
+            /* Full scale is the car's own BOOST top speed, not its base one: a
+               dial that pegs whenever the player boosts is not reading anything.
+               speedBoostMax is km/h and the resonator upgrade scales it -- the
+               same expression sfx.c and the AI motor block use, written out again
+               rather than shared, because this must still show a sane needle on a
+               build where either of those is broken. */
+            {
+                float top = rc.tune.speed_boost_max;
+                int rr = rc.reso_upgrade;
+                if (rr >= 0 && rr < 4)
+                    top *= rc.tune.resonator_speed[rr];
+                st.speed_max = top / 3.6f;
+            }
+            st.boost = rc.boost_tank;
+            st.boost_max = rb_boost_capacity(&rc.tune, rc.boost_upgrade);
+
+            race_ui_draw(&race_ui, &st, SCR_W, SCR_H);
         }
 
         /* HIT, over the world and UNDER the menu -- the menu dims everything

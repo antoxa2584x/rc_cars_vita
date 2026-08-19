@@ -128,6 +128,16 @@ void rlog_init(void)
        sceIoMkdir on an existing one is a harmless error we ignore. */
     sceIoMkdir(RLOG_DIR, 0777);
 #endif
+    /*
+     * REMOVED FIRST, because "w" does not reliably truncate on this platform and a
+     * log that is half this run and half the last one is a diagnostic trap. A real
+     * one: a 4,400-line file whose first 2,728 lines were the current session and
+     * whose remainder -- after one torn line -- was an older, longer one, which
+     * read as "the characters stopped loading half way through the session"
+     * because the tail had no .chr lines in it. remove() then fopen() gives a
+     * fresh file on any implementation; a missing file is not an error here.
+     */
+    remove(RLOG_FILE);
     L = fopen(RLOG_FILE, "w");
     if (L) {
         snprintf(path_shown, sizeof(path_shown), "%s", RLOG_FILE);

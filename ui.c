@@ -10,6 +10,7 @@
 #include "font.h"
 
 #include <vitaGL.h>
+#include <math.h>
 #include <string.h>
 
 typedef struct { float x, y, u, v, r, g, b, a; } uivtx;
@@ -150,6 +151,110 @@ void ui_image(float x, float y, float w, float h, unsigned int tex,
     if (!tex)
         return;
     n = quad(0, x, y, x + w, y + h, u0, v0, u1, v1, r, g, b, a);
+    flush(n, (GLuint)tex);
+}
+
+void ui_image_quad(const float x[4], const float y[4],
+                   const float u[4], const float vv[4],
+                   unsigned int tex, float r, float g, float b, float a)
+{
+    static const int IX[6] = { 0, 1, 2, 0, 2, 3 };
+    int k;
+
+    if (!tex)
+        glDisable(GL_TEXTURE_2D);
+    for (k = 0; k < 6; k++) {
+        uivtx *v = &g_v[k];
+        int i = IX[k];
+        v->x = x[i]; v->y = y[i];
+        v->u = u[i]; v->v = vv[i];
+        v->r = r; v->g = g; v->b = b; v->a = a;
+    }
+    flush(6, (GLuint)tex);
+    if (!tex)
+        glEnable(GL_TEXTURE_2D);
+}
+
+void ui_image_rot(float cx, float cy, float w, float h, float ang,
+                  unsigned int tex,
+                  float u0, float v0, float u1, float v1,
+                  float r, float g, float b, float a)
+{
+    /* Deliberately NOT routed through quad(): that builder is shared by every
+       glyph and every panel in this file, and the last time it grew a parameter
+       every glyph came out half its cell (see traps.md). Six vertices written
+       out here cost nothing and cannot reach anything else. */
+    static const int IX[6] = { 0, 1, 2, 0, 2, 3 };
+    const float c = cosf(ang), s = sinf(ang);
+    const float hx = w * 0.5f, hy = h * 0.5f;
+    const float lx[4] = { -hx,  hx,  hx, -hx };
+    const float ly[4] = { -hy, -hy,  hy,  hy };
+    const float pu[4] = {  u0,  u1,  u1,  u0 };
+    const float pv[4] = {  v0,  v0,  v1,  v1 };
+    int k;
+
+    if (!tex)
+        return;
+    for (k = 0; k < 6; k++) {
+        uivtx *v = &g_v[k];
+        int i = IX[k];
+        /* Y runs DOWN in this projection, so a positive `ang` has to turn the
+           +Y axis toward +X to read as clockwise on screen. */
+        v->x = cx + lx[i] * c - ly[i] * s;
+        v->y = cy + lx[i] * s + ly[i] * c;
+        v->u = pu[i]; v->v = pv[i];
+        v->r = r; v->g = g; v->b = b; v->a = a;
+    }
+    flush(6, (GLuint)tex);
+}
+
+void ui_arc(float cx, float cy, float r0, float r1, float a0, float a1,
+            int segs, unsigned int tex,
+            float cu, float cv, float tr0, float tr1, int tex_mirror,
+            float r, float g, float b, float a)
+{
+    int i, n = 0;
+
+    if (!tex || segs < 1)
+        return;
+    if (segs > UI_ARC_MAX_SEGS)
+        segs = UI_ARC_MAX_SEGS;
+
+    for (i = 0; i < segs; i++) {
+        /* Two rays, and each contributes its inner and its outer point. The
+           screen point and the texture point are the SAME angle about two
+           different centres at two different radii, which is what makes the
+           sector sample the ring it is drawn as. */
+        const float t0 = a0 + (a1 - a0) * (float)i / (float)segs;
+        const float t1 = a0 + (a1 - a0) * (float)(i + 1) / (float)segs;
+        static const int IX[6] = { 0, 1, 3, 0, 3, 2 };
+        float px[4], py[4], qu[4], qv[4];
+        int k;
+
+        /* zero straight up, positive clockwise: (sin, -cos) on screen. */
+        px[0] = cx + sinf(t0) * r0; py[0] = cy - cosf(t0) * r0;
+        px[1] = cx + sinf(t1) * r0; py[1] = cy - cosf(t1) * r0;
+        px[2] = cx + sinf(t0) * r1; py[2] = cy - cosf(t0) * r1;
+        px[3] = cx + sinf(t1) * r1; py[3] = cy - cosf(t1) * r1;
+        {
+            const float ms = tex_mirror ? -1.f : 1.f;
+            qu[0] = cu + ms * sinf(t0) * tr0; qv[0] = cv - cosf(t0) * tr0;
+            qu[1] = cu + ms * sinf(t1) * tr0; qv[1] = cv - cosf(t1) * tr0;
+            qu[2] = cu + ms * sinf(t0) * tr1; qv[2] = cv - cosf(t0) * tr1;
+            qu[3] = cu + ms * sinf(t1) * tr1; qv[3] = cv - cosf(t1) * tr1;
+        }
+
+        if (n + 6 > MAX_VTX)
+            break;
+        for (k = 0; k < 6; k++) {
+            uivtx *v = &g_v[n + k];
+            int j = IX[k];
+            v->x = px[j]; v->y = py[j];
+            v->u = qu[j]; v->v = qv[j];
+            v->r = r; v->g = g; v->b = b; v->a = a;
+        }
+        n += 6;
+    }
     flush(n, (GLuint)tex);
 }
 

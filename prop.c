@@ -450,6 +450,32 @@ void prop_step(props_t *pr, const rb_car *car, float dt)
 
 /* ------------------------------------------------------------------ draw -- */
 
+/* See prop.h. */
+void prop_dump(const props_t *pr, const float eye[3], float radius)
+{
+    int i, shown = 0;
+    float zero[3] = { 0.f, 0.f, 0.f };
+    if (!pr) return;
+    if (!eye) eye = zero;
+    rlog("[rccars] props: %d placed, %d drawn last frame, scene %s\n",
+         pr->n, pr->n_drawn, pr->scene ? "loaded" : "MISSING");
+    for (i = 0; i < pr->n; i++) {
+        const prop_t *p = &pr->p[i];
+        float dx = p->pos[0] - eye[0], dy = p->pos[1] - eye[1];
+        float dz = p->pos[2] - eye[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > radius) continue;
+        shown++;
+        rlog("[rccars]   %-10s at (%.1f %.1f %.1f) %.1f m %s mesh=%d\n",
+             PROP_MODELS[p->model].name, p->pos[0], p->pos[1], p->pos[2], d,
+             p->awake ? "awake" : "asleep",
+             (p->model >= 0 && p->model < PROP_N_MODELS)
+                 ? pr->bind[p->model] : -1);
+    }
+    if (!shown)
+        rlog("[rccars]   (none within %.0f m)\n", radius);
+}
+
 void prop_draw(props_t *pr, const float eye[3])
 {
     int i;

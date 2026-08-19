@@ -126,6 +126,40 @@ static const chr_proxy_t CHR_PROXY[] = {
 
 #define CHR_N_PROXY  13
 
+/*
+ * EACH MODEL'S OWN SOUND, out of its own MOD_SNDCHANNEL -- six of the thirteen
+ * carry one and the other seven are silent. rmin > rmax on every one of them, as
+ * the props' 30/8 is, and both are passed through as authored.
+ *
+ * This is data and not a rule: the Crab and the Spider have no channel, so a car
+ * that runs one over raises no cue of its own. char.c hands the wav name up and
+ * the caller decides what it sounds like, the same split menu.c keeps from
+ * sfx.c.
+ */
+typedef struct {
+    const char *model;
+    const char *wav;                /* NULL: the model has no channel */
+    float rmin, rmax;
+} chr_snd_t;
+
+static const chr_snd_t CHR_SND[] = {
+    { "Dog",       "dog_attack",      15.0f,   5.0f     },
+    { "Seagull",   "seagull_vzliot",  50.0f,   5.0f     },
+    { "Crab",      NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Spider",    NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Vulture",   NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Man",       "man_voice",       20.0f,   0.0f     },
+    { "Woman",     "woman_voice",     20.0f,   0.0f     },
+    { "RepairMan", "man_voice",       20.0f,   0.0f     },
+    { "Guard",     "man_voice",       20.0f,   0.0f     },
+    { "Truck",     NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Trailer",   NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Hammer",    NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+    { "Btr",       NULL,              0.0f,    0.0f     },  /* no MOD_SNDCHANNEL */
+};
+
+#define CHR_N_SND  13
+
 /* Behaviour families. Each names what the instance's own brief supports. */
 typedef enum {
     CHR_KIND_DOG,      /* a vision cone, a chase, an attackVolume, a resetPlace */

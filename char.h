@@ -199,6 +199,25 @@ typedef struct {
  */
 #define CHR_MAX_INF 5
 
+/*
+ * How many frames of skinning scratch to keep. vitaGL's own circular vertex
+ * pool is one arena per display buffer (gxm_display_buffer_count, 3 by default),
+ * reset at swap for the buffer coming round again -- so three is what says "the
+ * GPU is done with it". See the skin ring in chr_t.
+ */
+#define CHR_SKIN_RINGS 3
+
+/*
+ * WHAT char_draw IS ALLOWED TO DRAW. A diagnostic, set from main.c and cycled on
+ * a button: a screenshot cannot name geometry, so the way to find out what an
+ * object on screen IS, is to stop drawing one class at a time and see what
+ * disappears. `chr_t` carries it rather than a static so a track change resets it
+ * with everything else.
+ */
+#define CHR_HIDE_NONE 0
+#define CHR_HIDE_PATH 1     /* the road cars and the vultures: every replayer */
+#define CHR_HIDE_ALL  2
+
 typedef struct {
     char name[CHR_NAME];
     unsigned int n_parts, n_batches, n_clips, n_slot, n_var;
@@ -218,6 +237,7 @@ typedef struct {
     float yaw_off;
     float radius;                   /* about the model origin, for culling */
     unsigned int max_verts;         /* largest skinned batch, for the scratch */
+    unsigned int skin_verts;        /* ALL of them, summed -- see CHR_SKIN_RINGS */
     /* This model's entry in char_data.h's CHR_PROXY, resolved by name once at
        load. NULL for a model the table does not name; ->n is 0 for the Seagull
        and the Vulture, which the engine's own registries leave unsolid. */
@@ -320,11 +340,49 @@ typedef struct {
      * Vita: vitaGL maps only the newlib heap for the GPU (mem_utils.c:535), so
      * a `static float v[N]` handed to gl*Pointer is an address GXM cannot see.
      * fx.c, trace.c and envmap.c all had to move for the same reason.
+     *
+     * AND IT IS A RING OF ARENAS, ONE PER DISPLAY BUFFER, BUMP-ALLOCATED PER
+     * DRAW. One buffer reused per batch is what drew the Woman, the Dog, the
+     * RepairMan and the Guard as exploding spikes on hardware while every host
+     * harness said the blend was perfect:
+     *
+     *   the custom vitaGL is built with DRAW_SPEEDHACK=2, so for a draw whose
+     *   vertex data exceeds SAFE_DRAW_SIZE_THRESHOLD (0x8000 = 32 KB) it stops
+     *   copying into a mapped temp and HANDS GXM THE CLIENT POINTER (ffp.c:1553,
+     *   1580). GXM reads it when the scene flushes, not when glDrawElements is
+     *   called -- so every big skinned draw in the frame read whatever the LAST
+     *   fill had left in the shared buffer.
+     *
+     *   At 20 bytes a vertex the line is 1,638 verts, and it cuts straight
+     *   through this cast: Woman 1798 + 1930, Dog 2028, RepairMan 1668 and
+     *   Guard 1950 are over it, Man 1572 + 1564, RepairMan's second 1364,
+     *   Guard's 1386 and every Seagull batch are under. That is exactly which
+     *   characters were reported broken and which were not.
+     *
+     * So each skinned draw gets its own slice, valid for the whole frame, and
+     * the arena rotates over CHR_SKIN_RINGS frames -- which is vitaGL's OWN
+     * discipline for the pool it copies small draws into (circular_data_pool is
+     * one arena per display buffer, advanced at swap by
+     * vgl_framecount % gxm_display_buffer_count, gxm.c:790), and 3 is that
+     * count. Sized at load to every drawable instance's total skinned vertices,
+     * so a frame that draws all of them still fits.
      */
-    float *skin;                    /* 5 floats per vertex, like a packed vert */
-    unsigned int skin_cap;
+    /* Per texture, kept for char_dump and for the same reason scene.c keeps
+       has_px: a declared texture whose image is missing gets an id from
+       glGenTextures and never a glTexImage2D, which leaves the sampler
+       undefined -- so a white or black model is a question this can answer
+       without a rebuild. */
+    char (*tex_name)[CHR_NAME];
+    unsigned char *tex_px;
+
+    float *skin[CHR_SKIN_RINGS];    /* 5 floats per vertex, like a packed vert */
+    unsigned int skin_cap;          /* VERTICES per arena */
+    unsigned int skin_used;         /* vertices taken out of this frame's arena */
+    unsigned int skin_ring;         /* which arena this frame is filling */
+    int skin_full;                  /* the overflow has been logged once */
 
     unsigned int n_drawn, n_stepped;
+    int hide;                       /* CHR_HIDE_*, a diagnostic -- see above */
 } chr_t;
 
 /*
@@ -419,5 +477,21 @@ int chr_clip_index(const chr_model_t *m, const char *name);
    quad test -- every shipped volume is a parallelogram and nothing here relies
    on it. */
 int chr_in_volume(const chr_volume_t *v, float x, float y, float z);
+
+/*
+ * EVERY PLACED CHARACTER, WITH WHAT IT WOULD DRAW WITH, to the log. A diagnostic,
+ * not telemetry: it is what answers "what is that white box on screen", which
+ * three rounds of screenshots could not. Per instance: model, variant, position,
+ * distance from the eye, whether it is inside CHR_DRAW_DIST, and for every
+ * texture slot the GL id its variant resolves to, with `!` on an id of 0 (nothing
+ * bound -- the model draws white) and `?` on one whose image never uploaded (the
+ * sampler is undefined -- black or garbage). main.c calls it on a button.
+ */
+void char_dump(const chr_t *c, const float eye[3]);
+
+/* The wav one instance's model names in its own MOD_SNDCHANNEL, or NULL where the
+   model has none -- see char.c. What the caller does with the name is its own
+   business; char.c never touches the audio layer. */
+const char *chr_model_wav(const chr_t *c, unsigned int inst);
 
 #endif /* CHAR_H */

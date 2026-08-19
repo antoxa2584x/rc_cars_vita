@@ -178,4 +178,10 @@ void prop_draw(props_t *pr, const float eye[3]);
    glMultMatrixf -- the model origin, not the centre of mass. */
 void prop_matrix(const prop_t *p, float out[16]);
 
+/* Every placed prop within `radius` of the eye, to the log: model, position,
+   distance, awake/asleep and whether props.vsc bound a mesh for it at all. A
+   diagnostic in char_dump's manner -- it answers "what is that object on
+   screen", which a screenshot cannot. main.c calls it on a button. */
+void prop_dump(const props_t *pr, const float eye[3], float radius);
+
 #endif /* PROP_H */

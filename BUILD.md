@@ -195,10 +195,24 @@ invisible on the only machine whose numbers matter.
 
     ux0:data/rccars/rccars.log
 
-Truncated at each launch, flushed after every line (so a crash keeps the line that
-says why), and capped at 4 MB. Nothing may call `rlog` per frame — it costs a
+`remove()`d and recreated at each launch -- `fopen(..., "w")` alone does NOT
+reliably truncate here, and a log that is half this run and half the last one has
+already cost one wrong diagnosis: 4,400 lines of which the first 2,728 were the
+current session and the rest, after one torn line, an older and longer one, which
+read as "the characters stopped loading half way through the session" because the
+stale tail had no `.chr` load lines in it. **If a log ever looks like it changes
+behaviour part way down, check for a torn line first.** Flushed after every line
+(so a crash keeps the line that says why), and capped at 4 MB. Nothing may call `rlog` per frame — it costs a
 memory-card write per line, and the existing callers are per second or per load.
 Off the Vita it is stdout, so the host harnesses link `rlog.c` unchanged.
+
+**TRIANGLE dumps an inventory** — every character near the eye with its model, variant,
+position, distance, drawn/culled and the GL texture id each of its slots resolves to
+(`!` = nothing bound, so the model draws white; `?` = bound but no image ever uploaded,
+so the sampler is undefined), then every prop within 30 m and every opponent. Park
+facing the thing on screen, press TRIANGLE, read the log: it is the only way to put a
+NAME to geometry in a screenshot, and three rounds of screenshots is what it cost to
+learn that.
 
 Two lines are worth going straight to:
 
@@ -373,7 +387,7 @@ leaves the previous binary sitting there to answer for it:
 
     rm -f rb_test vis_test carparts_test menu_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
-          colprof flipped antheight aitest
+          colprof flipped antheight aitest chrfloat curb hudshot
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -413,13 +427,37 @@ leaves the previous binary sitting there to answer for it:
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
     gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c hud.c countdown.c \
-        -lm -o ui_test
-                            # menu drawing, the !HIT! banner, and the 3-2-1-GO
-                            # race start. hud.c and countdown.c are on this line
-                            # because they draw THROUGH ui.c, so the same recorder
-                            # reads back what really went on screen -- WHICH CELL
-                            # of each atlas, at the recovered size, in the
-                            # recovered vertical band.
+        race_ui.c -lm -o ui_test
+                            # menu drawing, the !HIT! banner, the 3-2-1-GO race
+                            # start, and the IN-RACE HUD -- the minimap, the place
+                            # badge, the two clocks and the two gauges. All four
+                            # of those files are on this line because they draw
+                            # THROUGH ui.c, so the same recorder reads back what
+                            # really went on screen -- which CELL of which atlas,
+                            # at the recovered size, in the recovered band, at the
+                            # recovered angle, over the recovered sweep.
+                            # 250 checks; 25 of 25 mutants die.
+    gcc -I. -Itestgl -O2 ../rccars_re/hudshot.c ui.c race_ui.c -lm -o hudshot
+                            # NOT a test: it PRINTS the HUD's triangles, and
+                            # rccars_re/hudshot.py composites them over the game's
+                            # real .csi art into a 960x544 PNG. ui_test asserts
+                            # where every quad went and cannot say whether the
+                            # result looks like a HUD, which is the standing rule
+                            # about verifying visually. Its most useful picture is
+                            # the minimap: the car goes at the race start out of
+                            # tracks.h (the .sb files) and the transform comes out
+                            # of the exe, so an arrow landing ON the painted
+                            # ribbon is two independent sources agreeing.
+                            #
+                            #   ./hudshot 4 | python3 ../rccars_re/hudshot.py \
+                            #       /tmp/hud.png --track 4
+                            #
+                            # AND read the picture as a pointer, not a verdict:
+                            # rccars_re/mapcheck.py is what MEASURES the minimap,
+                            # by holding the .vsc's own cp_N markers against the
+                            # ribbon as painted in trackmap_<n>. Needs no build:
+                            #
+                            #   python3 ../rccars_re/mapcheck.py
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \
@@ -458,6 +496,16 @@ leaves the previous binary sitting there to answer for it:
         ../rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
         contact.c collide.c rlog.c ../rccars_re/glstub_host.c \
         -lm -o antheight             # where the proxy is vs where the car is
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
+        ../rccars_re/chrfloat.c char.c scene.c col.c carani.c rb.c contact.c \
+        collide.c rbcar.c rlog.c ../rccars_re/glstub_host.c \
+        -lm -o chrfloat        # where the characters and their paths actually
+                               # ARE, against the real grids. A probe, not a
+                               # test -- it prints, it does not assert, and
+                               # chartest part 13 is the assertions. glstub_host
+                               # carries char.c's glTranslatef/glRotatef/
+                               # glScalef for it, so nothing here may check a
+                               # draw.
 
 `flipped` and `antheight` link `../rccars_re/glstub_host.c`, a no-op GL, because
 they want `scene.c` for the geometry it loads and have no renderer. That is NOT
@@ -466,6 +514,10 @@ assert on a drawing call, because a no-op stub cannot fail one. `antheight`'s ow
 header carried a build line that omitted the stub and had stopped linking when
 `scene.c` gained its VBO calls; it is here now so that cannot happen quietly
 again.
+
+`chrfloat` and `antheight` are the two probes: they print numbers and assert nothing, so
+read them, do not run them for a pass. Everything either one found is asserted in
+`chartest` or `proptest`.
 
 `allstarts` is the one to run after any change to the physics. It parks the car at
 each track's own race start for 15 s and then drives it for 2 s, on that track's

@@ -129,6 +129,13 @@ typedef enum {
 
 void sfx_char_voice(sfx_voice_t which, const float pos[3], float gain);
 
+/* The same one-shot, asked for by the WAV NAME a model declares in its own
+   MOD_SNDCHANNEL (char.c's chr_model_wav). NULL, or a name no resident voice
+   carries, is silent -- which is what the Crab and the Spider are. Use this
+   wherever the model is known: it takes the decision out of the caller, and the
+   caller's own version of it gave a squashed crab a man's voice. */
+void sfx_char_wav(const char *wav, const float pos[3], float gain);
+
 /* ------------------------------------------------------------- the opponents
  *
  * One positional engine loop per AI car, because that is all the shipped data

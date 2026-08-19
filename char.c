@@ -161,6 +161,29 @@ int chr_clip_index(const chr_model_t *m, const char *name)
     return -1;
 }
 
+/*
+ * The wav ONE INSTANCE'S MODEL names in its own MOD_SNDCHANNEL, or NULL for a
+ * model that has none -- the Crab, the Spider, the Vulture and the four road
+ * cars, seven of the thirteen. char_data.h's CHR_SND is the table and it is read
+ * out of the models themselves.
+ *
+ * This is here rather than in main.c because WHICH SOUND A MODEL OWNS is data;
+ * what that sound is played through is the caller's, which is the same split
+ * menu.c keeps from sfx.c. A cue from a model with no channel is silent, and it
+ * was raising a man's voice for a squashed crab.
+ */
+const char *chr_model_wav(const chr_t *c, unsigned int idx)
+{
+    unsigned int j;
+    const char *model;
+    if (!c || idx >= c->n_inst) return NULL;
+    model = c->inst[idx].place->model;
+    for (j = 0; j < (unsigned)CHR_N_SND; j++)
+        if (!strcmp(CHR_SND[j].model, model))
+            return CHR_SND[j].wav;
+    return NULL;
+}
+
 /* The first of several names the model has. The people call their walk "Walk"
    and the Dog calls its "run"; asking for a list rather than a name keeps the
    per-kind code from carrying a per-model table. */
@@ -277,7 +300,13 @@ void char_free(chr_t *c)
     free(c->tex);
     free(c->model);
     free(c->path);
-    free(c->skin);
+    {
+        unsigned int r;
+        for (r = 0; r < CHR_SKIN_RINGS; r++)
+            free(c->skin[r]);
+    }
+    free(c->tex_name);
+    free(c->tex_px);
     memset(c, 0, sizeof(*c));
 }
 
@@ -299,9 +328,21 @@ static int load_file(chr_t *c, const char *path)
 
     c->tex = c->n_tex ? calloc(c->n_tex, sizeof(GLuint)) : NULL;
     if (c->n_tex) {
+        c->tex_name = calloc(c->n_tex, sizeof(*c->tex_name));
+        c->tex_px = calloc(c->n_tex, 1);
         glGenTextures((GLsizei)c->n_tex, c->tex);
-        for (i = 0; i < c->n_tex; i++)
-            scene_read_texture(f, c->tex[i], NULL, 0, NULL, NULL);
+        for (i = 0; i < c->n_tex; i++) {
+            int got = 0;
+            scene_read_texture(f, c->tex[i], c->tex_name ? c->tex_name[i] : NULL,
+                               c->tex_name ? CHR_NAME : 0, NULL, &got);
+            if (c->tex_px) c->tex_px[i] = (unsigned char)got;
+            /* scene.c reports the same thing for a track and then refuses to draw
+               the batch; here it is the one fact that separates a model drawing
+               WHITE (nothing bound) from one drawing black (bound, no image). */
+            if (!got)
+                rlog("[rccars] %s: texture %u '%s' has no image\n", path, i,
+                     c->tex_name ? c->tex_name[i] : "?");
+        }
     }
 
     c->model = c->n_models ? calloc(c->n_models, sizeof(chr_model_t)) : NULL;
@@ -389,6 +430,10 @@ static int load_file(chr_t *c, const char *path)
                 }
                 if (b->nverts > m->max_verts)
                     m->max_verts = b->nverts;
+                /* Every skinned vertex this model submits in one frame -- the
+                   skin ring is sized on the sum, not the largest, because each
+                   batch needs its OWN slice. See CHR_SKIN_RINGS. */
+                m->skin_verts += b->nverts;
             }
             b->idx = malloc((size_t)b->nidx * sizeof(unsigned short));
             rd(f, b->idx, (size_t)b->nidx * sizeof(unsigned short));
@@ -478,6 +523,54 @@ static float ground(const chr_t *c, float x, float z, float fallback, float ceil
  * above the pivot so a Guard authored under a gantry is not lifted onto its
  * roof (which is exactly what beach_2's overpass did to the car's spawn).
  */
+/*
+ * THE FIRST TIME ALONG A RECORDING AT WHICH THE CHARACTER IS OUT OF THE SEA.
+ *
+ * beach_1's two people begin their recorded walks UNDER THE WATER. Measured
+ * against the track's own water grid: the Man is at y -1.65 against a surface at
+ * -0.37 for his first ~30 s of 469, and the Woman at -1.38 for her first ~60 s of
+ * 201 -- 1,713 of her 3,603 samples are below the surface, and the visible mesh
+ * within four metres of her there is the water plane at 0.00 and a sea bed at
+ * -2.24, so she is not standing on anything. Both come ashore and walk the beach
+ * for the rest of the recording.
+ *
+ * The sea is drawn after the characters and blends by depth (beach_1's ramp is
+ * alpha 0.10 to 1.00 over magnetRadius), so a submerged person is at best a smear
+ * and at a race start there is nothing there at all -- reported as "on the first
+ * map two npc people are missing", and they were, for the first minute, which is
+ * the minute anyone looks.
+ *
+ * THE PORT'S, and it moves the PHASE and not the recording: `phase` is already
+ * this file's own field (see char_data.h), the samples are untouched, and a path
+ * with no water under it -- every road car's -- is unaffected. What it picks is
+ * the first sample the recording itself puts at or above the water, which is the
+ * character walking rather than the character parked.
+ */
+static float first_dry_t(const chr_t *c, const chr_path_t *pa, float from)
+{
+    unsigned int j;
+    if (!c->col || !pa->n)
+        return from;
+    for (j = 0; j < pa->n; j++) {
+        float x = pa->p[j * 3], y = pa->p[j * 3 + 1], z = pa->p[j * 3 + 2];
+        float w = 0.0f, g = 0.0f, nx, ny, nz;
+        if (pa->t[j] < from)
+            continue;
+        /* Out of the sea AND standing on the track: the two halves of "in play".
+           Without the second, beach_1's Woman starts a metre above her own sea
+           bed, dry but hovering, because the recording leaves the water before it
+           reaches the sand. */
+        if (col_water_at(c->col, x, z, &w) && y < w)
+            continue;
+        if (!col_ground_at(c->col, x, z, y + 0.5f, &g, &nx, &ny, &nz))
+            continue;
+        if (y - g > 0.5f || y - g < -0.5f)
+            continue;
+        return pa->t[j];
+    }
+    return from;                    /* never in play: leave the phase alone */
+}
+
 /* Two probes -- see CHR_DROP_CEIL in char.h for why one is not enough. */
 static void drop(const chr_t *c, chr_inst_t *in)
 {
@@ -550,6 +643,10 @@ static float stride_rate(const chr_model_t *m, int clip, float speed)
     return clampf(speed / (len / cycle), 0.25f, 4.0f);
 }
 
+/* char_reset places a path replayer by calling this with dt = 0 -- see there. */
+static void advance_path(chr_t *c, chr_inst_t *in, const chr_model_t *m,
+                         float dt);
+
 int char_init(chr_t *c, const char *path, const char *track, const col_t *col)
 {
     unsigned int t, i;
@@ -604,17 +701,38 @@ int char_init(chr_t *c, const char *path, const char *track, const col_t *col)
         c->n_inst++;
     }
 
-    /* One scratch big enough for the largest skinned batch of any model here.
-       Malloc'd -- see char.h. */
-    for (i = 0; i < c->n_models; i++)
-        if (c->model[i].max_verts > c->skin_cap)
-            c->skin_cap = c->model[i].max_verts;
-    if (c->skin_cap)
-        c->skin = malloc((size_t)c->skin_cap * 5 * sizeof(float));
+    /*
+     * The skin ring: CHR_SKIN_RINGS arenas, each big enough for every skinned
+     * vertex every PLACED instance could submit in one frame. Not the largest
+     * batch -- the sum -- because a batch handed to GXM as a client pointer is
+     * read at flush and must still be its own by then. See char.h.
+     *
+     * The worst case is small: beach_2's eleven come to 11,485 verts (230 KB an
+     * arena, 690 KB for the ring) and beach_3's thirteen to 13,366. Malloc'd,
+     * because vitaGL maps only the heap for the GPU.
+     */
+    for (i = 0; i < c->n_inst; i++)
+        c->skin_cap += c->model[c->inst[i].model].skin_verts;
+    if (c->skin_cap) {
+        unsigned int r;
+        for (r = 0; r < CHR_SKIN_RINGS; r++) {
+            c->skin[r] = malloc((size_t)c->skin_cap * 5 * sizeof(float));
+            if (!c->skin[r]) {
+                rlog("[rccars] %s: no room for skinning arena %u/%u (%u KB) -- "
+                     "the skinned models will not draw\n", path, r + 1,
+                     (unsigned)CHR_SKIN_RINGS,
+                     (unsigned)(c->skin_cap * 5 * sizeof(float) / 1024));
+                break;
+            }
+        }
+    }
 
     char_reset(c);
-    rlog("[rccars] %s: %u characters, %u models, %u paths, %u textures\n",
-         path, c->n_inst, c->n_models, c->n_paths, c->n_tex);
+    rlog("[rccars] %s: %u characters, %u models, %u paths, %u textures, "
+         "skin ring %ux%u KB\n",
+         path, c->n_inst, c->n_models, c->n_paths, c->n_tex,
+         (unsigned)CHR_SKIN_RINGS,
+         (unsigned)(c->skin_cap * 5 * sizeof(float) / 1024));
     return 1;
 }
 
@@ -652,7 +770,32 @@ void char_reset(chr_t *c)
         if (in->path >= 0) {
             const chr_path_t *pa = &c->path[in->path];
             in->path_t = pl->phase * pa->duration;
+            /* ...and forward to where the recording has it out of the sea --
+               see first_dry_t. Nothing moves for a path with no water under it. */
+            in->path_t = first_dry_t(c, pa, in->path_t);
             in->cursor = 0;
+            /*
+             * AND PLACED ON ITS PATH, not on the authored pivot.
+             *
+             * A replayer's own `place` is a DUMMY. All six of beach_2's road
+             * cars, all six of beach_3's and urban_1's Hammer carry the same
+             * (-19.58, 8.07, 43.15) -- one triple in three different levels,
+             * with no surface at all under it on two of them and 0.65 m of air
+             * under it on the third -- and beach_1's Man and Woman share one
+             * whose nearest sample of the Woman's OWN recorded walk is 89.6 m
+             * away. Left there until something stepped them, beach_2's six
+             * vehicles sat interpenetrating in the air 100 m off the racing
+             * line, which is the reported "the npc cars are white boxes floating
+             * in the air", and beach_1's two people stood where nobody drives,
+             * which is the reported "two people missing". `chrfloat` prints
+             * every pivot, its ground and its distance to its own path.
+             *
+             * dt = 0 advances nothing: advance_path interpolates the sample pair
+             * `path_t` already names and writes the position, the heading and the
+             * clip. So an instance is on its path from the first frame, before
+             * anything has stepped it.
+             */
+            advance_path(c, in, m, 0.0f);
         } else if (pl->kind != CHR_KIND_PATH) {
             drop(c, in);
         }
@@ -1207,6 +1350,25 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
         chr_inst_t *in = &c->inst[i];
         const chr_model_t *m = &c->model[in->model];
         float dx, dy, dz;
+        /*
+         * A REPLAYER IS NEVER CULLED. CHR_STEP_DIST bounds the invented state
+         * machines -- the Dog's cone, the Seagull's takeoff, the Crab's shuttle,
+         * the Guard's watch -- because those are what a character does ABOUT the
+         * car and they cost a volume test and a walk each. A recorded path is
+         * neither: it is where that character IS at time t, it costs a cursor
+         * step and a lerp, and the engine's own layer is stepped once per frame
+         * over everything (0x4fc685 with dt; the 10 m range at 0x53343b bounds
+         * the COLLISION sweep, not the step).
+         *
+         * Culled, a replayer's clock stopped the moment the car left, so it
+         * froze wherever it happened to be -- for beach_1's Man and Woman, one
+         * frame after the start, on the first sample of a 469 s and a 201 s
+         * walk, for the whole race. Nothing else in this loop runs out of range:
+         * being run over needs the car within CHR_HIT_RADIUS and the reactions
+         * need a state that only the machines above can enter.
+         */
+        int replay = (in->place->kind == CHR_KIND_PATH
+                      || in->place->kind == CHR_KIND_WALKER);
 
         dx = in->x - car[0];
         dy = in->y - car[1];
@@ -1214,7 +1376,7 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
         in->dist2 = dx * dx + dy * dy + dz * dz;
         in->event = CHR_EV_NONE;
         in->solid_hit = 0;
-        if (in->dist2 > CHR_STEP_DIST * CHR_STEP_DIST)
+        if (!replay && in->dist2 > CHR_STEP_DIST * CHR_STEP_DIST)
             continue;
         c->n_stepped++;
 
@@ -1285,6 +1447,44 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
     }
 }
 
+/* See char.h. Deliberately one line per instance plus one per model, so a whole
+   track fits in a screenful of log and a screenshot can be matched to it. */
+void char_dump(const chr_t *c, const float eye[3])
+{
+    unsigned int i, k;
+    float zero[3] = { 0.0f, 0.0f, 0.0f };
+    if (!c) return;
+    if (!eye) eye = zero;
+    rlog("[rccars] chars: %u placed, %u models, %u textures\n",
+         c->n_inst, c->n_models, c->n_tex);
+    for (i = 0; i < c->n_inst; i++) {
+        const chr_inst_t *in = &c->inst[i];
+        const chr_model_t *m = &c->model[in->model];
+        float dx = in->x - eye[0], dy = in->y - eye[1], dz = in->z - eye[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        char slots[160];
+        int n = 0;
+        slots[0] = 0;
+        for (k = 0; k < m->n_slot && n < (int)sizeof slots - 24; k++) {
+            unsigned int ti = m->var
+                ? m->var[(unsigned)in->variant * m->n_slot + k] : 0xFFFFFFFFu;
+            GLuint id = (ti < c->n_tex) ? c->tex[ti] : 0;
+            const char *nm = (ti < c->n_tex && c->tex_name) ? c->tex_name[ti]
+                                                            : "-";
+            n += snprintf(slots + n, sizeof slots - (size_t)n, " %s#%u%s", nm,
+                          (unsigned)id,
+                          !id ? "!" : ((c->tex_px && ti < c->n_tex
+                                       && !c->tex_px[ti]) ? "?" : ""));
+        }
+        rlog("[rccars]   %-20s %-10s var%d at (%.1f %.1f %.1f) %.1f m %s "
+             "batches=%u clip=%s%s\n",
+             in->place->name, m->name, in->variant, in->x, in->y, in->z, d,
+             in->drawn ? "DRAWN" : "culled", m->n_batches,
+             (in->clip >= 0 && (unsigned)in->clip < m->n_clips)
+                 ? m->clip[in->clip].name : "-", slots);
+    }
+}
+
 int char_pos(const chr_t *c, unsigned int i, float out[3])
 {
     if (!c || i >= c->n_inst || !out) return 0;
@@ -1349,20 +1549,50 @@ int char_proxy(chr_t *c, unsigned int idx, float out[][4])
         return 0;
 
     switch (px->kind) {
-    case CHR_PX_COLUMN:
+    case CHR_PX_COLUMN: {
         /* Stacked along WORLD +Y from the instance position, which is what the
            providers do -- the up vector at 0x55e9a0 is (0, 1, 0) and neither the
            step nor the radius is turned by the instance's own yaw or scaled by
            its scale. The Crab's -0.18 and the Spider's CdtShiftY -0.24 are the
            same field: a shift on the first sphere. */
+        /*
+         * AND THE DOWNWARD SHIFT IS CLAMPED. THE PORT'S, and the one number here
+         * that is not the engine's.
+         *
+         * The recovered shifts bury both burrowers. A character is dropped onto
+         * the surface, so the Crab's r 0.2 sphere at pivot - 0.18 (0x554b14)
+         * spans -0.380 .. +0.020 m about the sand and the Spider's r 0.23 at
+         * CdtShiftY -0.24, off a pivot spider.ini puts HeightFloor 0.010 above
+         * the floor, tops out at 0.000 -- flush with it, to the millimetre. A
+         * settled car's own thirteen spheres span -0.002 .. 0.252 m above the
+         * ground, so nothing the car has can reach either one except by pressing
+         * a tyre into the terrain: `chrfloat` drives a real car straight at both
+         * of beach_1's Crabs and records 0 contacts, against 148 for a Woman.
+         * That is the reported "the crab has no collision", and the animal has a
+         * 3.3 s HIT clip and a place in the engine's own $CAR/CRAB pair for
+         * something.
+         *
+         * What the retail resolvers do with these is not fully recovered -- the
+         * $CAR/CRAB resolver at 0x534670 builds ONE contact out of two POSITIONS
+         * (0x534be0: normal = a - b normalised, point = their midpoint) rather
+         * than out of the two sphere sets this does -- so the shift may well have
+         * been tuned against a coarser test. What is not in question is that a
+         * sphere entirely under the surface cannot be touched by a car on top of
+         * it, so the centre is clamped to the pivot plane: the PEOP and GUAM
+         * convention, a first sphere centred at the feet, with the recovered
+         * radius and count untouched. Nothing else in the table is affected --
+         * every other shift is 0.
+         */
+        float shift = px->shift_y < 0.0f ? 0.0f : px->shift_y;
         for (k = 0; k < px->n && k < CHR_PROXY_MAX; k++) {
             out[n][0] = in->x;
-            out[n][1] = in->y + px->shift_y + px->step_y * (float)k;
+            out[n][1] = in->y + shift + px->step_y * (float)k;
             out[n][2] = in->z;
             out[n][3] = px->radius;
             n++;
         }
         break;
+    }
 
     case CHR_PX_BONES: {
         /* The Dog's: five spheres at the POSED world positions of LHAND1,
@@ -1583,6 +1813,10 @@ void char_draw(chr_t *c, const float eye[3])
         return;
     if (!eye) eye = zero;
     c->n_drawn = 0;
+    /* Next arena, empty. One frame per display buffer, which is what says the
+       GPU has finished with the one three frames back -- see CHR_SKIN_RINGS. */
+    c->skin_ring = (c->skin_ring + 1u) % (unsigned)CHR_SKIN_RINGS;
+    c->skin_used = 0;
     for (i = 0; i < c->n_inst; i++) {
         chr_inst_t *in = &c->inst[i];
         float dx = in->x - eye[0], dy = in->y - eye[1], dz = in->z - eye[2];
@@ -1613,6 +1847,12 @@ void char_draw(chr_t *c, const float eye[3])
         const chr_model_t *m;
         if (!in->drawn)
             continue;
+        /* The isolation ladder -- see CHR_HIDE_* in char.h. */
+        if (c->hide == CHR_HIDE_ALL)
+            continue;
+        if (c->hide == CHR_HIDE_PATH
+            && in->place->kind == CHR_KIND_PATH)
+            continue;
         m = &c->model[in->model];
         chr_pose(c, i);
         c->n_drawn++;
@@ -1637,9 +1877,27 @@ void char_draw(chr_t *c, const float eye[3])
                 continue;
             glBindTexture(GL_TEXTURE_2D, tex);
             if (bt->skinned) {
-                float *out = c->skin;
-                if (!out || bt->nverts > c->skin_cap)
+                /*
+                 * ITS OWN SLICE OF THIS FRAME'S ARENA. Not a shared scratch:
+                 * past 32 KB of vertex data vitaGL hands GXM this very pointer
+                 * and reads it at flush, so two draws sharing it means the
+                 * second fill is what the first one draws. See CHR_SKIN_RINGS
+                 * in char.h for the measurement and for who was over the line.
+                 */
+                float *base = c->skin[c->skin_ring];
+                float *out;
+                if (!base) continue;
+                if (c->skin_used + bt->nverts > c->skin_cap) {
+                    if (!c->skin_full) {
+                        c->skin_full = 1;
+                        rlog("[rccars] char: skinning arena full at %u/%u verts"
+                             " -- a batch of %u is not drawn\n", c->skin_used,
+                             c->skin_cap, bt->nverts);
+                    }
                     continue;
+                }
+                out = base + (size_t)c->skin_used * 5;
+                c->skin_used += bt->nverts;
                 for (v = 0; v < bt->nverts; v++) {
                     const float *src = &bt->verts[v * 5];
                     float acc[3] = { 0.0f, 0.0f, 0.0f };

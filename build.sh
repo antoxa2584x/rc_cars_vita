@@ -6,9 +6,11 @@
 #
 #     ./build.sh
 #
-# game_data/ holds six things, copied from an installed copy of RC Cars:
+# game_data/ holds eight things, copied from an installed copy of RC Cars:
 #
 #     game_data/RCCars.pack     the texture and sound archive
+#     game_data/RCCars.exe      read-only, for the tables generators
+#     game_data/Language/       the engine's own bitmap font (Smash20/Smash26)
 #     game_data/RCCarsDB/       the .sb scene databases (tracks, cars, props)
 #     game_data/Tracks/         the soundtrack MP3s
 #     game_data/Autoexec.gm     the playlist that orders them
@@ -70,7 +72,15 @@ NEEDED=(RCCars.pack      # unpack_tiox.py: textures, wavs, settings
         RCCarsDB         # pack_vsc/pack_col/pack_props: the .sb scenes
         Tracks           # pack_snd.py: the soundtrack
         Autoexec.gm      # pack_snd.py: the playlist that orders it
-        GameIcon.ico)    # gen_sce_sys.py: the bubble
+        GameIcon.ico     # gen_sce_sys.py: the bubble
+        RCCars.exe       # gen_hud_data.py: the minimap's per-track transform
+                         #   and the map panel's outline live in .data. Every
+                         #   OTHER generator that reads the exe has the path
+                         #   baked in, which is why this was the eighth entry
+                         #   rather than the second.
+        Language)        # gen_hud_data.py + pack_props.py: the engine's OWN
+                         #   font, Smash20/Smash26, which is here and not in
+                         #   RCCars.pack -- see traps.md
 
 # Optional. header.jpg is the LiveArea's wallpaper and gate; it ships with the
 # Steam release but not with every install. Without it the LiveArea is derived
@@ -81,6 +91,23 @@ OPTIONAL=(header.jpg)
 TRACKS=(beach_1 beach_2 beach_3 beach_4
         country_1 country_2 country_3 country_4
         urban_1 urban_2)
+
+# THE ENGINE'S OWN TRACK ORDER, and it must not be filtered. `-t` REPLACES
+# TRACKS, so a loop counter over it is not the track's index -- which is how
+# `-t beach_1,urban_2` first packed urban_2 (track 9) with trackmap_2. Anything
+# that needs a track's NUMBER -- and `trackmap_<n>` is numbered from this order,
+# the same order tracks.h and hud_data.h's MAP_CALIB are in -- looks it up here.
+ALL_TRACKS=("${TRACKS[@]}")
+
+track_index() {                   # track_index <name> -> 0-based, or 255
+    local i=0 t
+    for t in "${ALL_TRACKS[@]}"; do
+        [ "$t" = "$1" ] && { echo "$i"; return 0; }
+        i=$((i + 1))
+    done
+    echo 255
+    return 1
+}
 
 usage() {
     sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
@@ -338,12 +365,27 @@ if wanted tracks; then
     step "Packing tracks"
     for t in "${TRACKS[@]}"; do
         src="$DB/$t.sb"
+        # The track's number comes out of ALL_TRACKS by NAME, never out of this
+        # loop -- `-t` replaces TRACKS and a missing .sb skips an entry, and
+        # either one shifts a counter onto the wrong track's map.
+        n=$(( $(track_index "$t") + 1 ))
+        [ "$n" -le 10 ] || die "unknown track '$t' -- not in the engine's ten"
         [ -f "$src" ] || { warn "$src missing, skipped"; continue; }
 
         if current "$ASSETS/$t.vsc" "$src" "$RE/pack_vsc.py"; then
             skip "$t.vsc"
         else
+            # --extra-tex trackmap_<n>: the minimap's own painted art, one per
+            # track and referenced by no mesh, so it is bound by NAME at runtime
+            # through scene_tex (race_ui.c). PER TRACK rather than in props.vsc
+            # because a 512x512 map is 0.7 MB and ten of them would be resident
+            # all session to show one. The index is 1-based and matches the
+            # order in tracks.h and in MAP_CALIB, which is the exe's own:
+            # FUN_004a9840 formats `trackmap_%i` from track + 1 and copies row
+            # `track` of the two calibration tables beside it. `n` comes from
+            # ALL_TRACKS by name -- see track_index.
             run python3 "$RE/pack_vsc.py" "$src" "$ASSETS/$t.vsc" --markers \
+                --extra-tex "trackmap_$n" \
                 --csidir "$EXTRACTED" --embdir "$EMB"
         fi
 
@@ -451,6 +493,23 @@ fi
 # msg_hits belongs with the props on the merits as well -- it is the thing that
 # says you hit one. Texture quality divides both by four a step.
 
+# AND THE REST OF THE IN-RACE HUD rides here too, for the same reason: every one
+# of these is bound by name at runtime, belongs to no track and no car, and
+# props.vsc is the app's one load-once scene, so none of the bindings is ever
+# renewed. Two 64x32 marker sheets for the minimap (map_arrow and map_cp, each
+# TWO 32x32 cells), the six place badges, the word `Lap', the two dial textures
+# (cockpit_sp1 is the dial and its gold sweep track, cockpit_sp2 the same ring
+# with the red fill), and BOTH of the engine's own font atlases.
+#
+# THE FONTS ARE NOT IN THE PACK. Smash20.csi and Smash26.csi sit in
+# Language/English/ on the installed game -- which is why this port spent years
+# saying the game shipped no reusable glyph atlas (see traps.md and race_ui.h) --
+# so --texroot2 points the .csi index at that directory as well. The two .dat
+# beside them give the character order and Settings/smash20.ini / smash26.ini the
+# metrics; gen_hud_data.py reads all four.
+HUDTEX=map_arrow,map_cp,place1,place2,place3,place4,place5,place6,lap
+HUDTEX=$HUDTEX,cockpit_sp1,cockpit_sp2,Smash20,Smash26
+
 if wanted props; then
     step "Packing props"
     if current "$ASSETS/props.vsc" "$DB/stone.sb" "$RE/pack_props.py"; then
@@ -458,7 +517,8 @@ if wanted props; then
     else
         run python3 "$RE/pack_props.py" "$ASSETS/props.vsc" \
             --src "$DB/stone.sb" --texroot "$EXTRACTED" \
-            --extra-tex msg_hits,msg_321_s_f
+            --texroot2 "$GAME/Language/English" \
+            --extra-tex "msg_hits,msg_321_s_f,$HUDTEX"
     fi
 fi
 
@@ -533,6 +593,23 @@ if wanted tables; then
         skip "char_data.h"
     else
         run python3 "$RE/gen_char_data.py" "$VITA/char_data.h"
+    fi
+
+    # The in-race HUD's data: the per-track world -> minimap transform and the
+    # map panel's outline out of RCCars.exe, the whole screen layout out of
+    # Settings/map.ini + cockpit.ini + cockpit_time.ini, the dial's own geometry
+    # measured off cockpit_sp1/sp2, and the Smash font's metrics and per-glyph
+    # ink out of Language/English + smash20.ini / smash26.ini. It ASSERTS what it
+    # can -- the ten map transforms come out uniform, unrotated and with every
+    # race start on the art -- so a wrong address fails the build instead of
+    # shipping a plausible number.
+    if current "$VITA/hud_data.h" "$GAME/RCCars.exe" "$RE/gen_hud_data.py"; then
+        skip "hud_data.h"
+    else
+        run python3 "$RE/gen_hud_data.py" "$VITA/hud_data.h" \
+            --exe "$GAME/RCCars.exe" --settings "$EXTRACTED/Settings" \
+            --lang "$GAME/Language/English" \
+            --textures "$EXTRACTED/Textures.1"
     fi
 
     if [ -f "$VITA/font.h" ] && [ "$FORCE" = 0 ]; then
