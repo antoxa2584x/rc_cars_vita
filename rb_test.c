@@ -1349,6 +1349,44 @@ static void jump_water_checks(void)
            "the vertical part of a tilted hop is less than the total");
     }
 
+    /* WHAT rbcar_yaw_deg ACTUALLY RETURNS, asserted rather than commented.
+     *
+     * It is the RENDERER'S VIEW YAW -- the angle a camera needs to look at the
+     * car's forward -- and so it is 180 degrees from where the car POINTS. Three
+     * consumers depend on that (cam.c, the chase camera, shadow_draw_yaw) and
+     * main.c draws the car model with `veh.yaw + 180` because of it. It is also a
+     * trap: it cost the minimap its arrow, which came out 180 degrees round on
+     * every track and every opponent because a fourth caller read it as a heading.
+     *
+     * So this pins BOTH halves: rbcar_init's yaw really does put local +Z on
+     * (sin y, 0, cos y), and rbcar_yaw_deg really is that plus 180. A "fix" to
+     * either one fails here and says which. */
+    {
+        static const float YW[6] = { 0.f, 45.f, 90.f, 135.f, 180.f, -90.f };
+        int q, bad_fwd = 0, bad_view = 0;
+        for (q = 0; q < 6; q++) {
+            rb_car y;
+            float r = YW[q] * 0.017453292519943295f, got, want, d;
+            rbcar_init(&y, 0, &FLAT_WORLD, 0.f, 0.f, 0.f, YW[q]);
+            /* column 2 of the column-major matrix is local +Z in world space */
+            if (fabs(y.m[8] - sinf(r)) > 1e-4 || fabs(y.m[10] - cosf(r)) > 1e-4
+                || fabs(y.m[9]) > 1e-4)
+                bad_fwd++;
+            got = rbcar_yaw_deg(&y);
+            want = YW[q] + 180.f;
+            d = got - want;
+            while (d > 180.f) d -= 360.f;
+            while (d < -180.f) d += 360.f;
+            if (fabs(d) > 0.05) bad_view++;
+        }
+        ck(bad_fwd == 0,
+           "rbcar_init's yaw puts local +Z on (sin y, 0, cos y) -- the rig's "
+           "own convention, over six headings");
+        ck(bad_view == 0,
+           "and rbcar_yaw_deg returns that plus 180 -- the VIEW yaw, not the "
+           "heading. Anything wanting the heading must add 180 back");
+    }
+
     /* The reset itself. Roll the car right over and settle it on its roof. */
     {
         float tilt_before, tilt_after, yaw_before, yaw_after, y_after;

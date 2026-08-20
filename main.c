@@ -492,10 +492,24 @@ static void respawn_checkpoint(void)
 /* ai_track.spine, bound to checkpoint.c's own spine. The original asks the same
    question of the player and of every opponent (FUN_004ea120), so this is the one
    function both sides are measured with. */
-static int ai_spine(void *ctx, float x, float y, float z,
+static int ai_spine(void *ctx, float x, float y, float z, float hint,
                     float *dist, int *cp)
 {
-    return cp_spine_dist((const checkpoints_t *)ctx, x, y, z, dist, cp);
+    /* The HINTED query, not the plain one: the unhinted search flips between arc
+       positions hundreds of metres apart wherever a track passes near itself, and
+       that jump went straight into the lead the rubber band reads and into the
+       place on screen. checkpoint.h, cp_spine_dist_near. */
+    return cp_spine_dist_near((const checkpoints_t *)ctx, x, y, z, hint,
+                              dist, cp);
+}
+
+/* ai_track.lap_progress: how far round the lap the PLAYER is, anchored on the
+   latched checkpoint index. A separate query from the projection above because
+   the projection is not a sound progress measure on these tracks -- see
+   checkpoint.h at cp_spine_dist_near and cp_lap_progress. */
+static int ai_lap_progress(void *ctx, float x, float y, float z, float *out)
+{
+    return cp_lap_progress((const checkpoints_t *)ctx, x, y, z, out);
 }
 
 /* Load the roster and the models it needs. Called by load_track AFTER cp_init,
@@ -521,6 +535,8 @@ static void load_ai(int idx)
 
     ai_tr.ctx = &cps;
     ai_tr.spine = ai_spine;
+    /* And the LATCHED progress the placing uses -- see ai_track.lap_progress. */
+    ai_tr.lap_progress = ai_lap_progress;
     ai_tr.spine_len = cps.spine_len;
 
     if (!ai_init(&ai, idx, "app0:assets", col_rb_world(&col),
@@ -633,9 +649,14 @@ static int load_track(int idx)
        this track's world -> art transform out of MAP_CALIB; a track packed
        without --extra-tex trackmap_<n> gets 0 back and simply has no minimap,
        with the rest of the HUD unaffected. */
-    snprintf(path, sizeof(path), "trackmap_%d", idx + 1);
+    /* MAP_TRACKMAP, not idx + 1: the engine numbers its levels in
+       championship.ini's TrackN order, so beach_2's map is trackmap_6 and
+       beach_4's is trackmap_10. Asking for idx + 1 gave eight of the ten another
+       track's painting -- and MAP_CALIB, which race_ui_set_track reads, is
+       reindexed the same way by the generator, so both halves move together. */
+    snprintf(path, sizeof(path), "trackmap_%d", MAP_TRACKMAP[idx]);
     race_ui_set_track(&race_ui, idx, scene_tex(&track, path));
-    rlog("[rccars] hud: %s %s\n", path,
+    rlog("[rccars] hud: %s (%s) %s\n", path, MAP_TRACK_NAME[idx],
          race_ui.have_map ? "bound (the game's own painted map)"
                           : "NOT PACKED -- no minimap");
     return 1;
@@ -1675,9 +1696,19 @@ unsigned int acc_ticks = 0;
         /* The solid world. Water is excluded here and drawn by water.c below,
            because it moves and because the foam has to blend; the transition
            decals are excluded because they MULTIPLY this rather than being part
-           of it. */
+           of it; the transition BANDS are excluded because a two-texture blend
+           does not fit one pass -- scene_draw_blend draws them next, and drawing
+           them here as well would put an opaque copy of the first texture under
+           the blend and cost the pass. */
         scene_draw(&track, BATCH_SKY | BATCH_ANY_WATER | BATCH_MODULATE
-                          | BATCH_TRANSP, 0);
+                          | BATCH_TRANSP | BATCH_BLEND, 0);
+
+        /* Where two ground surfaces meet: the second base texture, the mask that
+           fades between them, and the lightmap over both. Solid geometry, so it
+           goes down with the world and before every decal -- the tyre marks,
+           the sand strips and the painted markings all belong ON this, and the
+           shadow has to darken it. See BATCH_BLEND in scene.h. */
+        scene_draw_blend(&track);
 
         /* The sand / wet-sand transition, and anything else the artists authored
            as a signed detail map. Same object as a tyre mark and the same blend:
@@ -1910,14 +1941,32 @@ unsigned int acc_ticks = 0;
             memset(&st, 0, sizeof st);
             st.car_x = veh.x;
             st.car_z = veh.z;
-            /* veh.yaw is degrees in the rig's convention (0 faces world +Z);
-               race_ui.c takes radians in that same convention and derives the
-               marker's screen angle from it. */
-            st.car_yaw = veh.yaw * 0.017453292519943295f;
+            /* +180, AND THAT IS THE WHOLE OF THE MINIMAP-ARROW BUG.
+             *
+             * veh.yaw is rbcar_yaw_deg, which is NOT the car's heading -- it is
+             * the RENDERER's view yaw, the angle a camera needs to look at the
+             * car's forward, and its own comment says so. It is 180 degrees from
+             * where the car points, measured: rbcar_init(0) puts local +Z on
+             * (0,0,1) and rbcar_yaw_deg then returns -180.
+             *
+             * The car MODEL is drawn with the same +180 a few hundred lines up
+             * (`glRotatef(veh.yaw + 180.f, ...)`), which is the precedent and the
+             * reason not to touch rbcar_yaw_deg: the chase camera and the shadow
+             * both want the view yaw it returns. race_ui.c wants the rig's own
+             * convention, 0 facing world +Z, so the conversion belongs here. */
+            st.car_yaw = (veh.yaw + 180.f) * 0.017453292519943295f;
 
             for (i = 0; i < ai.n && i < RUI_MAX_OTHERS; i++) {
                 st.other_x[st.n_others] = ai.car[i].rb.body.x[0];
                 st.other_z[st.n_others] = ai.car[i].rb.body.x[2];
+                /* Their heading too, so their markers turn the way the player's
+                   does -- and with the same +180, for the same reason: an AI car
+                   is an rb_car whose state is written rather than integrated
+                   (ai.h), so rbcar_yaw_deg gives its VIEW yaw just as it does the
+                   player's. */
+                st.other_yaw[st.n_others] =
+                    (rbcar_yaw_deg(&ai.car[i].rb) + 180.f)
+                    * 0.017453292519943295f;
                 st.n_others++;
             }
             /* cp[i].p[0] is the checkpoint marker itself -- the cp_N node -- and
@@ -1930,14 +1979,24 @@ unsigned int acc_ticks = 0;
             }
             st.cp_next = cps.next;
 
-            /* ai_player_place ranks by cumulative spine distance and needs
-               ai_step to have run; with no opponents loaded it is 1, which is
-               the truth. */
+            /* THE PLACE IS THE POSITION ON THE TRACK, not the clock:
+               ai_player_place ranks by CUMULATIVE spine distance -- the original's
+               own quantity, `spine_len * lap + distance into the lap' -- for the
+               player and for every opponent. It needs ai_step to have run with the
+               spine bound (load_ai binds it to checkpoint.c's own), and with no
+               opponents loaded it is 1, which is the truth.
+
+               It read as if it ignored where the cars were until cp_step stopped
+               counting the race's opening crossing of the start/finish line as a
+               lap: one phantom lap is 450 to 550 m of lead over a field with none,
+               so the player came first from the grid to the flag. See
+               checkpoints_t.started. */
             st.place = ai_player_place(&ai);
             st.n_racers = ai.n + 1;
 
-            /* cps.lap counts laps COMPLETED, so the lap being driven is one
-               more. n_laps stays 0: the lap limit is a race-setup value and this
+            /* cps.lap counts laps COMPLETED -- 0 on the grid, and NOT 1: the
+               opening crossing of the line completes none -- so the lap being
+               driven is one more. n_laps stays 0: the lap limit is a race-setup value and this
                port has no race setup -- nothing in the shipped data carries a
                per-track count (championship.ini has cash and placings and no
                laps), so the HUD shows `3' rather than inventing `3/6'. See

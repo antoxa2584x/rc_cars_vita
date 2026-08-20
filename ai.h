@@ -175,8 +175,25 @@ typedef struct {
 typedef struct {
     void *ctx;
     /* -> 1 on success. `dist` metres along the spine, `cp` the checkpoint that
-       owns the nearest spine point. Either output may be NULL. */
-    int (*spine)(void *ctx, float x, float y, float z, float *dist, int *cp);
+       owns the nearest spine point. Either output may be NULL.
+     *
+     * `hint` is where this car was found LAST time, in the same metres, or
+     * negative for "nowhere yet". It is not an optimisation: the unhinted query
+     * searches the whole spine and flips between arc positions hundreds of metres
+     * apart wherever a track passes near itself -- 3 to 16 times a lap on every
+     * shipped recording -- which put the same jump into every lead and every
+     * placing. See checkpoint.h at cp_spine_dist_near. */
+    int (*spine)(void *ctx, float x, float y, float z, float hint,
+                 float *dist, int *cp);
+    /* THE PLAYER'S PROGRESS ROUND THE LAP, metres, 0 at the start/finish line.
+     *
+     * A SEPARATE QUERY from `spine` and the reason is the whole placing bug:
+     * `spine` projects a position onto the checkpoint polyline, which is not the
+     * road and is genuinely ambiguous where a track passes near itself -- it
+     * jumps more than 10 m between consecutive samples 4 to 16 times a lap on
+     * every one of the ten. Anchored on the LATCHED checkpoint index instead
+     * (cp_lap_progress), it cannot flicker. */
+    int (*lap_progress)(void *ctx, float x, float y, float z, float *out);
     float spine_len;         /* the closed spine's total length, metres */
 } ai_track;
 
@@ -216,6 +233,27 @@ typedef struct {
     int   lap;
     float dist;              /* metres walked along the polyline, all laps */
     float spine_dist;        /* the unwrapped spine distance, for placings */
+    /* WITHIN the lap, and the hint the next query gets. Negative until the first
+       successful query, so a fresh or reset car searches the whole spine once. */
+    float spine_at;
+    /* LAPS OF THE SPINE, counted by `spine_at` WRAPPING -- not by the recording
+     * running out, which is what `lap` below counts.
+     *
+     * THE TWO ARE DIFFERENT QUESTIONS AND CONFLATING THEM PUT THE PLACE WRONG.
+     * `lap` ticks wherever a recording happens to end; measured over all 30
+     * shipped ones, 24 end at the start/finish line (arc 0, where the player's
+     * own lap ticks) and six do not -- country_4's three at 47.5 m, urban_2's
+     * three at 553.4 m, which on an 874 m spine is 320 m of every lap during
+     * which the opponents had counted a lap the player had not. That is a
+     * spurious 874 m of lead, so on urban_2 the place was simply wrong for a
+     * third of every lap.
+     *
+     * Counted at the SEAM, both sides use one definition and the comparison is
+     * exact wherever a recording starts or ends. It also fixes the grid: every
+     * car begins a few metres SHORT of the line, so every `spine_at` starts near
+     * spine_len -- and with this at 0 for everyone they are all equal there,
+     * where before whoever crossed the line first appeared to lose a whole lap. */
+    int   spine_lap;
     int   cp;                /* the checkpoint it is heading for */
     int   airborne;          /* no wheel loaded, from the recorded suspension */
 
@@ -274,6 +312,16 @@ typedef struct {
        without asking twice */
     float  player_dist;
     int    player_cp;
+    /* The player's own within-lap distance, kept for the same reason
+       ai_car.spine_at is. Negative until the first query. */
+    float  player_at;
+    /* and the PROJECTION's answer, kept only so the hint plumbing has somewhere
+       to live and the log can see both. Not what the placing uses. */
+    float  player_at_proj;
+    /* and its seam-counted lap, for the same reason ai_car.spine_lap exists: the
+       placing compares the player against the opponents, so both sides have to
+       count laps at the same point on the spine. */
+    int    player_lap_seam;
 } ai_t;
 
 /* The rate the commanded speed chases its target, m/s^2. FUN_00503880's third

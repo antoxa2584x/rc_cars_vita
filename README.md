@@ -10,7 +10,7 @@
 [![status](https://img.shields.io/badge/status-playable-2ea043?style=flat-square)](#roadmap)
 [![fps](https://img.shields.io/badge/on%20hardware-45--60%20FPS%20%40%20960x544-orange?style=flat-square)](#)
 
-10 tracks · 3 cars · 129 knockable props · the game's own physics, transcribed
+10 tracks · 3 cars · a grid of four · 59 characters · 129 knockable props · the game's own physics, transcribed
 
 Runs on a **real Vita** at 45–60 FPS, full 960×544.
 
@@ -70,8 +70,8 @@ Nothing under `game_data/` is written to, and none of it is in this repository.
 
 <br>
 
-`build.sh` runs nine stages and skips any whose output is already newer than its
-input, so the second run goes straight to compiling.
+`build.sh` runs eleven stages and skips any whose output is already newer than
+its input, so the second run goes straight to compiling.
 
 | stage | tool | output |
 |---|---|---|
@@ -80,9 +80,11 @@ input, so the second run goes straight to compiling.
 | `tracks` | `pack_vsc.py`, `pack_col.py` | ten `.vsc` scenes and their `.col` grids |
 | `cars` | `pack_vsc.py` | three rigged cars, with shadow and env-map data |
 | `props` | `pack_props.py` | the 13 knockable models, one file for all tracks |
+| `chars` | `pack_chars.py` | the 59 placed characters, one `.chr` per track |
 | `sound` | `pack_snd.py` | 118 sounds at 22050 Hz, plus 18 MP3s |
-| `tables` | `gen_tracks.py`, `gen_font.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, the app art |
-| `check` | `vsc_check.py` | every packed scene — exit 0 is clean |
+| `tables` | `gen_tracks.py`, `gen_font.py`, `gen_char_data.py`, `gen_hud_data.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, `char_data.h`, `hud_data.h`, the app art |
+| `ai` | `gen_ai_data.py`, `pack_ai.py` | `ai_data.h` and ten `.aip` opponent paths |
+| `check` | `vsc_check.py` | every packed scene, against its source `.sb` — exit 0 is clean |
 | `build` | cmake + make | `build/rccars_viewer.vpk` |
 
 ```
@@ -109,44 +111,78 @@ The conversion tools live in `rccars_re/`, alongside this repository; point
 | **○** | jump; on the roof or a side, rights the car where it stands |
 | **START** | menu — track, car, skin, tuning parts, texture quality, quit |
 | **□** | toggle shadow, water animation and checkpoint arrows |
+| **△** | log an inventory of what is near the eye, and cycle the isolate modes |
 | **SELECT** | free-fly camera |
 
 ## 🚧 Roadmap
 
-The port drives. What it is missing is the game *around* the driving — and most
-of it is already sitting in the data, recovered and unused.
+The port races. A grid of four holds for the countdown, the laps are counted off
+the checkpoint chain, the HUD says where you are in the field — and what is left
+is the game *around* the race, most of it already sitting in the data, recovered
+and unused.
+
+#### The race
+
+- [x] The grid, the countdown, and the whole field held until **GO!**
+- [x] Laps off the checkpoint chain, and a dead car put back at the last
+      checkpoint it passed
+- [x] Place, against the field, on a progress measure both sides count the same
+      way — the latched checkpoint index, not a projection onto the spine
+- [ ] Wrong-way detection
+- [ ] A finish. `FINISH` is recovered, packed and addressable in the countdown's
+      own artwork, and nothing raises it because there is nothing to end
+- [ ] Results and standings screens
 
 #### AI opponents
 
-- [ ] The race module: grid, laps, wrong-way detection, finish
-- [ ] Opponent driving on the transcribed physics, so they share the car's model
-- [ ] Racing lines from `Profiles/*.gpf`, the same path format the road cars use
-- [ ] Wire up the AI sound families already in the bank — `carAI_*`, `motorAI_*`,
-      11 names that `snd.dat` lists and nothing currently plays
+- [x] They replay the profiles the game shipped — `CarProfiles/<level>/<car><n>.dat`,
+      a real lap on this same physics, walked at a rubber-banded speed in the one
+      dimension the original rubber-bands
+- [x] Solid: bumpable, with the impulse split by mass, throwing their own dust
+      and taking the env-map glance
+- [x] One positional `motorAI_accel1` loop each
+- [ ] The original's **second** mode: a fully simulated steering controller
+      (`FUN_004fe1f0`), recovered and deliberately not transcribed — a simulated
+      opponent is another `rb_car_tick`, which is why the original has `AIEmu`
+- [ ] The rest of the AI sound families — `carAI_*`, names `snd.dat` lists and
+      nothing plays
+- [ ] Fielding five instead of three: `AI_MAX_FIELD` is a one-line change and
+      everything downstream already sizes to `AI_MAX_OPPONENTS`
 
 #### NPCs and the dynamic layer
 
-- [ ] **59 characters** the artists placed and the port renders none of: Dog ×9,
-      Seagull ×7, Truck ×6, Guard ×6, Spider ×6, Crab ×4, Vulture ×4, and more
-- [ ] They are keyframed node hierarchies, **not skinned** — a TRS keyframe per
-      node per sample, the identical structure `carani.c` already drives for the
-      car rig. AIChars has 815 animation nodes over 13 sequences; `people.sb` 1,359 over 19
-- [ ] Behaviour is fully specified in `Settings/`: `dog.ini` is a vision cone and
-      a chase, `seagull.ini` walks then takes off, `guard.ini` shoots
-- [ ] `MOD_INSTANCE` resolution in `pack_vsc.py` — instances name objects in a
-      *separate* database, which is why they currently flatten to nothing
+- [x] **59 characters** the artists placed and the port used to render none of:
+      Dog ×9, Seagull ×7, Truck ×6, Guard ×6, Spider ×6, Crab ×4, Vulture ×4,
+      and more
+- [x] They are keyframed node hierarchies, **not skinned** — a TRS keyframe per
+      node per sample, the identical structure `carani.c` already drove for the
+      car rig. AIChars has 815 animation nodes over 13 sequences; `people.sb`
+      1,359 over 19. The four models that *are* skinned get a bone blend of
+      their own
+- [x] `MOD_INSTANCE` resolution in `pack_vsc.py` — instances name objects in a
+      *separate* database, which is why they used to flatten to nothing
+- [x] Behaviour: the walkers and the road cars replay their authored paths, and
+      the Dog, Seagull, Crab, Spider and Guard run state machines on the
+      constants the nine `Settings/*.ini` loaders yield — a vision cone and a
+      chase, a walk then a take-off, a shot
+- [ ] The engine's own character AI. The loaders are recovered; what the engine
+      *does* with those constants is not, so the machines above are the port's
 
 #### Game interface
 
+- [x] In-race HUD: the minimap, the place, the two clocks and the two gauges,
+      laid out off the original's own `opt_cock_all` artwork
+- [x] `!HIT!` when the car knocks a prop, in the game's own lettering
 - [ ] A real front end: the original's `Interface.sb` and `RaceTextures.sb` are
       right there in `RCCarsDB/`
-- [ ] In-race HUD — position, lap, timer, speedo
-- [ ] Results and standings screens
 - [ ] Replace the debug menu with something that is not a debug menu
+- [ ] An options row for the things that only exist as a call today — the speed
+      dial's units, for one
 
 #### Progression
 
-- [ ] Championship structure over the ten tracks
+- [ ] Championship structure over the ten tracks; `championship.ini` pays
+      `Place1`..`Place3` per track and is the reason the field is four
 - [ ] Upgrades: the three tyre levels and the turbo sets are already packed per
       car, and `carparts.c` already shows the fitted parts on the model — as it
       does the car's paint, four skins each, which the menu can already pick
@@ -158,13 +194,17 @@ of it is already sitting in the data, recovered and unused.
 
 #### Save data
 
-- [ ] Player profile in `ux0:data/`
+- [ ] Player profile in `ux0:data/` — only the log is written there today
 - [ ] Best laps and ghosts — the install has a `GhostRecords/` folder to learn the format from
 - [ ] Settings persistence, so texture colours and camera choices survive a restart
 - [ ] Multiple profiles, as the original's `Players/` does
 
 #### Graphics
 
+- [x] The sun disc and its lens flare, off the `SUN_AF` marker in each track
+- [x] **Surface transitions** — where two ground textures meet the artists
+      authored a blend band, a second base texture and an alpha mask per face.
+      3,608 faces over nine tracks, drawn rather than butted at a hard line
 - [ ] Fix the one batch of 77 with no texture — visible black patches
 - [ ] Wall collision; ground queries are all there is today
 - [ ] Better shadows than one projected silhouette
@@ -179,6 +219,13 @@ of it is already sitting in the data, recovered and unused.
 
 - One batch of 77 has no texture, showing as black patches.
 - No wall collision — ground queries only.
+- The race has no end: laps count up and nothing raises `FINISH`.
+- No wrong-way detection, so a car driven backwards simply stops making progress.
+- The opponents replay recorded laps rather than driving; the original's second,
+  simulated mode is recovered and not transcribed.
+- The character behaviour machines are the port's own, on the game's constants —
+  the engine's own character AI is not recovered.
+- Nothing is saved but the log. Every setting is back to its default on restart.
 - `CenterMassOY` is recovered and used (the com sits 0.0000 / 0.0323 / 0.0323 m
   above the model origin), but the body collision proxy's roof stations and its X
   offset are still fitted rather than read from the game's data.
@@ -204,9 +251,16 @@ scene.c               .vsc loader and draw
 shadow.c water.c      projected car shadow, animated water
 checkpoint.c fx.c     checkpoint arrows, particles and tyre marks
 trace.c envmap.c      tyre marks on the ground, body env-mapping
+sun.c                 the sun disc and its lens flare
 prop.c                the 13 knockable prop models, 129 placements
+ai.c                  the opponents: the shipped profiles, replayed
+char.c                the 59 characters: keyframed rigs, paths and behaviour
+carparts.c antenna.c  the fitted upgrades, and the animated aerial
+race_ui.c hud.c       the HUD: minimap, place, clocks, gauges, !HIT!
+countdown.c           3, 2, 1, GO!
 mix.c audio.c sfx.c   mixer thread, sceAudioOut, positional sound
 menu.c ui.c font.h    in-game menu
+rlog.c                the memory-card log, off the game thread
 *_data.h tracks.h     generated tables — regenerate, do not hand-edit
 third_party/          minimp3, for the streamed music
 mintest/              20-line vitaGL app, to isolate runtime failures
@@ -229,6 +283,7 @@ simply leave the newer subsystems dark.
 | VSC6 | lightmaps: a second UV per vertex, a lightmap index per batch |
 | VSC7 | an env-map class per batch, plus normals for the batches that have one |
 | VSC8 | the props file — a different layout from the scenes above |
+| VSC9 | the surface blend: a second base texture, a mask, and their two UV sets |
 
 | `.col` collision | adds |
 |---|---|

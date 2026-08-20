@@ -111,6 +111,19 @@ const float *rbcar_matrix(const rb_car *c);
 
 /* Heading in degrees for the chase camera, measured the way the app's old
    vehicle_t did: forward = (sin yaw, 0, -cos yaw). */
+/* THE RENDERER'S VIEW YAW, which is 180 degrees from where the car POINTS.
+ *
+ * It is the angle a camera needs in order to look at the car's forward, which is
+ * what cam.c, the chase camera and shadow_draw_yaw all want -- and main.c draws
+ * the car MODEL with `veh.yaw + 180` for exactly that reason. Anything that wants
+ * the car's own heading (the rig's convention: local +Z on (sin y, 0, cos y),
+ * which is what rbcar_init TAKES) must add 180 as well.
+ *
+ * Not a wart to be fixed: three consumers depend on it. But it is a trap, and it
+ * cost the minimap's arrow -- drawn 180 degrees round on every track and every
+ * opponent -- so rb_test asserts the relationship rather than leaving it to a
+ * comment. Measured: rbcar_init(0) puts local +Z on (0, 0, 1) and this returns
+ * -180. */
 float rbcar_yaw_deg(const rb_car *c);
 
 #endif

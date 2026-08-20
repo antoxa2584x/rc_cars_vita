@@ -458,6 +458,23 @@ leaves the previous binary sitting there to answer for it:
                             # ribbon as painted in trackmap_<n>. Needs no build:
                             #
                             #   python3 ../rccars_re/mapcheck.py
+    gcc -I. -Itestgl -O2 ../rccars_re/cpground.c scene.c checkpoint.c col.c \
+        carani.c rb.c contact.c collide.c rbcar.c rlog.c \
+        ../rccars_re/glstub_host.c -lm -o cpground
+                            # a probe: what the checkpoint GROUND probe finds at
+                            # each candidate ceiling. col_ground_at returns the
+                            # HIGHEST surface under its ceiling, so on a track
+                            # with tunnels the ceiling decides floor or roof --
+                            # nine of the fifty checkpoints used to resolve to a
+                            # roof, putting the respawn and the marker on top of
+                            # it. This is what sized CP_GROUND_CEIL.
+    gcc -I. -Itestgl -O2 ../rccars_re/placechk.c scene.c checkpoint.c col.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c \
+        ../rccars_re/glstub_host.c -lm -o placechk
+                            # also a probe: the PLACING's two inputs on every real
+                            # track -- monotonic AND moving. The second half is
+                            # what caught three wrong fixes, since a frozen
+                            # progress measure never goes backwards.
     gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \
@@ -665,6 +682,38 @@ camera-locked (beach_1's column shafts, beach_3's round walls near the start, th
 left `envmap_init` with no sky for the car's glance. `vsc_check.py` now asserts
 exactly one sky batch and that it is as wide as the level. Reasoning in full at
 `pack_vsc.py`'s `SKY_TEX_RE`.
+
+### Surface transitions -- VSC9
+
+Where two ground surfaces meet, the artists authored a **blend band**: the face
+carries a second base texture (`BAS2`) and an alpha mask (`ALP1`) alongside the
+usual `BAS1` and `LM_1`, and the engine lerps the two. 3,608 faces over nine
+tracks; country_1 authors none and still packs as VSC6. Recovered from the
+engine's own layer-type map (`FUN_0046fc20`) and documented in full in
+`docs/render-world.md`, "The surface transition is a SECOND BASE TEXTURE and a
+MASK".
+
+    python3 ../rccars_re/pack_vsc.py <...>/beach_1.sb assets/beach_1.vsc --markers ...
+    python3 ../rccars_re/pack_vsc.py ... --no-blend      # the mutant, for vsc_check
+
+Format bumped to **VSC9**: two more texture indices per batch and, on a blend
+batch only, a four-float side array per vertex (the second base texture's UVs and
+the mask's) sitting between the normals and the indices -- the same arrangement as
+the env-map normals, for the same reason.
+
+- **INSTALL THE ASSETS AND THE BINARY TOGETHER.** An eboot older than this
+  rejects a VSC9 file at the magic (the loader accepted `VSC3`..`VSC8`), so a
+  half-installed test is a track that will not load at all rather than one that
+  looks unchanged
+- `scene_draw_blend` draws them in three passes, because a lit blend has three
+  inputs and vitaGL's fixed-function path compiles two texture coordinate sets
+  unless built with `HAVE_HIGH_FFP_TEXUNITS`. The arithmetic, and why the obvious
+  two-pass version is wrong, is in the comment on that function
+- The build's check stage now passes `--sb "$DB"` to `vsc_check.py`: it walks each
+  source `.sb` with its own reader and asserts the number of authored transition
+  faces equals the packed blend triangle count. It is the only invariant here that
+  can notice the PACKER declining to pack something, which is the failure this
+  feature had for the whole life of the port
 
 ### Alpha testing
 

@@ -1,7 +1,7 @@
 /*
  * scene.h -- the .vsc runtime scene, moved out of main.c.
  *
- * Six versions load:
+ * Seven versions load:
  *
  *   VSC3   textures + batches                      (a plain flattened scene)
  *   VSC4   + the car's rig                         (see carani.c)
@@ -11,6 +11,8 @@
  *            that have one                         (the body glance, envmap.c)
  *   VSC8   + a table of named models sharing one file, and a model index per
  *            batch                                 (props.vsc, see prop.c)
+ *   VSC9   + the SURFACE BLEND: a second base texture and a mask per batch,
+ *            and the two UV sets they need         (see BATCH_BLEND)
  *
  * The surface flags are what let the port animate water the way the game does.
  * The engine knows a mesh is coast or stream or the WaterLOD surface because of
@@ -30,6 +32,13 @@
 /* lu, lv are the LIGHTMAP UVs -- the .sb's second UV layer, tagged LM_1. Zero
    on a batch with no lightmap, and on any scene older than VSC6. */
 typedef struct { float x, y, z, u, v, lu, lv; } vtx_t;
+
+/* The two UV sets a BATCH_BLEND batch needs on top of those: the second base
+   texture's, and the mask's. A side array rather than four more floats in
+   vtx_t -- 2.5% of the world's triangles blend, and widening every vertex to
+   say so would cost more memory than the whole feature. Same arrangement, and
+   the same reason, as the env-map normals. */
+typedef struct { float u2, v2, mu, mv; } blend_uv_t;
 
 /* batch flags -- must match pack_vsc.py's BATCH_* */
 #define BATCH_SKY     1u
@@ -81,6 +90,39 @@ typedef struct { float x, y, z, u, v, lu, lv; } vtx_t;
    name rule entirely, they were drawn as opaque `sea`-textured slabs -- flat
    teal plates lying on the ground, which is exactly what was reported. */
 #define BATCH_POOL  128u
+
+/*
+ * THE SURFACE TRANSITION: two base textures lerped by a mask texture.
+ *
+ *     colour = mask * tex + (1 - mask) * tex2,  the whole thing times the
+ *     lightmap
+ *
+ * Reported as the surfaces on a map meeting at a hard line where the original
+ * blends them, and the port had no mechanism for it -- these notes said the
+ * original's was not recovered. It is in every track file. A .sb face's UV
+ * layers are TAGGED, and the engine's own 4CC -> layer-type map (FUN_0046fc20,
+ * called per layer by _mod2ConvertFace at 0x00435ed0) answers BAS1..BAS4 -> 0..3,
+ * LM_1 -> 0x10, DET1 -> 0x100 and ALP1..ALP4 -> 0x1000..3. Nine of the ten tracks
+ * carry faces with BAS1 + BAS2 + ALP1 + LM_1 -- two ground textures, the mask
+ * that blends them, and the lightmap -- and sb2obj.py was reading the first two
+ * and stopping. 3,608 faces over the nine; country_1 authors none.
+ *
+ * These bands are one quad wide (median 1.10 m on beach_1, 0.52-1.71 m over the
+ * ten) and the mask is a vertical ramp with an organic edge, tiled along the
+ * band, so the whole gradient lives inside single triangles. On beach_1 the sand
+ * pairs that were measured as 404.5 m of hard line -- sand_halfdry|sand_wet and
+ * Sand_trample|sand_halfdry -- are now blended over every metre of it.
+ *
+ * What is still hard is hard in the ORIGINAL: the artists' other technique is a
+ * hand-painted transition strip (textures named `trasition`, `transition_mine_1`,
+ * `rock_05re_grass`) that carries the blend in the image and butts up against
+ * its neighbours. Nothing in the data asks for those to be blended.
+ *
+ * Drawn by scene_draw_blend, which needs THREE passes because a lit blend has
+ * three inputs and vitaGL's fixed-function path offers two texture coordinate
+ * sets. See the comment there.
+ */
+#define BATCH_BLEND 256u
 
 #define BATCH_ANY_WATER (BATCH_WATER | BATCH_COAST | BATCH_STREAM \
                          | BATCH_FALL | BATCH_POOL)
@@ -189,6 +231,14 @@ typedef struct {
     unsigned int tex, flags, part, nverts, nidx;
     unsigned int lm_tex;            /* index into tex_ids, or 0xFFFFFFFF */
     GLuint gl_lm;                   /* resolved, 0 = unlit */
+    /* VSC9, and only on a BATCH_BLEND batch: the second base texture and the
+       mask that blends the two. Either failing to resolve takes the flag back
+       off, and the batch draws as plain `tex` -- the pre-blend appearance,
+       which is wrong but is not a blend against an undefined sampler. */
+    unsigned int tex2, mask_tex;
+    GLuint gl_tex2, gl_mask;
+    blend_uv_t *buv;                /* nverts entries, NULL unless BATCH_BLEND */
+    GLuint gl_vbo_buv;              /* buv on the GPU, 0 = client pointer */
     unsigned int env;               /* ENV_*, 0 on a scene older than VSC7 */
     unsigned int model;             /* VSC8: which prop model, 0 otherwise */
     /* Model-space vertex normals, 3 floats each, NULL unless env != 0. The
@@ -426,6 +476,12 @@ int scene_model_index(const scene_t *s, const char *name);
    `scene_draw(s, BATCH_SKY | BATCH_ANY_WATER, 0)`, the sky is
    `scene_draw(s, BATCH_SKY, BATCH_SKY)`, and water.c asks for its own. */
 void scene_draw(const scene_t *s, unsigned int mask, unsigned int match);
+
+/* The transition bands -- every BATCH_BLEND batch, in three passes of its own.
+   Call it straight after the solid world (which must EXCLUDE BATCH_BLEND) and
+   before anything translucent; it leaves the state the solid world established.
+   A scene with no blend batch draws nothing and costs one loop. */
+void scene_draw_blend(const scene_t *s);
 
 /* GL texture id by packed name, or 0. Used for the textures no geometry
    references: the shore-wave sprite, the checkpoint arrows, the car's

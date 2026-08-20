@@ -65,12 +65,20 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
     }
 
     /* The terrain under each checkpoint, so the marker can stand ON the ground
-       rather than at whatever height the marker node happens to float at. */
+       rather than at whatever height the marker node happens to float at.
+     *
+       CEILED at CP_GROUND_CEIL, and that is the whole of a reported bug: at the
+       5 m this used, nine of the fifty checkpoints found the ROOF over a tunnel
+       or a bridge instead of the floor under it, and cp_t.ground is what BOTH the
+       respawn point and the animated marker are placed at -- so a car sent back
+       to a tunnel checkpoint arrived on top of the tunnel, with its marker up
+       there too and nowhere near the graffiti on the road. */
     for (k = 0; k < c->n; k++) {
         float gy, nx, ny, nz;
         const float *p = c->cp[k].p[0];
         c->cp[k].ground = p[1];
-        if (col && col_ground_at(col, p[0], p[2], p[1] + 5.f, &gy, &nx, &ny, &nz))
+        if (col && col_ground_at(col, p[0], p[2], p[1] + CP_GROUND_CEIL,
+                                 &gy, &nx, &ny, &nz))
             c->cp[k].ground = gy;
     }
 
@@ -209,6 +217,10 @@ void cp_restart(checkpoints_t *c, float x, float y, float z)
        what a race start is. */
     c->lap = 0;
     c->last = -1;
+    /* And the race is not under way, so the crossing of the line that a race
+       start makes within its first second counts no lap. cp_resync deliberately
+       does NOT clear this, for the same reason it keeps the lap. */
+    c->started = 0;
     cp_resync(c, x, y, z);
 }
 
@@ -317,38 +329,166 @@ void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
        lands where the checkpoint is however fast the car is going. */
     c->passed = c->next;
     c->last = c->next;                 /* latched, for the respawn point */
-    /* Checkpoint 0 IS the start/finish line, so passing it is the lap. It is also
-       the FIRST thing a race passes, on every track -- cp_restart aims here. */
-    if (c->next == 0)
-        c->lap++;
+    /* Checkpoint 0 IS the start/finish line, so passing it is the lap -- from the
+       SECOND time. It is also the first thing a race passes, on every track,
+       because cp_restart aims here and the grid is short of it; that opening
+       crossing completes no lap. See checkpoints_t.started. */
+    if (c->next == 0) {
+        if (c->started)
+            c->lap++;
+        else
+            c->started = 1;
+    }
     c->next = (c->next + 1) % c->n;
     c->in_zone = 0;
     c->zone_min = 0.f;
 }
 
-int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,
-                  float *dist, int *cp)
+/* The stitched polyline, as SEGMENTS. `i` walks 0 .. cp_spine_n(c)-1 and the
+ * segment is point[i] -> point[i+1], wrapping to point[0] -- the loader's own
+ * order, cp_0, cp_0_1..., cp_1, ..., which is what cp_init accumulated `cum`
+ * over. Written as a flat index so the query below can be one loop. */
+static int cp_spine_n(const checkpoints_t *c)
+{
+    int k, n = 0;
+    for (k = 0; k < c->n; k++)
+        n += c->cp[k].n;
+    return n;
+}
+
+static void cp_spine_pt(const checkpoints_t *c, int i, const float **p,
+                        float *cum)
+{
+    int k;
+    for (k = 0; k < c->n; k++) {
+        if (i < c->cp[k].n) {
+            *p = c->cp[k].p[i];
+            *cum = c->cum[k][i];
+            return;
+        }
+        i -= c->cp[k].n;
+    }
+    *p = c->cp[0].p[0];
+    *cum = c->cum[0][0];
+}
+
+int cp_spine_dist_near(const checkpoints_t *c, float x, float y, float z,
+                       float hint, float *dist, int *cp)
 {
     float near2 = 1e30f;
-    int k, j, bk = -1, bj = 0;
+    float best_arc = 0.f;
+    int i, n, best_cp = -1;
 
     (void)y;
     if (!c || c->n <= 0)
         return 0;
-    for (k = 0; k < c->n; k++) {
-        for (j = 0; j < c->cp[k].n; j++) {
-            float d2 = dist2_xz(c->cp[k].p[j], x, z);
-            if (d2 < near2) {
-                near2 = d2;
-                bk = k;
-                bj = j;
+    n = cp_spine_n(c);
+    if (n < 2)
+        return 0;
+
+    (void)hint;
+    {
+        for (i = 0; i < n; i++) {
+            const float *a, *b;
+            float ca, cb, seg, dx, dz, t, px, pz, d2, arc;
+            int ka;
+
+            cp_spine_pt(c, i, &a, &ca);
+            cp_spine_pt(c, (i + 1) % n, &b, &cb);
+            /* The closing segment wraps, so its length comes off the total. */
+            seg = (i + 1 == n) ? (c->spine_len - ca) : (cb - ca);
+            if (!(seg > 1e-6f))
+                continue;
+
+            /* Project onto the segment in XZ and clamp to it -- the nearest point
+               on the nearest SEGMENT, which is what this file's header has always
+               claimed and what the old sample-snapping version did not do. It is
+               also what makes the answer CONTINUOUS as the car drives, which the
+               window and the seam detection both need. */
+            dx = b[0] - a[0];
+            dz = b[2] - a[2];
+            {
+                const float len2 = dx * dx + dz * dz;
+                t = (len2 > 1e-9f)
+                    ? ((x - a[0]) * dx + (z - a[2]) * dz) / len2 : 0.f;
+                if (t < 0.f) t = 0.f;
+                else if (t > 1.f) t = 1.f;
+            }
+            px = a[0] + dx * t;
+            pz = a[2] + dz * t;
+            d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+            if (d2 >= near2)
+                continue;
+            near2 = d2;
+            arc = ca + seg * t;
+            if (arc >= c->spine_len)
+                arc -= c->spine_len;
+            best_arc = arc;
+            /* which checkpoint owns this segment's START point */
+            {
+                int j = i;
+                best_cp = 0;
+                for (ka = 0; ka < c->n; ka++) {
+                    if (j < c->cp[ka].n) { best_cp = ka; break; }
+                    j -= c->cp[ka].n;
+                }
             }
         }
     }
-    if (bk < 0)
+    if (best_cp < 0)
         return 0;
-    if (dist) *dist = c->cum[bk][bj];
-    if (cp) *cp = bk;
+    if (dist) *dist = best_arc;
+    if (cp) *cp = best_cp;
+    return 1;
+}
+
+int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,
+                  float *dist, int *cp)
+{
+    return cp_spine_dist_near(c, x, y, z, -1.f, dist, cp);
+}
+
+int cp_lap_progress(const checkpoints_t *c, float x, float y, float z,
+                    float *out)
+{
+    float from, to, span, d, t;
+    int prev;
+
+    (void)y;
+    if (!c || c->n <= 0 || c->spine_len <= 0.f)
+        return 0;
+
+    /* Nothing latched yet: the car is on the grid, short of the line, and has
+       driven none of the lap. Not "nearly a whole lap", which is what an arc
+       position would say there and what made every car look a lap ahead at the
+       start. */
+    if (c->last < 0) {
+        if (out)
+            *out = 0.f;
+        return 1;
+    }
+
+    prev = c->last;
+    from = c->cum[prev][0];
+    /* The arc at `next`. Wrapping to the whole spine rather than to 0, so the
+       stretch from the last checkpoint to the line comes out as the end of the
+       lap and not as the start of one. */
+    to = (c->next == 0) ? c->spine_len : c->cum[c->next][0];
+    span = to - from;
+    if (!(span > 1e-3f)) {
+        if (out)
+            *out = from;
+        return 1;
+    }
+    /* Fraction of the way from `last` to `next`, by straight-line distance to
+       `next` against the span -- continuous, and clamped so a car that has
+       wandered cannot report progress it has not made. */
+    d = cp_dist_to_next(c, x, y, z);
+    t = 1.f - d / span;
+    if (t < 0.f) t = 0.f;
+    else if (t > 1.f) t = 1.f;
+    if (out)
+        *out = from + span * t;
     return 1;
 }
 

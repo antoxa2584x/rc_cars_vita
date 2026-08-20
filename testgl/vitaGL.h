@@ -92,6 +92,13 @@ typedef struct {
        glMultMatrixf, and this). */
     GLenum blend_src, blend_dst;
     GLenum env_mode;
+    /* The depth comparison, and what unit 1 was doing: which texture, which env
+       mode, and where its alpha came from. All of it is state the transition
+       bands depend on and none of it is visible in a vertex. */
+    GLenum depth_func;
+    GLuint unit1_tex;
+    GLenum unit1_env, unit1_a_src;
+    const void *unit1_uv;
 } glcap_draw;
 
 typedef struct {
@@ -208,6 +215,29 @@ void glcap_mipgen_reset(void);
 #define GL_OPERAND0_RGB          0x8590
 #define GL_OPERAND1_RGB          0x8591
 #define GL_OPERAND2_RGB          0x8592
+
+/* And the ALPHA half of the combiner, for scene.c's transition bands: the mask
+   contributes nothing but its alpha, so unit 1 replaces RGB from the unit below
+   and takes alpha from its own texture. Recorded, not stubbed -- routing the
+   mask into RGB instead would tint every band grey and no capture of the
+   vertices could see it. */
+#define GL_REPLACE               0x1E01
+#define GL_PREVIOUS              0x8578
+#define GL_COMBINE_ALPHA         0x8572
+#define GL_SRC0_ALPHA            0x8588
+#define GL_SRC1_ALPHA            0x8589
+#define GL_SRC2_ALPHA            0x858A
+#define GL_OPERAND0_ALPHA        0x8598
+#define GL_OPERAND1_ALPHA        0x8599
+#define GL_OPERAND2_ALPHA        0x859A
+
+/* The depth comparison. The blend's second and third passes redraw the same
+   triangles at the same depth with writes off, which needs GL_LEQUAL -- under
+   the default GL_LESS every one of those fragments is rejected and the band
+   draws as its second texture alone. A no-op stub cannot tell those apart. */
+#define GL_LESS                  0x0201
+#define GL_LEQUAL                0x0203
+void glDepthFunc(GLenum f);
 
 void glActiveTexture(GLenum unit);
 void glClientActiveTexture(GLenum unit);

@@ -170,6 +170,30 @@
  * sub-millimetre jitter a sleeping body has. */
 #define CP_PASS_EPS 0.05f
 
+/* HOW MUCH HEADROOM the marker's ground probe gets, metres above the marker's own
+ * authored y.
+ *
+ * col_ground_at returns the HIGHEST surface not above its ceiling, so on a track
+ * where the racing line runs under something the ceiling decides whether the
+ * probe finds the floor or the roof. **It shipped at 5 m and nine of the fifty
+ * checkpoints found a ROOF** -- beach_2's cp_4, beach_3's cp_2 and cp_3,
+ * country_2's cp_3 to cp_6 (four in a row: MINES is a tunnel), country_4's cp_3
+ * and urban_1's cp_3 -- which put BOTH the respawn and the animated marker up on
+ * top of it. A car sent back to a tunnel checkpoint landed on the roof.
+ *
+ * Bounded from both sides by measurement over all fifty (rccars_re/cpground.c):
+ *   - the floor sits between 0.49 m BELOW the marker and 0.24 m above it, which
+ *     is checkpoint.h's own "the marker floats 0.18 to 0.49 m over the terrain"
+ *     seen from the other side -- so the ceiling must clear 0.24 m
+ *   - the lowest roof is 2.46 m above its floor (country_2's cp_4), so the
+ *     ceiling must stay under that
+ * 1 m is four times the first and two and a half times inside the second, AND it
+ * is the number place_car already uses for exactly this reason: beach_2's race
+ * start is under an overpass, ground 3.19 and roof 10.08. At 1 m no checkpoint on
+ * any of the ten finds a roof. */
+#define CP_GROUND_CEIL 1.0f
+
+
 /* A RADIUS CAN BE MISSED, AND THE CURSOR DOES NOT STEP OVER IT. Stated here
  * because it is a decision with a cost either way, and both costs are measured.
  *
@@ -273,6 +297,30 @@ typedef struct {
      * clears both. */
     int last;
 
+    /* THE START/FINISH LINE HAS BEEN CROSSED ONCE, so the race is under way.
+     *
+     * THE RACE BEGINS ON THAT LINE. cp_restart aims at checkpoint 0 and the grid
+     * sits 2.3 to 20.5 m short of it on all ten tracks, so the FIRST thing every
+     * race does -- within a second or two of GO -- is cross it. That crossing
+     * completes no lap, and counting it did two visible things: the HUD read
+     * `Lap 2' before the first corner, and `ai_player_place' put the player first
+     * for the whole race, because the placing is
+     * `spine_len * lap + distance along it' and a spurious lap is 450 to 550 m of
+     * lead over a field that has none.
+     *
+     * So `lap` counts laps COMPLETED: 0 on the grid, 1 when the line is crossed
+     * the second time. The opponents' own lap counter (ai.c, off their recording
+     * wrapping) is 0-based in exactly the same way, which is what makes the two
+     * comparable at all.
+     *
+     * `passed` and `last` are NOT affected -- the opening crossing is a real
+     * crossing, it fires its cue and it latches as the respawn point, which is
+     * right: a car that dies on the first corner goes back to the line.
+     *
+     * cp_restart clears this with the lap; cp_resync KEEPS it, for the same reason
+     * it keeps the lap -- a teleport does not un-start a race. */
+    int started;
+
     float t;
     GLuint tex_common[3];         /* cp_ar_2_f1..3, green, ordinary checkpoints */
     GLuint tex_custom[3];         /* cp_ar_3_f1..3, red, the start/finish line */
@@ -325,9 +373,61 @@ void cp_restart(checkpoints_t *c, float x, float y, float z);
  * (sin yaw, 0, cos yaw). */
 int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg);
 
-/* Metres along the closed spine at (x, z), continuous: the nearest point on the
-   nearest spine SEGMENT rather than the nearest sample. -> 0 with `out_s`
-   untouched when there is no spine.
+/* THE NEAREST POINT ON THE NEAREST SPINE SEGMENT, and `hint` is IGNORED.
+ *
+ * The signature keeps the hint because ai.c has one to give and because two
+ * attempts at using it are worth recording rather than repeating:
+ *
+ *   - a HARD WINDOW around the hint. The spine's samples are 23 to 40 m apart on
+ *     these tracks, so a window narrower than that can see only one segment and
+ *     the answer FREEZES at whatever it first returned -- and every monotonicity
+ *     check passed, because a constant never goes backwards.
+ *   - a SOFT PENALTY on arc drift, which is worse: the penalty is measured from
+ *     the previous ANSWER, so once the answer is wrong it pins itself there for
+ *     good. At the strength that removed every flip, several recordings advanced
+ *     0.07 of a lap over their whole length.
+ *
+ * Both were caught only by a check on FORWARD PROGRESS -- that the answer covers
+ * a spine length per lap -- which is the check to write first for anything
+ * incremental. See traps.md.
+ *
+ * WHAT IS FIXED HERE is the projection itself: this snapped to the nearest
+ * SAMPLE, which this comment has always described as the nearest point on the
+ * nearest SEGMENT. With samples tens of metres apart that made the answer jump
+ * between them; it now really does project onto segments, which is continuous.
+ *
+ * IT IS STILL NOT A SOUND PROGRESS MEASURE, and nothing in this file can make it
+ * one: the checkpoint polyline is NOT the road (traps.md), its refining points
+ * run up to 63 m off it, and where a track passes near itself the closest segment
+ * is genuinely ambiguous. Measured over all 30 shipped recordings, it jumps more
+ * than 10 m between consecutive samples 4 to 16 times a lap.
+ *
+ * SO THE PLACING DOES NOT USE IT. ai.c measures progress the way the engine does
+ * -- carried forward per racer, not re-derived from a position -- off each
+ * opponent's own recorded path length and off the player's LATCHED checkpoint
+ * index. This query is left for the AI's `cp` index and for anything that wants
+ * a rough answer. */
+int cp_spine_dist_near(const checkpoints_t *c, float x, float y, float z,
+                       float hint, float *dist, int *cp);
+
+/* HOW FAR ROUND THE LAP, 0 at the start/finish line and rising to `spine_len`,
+ * anchored on the LATCHED checkpoint index rather than on a projection.
+ *
+ * `last` cannot flicker -- it is a state machine that only ever advances on a
+ * pass -- and the distance to `next` is continuous, so this is monotonic between
+ * crossings and jumps only at one. That is what makes it comparable with an
+ * opponent's own recorded progress, which is the whole point: the placing
+ * compares the two.
+ *
+ * Before the FIRST crossing of a race the car is short of the line with nothing
+ * latched, and the answer is 0 -- which is the truth: it has driven none of the
+ * lap. -> 0 and leaves `*out` alone with no spine. */
+int cp_lap_progress(const checkpoints_t *c, float x, float y, float z,
+                    float *out);
+
+/* Metres along the closed spine at (x, z). The nearest sample over the WHOLE
+   spine -- see cp_spine_dist_near for why that flickers, and prefer it wherever
+   a previous answer exists. -> 0 with `out_s` untouched when there is no spine.
 
    This is the progress measure the crossing test runs on. It is deliberately NOT
    what cp_spine_dist answers with -- see there. */

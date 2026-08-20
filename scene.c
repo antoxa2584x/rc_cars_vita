@@ -183,7 +183,7 @@ int scene_load(const char *path, scene_t *s)
 
     memset(s, 0, sizeof(*s));
     if (!rd(f, magic, 4) || memcmp(magic, "VSC", 3)
-        || magic[3] < '3' || magic[3] > '8') {
+        || magic[3] < '3' || magic[3] > '9') {
         rlog("[rccars] %s: bad magic\n", path);
         fclose(f);
         return 0;
@@ -220,6 +220,7 @@ int scene_load(const char *path, scene_t *s)
     size_t up_bytes = 0;         /* texture memory actually uploaded */
     size_t buf_bytes = 0;        /* vertex + index memory put on the GPU */
     unsigned int n_buffered = 0; /* batches that got one */
+    unsigned int n_blend = 0, n_blend_dropped = 0;
     /* Per texture: would the alpha test reject any of its texels? Drives
        BATCH_ALPHA_KEYED -- see scene.h for why this is worth knowing. */
     unsigned char *keyed = calloc(s->n_tex ? s->n_tex : 1, 1);
@@ -279,6 +280,11 @@ int scene_load(const char *path, scene_t *s)
             rd(f, &b->env, 4);
         if (ver >= 8)
             rd(f, &b->model, 4);
+        b->tex2 = b->mask_tex = 0xFFFFFFFFu;
+        if (ver >= 9) {
+            rd(f, &b->tex2, 4);
+            rd(f, &b->mask_tex, 4);
+        }
         rd(f, &b->nverts, 4);
         rd(f, &b->nidx, 4);
         b->verts = malloc(sizeof(vtx_t) * b->nverts);
@@ -303,9 +309,47 @@ int scene_load(const char *path, scene_t *s)
             else
                 fseek(f, (long)(sizeof(float) * 3 * b->nverts), SEEK_CUR);
         }
+        /* And the blend's two UV sets, on the same rule as the normals: after
+           the vertices, before the indices, and only on a batch that has them.
+           A reader that took them unconditionally would shift every batch after
+           the first blend one. */
+        if (ver >= 9 && (b->flags & BATCH_BLEND)) {
+            b->buv = malloc(sizeof(blend_uv_t) * b->nverts);
+            if (b->buv)
+                rd(f, b->buv, sizeof(blend_uv_t) * b->nverts);
+            else
+                fseek(f, (long)(sizeof(blend_uv_t) * b->nverts), SEEK_CUR);
+        }
         rd(f, b->idx, sizeof(unsigned short) * b->nidx);
         b->gl_tex = (b->tex < s->n_tex) ? s->tex_ids[b->tex] : 0;
         b->gl_lm = (b->lm_tex < s->n_tex) ? s->tex_ids[b->lm_tex] : 0;
+        b->gl_tex2 = (b->tex2 < s->n_tex) ? s->tex_ids[b->tex2] : 0;
+        b->gl_mask = (b->mask_tex < s->n_tex) ? s->tex_ids[b->mask_tex] : 0;
+        /* A blend needs all four of its inputs. Missing any, the bit comes off
+           and the batch joins the ordinary world pass drawn as plain `tex`:
+           wrong, but not a blend against an undefined sampler, and main.c's
+           solid pass filters on this same flag so nothing is lost. */
+        if ((b->flags & BATCH_BLEND)
+            && (!b->gl_tex2 || !b->gl_mask || !b->buv
+                || !has_px[b->tex2 < s->n_tex ? b->tex2 : 0]
+                || !has_px[b->mask_tex < s->n_tex ? b->mask_tex : 0])) {
+            b->flags &= ~BATCH_BLEND;
+            free(b->buv);
+            b->buv = NULL;
+            n_blend_dropped++;
+        }
+        /* THE MASK MUST NOT WRAP IN T. Its v runs exactly 0 to 1 across the
+           band, and it tiles only along it, so REPEAT plus GL_LINEAR samples the
+           white last row next to the black first one and leaves a hairline of
+           half-blend down both edges of every band. Set here rather than in
+           scene_read_texture because a texture does not know what it is for
+           until a batch names it -- and glTexParameteri applies to the object,
+           so the order does not matter. */
+        if (b->flags & BATCH_BLEND) {
+            glBindTexture(GL_TEXTURE_2D, b->gl_mask);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
         /* Only this batch's own texture decides it. The lightmap cannot: it is
            opaque everywhere, and on unit 1 the alpha comes from unit 0 anyway --
            the same fact that makes the one-pass lightmap correct.
@@ -365,7 +409,23 @@ int scene_load(const char *path, scene_t *s)
                            + sizeof(unsigned short) * b->nidx;
                 n_buffered++;
             }
+            /* The blend UVs get their own buffer. They have to be buffer-backed
+               too: vitaGL's is_full_vbo goes false the moment ONE enabled
+               attribute is a client pointer, and then every stream is memcpy'd
+               again -- the exact cost SCENE VERTEX BUFFERS exists to remove. */
+            if (b->gl_vbo && b->buv) {
+                glGenBuffers(1, &b->gl_vbo_buv);
+                if (b->gl_vbo_buv) {
+                    glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_buv);
+                    glBufferData(GL_ARRAY_BUFFER,
+                                 (GLsizeiptr)(sizeof(blend_uv_t) * b->nverts),
+                                 b->buv, GL_STATIC_DRAW);
+                    buf_bytes += sizeof(blend_uv_t) * b->nverts;
+                }
+            }
         }
+        if (b->flags & BATCH_BLEND)
+            n_blend++;
     }
     /* Never leave one bound: every other module in the port draws from client
        pointers, which a bound buffer silently reinterprets as offsets. */
@@ -401,6 +461,17 @@ int scene_load(const char *path, scene_t *s)
         }
         rlog("[rccars]   alpha test: %u/%u batches need it (%u tris); "
                       "%u tris draw opaque\n", nk, s->n_batches, tk, to);
+        if (n_blend || n_blend_dropped) {
+            unsigned int bt = 0;
+            for (unsigned int i = 0; i < s->n_batches; i++)
+                if (s->batches[i].flags & BATCH_BLEND)
+                    bt += s->batches[i].nidx / 3;
+            rlog("[rccars]   surface blend: %u batches, %u tris\n",
+                 n_blend, bt);
+        }
+        if (n_blend_dropped)
+            rlog("[rccars]   %u BLEND batch(es) lost an input and draw flat "
+                 "-- a packing gap, see BATCH_BLEND\n", n_blend_dropped);
         if (nn)
             rlog("[rccars]   %u batch(es), %u tris have NO TEXTURE and "
                           "are not drawn -- a packing gap, see BATCH_NO_TEXTURE\n",
@@ -606,6 +677,179 @@ void scene_draw(const scene_t *s, unsigned int mask, unsigned int match)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
+/*
+ * THE TRANSITION BANDS -- three passes, in this order, over the same triangles:
+ *
+ *   1  BAS2 alone, opaque, depth write ON        framebuffer = B2
+ *   2  BAS1 with the mask as its ALPHA, blended  framebuffer = m*B1 + (1-m)*B2
+ *   3  the lightmap, multiplied into that        framebuffer *= LM
+ *
+ * which is exactly LM * (m*B1 + (1-m)*B2), the engine's own lerp with the
+ * lighting applied once. See BATCH_BLEND in scene.h for where the mask and the
+ * polarity come from.
+ *
+ * WHY THREE AND NOT TWO. The natural version is one opaque pass of B2*LM (the
+ * ordinary world pass, already written) and one blended pass of B1*LM at alpha
+ * = mask. That needs THREE inputs in the second pass, and vitaGL's
+ * fixed-function path compiles two texture coordinate sets unless it is built
+ * with HAVE_HIGH_FFP_TEXUNITS (shared.h:32) -- which this build is not, and
+ * rebuilding vitaGL for 2.5% of the world's triangles is a change to every
+ * other subsystem's shaders as well. So the lightmap is factored out and applied
+ * last, with GL_ZERO/GL_SRC_COLOR, which needs only one unit. The alternative
+ * that keeps two passes is to drop the lightmap from the blended half, and that
+ * is visibly wrong in shade -- the B1 side of every band would read full-bright.
+ *
+ * Cost: the bands are drawn three times. That is 766 triangles on beach_1 and 42
+ * to 611 on the eight other tracks that have any, against 30-48k for the world --
+ * under 5% of one pass.
+ *
+ * The mask's alpha is the whole reason pack_vsc.py moves its luminance into the
+ * alpha channel: COMBINE_ALPHA can take GL_TEXTURE, and no combiner can route a
+ * texture's RGB into alpha.
+ */
+
+/* Where a blend UV component lives: an address, or an offset into the batch's
+   OWN blend buffer. The two arrays have separate buffers, so this cannot share
+   VTX_AT -- and the offset is into gl_vbo_buv, not gl_vbo. */
+#define BUV_AT(b, field) \
+    ((b)->gl_vbo_buv ? (const void *)(size_t)offsetof(blend_uv_t, field) \
+                     : (const void *)&(b)->buv[0].field)
+
+/* Position always comes out of the vertex buffer; the coordinate set may come
+   out of either array, so each is bound immediately before its pointer call --
+   GL captures the buffer that is bound AT the gl*Pointer call. */
+static void blend_streams(const batch_t *b, int coords_from_buv, size_t field)
+{
+    glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo);
+    glVertexPointer(3, GL_FLOAT, sizeof(vtx_t), VTX_AT(b, x));
+    if (coords_from_buv) {
+        glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_buv);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(blend_uv_t),
+                          b->gl_vbo_buv ? (const void *)field
+                                        : (const void *)((const char *)b->buv + field));
+    } else {
+        glTexCoordPointer(2, GL_FLOAT, sizeof(vtx_t),
+                          b->gl_vbo ? (const void *)field
+                                    : (const void *)((const char *)b->verts + field));
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->gl_ibo);
+}
+
+static void blend_draw(const batch_t *b)
+{
+    glDrawElements(GL_TRIANGLES, b->nidx, GL_UNSIGNED_SHORT,
+                   b->gl_ibo ? (const void *)0 : (const void *)b->idx);
+}
+
+static int blend_visible(const scene_t *s, const batch_t *b)
+{
+    if (!(b->flags & BATCH_BLEND))
+        return 0;
+    if (b->flags & BATCH_NO_TEXTURE)
+        return 0;
+    if (cull_on && !s->has_rig && culled(b))
+        return 0;
+    return 1;
+}
+
+void scene_draw_blend(const scene_t *s)
+{
+    unsigned int i;
+    int any = 0;
+
+    for (i = 0; i < s->n_batches; i++)
+        if (s->batches[i].flags & BATCH_BLEND) { any = 1; break; }
+    if (!any)
+        return;
+
+    /* The mask is an alpha ramp from 0 up: under the world's GL_GREATER 0.5 the
+       whole soft half of every band would be discarded instead of blended, which
+       is the same hard cut the painted markings were suffering. Off for all three
+       passes, and back on at the end because that is the state main.c keeps. */
+    glDisable(GL_ALPHA_TEST);
+    /* With no colour array bound, src = texture * current colour, and whatever
+       drew last owns that. */
+    glColor4f(1.f, 1.f, 1.f, 1.f);
+
+    /* ---- pass 1: the second base texture, opaque ------------------------- */
+    for (i = 0; i < s->n_batches; i++) {
+        batch_t *b = &s->batches[i];
+        if (!blend_visible(s, b))
+            continue;
+        stats.batches++;
+        stats.tris += b->nidx / 3;
+        glBindTexture(GL_TEXTURE_2D, b->gl_tex2);
+        blend_streams(b, 1, offsetof(blend_uv_t, u2));
+        blend_draw(b);
+    }
+
+    /* ---- pass 2: the first base texture, at alpha = mask ------------------
+       Unit 1 carries the mask and does nothing to the colour: COMBINE with
+       REPLACE on both halves, taking RGB from the unit below and ALPHA from the
+       mask texture. Depth writes off and GL_LEQUAL, because this is the same
+       geometry at the same depth as pass 1 -- identical vertices through
+       identical matrices, so the values are bit-identical and LEQUAL is exact,
+       not a tolerance. */
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDepthFunc(GL_LEQUAL);
+    glActiveTexture(GL_TEXTURE1);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_REPLACE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
+    glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_COLOR);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_TEXTURE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_ALPHA, GL_SRC_ALPHA);
+    glClientActiveTexture(GL_TEXTURE1);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glClientActiveTexture(GL_TEXTURE0);
+    glActiveTexture(GL_TEXTURE0);
+    /* lm_bind's own bookkeeping: unit 1 is on now, so the next lm_bind(0) turns
+       it off. Leaving this at 0 leaves the mask bound on unit 1 for every
+       unlit batch anything else draws. */
+    lm_on = 1;
+    for (i = 0; i < s->n_batches; i++) {
+        batch_t *b = &s->batches[i];
+        if (!blend_visible(s, b))
+            continue;
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, b->gl_mask);
+        glClientActiveTexture(GL_TEXTURE1);
+        glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_buv);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(blend_uv_t), BUV_AT(b, mu));
+        glClientActiveTexture(GL_TEXTURE0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, b->gl_tex);
+        blend_streams(b, 0, offsetof(vtx_t, u));
+        blend_draw(b);
+    }
+    lm_bind(0, NULL);
+
+    /* ---- pass 3: the lightmap, multiplied in ----------------------------- */
+    glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+    for (i = 0; i < s->n_batches; i++) {
+        batch_t *b = &s->batches[i];
+        /* An unlit blend batch is finished after pass 2. Every transition face
+           in the ten tracks carries an LM_1 layer, so this is a guard and not a
+           case -- but multiplying by an unbound sampler is undefined, not dark. */
+        if (!blend_visible(s, b) || !b->gl_lm)
+            continue;
+        glBindTexture(GL_TEXTURE_2D, b->gl_lm);
+        blend_streams(b, 0, offsetof(vtx_t, lu));
+        blend_draw(b);
+    }
+
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
 int scene_model_index(const scene_t *s, const char *name)
 {
     unsigned int i;
@@ -705,10 +949,13 @@ void scene_release(scene_t *s)
             glDeleteBuffers(1, &s->batches[i].gl_vbo);
         if (s->batches[i].gl_ibo)
             glDeleteBuffers(1, &s->batches[i].gl_ibo);
+        if (s->batches[i].gl_vbo_buv)
+            glDeleteBuffers(1, &s->batches[i].gl_vbo_buv);
         free(s->batches[i].verts);
         free(s->batches[i].idx);
         free(s->batches[i].rest);
         free(s->batches[i].nrm);
+        free(s->batches[i].buv);
     }
     free(s->batches);
     memset(s, 0, sizeof(*s));

@@ -61,19 +61,21 @@ static const float MAP_OUTLINE[MAP_OUTLINE_N][2] = {
    determine an affine exactly; race_ui.c solves the same one.
 
    The generator CHECKS each row rather than trusting the pairing: a
-   painted top-down map has to come out a uniform scale with no rotation,
-   and it does on all ten. Per track (1/scale in metres across the art,
-   the off-diagonal cosine, and where the race start lands):
-     beach_1    195.4 x 195.3 m   cos +0.053   start (0.619, 0.392)
-     beach_2    209.5 x 214.6 m   cos +0.005   start (0.741, 0.151)
-     beach_3    206.2 x 217.4 m   cos +0.014   start (0.551, 0.647)
-     beach_4    206.9 x 221.9 m   cos +0.011   start (0.489, 0.329)
-     country_1  176.6 x 172.8 m   cos -0.010   start (0.702, 0.518)
-     country_2  221.2 x 215.4 m   cos -0.052   start (0.532, 0.487)
-     country_3  208.9 x 212.5 m   cos -0.003   start (0.488, 0.156)
-     country_4  164.3 x 166.8 m   cos +0.018   start (0.397, 0.895)
-     urban_1    188.3 x 188.3 m   cos +0.004   start (0.297, 0.788)
-     urban_2    209.0 x 232.8 m   cos -0.064   start (0.472, 0.448)
+   painted top-down map has to come out CONFORMAL -- one scale, one
+   rotation, no shear, no mirror -- and it does on all ten. **The rotation
+   is real and is per track**: the artists turned each painting to fit the
+   panel, so a marker's heading has to go through the transform and cannot
+   be derived from an axis convention (race_ui_map_heading). Per track:
+     beach_1    trackmap_1  SURF     195.4 x 195.3 m  cos +0.053  +x at  +145.7 deg  start (0.619, 0.392)
+     beach_2    trackmap_6  CAMPING  221.2 x 215.4 m  cos -0.052  +x at   +50.3 deg  start (0.707, 0.224)
+     beach_3    trackmap_3  FORT     206.2 x 217.4 m  cos +0.014  +x at   -53.5 deg  start (0.551, 0.647)
+     beach_4    trackmap_10 WAR PATH 209.0 x 232.8 m  cos -0.064  +x at  -129.4 deg  start (0.338, 0.640)
+     country_1  trackmap_8  RANCHO   164.3 x 166.8 m  cos +0.018  +x at   +89.1 deg  start (0.598, 0.264)
+     country_2  trackmap_5  MINES    176.6 x 172.8 m  cos -0.010  +x at  +158.2 deg  start (0.371, 0.523)
+     country_3  trackmap_2  FISHERS  209.5 x 214.6 m  cos +0.005  +x at   +39.3 deg  start (0.545, 0.200)
+     country_4  trackmap_9  SILO     188.3 x 188.3 m  cos +0.004  +x at   +14.8 deg  start (0.828, 0.616)
+     urban_1    trackmap_7  AWACS    208.9 x 212.5 m  cos -0.003  +x at   +41.3 deg  start (0.185, 0.559)
+     urban_2    trackmap_4  AAD      206.9 x 221.9 m  cos +0.011  +x at   +14.6 deg  start (0.498, 0.562)
 
    THAT IS STILL THESE TWO TABLES AGAINST EACH OTHER. Held against a
    DIFFERENT shipped artifact -- the cp_N markers in each packed .vsc
@@ -87,38 +89,72 @@ typedef struct {
     float art[3][2];     /* u, v in the 512x512 trackmap */
 } map_calib;
 
+/* THE MAP NUMBER each of this port's tracks uses, and the engine's own
+   name for it. The rows above are in THIS port's order (tracks.h's) with
+   each one lifted from the engine level that track really is, so nothing
+   downstream has to know the engine numbers a level differently -- but
+   main.c still has to ASK for `trackmap_<n>` by the engine's number,
+   because that is what the file is called. Read out of
+   Scripts/championship.ini's own section comments and checked against a
+   geometric fit; see engine_levels(). */
+#define MAP_TRACKMAP_BEACH_1     1   /* SURF */
+#define MAP_TRACKMAP_BEACH_2     6   /* CAMPING */
+#define MAP_TRACKMAP_BEACH_3     3   /* FORT */
+#define MAP_TRACKMAP_BEACH_4    10   /* WAR PATH */
+#define MAP_TRACKMAP_COUNTRY_1   8   /* RANCHO */
+#define MAP_TRACKMAP_COUNTRY_2   5   /* MINES */
+#define MAP_TRACKMAP_COUNTRY_3   2   /* FISHERS */
+#define MAP_TRACKMAP_COUNTRY_4   9   /* SILO */
+#define MAP_TRACKMAP_URBAN_1     7   /* AWACS */
+#define MAP_TRACKMAP_URBAN_2     4   /* AAD */
+static const int MAP_TRACKMAP[10] = { 1, 6, 3, 10, 8, 5, 2, 9, 7, 4 };
+
+/* And the engine's own display names, which are not `Beach 1' at all. */
+static const char *const MAP_TRACK_NAME[10] = {
+    "SURF",        /* beach_1 */
+    "CAMPING",     /* beach_2 */
+    "FORT",        /* beach_3 */
+    "WAR PATH",    /* beach_4 */
+    "RANCHO",      /* country_1 */
+    "MINES",       /* country_2 */
+    "FISHERS",     /* country_3 */
+    "SILO",        /* country_4 */
+    "AWACS",       /* urban_1 */
+    "AAD",         /* urban_2 */
+};
+
 #define MAP_N_TRACKS 10
 static const map_calib MAP_CALIB[MAP_N_TRACKS] = {
-    /* beach_1 -- trackmap_1 */
+    /* beach_1 -- trackmap_1, SURF */
     { { {   -18.32300f,   -10.89700f }, {   -28.02800f,    23.01600f }, {    -0.00200f,    -9.41700f } },
       { {  0.4101562f,  0.4921875f }, {  0.2441406f,  0.5566406f }, {  0.4570312f,  0.5742188f } } },
-    /* beach_2 -- trackmap_2 */
-    { { {    -4.72900f,   -29.40200f }, {   -57.25500f,   -27.65200f }, {     7.85800f,    23.74800f } },
-      { {  0.4394531f,  0.3515625f }, {  0.2871094f,  0.5507812f }, {  0.6699219f,  0.4609375f } } },
-    /* beach_3 -- trackmap_3 */
-    { { {    56.99400f,   -67.27200f }, {   -48.36300f,    11.09800f }, {   -37.47200f,   -37.09000f } },
-      { {  0.1445312f,  0.4335938f }, {  0.7656250f,  0.4453125f }, {  0.5937500f,  0.5937500f } } },
-    /* beach_4 -- trackmap_4 */
-    { { {    19.05100f,   -72.29400f }, {   -36.97800f,   -36.61000f }, {    64.69400f,    23.49400f } },
-      { {  0.2128906f,  0.3828125f }, {  0.3007812f,  0.6835938f }, {  0.6875000f,  0.2734375f } } },
-    /* country_1 -- trackmap_5 */
-    { { {   -27.22900f,    11.02700f }, {    33.12800f,    38.58600f }, {    14.50600f,   -49.81900f } },
-      { {  0.3203125f,  0.3671875f }, {  0.2988281f,  0.7421875f }, {  0.7363281f,  0.4589844f } } },
-    /* country_2 -- trackmap_6 */
+    /* beach_2 -- trackmap_6, CAMPING */
     { { {   -16.75900f,    39.28300f }, {   -79.66800f,   -14.82800f }, {    18.39200f,    11.45200f } },
       { {  0.5410156f,  0.6386719f }, {  0.1718750f,  0.6191406f }, {  0.5859375f,  0.4335938f } } },
-    /* country_3 -- trackmap_7 */
-    { { {   -72.88900f,   -34.10000f }, {   -63.04700f,    42.41100f }, {    12.70500f,    32.66700f } },
-      { {  0.1445312f,  0.5351562f }, {  0.4453125f,  0.7382812f }, {  0.6503906f,  0.4355469f } } },
-    /* country_4 -- trackmap_8 */
-    { { {   -48.96300f,    15.00200f }, {    37.44400f,    13.42300f }, {    43.37500f,   -59.48100f } },
-      { {  0.1777344f,  0.6035156f }, {  0.7031250f,  0.5859375f }, {  0.7246094f,  0.1484375f } } },
-    /* urban_1 -- trackmap_9 */
-    { { {   -23.31200f,    41.31500f }, {    36.89800f,    30.00500f }, {   -25.36900f,   -41.33800f } },
-      { {  0.6992188f,  0.6308594f }, {  0.7226562f,  0.3066406f }, {  0.2714844f,  0.5312500f } } },
-    /* urban_2 -- trackmap_10 */
+    /* beach_3 -- trackmap_3, FORT */
+    { { {    56.99400f,   -67.27200f }, {   -48.36300f,    11.09800f }, {   -37.47200f,   -37.09000f } },
+      { {  0.1445312f,  0.4335938f }, {  0.7656250f,  0.4453125f }, {  0.5937500f,  0.5937500f } } },
+    /* beach_4 -- trackmap_10, WAR PATH */
     { { {    41.93200f,   -56.75800f }, {   -80.34700f,    12.02700f }, {     4.38400f,    54.51100f } },
       { {  0.4472656f,  0.7773438f }, {  0.7265625f,  0.1660156f }, {  0.3066406f,  0.2753906f } } },
+    /* country_1 -- trackmap_8, RANCHO */
+    { { {   -48.96300f,    15.00200f }, {    37.44400f,    13.42300f }, {    43.37500f,   -59.48100f } },
+      { {  0.1777344f,  0.6035156f }, {  0.7031250f,  0.5859375f }, {  0.7246094f,  0.1484375f } } },
+    /* country_2 -- trackmap_5, MINES */
+    { { {   -27.22900f,    11.02700f }, {    33.12800f,    38.58600f }, {    14.50600f,   -49.81900f } },
+      { {  0.3203125f,  0.3671875f }, {  0.2988281f,  0.7421875f }, {  0.7363281f,  0.4589844f } } },
+    /* country_3 -- trackmap_2, FISHERS */
+    { { {    -4.72900f,   -29.40200f }, {   -57.25500f,   -27.65200f }, {     7.85800f,    23.74800f } },
+      { {  0.4394531f,  0.3515625f }, {  0.2871094f,  0.5507812f }, {  0.6699219f,  0.4609375f } } },
+    /* country_4 -- trackmap_9, SILO */
+    { { {   -23.31200f,    41.31500f }, {    36.89800f,    30.00500f }, {   -25.36900f,   -41.33800f } },
+      { {  0.6992188f,  0.6308594f }, {  0.7226562f,  0.3066406f }, {  0.2714844f,  0.5312500f } } },
+    /* urban_1 -- trackmap_7, AWACS */
+    { { {   -72.88900f,   -34.10000f }, {   -63.04700f,    42.41100f }, {    12.70500f,    32.66700f } },
+      { {  0.1445312f,  0.5351562f }, {  0.4453125f,  0.7382812f }, {  0.6503906f,  0.4355469f } } },
+    /* urban_2 -- trackmap_4, AAD */
+    { { {    19.05100f,   -72.29400f }, {   -36.97800f,   -36.61000f }, {    64.69400f,    23.49400f } },
+      { {  0.2128906f,  0.3828125f }, {  0.3007812f,  0.6835938f }, {  0.6875000f,  0.2734375f } } },
 };
 
 /* ---------------------------------------- the badges and the clocks */

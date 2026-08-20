@@ -859,6 +859,11 @@ void ai_reset(ai_t *ai)
         a->dist = 0.0f;
         a->lead = 0.0f;
         a->spine_dist = 0.0f;
+        /* and no hint: a reset car has not been found on the spine yet, so its
+           first query searches the whole of it. 0 is a VALID arc position (the
+           start line), which is why this is negative and not zero. */
+        a->spine_at = -1.0f;
+        a->spine_lap = 0;
         a->cp = 0;
         a->coeff = ai->coeff_static;
         a->speed = 0.0f;
@@ -874,6 +879,9 @@ void ai_reset(ai_t *ai)
         rb_boost_reset(&a->rb);
     }
     ai->player_dist = 0.0f;
+    ai->player_at = -1.0f;
+    ai->player_at_proj = -1.0f;
+    ai->player_lap_seam = 0;
     ai->player_cp = 0;
 }
 
@@ -1005,6 +1013,24 @@ static void ai_throttle(ai_car *a)
     a->rb.in.throttle = a->rb.in.accel ? 1.0f : 0.0f;
 }
 
+/* A FORWARD CROSSING OF THE SPINE'S SEAM, from the previous within-lap arc
+ * position to this one. -> 1 to add a lap, -1 to take one off, 0 otherwise.
+ *
+ * "Wrapped" is a jump of more than half the spine, which is safe because
+ * cp_spine_dist_near is windowed to CP_SPINE_WINDOW (15 m) and cannot jump
+ * further than that any other way -- the two facts hold each other up. A
+ * negative `prev` is the first query after a reset and counts nothing. */
+static int ai_seam_cross(float prev, float now, float spine_len)
+{
+    if (prev < 0.f || spine_len <= 0.f)
+        return 0;
+    if (now < prev - spine_len * 0.5f)
+        return 1;                       /* over the line, forward */
+    if (now > prev + spine_len * 0.5f)
+        return -1;                      /* back over it */
+    return 0;
+}
+
 void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
              int player_lap, float dt)
 {
@@ -1016,12 +1042,26 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
         return;
 
     if (tr && tr->spine)
-        have_spine = tr->spine(tr->ctx, px, py, pz, &pdist, &pcp);
+        have_spine = tr->spine(tr->ctx, px, py, pz, ai->player_at, &pdist, &pcp);
+    /* THE PLAYER'S PROGRESS, off the LATCHED checkpoint index rather than off a
+     * projection -- see ai_track.lap_progress. The projection stays bound for
+     * `player_cp`, which is the gap term the rubber band's own curve indexes and
+     * which a few metres of ambiguity does not disturb. */
+    if (tr && tr->lap_progress) {
+        float lp = 0.f;
+        if (tr->lap_progress(tr->ctx, px, py, pz, &lp)) {
+            ai->player_lap_seam += ai_seam_cross(ai->player_at, lp,
+                                                 tr->spine_len);
+            ai->player_at = lp;
+            ai->player_dist = lp
+                              + (float)ai->player_lap_seam * tr->spine_len;
+        }
+    }
     if (have_spine) {
-        /* Cumulative, the same way FUN_004eb630 builds it. */
-        ai->player_dist = pdist + (float)player_lap * tr->spine_len;
+        ai->player_at_proj = pdist;
         ai->player_cp = pcp;
     }
+    (void)player_lap;
 
     for (i = 0; i < ai->n; i++) {
         ai_car *a = &ai->car[i];
@@ -1052,7 +1092,8 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
          * aitest part 9 checks it exactly. */
         if (have_spine
             && tr->spine(tr->ctx, a->rec_x[0], a->rec_x[1], a->rec_x[2],
-                         &adist, &acp)) {
+                         a->spine_at, &adist, &acp)) {
+            a->spine_at = adist;
             a->cp = acp;
             /* The distance the original compares is CUMULATIVE across laps:
              * FUN_004ea120 hands its raw pair to FUN_004eb630, which returns
@@ -1065,7 +1106,19 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
              * answers WITHIN a lap, so the lap count is added here to rebuild the
              * original's own quantity. The lap comes from the path running out,
              * below, which is the only lap signal ai.c has. */
-            a->spine_dist = adist + (float)a->lap * tr->spine_len;
+            /* AN OPPONENT'S PROGRESS IS ITS OWN RECORDING, not a projection:
+             * `dist` is metres walked along a polyline of two to eleven thousand
+             * samples, exact and monotonic by construction, and `path_len` is
+             * that polyline's length. Scaled to the spine so the two sides are in
+             * the same metres.
+             *
+             * This is what the engine does -- FUN_004ea7b0 reads a lap and a
+             * distance STORED on each racer's record rather than re-deriving them
+             * from a position -- and it is why the projection's 4-to-16 jumps a
+             * lap never reach the placing. */
+            a->spine_dist = (a->path_len > 1e-3f)
+                            ? a->dist * (tr->spine_len / a->path_len)
+                            : adist;
             a->lead = a->spine_dist - ai->player_dist;
             gap = ai->player_cp - acp;    /* FUN_004fd5e0's iVar2 */
         } else {

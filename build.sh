@@ -363,13 +363,23 @@ fi
 
 if wanted tracks; then
     step "Packing tracks"
+    # WHICH trackmap_<n> each track uses, straight out of the generator that owns
+    # the answer -- so the packer and hud_data.h cannot name two different maps.
+    # The engine does NOT number levels the way this port does: its order is
+    # Scripts/championship.ini's TrackN order, so beach_2 is trackmap_6 and
+    # beach_4 is trackmap_10. Packing by position in TRACKS gave eight of the ten
+    # another track's map, and MAP_CALIB the matching wrong transform with it.
+    declare -A TRACKMAP=()
+    while read -r _tn _tm; do
+        [ -n "$_tn" ] && TRACKMAP["$_tn"]=$_tm
+    done < <(python3 "$RE/gen_hud_data.py" --print-maps \
+                     --champ "$EXTRACTED/Scripts/championship.ini")
+    [ ${#TRACKMAP[@]} -eq 10 ] || die "gen_hud_data.py --print-maps gave ${#TRACKMAP[@]} tracks, not 10"
+
     for t in "${TRACKS[@]}"; do
         src="$DB/$t.sb"
-        # The track's number comes out of ALL_TRACKS by NAME, never out of this
-        # loop -- `-t` replaces TRACKS and a missing .sb skips an entry, and
-        # either one shifts a counter onto the wrong track's map.
-        n=$(( $(track_index "$t") + 1 ))
-        [ "$n" -le 10 ] || die "unknown track '$t' -- not in the engine's ten"
+        n=${TRACKMAP[$t]}
+        [ -n "$n" ] || die "no trackmap number for '$t' -- not one of the engine's ten"
         [ -f "$src" ] || { warn "$src missing, skipped"; continue; }
 
         if current "$ASSETS/$t.vsc" "$src" "$RE/pack_vsc.py"; then
@@ -379,11 +389,11 @@ if wanted tracks; then
             # track and referenced by no mesh, so it is bound by NAME at runtime
             # through scene_tex (race_ui.c). PER TRACK rather than in props.vsc
             # because a 512x512 map is 0.7 MB and ten of them would be resident
-            # all session to show one. The index is 1-based and matches the
-            # order in tracks.h and in MAP_CALIB, which is the exe's own:
-            # FUN_004a9840 formats `trackmap_%i` from track + 1 and copies row
-            # `track` of the two calibration tables beside it. `n` comes from
-            # ALL_TRACKS by name -- see track_index.
+            # all session to show one. `n` is the ENGINE's level number for this
+            # track -- FUN_004a9840 formats `trackmap_%i` from level + 1 and
+            # copies row `level` of the two calibration tables beside it -- and it
+            # comes out of gen_hud_data.py, which reads it from
+            # championship.ini's own section comments.
             run python3 "$RE/pack_vsc.py" "$src" "$ASSETS/$t.vsc" --markers \
                 --extra-tex "trackmap_$n" \
                 --csidir "$EXTRACTED" --embdir "$EMB"
@@ -706,7 +716,12 @@ if wanted check; then
     done
     shopt -u nullglob
     [ ${#vscs[@]} -gt 0 ] || die "no .vsc in $ASSETS — run the packing stages first"
-    run python3 "$RE/vsc_check.py" "${vscs[@]}"
+    # --sb: the one check that needs the SOURCE scenes. It counts the faces the
+    # artists authored as transition bands and asserts every one of them reached
+    # the file -- the only invariant here that can notice the PACKER declining to
+    # pack something, which is the failure the blend had for the whole life of the
+    # port. See sb_blend_faces in vsc_check.py.
+    run python3 "$RE/vsc_check.py" --sb "$DB" "${vscs[@]}"
 fi
 
 # ------------------------------------------------------------ 10. the build ---

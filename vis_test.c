@@ -24,6 +24,7 @@
 #include "shadow.h"
 #include "water.h"
 #include "checkpoint.h"
+#include "hud_data.h"
 #include "antenna.h"
 #include "col.h"
 #include "vis_data.h"
@@ -60,6 +61,7 @@ static int st_depth_mask = 1, st_blend = 0, st_alpha = 1, st_cull = 1;
 static int st_pol_offset = 0;
 static float st_pol_factor = 0.f, st_pol_units = 0.f;
 static GLenum st_blend_src = GL_SRC_ALPHA, st_blend_dst = GL_ONE_MINUS_SRC_ALPHA;
+static GLenum st_depth_func = GL_LESS;
 static int st_color_array = 0;
 static int st_lm_array = 0;
 static GLuint next_tex_id = 1;
@@ -79,12 +81,20 @@ void glClientActiveTexture(GLenum unit) { cur_client_unit = (unit == GL_TEXTURE1
    IS the bug, and it never reached the recording. */
 float glcap_env_color[4] = {0.f, 0.f, 0.f, 1.f};
 static GLenum st_env_mode = GL_MODULATE;
+/* Unit 1's env, and where it takes its alpha from. Separate from unit 0's
+   because the two are set to different things in the same pass. */
+static GLenum st_env_mode1 = GL_MODULATE, st_a_src1 = GL_TEXTURE;
 void glTexEnvi(GLenum t, GLenum p, GLint v)
 {
     (void)t;
-    if (p == GL_TEXTURE_ENV_MODE && !cur_unit)
-        st_env_mode = (GLenum)v;
+    if (p == GL_TEXTURE_ENV_MODE) {
+        if (cur_unit) st_env_mode1 = (GLenum)v;
+        else          st_env_mode  = (GLenum)v;
+    }
+    if (p == GL_SRC0_ALPHA && cur_unit)
+        st_a_src1 = (GLenum)v;
 }
+void glDepthFunc(GLenum f) { st_depth_func = f; }
 void glTexEnvfv(GLenum t, GLenum p, GLfloat *v)
 {
     (void)t;
@@ -336,6 +346,11 @@ static void cap_begin(GLenum mode, int n)
     d->blend_src = st_blend_src;
     d->blend_dst = st_blend_dst;
     d->env_mode = st_env_mode;
+    d->depth_func = st_depth_func;
+    d->unit1_tex = glcap_unit_enabled[1] ? glcap_unit_tex[1] : 0;
+    d->unit1_env = st_env_mode1;
+    d->unit1_a_src = st_a_src1;
+    d->unit1_uv = (glcap_unit_enabled[1] && st_lm_array) ? cap_lm_uv : NULL;
     draw_had_matrix[glcap.n_draws - 1] = pending_matrix;
     draw_lm_tex[glcap.n_draws - 1] =
         (glcap_unit_enabled[1] && st_lm_array) ? glcap_unit_tex[1] : 0;
@@ -852,6 +867,26 @@ static int cp_flatten(const checkpoints_t *c, float path[][3])
  * in a continuous quantity, and teleporting from one waypoint to the next cannot
  * see WHERE it happened -- which is the entire property under test.
  */
+/* ai_track.spine for the checks that drive ai_step -- the same adapter main.c
+   binds, including the HINT, because the hint is the thing under test. */
+static int vt_spine(void *ctx, float x, float y, float z, float hint,
+                    float *dist, int *cp)
+{
+    return cp_spine_dist_near((const checkpoints_t *)ctx, x, y, z, hint,
+                              dist, cp);
+}
+
+/* ai_track.lap_progress -- the LATCHED measure the placing uses for the player. */
+static int vt_progress(void *ctx, float x, float y, float z, float *out)
+{
+    return cp_lap_progress((const checkpoints_t *)ctx, x, y, z, out);
+}
+
+/* How many times THIS drive has crossed the start/finish line. The lap rule
+   below needs to tell the opening crossing from the rest, and cp_drive is called
+   fresh for each path. */
+static int line_crossings;
+
 static int cp_drive(checkpoints_t *c, const float path[][3], int np, int laps,
                     float step, float *worst, int *order, int *lap_bad)
 {
@@ -860,6 +895,7 @@ static int cp_drive(checkpoints_t *c, const float path[][3], int np, int laps,
     *worst = -1.f;
     *order = 1;
     *lap_bad = 0;
+    line_crossings = 0;
 
     cp_step(c, path[0][0], path[0][1], path[0][2], 0.016f);
     {
@@ -888,15 +924,28 @@ static int cp_drive(checkpoints_t *c, const float path[][3], int np, int laps,
                 float x = ax + (bx - ax) * u, z = az + (bz - az) * u;
                 int lap_was = c->lap;
                 cp_step(c, x, 0.f, z, 0.016f);
-                /* THE LAP HAS TO TICK OVER ON THE START LINE and nowhere else.
+                /* THE LAP HAS TO TICK OVER ON THE START LINE, nowhere else, AND
+                   NOT ON THE OPENING CROSSING.
                    Counting it one station early passes any check on the TOTAL --
                    there is still exactly one per lap -- and it is a real error,
-                   because the opponents' lead is spine_len*(lap - 1) + distance
-                   along the spine, so a lap counted at the last checkpoint puts a
-                   whole lap of it into the stretch before the line. A mutant that
-                   did exactly that survived everything here until this line. */
-                if ((c->lap != lap_was) != (c->passed == 0))
-                    *lap_bad = 1;
+                   because the opponents' lead is spine_len*lap + distance along
+                   the spine, so a lap counted at the last checkpoint puts a whole
+                   lap of it into the stretch before the line. A mutant that did
+                   exactly that survived everything here until this line.
+                 *
+                   And the OPENING crossing counts none: the grid is short of the
+                   line on all ten tracks, so every race crosses it in its first
+                   second, and counting that put the player a phantom 500 m ahead
+                   of a field with no laps -- which read on screen as `Lap 2'
+                   before the first corner and as first place for the whole race.
+                   See checkpoints_t.started. */
+                if (c->passed == 0)
+                    line_crossings++;
+                {
+                    const int want_tick = (c->passed == 0 && line_crossings > 1);
+                    if ((c->lap != lap_was) != want_tick)
+                        *lap_bad = 1;
+                }
                 if (c->passed >= 0) {
                     const float *m = c->cp[c->passed].p[0];
                     float e = sqrtf((x - m[0]) * (x - m[0])
@@ -1003,8 +1052,26 @@ static void part2_checkpoints(void)
             ck(worst >= 0.f && worst < 2.f * STEP,
                "and each fires AT its own marker, not between two of them",
                "worst %.3f m from the marker (step %.2f m)", worst, STEP);
-            ck(c.lap == 3, "and the start line is what counts a lap",
-               "lap = %d after 2 laps from the line (1 at the start + 2)", c.lap);
+            ck(c.lap == 2, "and the start line is what counts a lap",
+               "lap = %d after 2 laps from the line -- the OPENING crossing "
+               "counts none, so 2 and not 3", c.lap);
+            /* AND A RESTART RE-ARMS IT. cp_restart clears `started` along with
+               the lap, so the next race's own opening crossing counts none
+               either -- otherwise the first race is right and every one after it
+               reads `Lap 2' from the grid, which is the same bug with a lifetime
+               instead of a line of code. Driven, not asserted on the field. */
+            {
+                float w2; int o2, lb2, f2;
+                cp_restart(&c, path[0][0], path[0][1], path[0][2]);
+                ck(c.lap == 0, "a restart puts the lap back to 0", "lap %d", c.lap);
+                f2 = cp_drive(&c, path, np, 2, STEP, &w2, &o2, &lb2);
+                ck(f2 == 2 * c.n + 1 && !lb2,
+                   "and the SECOND race crosses the line the same number of times",
+                   "%d crossings, lap_bad %d", f2, lb2);
+                ck(c.lap == 2,
+                   "and counts the same two laps -- the restart re-armed the "
+                   "opening crossing", "lap = %d", c.lap);
+            }
         }
 
         /* A WIDE LINE, 3 m off. This used to be here as the case a radius rule
@@ -1258,20 +1325,28 @@ static void part2_checkpoints(void)
         }
     }
 
-    /* cp_progress is continuous where cp_spine_dist snaps to a sample -- that is
-       the whole reason the crossing can be located to a frame of travel. Measured
-       against the fixture's own geometry: the first leg runs 10 m along +X from
-       the origin, so 4 m along it is 4 m of arc, and the nearest spine SAMPLE is
-       still cp_1 at the origin. */
+    /* BOTH arc measures interpolate along a leg. Measured against the fixture's
+       own geometry: the first leg runs 10 m along +X from the origin, so 4 m
+       along it is 4 m of arc.
+     *
+       This check used to assert the OPPOSITE of the second line -- that
+       cp_spine_dist SNAPPED to the nearest sample, returning 0 here -- and said
+       so as though it were intended ("the AI's measure, left alone"). It was the
+       old implementation written down as a requirement: checkpoint.h has always
+       described that function as the nearest point on the nearest SEGMENT, and
+       with the spine's samples 23 to 40 m apart on the real tracks the snapping
+       made its answer jump between them. Same shape as the lap count blessed at
+       "1 at the start + 2". */
     {
-        float s4 = -1.f, s_snap = -1.f;
+        float s4 = -1.f, s_seg = -1.f;
         cp_progress(&c, 4.f, 0.f, &s4);
-        cp_spine_dist(&c, 4.f, 0.f, 0.f, &s_snap, NULL);
+        cp_spine_dist(&c, 4.f, 0.f, 0.f, &s_seg, NULL);
         ck(near(s4, 4.f, 1e-3f), "cp_progress interpolates along a leg",
            "%.3f m of arc, 4 m along a 10 m leg", s4);
-        ck(near(s_snap, 0.f, 1e-3f),
-           "while cp_spine_dist still snaps -- the AI's measure, left alone",
-           "%.3f m", s_snap);
+        ck(near(s_seg, 4.f, 1e-3f),
+           "and so does cp_spine_dist -- the nearest point on the nearest "
+           "SEGMENT, which is what its header always said",
+           "%.3f m", s_seg);
     }
 
     /* The lateral offset must not move the arc position: a car three metres wide
@@ -1486,6 +1561,8 @@ static void part2_checkpoints(void)
             "country_2", "country_3", "country_4", "urban_1", "urban_2"
         };
         int t, bad_fires = 0, bad_order = 0, bad_lap = 0, loaded = 0;
+        int cp_ground_n = 0, cp_ground_roof = 0, cp_ground_under = 0;
+        int cp_ground_hit = 0, cp_respawn_n = 0, cp_respawn_bad = 0;
         float worst_all = -1.f;
         /* The respawn point, on the real spines: how many checkpoints across all
            ten tracks failed to give one, landed away from their own marker, or were
@@ -1513,15 +1590,85 @@ static void part2_checkpoints(void)
             cp_init(&rc, &ts, &tc);
             rc.enabled = (rc.n > 0);
 
+            /* THE MARKER'S GROUND IS THE FLOOR, NOT THE ROOF OVER IT.
+             *
+             * cp_t.ground is where BOTH the respawn point and the animated
+             * marker go, and col_ground_at returns the HIGHEST surface under its
+             * ceiling -- so on a track whose racing line runs through a tunnel
+             * the ceiling decides which one it finds. At the 5 m cp_init shipped
+             * with, NINE of the fifty checkpoints found a roof: a car sent back
+             * to a tunnel checkpoint arrived on top of the tunnel, with its
+             * marker up there and nowhere near the graffiti on the road.
+             *
+             * Both directions are held, because one alone passes on a broken
+             * probe: the ground may not be ABOVE the marker by more than half a
+             * metre (measured, the floor runs from 0.49 m below it to 0.24 m
+             * above), and at least nine checkpoints across the ten must still
+             * have something well OVER the ground that was chosen -- which is
+             * what says the tunnels are real and this is under them rather than
+             * that the probe found nothing at all. */
+            {
+                int k2;
+                for (k2 = 0; k2 < rc.n; k2++) {
+                    const float *mk = rc.cp[k2].p[0];
+                    float over, nx2, ny2, nz2;
+                    cp_ground_n++;
+                    if (rc.cp[k2].ground > mk[1] + 0.5f)
+                        cp_ground_roof++;
+                    /* AND THE PROBE ACTUALLY HIT SOMETHING. cp_init falls back to
+                       the marker's own y when nothing is under the ceiling, which
+                       is safe but is NOT the ground -- and a ceiling too tight to
+                       clear the floor (which runs up to 0.24 m ABOVE the marker)
+                       loses it silently, passing the roof test because the
+                       marker's own y is obviously not a roof. */
+                    if (rc.cp[k2].ground != mk[1])
+                        cp_ground_hit++;
+                    /* AND IT REALLY IS UNDER SOMETHING on the tunnel ones:
+                       anything more than 1.5 m over the ground that was chosen is
+                       a roof or a deck. Without this, a probe that found nothing
+                       at all would pass the test above. */
+                    if (col_ground_at(&tc, mk[0], mk[2],
+                                      rc.cp[k2].ground + 8.f,
+                                      &over, &nx2, &ny2, &nz2)
+                        && over > rc.cp[k2].ground + 1.5f)
+                        cp_ground_under++;
+                }
+                /* AND THE TWO PROBES AGREE, which is the path the reported bug
+                 * actually took and which nothing else here covers: cp_init
+                 * probes once for cp_t.ground, then main.c's place_car probes
+                 * AGAIN from that height with its own ceiling of ref_y + 1 m.
+                 * Two ceilings, two call sites, and no harness compiles main.c --
+                 * so the composition is replicated here. If they disagree the car
+                 * lands somewhere the marker is not, which under a tunnel means
+                 * on the roof. */
+                for (k2 = 0; k2 < rc.n; k2++) {
+                    float pos[3], yaw2, gy2, nx2, ny2, nz2;
+                    checkpoints_t rr = rc;
+                    rr.last = k2;
+                    if (!cp_respawn_pose(&rr, pos, &yaw2))
+                        continue;
+                    cp_respawn_n++;
+                    gy2 = pos[1];
+                    /* place_car's own probe, verbatim: ceiling at ref_y + 1. */
+                    if (!col_ground_at(&tc, pos[0], pos[2], pos[1] + 1.0f,
+                                       &gy2, &nx2, &ny2, &nz2))
+                        gy2 = pos[1];
+                    if (fabsf(gy2 - rc.cp[k2].ground) > 0.25f)
+                        cp_respawn_bad++;
+                }
+            }
+
             np = cp_flatten(&rc, path);
             /* 0.125 m: one 1/60 frame at this car's 7.5 m/s top speed, so the
                error bound below is bounded by a real frame and not by a step
                chosen to make it pass. */
             fires = cp_drive(&rc, path, np, 2, 0.125f, &worst, &order_ok,
                              &lap_bad);
-            /* 2*n + 1 and lap 3: the spine path starts ON the start line, so the
-               race opens by crossing it. See the fixture above. */
-            if (fires != 2 * rc.n + 1 || rc.lap != 3) bad_fires++;
+            /* 2n + 1 crossings over two laps -- the +1 is the OPENING crossing of
+               the line, which every race makes in its first second -- and 2 laps
+               COMPLETED, because that opening one completes none. See
+               checkpoints_t.started. */
+            if (fires != 2 * rc.n + 1 || rc.lap != 2) bad_fires++;
             if (!order_ok) bad_order++;
             if (lap_bad) bad_lap++;
             if (worst > worst_all) worst_all = worst;
@@ -1599,6 +1746,29 @@ static void part2_checkpoints(void)
 
         ck(loaded == 10, "all ten packed tracks load (run from rccars_vita/)",
            "%d of 10", loaded);
+        ck(cp_ground_n >= 45,
+           "every track's checkpoints report a ground height",
+           "%d checkpoints over %d tracks", cp_ground_n, loaded);
+        ck(cp_ground_roof == 0,
+           "and NONE of them sits on the roof over its own marker -- the "
+           "respawn and the animated marker both go where this says",
+           "%d of %d above the marker by over 0.5 m",
+           cp_ground_roof, cp_ground_n);
+        ck(cp_ground_hit >= 48,
+           "and the probe really found terrain under all but a couple -- a "
+           "ceiling too tight to clear the floor falls back to the marker's own "
+           "float height and looks fine",
+           "%d of %d hit", cp_ground_hit, cp_ground_n);
+        ck(cp_respawn_n >= 45 && cp_respawn_bad == 0,
+           "and place_car's SECOND probe lands where cp_init's first one said -- "
+           "two ceilings at two call sites, and no harness compiles main.c",
+           "%d of %d respawn points disagree by over 0.25 m",
+           cp_respawn_bad, cp_respawn_n);
+        ck(cp_ground_under >= 9,
+           "while at least nine really are UNDER something -- so the tunnels "
+           "are real and the probe is finding the floor, not nothing",
+           "%d with a surface 1.5 m or more over the chosen ground",
+           cp_ground_under);
         ck(loaded == 10 && bad_fires == 0,
            "every real spine passes each checkpoint once a lap, and counts the lap",
            "%d of %d tracks disagree", bad_fires, loaded);
@@ -5321,7 +5491,133 @@ static void part12_propdraw(void)
                    "uploaded through the RGBA path, so its alpha survives too",
                    "type 0x%x", cl0 >= 0 ? uploads[cl0].type : 0);
             }
+
+            /* AND THE WHOLE IN-RACE HUD, which rides in the same file for the
+             * same reasons: race_ui.c binds all of it by name out of props.vsc.
+             * Same rule about a skip -- every one of these has a font.h fallback,
+             * so a packer that quietly dropped them would look like a working
+             * build with a plainer HUD and nobody would report it.
+             *
+             * THE TWO FONT ATLASES ARE THE POINT OF THIS BLOCK. Smash20.csi and
+             * Smash26.csi are NOT in RCCars.pack -- they are in
+             * Language/English/, which is why this port spent years recording
+             * that the game shipped no glyph atlas -- so they only arrive if
+             * pack_props.py was given --texroot2. Nothing else in the suite can
+             * see that flag, and losing it degrades silently to Consolas. */
+            {
+                static const char *const HUDTEX[] = {
+                    "map_arrow", "map_cp", "place1", "place2", "place3",
+                    "place4", "place5", "place6", "lap",
+                    "cockpit_sp1", "cockpit_sp2"
+                };
+                int i, missing = 0, first_missing = -1;
+                for (i = 0; i < (int)(sizeof HUDTEX / sizeof HUDTEX[0]); i++)
+                    if (!scene_tex(&ps, HUDTEX[i])) {
+                        missing++;
+                        if (first_missing < 0) first_missing = i;
+                    }
+                ck(missing == 0,
+                   "props.vsc carries the HUD's eleven textures race_ui.c binds",
+                   "%d missing, first %s", missing,
+                   first_missing >= 0 ? HUDTEX[first_missing] : "-");
+                /* The two marker sheets are 64x32 -- TWO 32x32 cells side by
+                   side, which is what race_ui.c's `cell` argument splits and
+                   what makes "the checkpoint being headed for" expressible. A
+                   square one would make that split a lie. */
+                {
+                    GLuint m = scene_tex(&ps, "map_arrow");
+                    int ml = -1;
+                    for (k = 0; k < n_uploads; k++)
+                        if (uploads[k].tex == m && uploads[k].level == 0)
+                            ml = k;
+                    ck(ml >= 0 && uploads[ml].w == 2 * uploads[ml].h,
+                       "and map_arrow is twice as wide as tall -- its two cells",
+                       "%dx%d", ml >= 0 ? uploads[ml].w : -1,
+                       ml >= 0 ? uploads[ml].h : -1);
+                }
+                /* THE ENGINE'S OWN FONT, both sizes, at the size hud_data.h's
+                   10 x 9 grid arithmetic assumes. */
+                {
+                    GLuint fb = scene_tex(&ps, "Smash26");
+                    GLuint fs = scene_tex(&ps, "Smash20");
+                    int bl = -1, sl = -1;
+                    ck(fb != 0 && fs != 0,
+                       "and BOTH Smash atlases -- pack_props.py had --texroot2",
+                       "Smash26 %u, Smash20 %u", (unsigned)fb, (unsigned)fs);
+                    ck(fb != fs, "and they are two different textures",
+                       "%u vs %u", (unsigned)fb, (unsigned)fs);
+                    for (k = 0; k < n_uploads; k++) {
+                        if (uploads[k].tex == fb && uploads[k].level == 0) bl = k;
+                        if (uploads[k].tex == fs && uploads[k].level == 0) sl = k;
+                    }
+                    ck(bl >= 0 && uploads[bl].w == SF_ATLAS
+                       && uploads[bl].h == SF_ATLAS,
+                       "Smash26 is the square atlas the 10 x 9 grid divides",
+                       "%dx%d, SF_ATLAS %d", bl >= 0 ? uploads[bl].w : -1,
+                       bl >= 0 ? uploads[bl].h : -1, SF_ATLAS);
+                    ck(sl >= 0 && uploads[sl].w == SF_ATLAS
+                       && uploads[sl].h == SF_ATLAS,
+                       "and so is Smash20",
+                       "%dx%d", sl >= 0 ? uploads[sl].w : -1,
+                       sl >= 0 ? uploads[sl].h : -1);
+                    ck(bl >= 0 && uploads[bl].type == GL_UNSIGNED_BYTE,
+                       "through the RGBA path -- a font IS its alpha",
+                       "type 0x%x", bl >= 0 ? uploads[bl].type : 0);
+                }
+            }
             scene_release(&ps);
+        }
+    }
+
+    /* --- AND EVERY TRACK CARRIES ITS OWN MAP ---------------------------------
+     *
+     * The one link between the packer and hud_data.h that neither side can see.
+     * The engine does NOT number its levels the way this port does -- its order
+     * is Scripts/championship.ini's TrackN order, so beach_2's map is
+     * `trackmap_6` and beach_4's is `trackmap_10` -- and packing by position in
+     * the track list gave EIGHT of the ten another track's painting, with
+     * MAP_CALIB's matching wrong transform on top of it. That was reported as
+     * "minimap on the second map is not for the second map", and it was also the
+     * whole of the 3-to-19 m "residual" this file's notes used to record as
+     * unexplained: with the right pairing every track's checkpoints land within
+     * 0.7 m of its own painted ribbon.
+     *
+     * So: for each of the ten, the track's own .vsc must carry exactly the map
+     * MAP_TRACKMAP names for it. A missing one is a FAILED check -- race_ui.c
+     * would silently draw no minimap. */
+    {
+        int t, bad = 0, missing = 0;
+        for (t = 0; t < MAP_N_TRACKS; t++) {
+            char pth[160], nm[32];
+            scene_t ts;
+            memset(&ts, 0, sizeof ts);
+            snprintf(pth, sizeof pth, "assets/%s.vsc", AI_RACES[t].track);
+            if (!scene_load(pth, &ts)) { missing++; continue; }
+            snprintf(nm, sizeof nm, "trackmap_%d", MAP_TRACKMAP[t]);
+            if (!scene_tex(&ts, nm))
+                bad++;
+            else {
+                /* and NOT any other track's, which is what the bug looked like:
+                   a scene carrying two maps would pass the check above. */
+                int k2;
+                for (k2 = 1; k2 <= MAP_N_TRACKS; k2++) {
+                    char other[32];
+                    if (k2 == MAP_TRACKMAP[t]) continue;
+                    snprintf(other, sizeof other, "trackmap_%d", k2);
+                    if (scene_tex(&ts, other)) { bad++; break; }
+                }
+            }
+            scene_release(&ts);
+        }
+        ck(missing == 0, "all ten packed tracks load for the map check",
+           "%d missing", missing);
+        ck(bad == 0,
+           "and each carries EXACTLY the trackmap MAP_TRACKMAP names for it -- "
+           "the engine's level number, not this port's",
+           "%d wrong", bad);
+    }
+    {
+        {
         }
     }
 }
@@ -5999,11 +6295,608 @@ static void part14_aifx(void)
                 col_free(&dc);
             }
 
+            /* --- THE PROGRESS QUERY IS MONOTONIC ALONG A REAL DRIVEN LAP ------
+             *
+             * The placing and the rubber band both compare
+             * `spine_len * lap + cp_spine_dist(x, z)`, which is the engine's own
+             * quantity (FUN_004ea7b0 -> FUN_004eb630). So a place that flickers
+             * is a flickering INPUT, and the input was the projection: the
+             * UNWINDOWED query searches the whole spine for the nearest point and
+             * flips between arc positions hundreds of metres apart wherever a
+             * track passes near itself.
+             *
+             * Measured before the fix, over every sample of all 30 shipped
+             * recordings: 3 to 16 backward jumps per lap on every one of the ten
+             * tracks, the worst 425.8 m of a 460 m lap -- which dwarfs any real
+             * gap, so the player's place snapped to first or last and back for as
+             * long as the flip lasted. It is the reported bug.
+             *
+             * This drives REAL laps rather than a synthetic path, because the
+             * whole failure is about where a real track doubles back on itself.
+             * The seam wrap is not a jump and is subtracted out. */
+            {
+                int t2, tot_back = 0, tot_big = 0, laps = 0;
+                float worst_back = 0.f;
+                for (t2 = 0; t2 < 10; t2++) {
+                    char pth[160];
+                    scene_t s2;
+                    col_t c2;
+                    checkpoints_t k2;
+                    ai_t a2;
+                    int q;
+
+                    snprintf(pth, sizeof pth, "assets/%s.vsc", AI_RACES[t2].track);
+                    memset(&s2, 0, sizeof s2);
+                    if (!scene_load(pth, &s2))
+                        continue;
+                    snprintf(pth, sizeof pth, "assets/%s.col", AI_RACES[t2].track);
+                    memset(&c2, 0, sizeof c2);
+                    col_load(pth, &c2);
+                    cp_init(&k2, &s2, &c2);
+                    memset(&a2, 0, sizeof a2);
+                    if (ai_init(&a2, t2, "assets", col_rb_world(&c2), 1, 0)) {
+                        for (q = 0; q < a2.n; q++) {
+                            const ai_car *ac = &a2.car[q];
+                            float prev = -1e9f, hint = -1.f;
+                            int si;
+                            laps++;
+                            for (si = 0; si < ac->n; si++) {
+                                float dd, d2 = 0.f;
+                                if (!cp_spine_dist_near(&k2, ac->s[si].p[0],
+                                                        ac->s[si].p[1],
+                                                        ac->s[si].p[2], hint,
+                                                        &d2, NULL))
+                                    continue;
+                                hint = d2;
+                                if (prev > -1e8f) {
+                                    dd = d2 - prev;
+                                    if (dd < -k2.spine_len * 0.5f)
+                                        dd += k2.spine_len;   /* the seam */
+                                    if (dd < 0.f) {
+                                        tot_back++;
+                                        if (-dd > worst_back) worst_back = -dd;
+                                        if (-dd > 2.f) tot_big++;
+                                    }
+                                }
+                                prev = d2;
+                            }
+                        }
+                        ai_free(&a2);
+                    }
+                    scene_release(&s2);
+                    col_free(&c2);
+                }
+                ck(laps == 30,
+                   "all 30 shipped recordings drive the progress query",
+                   "%d of 30", laps);
+                /* A KNOWN-DEFECT CHECK, and deliberately the wrong way round:
+                   the projection DOES jump, that is why neither side of the
+                   placing uses it, and if it ever stops jumping this line is the
+                   one that says to go and reconsider that decision. The
+                   checkpoint polyline is not the road (traps.md) and its refining
+                   points run up to 63 m off it, so where a track passes near
+                   itself the nearest segment is genuinely ambiguous. */
+                ck(tot_big > 0 && worst_back > 100.f,
+                   "the raw projection still jumps -- which is WHY the placing "
+                   "does not use it; if this goes green, revisit ai.c",
+                   "%d backward steps, worst %.1f m, %d over 2 m",
+                   tot_back, worst_back, tot_big);
+            }
+
+            /* AND THE SAME THING THROUGH ai_step, which is what the game runs.
+             *
+             * The check above calls cp_spine_dist_near with a hint it keeps
+             * itself, so it holds checkpoint.c and says nothing about ai.c's
+             * bookkeeping -- and two mutants proved it: dropping either
+             * `ai->player_at = pdist` or `a->spine_at = adist` leaves the hint at
+             * -1 for ever, every query goes back to searching the whole spine, and
+             * the flicker returns with every check above still green.
+             *
+             * So this drives a real recorded lap through ai_step and watches
+             * ai_car.spine_dist, which is the CUMULATIVE quantity the placing and
+             * the rubber band actually compare. Cumulative, so it may not go
+             * backwards at all -- not even across the seam. */
+            {
+                scene_t s3;
+                col_t c3;
+                checkpoints_t k3;
+                ai_t a3;
+                ai_track t3;
+                int back3 = 0, steps = 0, q, player_back = -1;
+                float worst3 = 0.f;
+                float prev3[AI_MAX_OPPONENTS];
+
+                memset(&s3, 0, sizeof s3);
+                memset(&c3, 0, sizeof c3);
+                memset(&a3, 0, sizeof a3);
+                if (scene_load("assets/country_1.vsc", &s3)) {
+                    col_load("assets/country_1.col", &c3);
+                    cp_init(&k3, &s3, &c3);
+                    /* country_1: 13 to 16 backward jumps a lap before the fix, the
+                       worst of the ten. */
+                    if (ai_init(&a3, 4, "assets", col_rb_world(&c3), 1, 0)) {
+                        t3.ctx = &k3;
+                        t3.spine = vt_spine;
+                        t3.spine_len = k3.spine_len;
+                        for (q = 0; q < AI_MAX_OPPONENTS; q++)
+                            prev3[q] = -1e9f;
+                        /* THE PLAYER DRIVES TOO, along the first recording -- it
+                           has its own hint (ai_t.player_at) and its own line in
+                           ai_step, and parking it on the grid left that half
+                           untested: a mutant that dropped `ai->player_at = pdist`
+                           survived everything. Watched separately below. */
+                        float pprev = -1e9f;
+                        int pback = 0;
+                        const ai_car *pc = &a3.car[0];
+                        for (steps = 0; steps < 6000; steps++) {
+                            const int si = steps % (pc->n > 0 ? pc->n : 1);
+                            ai_step(&a3, &t3, pc->s[si].p[0], pc->s[si].p[1],
+                                    pc->s[si].p[2], 0, 1.f / 60.f);
+                            for (q = 0; q < a3.n; q++) {
+                                float d3 = a3.car[q].spine_dist;
+                                if (prev3[q] > -1e8f && d3 < prev3[q]) {
+                                    back3++;
+                                    if (prev3[q] - d3 > worst3)
+                                        worst3 = prev3[q] - d3;
+                                }
+                                prev3[q] = d3;
+                            }
+                            /* THE RESULT, not the hint. Watching ai_t.player_at
+                               looks right and is worthless: a mutant that never
+                               writes it leaves it at -1 for ever, so it never
+                               moves and never goes backwards. player_dist is what
+                               the placing compares, and with player_lap 0 it IS
+                               the within-lap distance -- so it wraps at the seam
+                               once a lap, which is not a jump. */
+                            if (pprev > -1e8f) {
+                                float dd = a3.player_dist - pprev;
+                                if (dd < -k3.spine_len * 0.5f)
+                                    dd += k3.spine_len;
+                                if (dd < -0.01f) {
+                                    pback++;
+                                    if (-dd > worst3) worst3 = -dd;
+                                }
+                            }
+                            pprev = a3.player_dist;
+                        }
+                        player_back = pback;
+                        ai_free(&a3);
+                    }
+                    scene_release(&s3);
+                    col_free(&c3);
+                }
+                ck(steps == 6000, "ai_step drives 100 s of a real recorded lap",
+                   "%d steps", steps);
+                ck(back3 == 0,
+                   "and the OPPONENTS' cumulative progress never goes backwards -- "
+                   "ai_car.spine_at's bookkeeping, not checkpoint.c's",
+                   "%d backward steps, worst %.1f m", back3, worst3);
+                ck(player_back == 0,
+                   "and neither does the PLAYER's -- ai_t.player_at, the other "
+                   "half, which a parked player never exercised",
+                   "%d backward steps", player_back);
+            }
+
+            /* --- THE PLACING'S TWO INPUTS, on every real track -----------------
+             *
+             * MONOTONIC *AND* MOVING. The second half is the one that matters and
+             * it caught three wrong fixes in a row: a progress measure that
+             * FREEZES is perfectly monotonic and completely useless, and every
+             * "0 backward steps" result was vacuous until forward travel was
+             * measured beside it. See traps.md.
+             *
+             * The two sides are measured differently on purpose, because
+             * projecting a car onto the checkpoint polyline is not sound on these
+             * tracks -- it jumps more than 10 m between consecutive samples 4 to
+             * 16 times a lap on every one of the ten:
+             *   - an OPPONENT's progress is its own recorded path length walked,
+             *     which is exact and monotonic by construction
+             *   - the PLAYER's is anchored on the LATCHED checkpoint index, which
+             *     cannot flicker
+             * The player is driven along the first opponent's own recording, so
+             * both cover the same ground. */
+            {
+                int t2, oback = 0, pback = 0, thin = 0, done = 0;
+                float pworst = 0.f;
+                for (t2 = 0; t2 < 10; t2++) {
+                    char pth[160];
+                    scene_t s4; col_t c4; checkpoints_t k4; ai_t a4; ai_track t4;
+                    int i2, q;
+                    float oprev[AI_MAX_OPPONENTS], pprev = -1e9f;
+                    float ofwd = 0.f, pfwd = 0.f;
+                    const ai_car *pc;
+
+                    snprintf(pth, sizeof pth, "assets/%s.vsc", AI_RACES[t2].track);
+                    memset(&s4, 0, sizeof s4);
+                    if (!scene_load(pth, &s4)) continue;
+                    snprintf(pth, sizeof pth, "assets/%s.col", AI_RACES[t2].track);
+                    memset(&c4, 0, sizeof c4);
+                    col_load(pth, &c4);
+                    cp_init(&k4, &s4, &c4);
+                    /* cp_init only enables the progression when the arrow
+                       TEXTURES loaded, and this recorder has none. The real app
+                       has them; without this cp_step does nothing and the player
+                       looks frozen for a reason that is the fixture's. */
+                    k4.enabled = 1;
+                    memset(&a4, 0, sizeof a4);
+                    if (ai_init(&a4, t2, "assets", col_rb_world(&c4), 1, 0)) {
+                        t4.ctx = &k4; t4.spine = vt_spine;
+                        t4.lap_progress = vt_progress;
+                        t4.spine_len = k4.spine_len;
+                        for (q = 0; q < AI_MAX_OPPONENTS; q++) oprev[q] = -1e9f;
+                        pc = &a4.car[0];
+                        /* 12000 ticks -- 200 s. The slowest track's player-side
+                           measure needs that to clear one full lap, and "one full
+                           lap" is the bound worth holding. */
+                        for (i2 = 0; i2 < 12000; i2++) {
+                            const int si = pc->n > 0 ? i2 % pc->n : 0;
+                            cp_step(&k4, pc->s[si].p[0], pc->s[si].p[1],
+                                    pc->s[si].p[2], 1.f / 60.f);
+                            ai_step(&a4, &t4, pc->s[si].p[0], pc->s[si].p[1],
+                                    pc->s[si].p[2], k4.lap, 1.f / 60.f);
+                            for (q = 0; q < a4.n; q++) {
+                                if (oprev[q] > -1e8f) {
+                                    float d = a4.car[q].spine_dist - oprev[q];
+                                    if (d > 0.f) { if (!q) ofwd += d; }
+                                    else if (d < -0.5f) oback++;
+                                }
+                                oprev[q] = a4.car[q].spine_dist;
+                            }
+                            if (pprev > -1e8f) {
+                                float d = a4.player_dist - pprev;
+                                if (d > 0.f) pfwd += d;
+                                else if (d < -0.5f) {
+                                    pback++;
+                                    if (-d > pworst) pworst = -d;
+                                }
+                            }
+                            pprev = a4.player_dist;
+                        }
+                        /* MOVING: both sides have to cover real ground. A frozen
+                           measure passes every other check here. */
+                        if (ofwd < k4.spine_len || pfwd < k4.spine_len)
+                            thin++;
+                        done++;
+                        ai_free(&a4);
+                    }
+                    scene_release(&s4);
+                    col_free(&c4);
+                }
+                ck(done == 10, "all ten tracks drive the placing's inputs",
+                   "%d of 10", done);
+                ck(thin == 0,
+                   "and BOTH sides cover at least a full lap -- a progress "
+                   "measure that freezes is monotonic and useless",
+                   "%d tracks under one lap", thin);
+                ck(oback == 0,
+                   "an opponent's progress never goes backwards -- it is its own "
+                   "recorded path length walked, exact by construction",
+                   "%d backward steps", oback);
+                /* The player's is BOUNDED, not zero: it is anchored on the
+                   latched checkpoint index and steps at a crossing, because the
+                   fraction between two checkpoints is a straight-line distance
+                   against an arc span. 25 m against the 426 m the projection used
+                   to jump. known-issues.md. */
+                ck(pworst < 25.f,
+                   "and the player's steps back by less than 25 m -- down from "
+                   "the projection's 426",
+                   "%d steps, worst %.1f m", pback, pworst);
+            }
+
+            /* --- THE PLACING IS THE POSITION ON THE SPINE, not the clock ------
+             *
+             * ai_player_place ranks by CUMULATIVE spine distance --
+             * `spine_len * lap + distance into the lap` -- for the player and for
+             * every opponent, which is the original's own quantity
+             * (FUN_004eb630). It reads correct and is trivially satisfied by any
+             * mutant while the INPUT is wrong, which is what shipped: cp_step
+             * counted the opening crossing of the start/finish line as a lap, so
+             * the player carried a phantom 450 to 550 m and came first from the
+             * grid to the flag on every track. It read as a placing that ignored
+             * where the cars were.
+             *
+             * So this drives the ranking directly, over a field of three at known
+             * distances, and then over the phantom itself. */
+            {
+                ai_t p;
+                memset(&p, 0, sizeof p);
+                p.n = 3;
+                p.car[0].spine_dist = 300.f;
+                p.car[1].spine_dist = 200.f;
+                p.car[2].spine_dist = 100.f;
+
+                p.player_dist = 400.f;
+                ck(ai_player_place(&p) == 1, "ahead of the field is first", "");
+                p.player_dist = 250.f;
+                ck(ai_player_place(&p) == 2,
+                   "between the first and the second is second", "");
+                p.player_dist = 150.f;
+                ck(ai_player_place(&p) == 3, "and so on down", "");
+                p.player_dist = 50.f;
+                ck(ai_player_place(&p) == 4, "last of four is fourth", "");
+                /* A TIE is not a promotion: the comparison is strict, so a car
+                   level with the player does not count as ahead of it. */
+                p.player_dist = 200.f;
+                ck(ai_player_place(&p) == 2,
+                   "and level with one of them beats it -- the compare is strict",
+                   "");
+                /* THE PHANTOM LAP, which is the bug this exists for. One spurious
+                   lap on the player is one spine length of lead, and it takes a
+                   car that is LAST to first. Written as the real expression --
+                   `spine_len * lap + into the lap` -- rather than as a number, so
+                   it says what went wrong. */
+                {
+                    const float spine_len = 500.f;
+                    const float into_lap = 50.f;      /* dead last */
+                    p.player_dist = 0.f * spine_len + into_lap;
+                    ck(ai_player_place(&p) == 4,
+                       "a player 50 m into lap 0 is LAST of four", "");
+                    p.player_dist = 1.f * spine_len + into_lap;
+                    ck(ai_player_place(&p) == 1,
+                       "and one phantom lap makes that same car FIRST -- which is "
+                       "why cp_step must not count the opening crossing", "");
+                }
+            }
+
             col_free(&rc);
             ai_free(&ai);
         }
     }
 
+}
+
+/* ============================================================= part 15 ==== */
+
+/*
+ * The transition bands: two base textures, a mask, and the lightmap over both.
+ *
+ * Written as a REAL VSC9 file rather than a hand-built scene_t, because half of
+ * what can go wrong here is in the reader: the blend's UV array sits between the
+ * vertices and the indices and only on a blend batch, exactly like the env-map
+ * normals, so a reader that takes it unconditionally -- or skips it -- shifts
+ * every batch after the first band. The fixture therefore has an ORDINARY batch
+ * after the blend ones, and its vertices are checked.
+ *
+ * Every float is distinct so a wrong attribute offset cannot pass: reading u
+ * where u2 was meant has to come back as a different number, which is the same
+ * trap w_batch_distinct exists for.
+ */
+static void w_batch_blend(FILE *f, unsigned tex, unsigned flags, unsigned lm,
+                          unsigned tex2, unsigned mask, int seed)
+{
+    int i;
+    w_u32(f, tex);
+    w_u32(f, flags);
+    w_u32(f, 0);                       /* part */
+    w_u32(f, lm);
+    w_u32(f, 0);                       /* env: VSC7 */
+    w_u32(f, 0);                       /* model: VSC8 */
+    w_u32(f, tex2);                    /* VSC9 */
+    w_u32(f, mask);
+    w_u32(f, 3);                       /* nverts */
+    w_u32(f, 3);                       /* nidx */
+    for (i = 0; i < 3; i++) {
+        float b = (float)(seed * 1000 + i * 20);
+        float v[7] = { b + 1.f, b + 2.f, b + 3.f,
+                       b + 4.f, b + 5.f,
+                       b + 6.f, b + 7.f };
+        fwrite(v, sizeof(float), 7, f);
+    }
+    if (flags & BATCH_BLEND)
+        for (i = 0; i < 3; i++) {
+            float b = (float)(seed * 1000 + i * 20);
+            float bl[4] = { b + 8.f, b + 9.f, b + 10.f, b + 11.f };
+            fwrite(bl, sizeof(float), 4, f);
+        }
+    for (i = 0; i < 3; i++)
+        w_u16(f, (unsigned)(2 - i));
+}
+
+static const char *write_blend_fixture(void)
+{
+    static const char *path = "/tmp/rccars_vis_test_blend.vsc";
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return NULL;
+    fwrite("VSC9", 1, 4, f);
+    w_u32(f, 4);                       /* textures */
+    w_u32(f, 4);                       /* batches */
+    w_u32(f, 0);                       /* parts */
+    w_u32(f, 0);                       /* markers */
+    { float r = 0.f; fwrite(&r, sizeof r, 1, f); }
+    w_u32(f, 0);                       /* models: VSC8 */
+    w_tex_rgba(f, "base_a", 64, 0, 0);
+    w_tex_rgba(f, "base_b", 64, 0, 0);
+    w_tex_rgba(f, "mask",   64, 0, 0);
+    w_tex_rgba(f, "flat_lm", 64, 0, 1);
+    /* 0: the lit band -- the case every track has */
+    w_batch_blend(f, 0, BATCH_BLEND, 3, 1, 2, 1);
+    /* 1: a band with no lightmap: pass 3 must skip it rather than multiply by
+          an unbound sampler */
+    w_batch_blend(f, 0, BATCH_BLEND, 0xFFFFFFFFu, 1, 2, 2);
+    /* 2: a band whose mask does not resolve -- the flag has to come OFF, or the
+          band blends against an undefined texture */
+    w_batch_blend(f, 0, BATCH_BLEND, 3, 1, 99, 3);
+    /* 3: an ordinary batch, LAST, so a mis-sized blend UV array shows up as
+          garbage geometry here rather than as nothing at all */
+    w_batch_blend(f, 0, 0, 3, 0xFFFFFFFFu, 0xFFFFFFFFu, 4);
+    fclose(f);
+    return path;
+}
+
+static void part15_blend(void)
+{
+    const char *path = write_blend_fixture();
+    scene_t s;
+    int i;
+
+    printf("\n-- part 15: the surface transition bands --\n");
+    if (!path) {
+        ck(0, "the blend fixture .vsc could be written", "fopen failed");
+        return;
+    }
+    scene_set_tex_quality(0);
+    if (!scene_load(path, &s)) {
+        ck(0, "the blend fixture loads", "scene_load failed");
+        return;
+    }
+
+    /* ---- what the reader made of it ------------------------------------- */
+    ck(s.n_batches == 4, "four batches", "%u", s.n_batches);
+    ck((s.batches[0].flags & BATCH_BLEND) && s.batches[0].gl_tex2
+       && s.batches[0].gl_mask && s.batches[0].buv,
+       "a band keeps its second texture, its mask and its extra UVs",
+       "flags %#x tex2 %u mask %u buv %p", s.batches[0].flags,
+       s.batches[0].gl_tex2, s.batches[0].gl_mask, (void *)s.batches[0].buv);
+    ck(!(s.batches[2].flags & BATCH_BLEND) && !s.batches[2].buv,
+       "a band whose mask does not resolve loses the flag and draws flat",
+       "flags %#x buv %p", s.batches[2].flags, (void *)s.batches[2].buv);
+    /* The stream stayed in step: the last batch's own numbers, read back. */
+    ck(s.batches[3].verts[2].x == 4041.f && s.batches[3].verts[2].lv == 4047.f,
+       "and the ordinary batch AFTER three bands still holds its own vertices",
+       "x %.1f lv %.1f", s.batches[3].verts[2].x, s.batches[3].verts[2].lv);
+    ck(s.batches[0].buv[1].u2 == 1028.f && s.batches[0].buv[1].mv == 1031.f,
+       "the blend UVs are the ones packed, in the right components",
+       "u2 %.1f mv %.1f", s.batches[0].buv[1].u2, s.batches[0].buv[1].mv);
+
+    /* ---- the solid pass must not draw them ------------------------------ *
+     * main.c filters the world pass on this same flag. If it did not, every band
+     * would get an opaque copy of its first texture underneath, which is both a
+     * wasted pass and the hard edge the blend exists to remove. */
+    gl_cap_reset();
+    scene_draw(&s, BATCH_BLEND, 0);
+    ck(glcap.n_draws == 2,
+       "the world pass draws the flat batches only -- 2 of 4",
+       "%d draws", glcap.n_draws);
+
+    /* ---- the three passes ----------------------------------------------- */
+    gl_cap_reset();
+    scene_draw_blend(&s);
+    ck(glcap.n_draws == 5,
+       "two bands draw twice each, and only the lit one takes the lightmap pass",
+       "%d draws", glcap.n_draws);
+    if (glcap.n_draws == 5) {
+        glcap_draw *p1 = &glcap.draws[0], *p2 = &glcap.draws[2],
+                   *p3 = &glcap.draws[4];
+        /* pass 1: the SECOND base texture, opaque, writing depth */
+        ck(p1->tex == s.batches[0].gl_tex2 && !p1->blend && p1->depth_mask
+           && p1->depth_func == GL_LESS && !p1->alpha_test,
+           "pass 1 lays the second texture down opaque, depth writes on",
+           "tex %u (want %u) blend %d mask %d func %#x alpha %d",
+           p1->tex, s.batches[0].gl_tex2, p1->blend, p1->depth_mask,
+           p1->depth_func, p1->alpha_test);
+        /* w_batch_blend reverses its indices, so the first vertex SUBMITTED is
+           vertex 2, whose base is 1000 + 2*20 = 1040. u2/v2 are +8/+9 of that. */
+        ck(glcap.uv[p1->first][0] == 1048.f && glcap.uv[p1->first][1] == 1049.f,
+           "and samples it through the SECOND UV set",
+           "u %.1f v %.1f", glcap.uv[p1->first][0], glcap.uv[p1->first][1]);
+        /* pass 2: the first base texture at alpha = mask */
+        ck(p2->tex == s.batches[0].gl_tex && p2->blend
+           && p2->blend_src == GL_SRC_ALPHA
+           && p2->blend_dst == GL_ONE_MINUS_SRC_ALPHA
+           && !p2->depth_mask && p2->depth_func == GL_LEQUAL,
+           "pass 2 blends the first texture over it, depth writes off, LEQUAL",
+           "tex %u blend %d %#x/%#x mask %d func %#x", p2->tex, p2->blend,
+           p2->blend_src, p2->blend_dst, p2->depth_mask, p2->depth_func);
+        ck(p2->unit1_tex == s.batches[0].gl_mask
+           && p2->unit1_env == GL_COMBINE && p2->unit1_a_src == GL_TEXTURE,
+           "with the mask on unit 1, contributing ALPHA and nothing else",
+           "unit1 tex %u (want %u) env %#x alpha src %#x", p2->unit1_tex,
+           s.batches[0].gl_mask, p2->unit1_env, p2->unit1_a_src);
+        /* By VALUE, not by address: this batch is buffer-backed, so what the
+           recorder resolved is a pointer into the stub's copy of the buffer.
+           buv[0].mu is 1010 and u2 is 1008, so an offset naming the wrong pair
+           cannot pass. */
+        ck(p2->unit1_uv && ((const float *)p2->unit1_uv)[0] == 1010.f,
+           "and unit 1 reading the MASK UVs, not the second texture's",
+           "first component %.1f",
+           p2->unit1_uv ? ((const float *)p2->unit1_uv)[0] : -1.f);
+        ck(glcap.uv[p2->first][0] == 1044.f && glcap.uv[p2->first][1] == 1045.f,
+           "unit 0 on the base UVs",
+           "u %.1f v %.1f", glcap.uv[p2->first][0], glcap.uv[p2->first][1]);
+        /* pass 3: the lightmap, multiplied into the pair */
+        ck(p3->tex == s.batches[0].gl_lm && p3->blend
+           && p3->blend_src == GL_ZERO && p3->blend_dst == GL_SRC_COLOR
+           && !p3->depth_mask,
+           "pass 3 multiplies the lightmap in -- ZERO/SRC_COLOR",
+           "tex %u (want %u) %#x/%#x mask %d", p3->tex, s.batches[0].gl_lm,
+           p3->blend_src, p3->blend_dst, p3->depth_mask);
+        ck(glcap.uv[p3->first][0] == 1046.f && glcap.uv[p3->first][1] == 1047.f,
+           "through the LIGHTMAP UVs, on unit 0",
+           "u %.1f v %.1f", glcap.uv[p3->first][0], glcap.uv[p3->first][1]);
+        ck(p3->unit1_tex == 0,
+           "and unit 1 out of the way for it", "unit1 %u", p3->unit1_tex);
+    }
+
+    /* ---- and the state it hands back ------------------------------------ *
+     * All of it is state the rest of the frame assumes: main.c keeps the alpha
+     * test enabled, everything else draws with GL_LESS and depth writes on, and
+     * a live GL_ARRAY_BUFFER turns every other module's client pointers into
+     * offsets (see SCENE VERTEX BUFFERS in scene.h). */
+    ck(!glcap_unit_enabled[1], "unit 1 is left disabled",
+       "enabled %d", glcap_unit_enabled[1]);
+    ck(st_depth_func == GL_LESS && st_depth_mask && st_alpha,
+       "the depth func, depth writes and the alpha test all go back",
+       "func %#x mask %d alpha %d", st_depth_func, st_depth_mask, st_alpha);
+    ck(glcap_buf_bound[0] == 0 && glcap_buf_bound[1] == 0,
+       "and nothing is left bound",
+       "array %u element %u", glcap_buf_bound[0], glcap_buf_bound[1]);
+
+    /* ---- and the REAL packed track ------------------------------------- *
+     * A hand-written fixture is a check on the reader against itself: I wrote
+     * both ends of it. What it cannot see is the PACKER and the loader
+     * disagreeing about the header -- pack_vsc.py omitted VSC8's model count
+     * from a VSC9 file and every field after it was read one texture-name-length
+     * out, which this fixture passed happily. So load what the build actually
+     * ships. */
+    {
+        scene_t rt;
+        if (scene_load("assets/beach_1.vsc", &rt)) {
+            unsigned int nb = 0, ok_in = 0, lit = 0;
+            for (i = 0; i < (int)rt.n_batches; i++) {
+                batch_t *b = &rt.batches[i];
+                if (!(b->flags & BATCH_BLEND))
+                    continue;
+                nb++;
+                if (b->gl_tex && b->gl_tex2 && b->gl_mask && b->buv
+                    && b->gl_tex2 != b->gl_tex)
+                    ok_in++;
+                if (b->gl_lm)
+                    lit++;
+            }
+            ck(nb == 13 && ok_in == nb && lit == nb,
+               "the shipped beach_1 carries its 13 bands, all four inputs bound",
+               "%u bands, %u complete, %u lit", nb, ok_in, lit);
+            {
+                unsigned int tris = 0;
+                for (i = 0; i < (int)rt.n_batches; i++)
+                    if (rt.batches[i].flags & BATCH_BLEND)
+                        tris += rt.batches[i].nidx / 3;
+                ck(tris == 766,
+                   "and the 766 transition faces the scene authors",
+                   "%u tris", tris);
+            }
+            gl_cap_reset();
+            scene_cull_off();
+            scene_draw_blend(&rt);
+            ck(glcap.n_draws == 39,
+               "which draw as 13 x 3 passes", "%d draws", glcap.n_draws);
+            scene_release(&rt);
+        } else {
+            printf("  note: assets/beach_1.vsc not present -- the shipped-track "
+                   "half of this part did not run\n");
+        }
+    }
+
+    /* A scene with no band draws nothing at all and touches no state. */
+    for (i = 0; i < (int)s.n_batches; i++)
+        s.batches[i].flags &= ~BATCH_BLEND;
+    gl_cap_reset();
+    scene_draw_blend(&s);
+    ck(glcap.n_draws == 0, "a scene with no band costs one loop and no draw",
+       "%d draws", glcap.n_draws);
+
+    scene_release(&s);
 }
 
 int main(void)
@@ -6023,6 +6916,7 @@ int main(void)
     part12_propdraw();
     part13_sun();
     part14_aifx();
+    part15_blend();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }
