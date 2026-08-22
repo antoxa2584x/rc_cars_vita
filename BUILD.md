@@ -9,13 +9,26 @@ there is nothing to translate.
 
     main.c            vitaGL renderer + flying camera
     CMakeLists.txt    builds eboot.bin and packages the .vpk
-    assets/*.vsc      packed scenes (produced by ../rccars_re/pack_vsc.py)
+    rccars_re/        the RE tools, a submodule -- every packer, generator and
+                      host test harness below lives in here
+    assets/*.vsc      packed scenes (produced by rccars_re/pack_vsc.py)
     assets/props.vsc  the 13 knockable props + the !HIT! banner, VSC8
-                      (../rccars_re/pack_props.py)
-    sce_sys/          bubble icon + LiveArea art (../rccars_re/gen_sce_sys.py)
+                      (rccars_re/pack_props.py)
+    sce_sys/          bubble icon + LiveArea art (rccars_re/gen_sce_sys.py)
     mintest/          20-line vitaGL app, used to isolate runtime failures
 
 ## Toolchain setup (done on this machine)
+
+The RE tools are a submodule, so the clone has to bring them along:
+
+    git clone --recurse-submodules git@github.com:antoxa2584x/rc_cars_vita.git
+
+    # already cloned without them, or the pointer moved:
+    git submodule update --init rccars_re
+
+Every `rccars_re/...` path below is that submodule, relative to this repository
+root, and every command in this file is run from the root. `build.sh --re DIR`
+(or `RCCARS_RE`) still points at a checkout somewhere else.
 
     git clone https://github.com/vitasdk/vdpm && cd vdpm
     export VITASDK=/usr/local/vitasdk
@@ -33,8 +46,8 @@ Two packaging gotchas worth remembering:
 ## Build
 
     export VITASDK=/usr/local/vitasdk PATH=$VITASDK/bin:$PATH
-    python3 ../rccars_re/pack_vsc.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.vsc
-    python3 ../rccars_re/pack_props.py assets/props.vsc \
+    python3 rccars_re/pack_vsc.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.vsc
+    python3 rccars_re/pack_props.py assets/props.vsc \
         --extra-tex msg_hits          # the 13 knockable props, ONE file for all
                                       # ten tracks -- plus the game's own !HIT!
                                       # banner, which belongs in this file
@@ -53,7 +66,7 @@ The app is **`RC Cars`** (`VITA_APP_NAME`, which becomes both `TITLE` and
 unchanged — it is the install path, and renaming it orphans anything already on
 a device rather than upgrading it.
 
-The art is the game's own, converted by `../rccars_re/gen_sce_sys.py`:
+The art is the game's own, converted by `rccars_re/gen_sce_sys.py`:
 
 | slot | size | format | source |
 |------|------|--------|--------|
@@ -81,8 +94,8 @@ visible. The files also come out about 3x smaller.
 
 Two guards, because a stale build directory would look fixed:
 
-    python3 ../rccars_re/gen_sce_sys.py                    # regenerate, verify on disk
-    python3 ../rccars_re/gen_sce_sys.py --check-vpk build/rccars_viewer.vpk
+    python3 rccars_re/gen_sce_sys.py                    # regenerate, verify on disk
+    python3 rccars_re/gen_sce_sys.py --check-vpk build/rccars_viewer.vpk
 
 `verify()` re-reads each IHDR after writing; `check_vpk` asserts the same of the
 art *inside* the packaged vpk, which is the file that actually gets promoted.
@@ -258,8 +271,8 @@ hardware-correct order. On a real Vita, leave it alone.
 Migrating assets packed the old way does **not** need a repack: the change is a
 permutation of bytes already in the file.
 
-    python3 ../rccars_re/fix565.py --check assets/*.vsc     # report, change nothing
-    python3 ../rccars_re/fix565.py assets/*.vsc             # rewrite in place
+    python3 rccars_re/fix565.py --check assets/*.vsc     # report, change nothing
+    python3 rccars_re/fix565.py assets/*.vsc             # rewrite in place
 
 It decides which order a file is in by decoding the **source .csi** and comparing,
 not by a statistic over the pixels -- a warmth heuristic got `car1.vsc` wrong,
@@ -282,8 +295,8 @@ Scene file format bumped to **VSC2** for the extra `mip count` field.
 
 The viewer now loads a track **and** a car, with a chase camera.
 
-    python3 ../rccars_re/pack_vsc.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.vsc
-    python3 ../rccars_re/pack_vsc.py "<...>/RCCarsDB/Car.sb" assets/car1.vsc --subtree Car1 --rig
+    python3 rccars_re/pack_vsc.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.vsc
+    python3 rccars_re/pack_vsc.py "<...>/RCCarsDB/Car.sb" assets/car1.vsc --subtree Car1 --rig
 
 `pack_vsc.py --subtree NAME` pulls one model out of a shared database.
 `Car.sb` holds three cars (folders `Overkill`, `Buggy`, `Hummer`), each with a
@@ -297,7 +310,7 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
 ## Full asset build -- ten tracks, three cars, the menu
 
     DB="/mnt/c/Games/RC Cars/RCCarsDB"
-    RE=../rccars_re
+    RE=rccars_re
 
     # every track: geometry, then the collision grid
     for t in beach_1 beach_2 beach_3 beach_4 \
@@ -404,12 +417,12 @@ leaves the previous binary sitting there to answer for it:
                             # that fixture drives a REAL recorded lap on a REAL
                             # .col grid and reads the particles back through
                             # testgl, the same recorder the rest of the file uses.
-    gcc -I. -Itestgl -O2 ../rccars_re/carparts_test.c carparts.c scene.c \
+    gcc -I. -Itestgl -O2 rccars_re/carparts_test.c carparts.c scene.c \
         carani.c rb.c contact.c collide.c rlog.c -o carparts_test -lm  # upgrade parts
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
+        rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c rlog.c -lm -o proptest                # the knockable props
-    gcc -I. -Itestgl -O2 ../rccars_re/chartest.c char.c scene.c col.c \
+    gcc -I. -Itestgl -O2 rccars_re/chartest.c char.c scene.c col.c \
         carani.c rb.c contact.c collide.c rbcar.c rlog.c -lm -o chartest
                             # the tracks' people, animals and road cars. scene.c
                             # is on this line for scene_read_texture, which the
@@ -422,11 +435,11 @@ leaves the previous binary sitting there to answer for it:
                             # character is placed entirely through glTranslatef /
                             # glRotatef / glScalef, and a stub that discarded
                             # them could see the vertices and not where they went.
-    gcc -I. -O2 ../rccars_re/menu_test.c menu.c contact.c rb.c collide.c \
+    gcc -I. -O2 rccars_re/menu_test.c menu.c contact.c rb.c collide.c \
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
-    gcc -I. -Itestgl -O2 ../rccars_re/ui_test.c ui.c hud.c countdown.c \
+    gcc -I. -Itestgl -O2 rccars_re/ui_test.c ui.c hud.c countdown.c \
         race_ui.c -lm -o ui_test
                             # menu drawing, the !HIT! banner, the 3-2-1-GO race
                             # start, and the IN-RACE HUD -- the minimap, the place
@@ -437,7 +450,7 @@ leaves the previous binary sitting there to answer for it:
                             # at the recovered size, in the recovered band, at the
                             # recovered angle, over the recovered sweep.
                             # 250 checks; 25 of 25 mutants die.
-    gcc -I. -Itestgl -O2 ../rccars_re/hudshot.c ui.c race_ui.c -lm -o hudshot
+    gcc -I. -Itestgl -O2 rccars_re/hudshot.c ui.c race_ui.c -lm -o hudshot
                             # NOT a test: it PRINTS the HUD's triangles, and
                             # rccars_re/hudshot.py composites them over the game's
                             # real .csi art into a 960x544 PNG. ui_test asserts
@@ -449,7 +462,7 @@ leaves the previous binary sitting there to answer for it:
                             # of the exe, so an arrow landing ON the painted
                             # ribbon is two independent sources agreeing.
                             #
-                            #   ./hudshot 4 | python3 ../rccars_re/hudshot.py \
+                            #   ./hudshot 4 | python3 rccars_re/hudshot.py \
                             #       /tmp/hud.png --track 4
                             #
                             # AND read the picture as a pointer, not a verdict:
@@ -457,10 +470,10 @@ leaves the previous binary sitting there to answer for it:
                             # by holding the .vsc's own cp_N markers against the
                             # ribbon as painted in trackmap_<n>. Needs no build:
                             #
-                            #   python3 ../rccars_re/mapcheck.py
-    gcc -I. -Itestgl -O2 ../rccars_re/cpground.c scene.c checkpoint.c col.c \
+                            #   python3 rccars_re/mapcheck.py
+    gcc -I. -Itestgl -O2 rccars_re/cpground.c scene.c checkpoint.c col.c \
         carani.c rb.c contact.c collide.c rbcar.c rlog.c \
-        ../rccars_re/glstub_host.c -lm -o cpground
+        rccars_re/glstub_host.c -lm -o cpground
                             # a probe: what the checkpoint GROUND probe finds at
                             # each candidate ceiling. col_ground_at returns the
                             # HIGHEST surface under its ceiling, so on a track
@@ -468,54 +481,54 @@ leaves the previous binary sitting there to answer for it:
                             # nine of the fifty checkpoints used to resolve to a
                             # roof, putting the respawn and the marker on top of
                             # it. This is what sized CP_GROUND_CEIL.
-    gcc -I. -Itestgl -O2 ../rccars_re/placechk.c scene.c checkpoint.c col.c \
+    gcc -I. -Itestgl -O2 rccars_re/placechk.c scene.c checkpoint.c col.c \
         ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c \
-        ../rccars_re/glstub_host.c -lm -o placechk
+        rccars_re/glstub_host.c -lm -o placechk
                             # also a probe: the PLACING's two inputs on every real
                             # track -- monotonic AND moving. The second half is
                             # what caught three wrong fixes, since a frozen
                             # progress measure never goes backwards.
-    gcc -I. -O2 ../rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
+    gcc -I. -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off ../rccars_re/curb.c \
+    gcc -I. -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \
         col.c rb.c rbcar.c contact.c collide.c carani.c \
         -lm -o curb                    # driving AT a low obstacle / a kerb
-    gcc -I../rccars_vita -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/wetcheck.c col.c rb.c contact.c collide.c rbcar.c \
+    gcc -I. -O2 -fno-fast-math -ffp-contract=off \
+        rccars_re/wetcheck.c col.c rb.c contact.c collide.c rbcar.c \
         -lm -o wetcheck                         # water, against the real grids
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/meshalign.c rb.c rbcar.c contact.c collide.c carani.c \
+        rccars_re/meshalign.c rb.c rbcar.c contact.c collide.c carani.c \
         -lm -o meshalign                        # drawn car vs physics car
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/rockroll.c rb.c rbcar.c contact.c collide.c \
+        rccars_re/rockroll.c rb.c rbcar.c contact.c collide.c \
         -lm -o rockroll                         # heave/pitch/roll, and inverted
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/allstarts.c col.c rb.c rbcar.c contact.c collide.c \
+        rccars_re/allstarts.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o allstarts        # all ten REAL starts on the REAL .col
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/track.c col.c rb.c rbcar.c contact.c collide.c carani.c \
+        rccars_re/track.c col.c rb.c rbcar.c contact.c collide.c carani.c \
         cam.c -lm -o track                 # one hand-picked spawn, with tracing
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/ceiling.c col.c rb.c rbcar.c contact.c collide.c \
+        rccars_re/ceiling.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o ceiling         # low overhead space: driving under roofs
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off -DCOL_PROFILE \
-        ../rccars_re/colprof.c col.c rb.c rbcar.c contact.c collide.c \
+        rccars_re/colprof.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c prop.c rlog.c -lm -o colprof   # where the SIM time goes
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/flipped.c scene.c carani.c col.c rb.c rbcar.c contact.c \
-        collide.c rlog.c ../rccars_re/glstub_host.c \
+        rccars_re/flipped.c scene.c carani.c col.c rb.c rbcar.c contact.c \
+        collide.c rlog.c rccars_re/glstub_host.c \
         -lm -o flipped                  # a car on its ROOF, on the real grids
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/aitest.c ai.c col.c rb.c rbcar.c contact.c collide.c \
-        carani.c scene.c rlog.c ../rccars_re/glstub_host.c \
+        rccars_re/aitest.c ai.c col.c rb.c rbcar.c contact.c collide.c \
+        carani.c scene.c rlog.c rccars_re/glstub_host.c \
         -lm -o aitest        # the AI opponents, on the real .aip and .col files
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
-        contact.c collide.c rlog.c ../rccars_re/glstub_host.c \
+        rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
+        contact.c collide.c rlog.c rccars_re/glstub_host.c \
         -lm -o antheight             # where the proxy is vs where the car is
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
-        ../rccars_re/chrfloat.c char.c scene.c col.c carani.c rb.c contact.c \
-        collide.c rbcar.c rlog.c ../rccars_re/glstub_host.c \
+        rccars_re/chrfloat.c char.c scene.c col.c carani.c rb.c contact.c \
+        collide.c rbcar.c rlog.c rccars_re/glstub_host.c \
         -lm -o chrfloat        # where the characters and their paths actually
                                # ARE, against the real grids. A probe, not a
                                # test -- it prints, it does not assert, and
@@ -524,7 +537,7 @@ leaves the previous binary sitting there to answer for it:
                                # glScalef for it, so nothing here may check a
                                # draw.
 
-`flipped` and `antheight` link `../rccars_re/glstub_host.c`, a no-op GL, because
+`flipped` and `antheight` link `rccars_re/glstub_host.c`, a no-op GL, because
 they want `scene.c` for the geometry it loads and have no renderer. That is NOT
 `testgl/`, which is vis_test's *recording* stub -- nothing in either harness may
 assert on a drawing call, because a no-op stub cannot fail one. `antheight`'s own
@@ -621,7 +634,7 @@ one for car 1, two for the others. The second clause is the one that catches a c
 packed with *another* car's skins, which loads, looks right at skin 1 and repaints
 into a different car's colours at skin 2.
 
-    python3 ../rccars_re/vsc_check.py assets/car1.vsc assets/car2.vsc \
+    python3 rccars_re/vsc_check.py assets/car1.vsc assets/car2.vsc \
         assets/car3.vsc assets/beach_1.vsc
 
 `meshalign` is the one to run after any change to `pack_vsc.py`, `rb_data.h` or
@@ -693,8 +706,8 @@ engine's own layer-type map (`FUN_0046fc20`) and documented in full in
 `docs/render-world.md`, "The surface transition is a SECOND BASE TEXTURE and a
 MASK".
 
-    python3 ../rccars_re/pack_vsc.py <...>/beach_1.sb assets/beach_1.vsc --markers ...
-    python3 ../rccars_re/pack_vsc.py ... --no-blend      # the mutant, for vsc_check
+    python3 rccars_re/pack_vsc.py <...>/beach_1.sb assets/beach_1.vsc --markers ...
+    python3 rccars_re/pack_vsc.py ... --no-blend      # the mutant, for vsc_check
 
 Format bumped to **VSC9**: two more texture indices per batch and, on a blend
 batch only, a four-float side array per vertex (the second base texture's UVs and
@@ -727,7 +740,7 @@ Screenshots: `vita_alpha.png` (chase camera, current), `vita_drive.png`
 
 ## Terrain collision
 
-    python3 ../rccars_re/pack_col.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.col
+    python3 rccars_re/pack_col.py "<...>/RCCarsDB/beach_1.sb" assets/beach_1.col
 
 The engine has its own collision data in the `MOD_COLLISION` node -- 4.5 MB, a
 bbox pair, a 128,289-entry index array and a 2.6 MB byte blob (probably a BSP or
@@ -830,7 +843,7 @@ body angles are visible immediately.
 ## Physics build
 
 `physics.c` / `physics.h` / `physics_data.h`, generated by
-`../rccars_re/gen_physics_header.py`.
+`rccars_re/gen_physics_header.py`.
 
 **The constants and curves are the game's own.** Per-car acceleration curves,
 top speeds, grip, drag, steering lock, suspension rates -- all recovered from

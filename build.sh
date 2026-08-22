@@ -6,6 +6,11 @@
 #
 #     ./build.sh
 #
+# The conversion tools are the rccars_re submodule, checked out in rccars_re/.
+# A clone without --recurse-submodules leaves it empty; fill it in with
+#
+#     git submodule update --init rccars_re
+#
 # game_data/ holds eight things, copied from an installed copy of RC Cars:
 #
 #     game_data/RCCars.pack     the texture and sound archive
@@ -53,7 +58,8 @@ set -euo pipefail
 VITA="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GAME="${RCCARS_GAME:-$VITA/game_data}"
-RE="${RCCARS_RE:-$VITA/../rccars_re}"
+RE_DEFAULT="$VITA/rccars_re"               # the submodule, not a sibling clone
+RE="${RCCARS_RE:-$RE_DEFAULT}"
 WORK="${RCCARS_WORK:-$VITA/.cache}"       # holds extracted/ and lightmaps/
 VITASDK="${VITASDK:-/usr/local/vitasdk}"
 
@@ -110,7 +116,7 @@ track_index() {                   # track_index <name> -> 0-based, or 255
 }
 
 usage() {
-    sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    sed -n '3,31p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     cat <<EOF
 
 Options:
@@ -190,6 +196,12 @@ while [ $# -gt 0 ]; do
 done
 
 GAME="${GAME%/}"
+# An unpopulated submodule is an empty directory, not a missing one, so it gets
+# past the cd below and dies on pack_vsc.py in preflight with nothing useful to
+# say. Name the one command that fixes it instead.
+if [ "$RE" = "$RE_DEFAULT" ] && [ ! -f "$RE/pack_vsc.py" ]; then
+    die "rccars_re/ is empty — run: git submodule update --init rccars_re"
+fi
 RE="$(cd "$RE" 2>/dev/null && pwd)" || die "--re: no such directory"
 mkdir -p "$WORK"; WORK="$(cd "$WORK" && pwd)"
 

@@ -7,7 +7,7 @@ game_data/
 .cache/
 
 # Game-derived content. Everything here is generated from a personal copy of
-# RC Cars by the scripts in ../rccars_re (pack_vsc.py, pack_props.py,
+# RC Cars by the scripts in rccars_re/ (pack_vsc.py, pack_props.py,
 # gen_sce_sys.py) and must not be redistributed. See BUILD.md.
 assets/
 sce_sys/icon0.png

@@ -29,6 +29,14 @@ acceleration curves, grip, drag, steering lock, suspension rates.
 
 ## ⚡ Quick start
 
+The conversion tools are a submodule, so clone with them:
+
+```bash
+git clone --recurse-submodules https://github.com/antoxa2584x/rc_cars_vita
+```
+
+If you already cloned without them, `git submodule update --init rccars_re`.
+
 You need your own copy of RC Cars. Put its files in `game_data/` and run the
 build script:
 
@@ -95,8 +103,9 @@ its input, so the second run goes straight to compiling.
 --game DIR        use this instead of game_data/ --clean           wipe build/ first
 ```
 
-The conversion tools live in `rccars_re/`, alongside this repository; point
-`--re` at them if they are somewhere else.
+The conversion tools are the [`rccars_re`](https://github.com/antoxa2584x/rccars_re)
+submodule, checked out in `rccars_re/`; point `--re` at another copy if you keep
+one somewhere else.
 
 </details>
 
@@ -262,6 +271,7 @@ mix.c audio.c sfx.c   mixer thread, sceAudioOut, positional sound
 menu.c ui.c font.h    in-game menu
 rlog.c                the memory-card log, off the game thread
 *_data.h tracks.h     generated tables — regenerate, do not hand-edit
+rccars_re/            submodule: the packers, generators and host harnesses
 third_party/          minimp3, for the streamed music
 mintest/              20-line vitaGL app, to isolate runtime failures
 BUILD.md              the working notes: every fix, trap and measurement
