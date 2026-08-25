@@ -1074,21 +1074,27 @@ static int bone_world(chr_t *c, unsigned int idx, const char *name, float o[3])
  * The engine's query is worldSphereQuery with kind 4 -- a sphere -- and the
  * port's equivalent is col_sphere against the same shipped grid, so this is the
  * one clause here that changes with the collision data rather than with a
- * constant. The radius is the engine's own 0x3fc00000, written out here beside
- * the site because it is pushed as part of the query struct rather than loaded
- * from .data and read_react cannot reach it.
+ * constant. The radius is the engine's own 0x3fc00000, in char.h as
+ * CHR_LIFT_RADIUS -- an immediate at the site rather than a .data read, which is
+ * why read_react cannot reach it.
  */
-#define CHR_LIFT_RADIUS 1.5f        /* 0x3fc00000, built at 0x510f0b */
-
 static int can_lift(const chr_t *c, const chr_inst_t *in)
 {
     float p[3];
+    rb_world_hit h[1];
+    int nh = 0;
     if (!c->col)
         return 1;                   /* no grid loaded: do not veto the throw */
     p[0] = in->x;
     p[1] = in->y + CHR_REACT_LIFT_UP;
     p[2] = in->z;
-    return !col_sphere(c->col, p, CHR_LIFT_RADIUS, NULL, 0, NULL);
+    /* One hit is all the question needs, but it has to be ONE and not NONE:
+       col_sphere's max_hits is the size of the narrow phase's output, and at 0
+       it returns "clear" without looking, which read as "there is always
+       headroom" and never vetoed a throw.  Passing NULL for n_hits on top of
+       that stored through it and took the process down (psp2core of
+       2026-08-25, char_step -> col_sphere+0xa). */
+    return !col_sphere(c->col, p, CHR_LIFT_RADIUS, h, 1, &nh);
 }
 
 /*

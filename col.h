@@ -123,7 +123,12 @@ int  col_ground_at(const col_t *c, float x, float z, float ceil_y,
                    float *out_y, float *nx_, float *ny_, float *nz_);
 
 /* Closest point on the collision mesh to `centre`, if within `radius`.
-   Fills up to max_hits results, deepest first. Backs rb_world.sphere. */
+   Fills up to max_hits results, deepest first. Backs rb_world.sphere.
+
+   `hits` must hold max_hits records and max_hits must be >= 1 EVEN FOR A
+   BOOLEAN "is anything in there" QUERY: with max_hits <= 0 or hits == NULL the
+   narrow phase has nowhere to write and the call returns 0, which reads as
+   "clear" rather than "not asked". `n_hits` may be NULL. */
 int  col_sphere(const col_t *c, const float centre[3], float radius,
                 rb_world_hit *hits, int max_hits, int *n_hits);
 
