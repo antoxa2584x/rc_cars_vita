@@ -39,6 +39,7 @@ progchk
 proptest
 rb_test
 rockroll
+settings_test
 ui_test
 vis_test
 wading
@@ -46,3 +47,8 @@ wetcheck
 
 # Logs from the Vita and from the build
 *.log
+
+# What settings_test writes and removes again; left here for a run it killed
+settings_test.tmp
+settings_test.tmp.new
+rccars_settings.txt

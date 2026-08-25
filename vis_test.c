@@ -414,6 +414,16 @@ static void cap_begin(GLenum mode, int n)
     d->blend_dst = st_blend_dst;
     d->env_mode = st_env_mode;
     d->depth_func = st_depth_func;
+    d->vptr = cap_pos;
+    /* The extent GXM would read. Filled by the draw itself, from the HIGHEST
+       vertex actually referenced -- for an indexed draw the index count is not
+       the span (a 1,681-vertex sea batch draws 9,600 indices, so stride times
+       count over-states it 5.7x). An over-statement is safe for a disjointness
+       test and only ever produces a false FAILURE, which is its own bug: a
+       harness whose measurement is wrong in the strict direction goes red on
+       correct code, and this file has lost half an hour to that once already
+       (part 11's quad-corner average). */
+    d->vbytes = 0;
     d->unit1_tex = glcap_unit_enabled[1] ? glcap_unit_tex[1] : 0;
     d->unit1_env = st_env_mode1;
     d->unit1_a_src = st_a_src1;
@@ -424,11 +434,20 @@ static void cap_begin(GLenum mode, int n)
     pending_matrix = 0;
 }
 
+/* The byte span of the vertices this draw referenced, for glcap_draw.vbytes. */
+static void cap_extent(int hi)
+{
+    int stride = cap_pos_stride > 0 ? cap_pos_stride : (int)sizeof(vtx_t);
+    if (glcap.n_draws > 0 && glcap.n_draws <= GLCAP_MAX_DRAWS)
+        glcap.draws[glcap.n_draws - 1].vbytes = (size_t)stride * (size_t)(hi + 1);
+}
+
 void glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
     cap_begin(mode, count);
     for (GLsizei i = 0; i < count; i++)
         cap_vertex(first + i);
+    cap_extent(count > 0 ? first + count - 1 : -1);
 }
 
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx)
@@ -438,10 +457,14 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx)
        wrong way round is a bug the recorder would otherwise hide. */
     const unsigned short *ix =
         (const unsigned short *)buf_resolve(GL_ELEMENT_ARRAY_BUFFER, idx);
+    int hi = -1;
     (void)type;
     cap_begin(mode, count);
-    for (GLsizei i = 0; i < count; i++)
+    for (GLsizei i = 0; i < count; i++) {
         cap_vertex(ix[i]);
+        if ((int)ix[i] > hi) hi = (int)ix[i];
+    }
+    cap_extent(hi);
 }
 
 void glEnable(GLenum c)
@@ -1807,7 +1830,13 @@ static void part2_checkpoints(void)
                 }
             }
 
-            free(tc.tris); free(tc.start); free(tc.idx);
+            /* col_free, not a hand-picked three of its nine arrays: this
+               freed `tris`, `start` and `idx` and left `surf`, `water_y`,
+               `eng_surf`, `light` and the two vertical-bound arrays behind,
+               so it had already rotted twice -- once when COL4 appended
+               eng_surf and again when COL5 appended light. 13.2 MB a run,
+               which is enough to make LeakSanitizer useless on this file. */
+            col_free(&tc);
             scene_release(&ts);
         }
 
@@ -1925,7 +1954,13 @@ static void part2_checkpoints(void)
             base.enabled = (base.n > 0);
             memset(&ai, 0, sizeof(ai));
             if (!ai_init(&ai, t, "assets", NULL, 1, 0) || base.n <= 0) {
-                free(tc.tris); free(tc.start); free(tc.idx);
+                /* col_free, not a hand-picked three of its nine arrays: this
+               freed `tris`, `start` and `idx` and left `surf`, `water_y`,
+               `eng_surf`, `light` and the two vertical-bound arrays behind,
+               so it had already rotted twice -- once when COL4 appended
+               eng_surf and again when COL5 appended light. 13.2 MB a run,
+               which is enough to make LeakSanitizer useless on this file. */
+            col_free(&tc);
                 scene_release(&ts);
                 continue;
             }
@@ -1970,7 +2005,13 @@ static void part2_checkpoints(void)
                 runs++;
             }
             ai_free(&ai);
-            free(tc.tris); free(tc.start); free(tc.idx);
+            /* col_free, not a hand-picked three of its nine arrays: this
+               freed `tris`, `start` and `idx` and left `surf`, `water_y`,
+               `eng_surf`, `light` and the two vertical-bound arrays behind,
+               so it had already rotted twice -- once when COL4 appended
+               eng_surf and again when COL5 appended light. 13.2 MB a run,
+               which is enough to make LeakSanitizer useless on this file. */
+            col_free(&tc);
             scene_release(&ts);
         }
 
@@ -7301,6 +7342,217 @@ static void part16b_col5(void)
     glcap_texels_free();
 }
 
+
+
+/* Judge a sequence of per-frame draw pointers.
+ *
+ * BOUND TO FIXED NUMBERS, NOT TO THE RING CONSTANT. The first version of this
+ * looped `for (i = 0; i < RINGS; i++) for (j = i+1; j < RINGS; j++)` and asked
+ * whether frame RINGS came back to frame 0 -- which is vacuous at RINGS == 1
+ * (both loops are empty and seen[1] IS seen[0]), so a mutant that turned the
+ * whole ring off SURVIVED. That is this project's oldest trap, a check comparing
+ * against the constant it guards, and it does not stop being that because the
+ * constant is a count rather than a threshold.
+ *
+ * What has to be true of a ring, in numbers nothing in the code can move:
+ *   - two CONSECUTIVE frames never share memory  (a single buffer fails)
+ *   - over N_PTR_FRAMES frames only a few distinct buffers appear  (a fresh
+ *     allocation every frame fails, and that is the other way to pass "it
+ *     changed")
+ *   - any two distinct buffers are disjoint  (slices advanced by less than a
+ *     slice would "rotate" and still be read over) */
+#define N_PTR_FRAMES 8
+#define MAX_DISTINCT_BUFS 4
+static void ck_ring(const char *who, const void *const *seen, const size_t *ext,
+                    int n)
+{
+    int i, j, distinct = 0, disjoint = 1, consec = 1;
+    const void *uniq[N_PTR_FRAMES];
+    size_t uext[N_PTR_FRAMES];
+
+    for (i = 0; i < n; i++) {
+        int found = 0;
+        for (j = 0; j < distinct; j++)
+            if (uniq[j] == seen[i]) found = 1;
+        if (!found) { uniq[distinct] = seen[i]; uext[distinct] = ext[i]; distinct++; }
+    }
+    for (i = 1; i < n; i++)
+        if (seen[i] == seen[i - 1]) consec = 0;
+    for (i = 0; i < distinct; i++)
+        for (j = i + 1; j < distinct; j++) {
+            const char *a = (const char *)uniq[i];
+            const char *b = (const char *)uniq[j];
+            if (a < b + uext[j] && b < a + uext[i]) disjoint = 0;
+        }
+    printf("  [%s] %d frames, %d distinct buffers, %zu B apiece\n",
+           who, n, distinct, ext[0]);
+    ck(consec, "no two CONSECUTIVE frames share the buffer", "%s, %d frames",
+       who, n);
+    ck(distinct >= 2, "so more than one buffer is in play", "%s, %d distinct",
+       who, distinct);
+    ck(distinct <= MAX_DISTINCT_BUFS,
+       "and it is a ring, not a new buffer every frame", "%s, %d over %d frames",
+       who, distinct, n);
+    ck(disjoint, "and the buffers do not overlap each other", "%s", who);
+}
+
+/* ==========================================================================
+ * part 17 -- THE CLIENT POINTER, not the bytes
+ *
+ * Past 32 KB in one draw the custom vitaGL (SAFER_DRAW_SPEEDHACK) stops copying
+ * a draw's vertices into its own mapped temp and hands GXM the app's pointer,
+ * which it reads AT FLUSH -- after the swap. So a buffer refilled the next frame
+ * is read while the GPU is still drawing the last one. That is what drew the big
+ * characters as exploding spikes until char.c got its skin ring, and every check
+ * in this file was blind to it, because a recorder that snapshots each draw's
+ * bytes sees a rule that lives in the implementation as a no-op.
+ *
+ * Measured, so this part exercises the cases that actually cross: fx peaks at
+ * 242 live particles / 40,656 B on beach_1 with the app's own four emitters, and
+ * three of the ten tracks carry a sea batch over the line (beach_1 196,196 B,
+ * country_3 51,492, beach_4 47,012). trace.c's worst is 16.1 KB and envmap.c's
+ * 12.9 KB, both under, which is why neither has a ring and why this part does
+ * not ask for one.
+ *
+ * The fixture's sea is deliberately 41 x 41 = 1,681 vertices, 47,068 B -- the
+ * size of country_3's and beach_4's real ones. part 3's grid is 441 vertices and
+ * therefore UNDER the line, so it cannot see any of this: a fixture smaller than
+ * the thing it stands in for tests the default rather than the mechanism.
+ * ========================================================================== */
+static void part17_clientptr(void)
+{
+    printf("\n-- part 17: the draw pointer, past the 32 KB copy line --\n");
+
+    /* --- the sea surface ------------------------------------------------- */
+    {
+        static const char *tex[] = {"water_wave", "water_wave_alpha"};
+        scene_t *s = make_scene(tex, 2);
+        water_t w;
+        col_t bed;
+        batch_t *big, *small_b;
+        float eye[3] = {0.f, 5.f, -20.f};
+        const void *seen[N_PTR_FRAMES];
+        size_t ext[N_PTR_FRAMES];
+        int f, nf = 0, small_fixed = 1;
+        const void *small_ptr = NULL;
+
+        add_grid2(s, BATCH_WATER, -20.f, 0.f, 40.f, 40.f, 40, 0.f);  /* OVER */
+        add_grid2(s, BATCH_WATER, 60.f, 0.f, 10.f, 10.f, 6, 0.f);    /* under */
+        big = &s->batches[0];
+        small_b = &s->batches[1];
+        big->gl_tex = s->tex_ids[0];
+        small_b->gl_tex = s->tex_ids[1];
+        make_shelf(&bed, 90.f, 30, 3.75f, -3.75f);
+        water_init(&w, s, &bed, 0);
+
+        ck((size_t)big->nverts * sizeof(vtx_t) > WATER_CLIENT_PTR_LIMIT
+           && (size_t)small_b->nverts * sizeof(vtx_t) <= WATER_CLIENT_PTR_LIMIT,
+           "the fixture straddles the line", "%zu B and %zu B against %u",
+           (size_t)big->nverts * sizeof(vtx_t),
+           (size_t)small_b->nverts * sizeof(vtx_t),
+           (unsigned)WATER_CLIENT_PTR_LIMIT);
+
+        for (f = 0; f < N_PTR_FRAMES; f++) {
+            int d;
+            gl_cap_reset();
+            water_step(&w, 1.f / 60.f);
+            water_draw(&w, eye);
+            for (d = 0; d < glcap.n_draws; d++) {
+                if (glcap.draws[d].tex == big->gl_tex && nf < N_PTR_FRAMES) {
+                    seen[nf] = glcap.draws[d].vptr;
+                    ext[nf] = glcap.draws[d].vbytes;
+                    nf++;
+                }
+                if (glcap.draws[d].tex == small_b->gl_tex) {
+                    if (!small_ptr) small_ptr = glcap.draws[d].vptr;
+                    else if (small_ptr != glcap.draws[d].vptr) small_fixed = 0;
+                    if (glcap.draws[d].vptr != (const void *)small_b->verts)
+                        small_fixed = 0;
+                }
+            }
+        }
+        ck(nf == N_PTR_FRAMES, "the big sea batch drew every frame",
+           "%d of %d", nf, N_PTR_FRAMES);
+        if (nf == N_PTR_FRAMES)
+            ck_ring("sea", seen, ext, nf);
+        /* The batch UNDER the line keeps the old behaviour exactly: no ring, no
+           copy, drawn straight out of its own array. Anything else would be a
+           cost paid where the library is still copying for us. */
+        ck(small_fixed, "a batch under the line still draws from b->verts",
+           "%p", (void *)small_ptr);
+
+        /* And the ring must not change WHAT is drawn: the slice has to carry the
+           animated vertices, not the rest pose. */
+        {
+            gl_cap_reset();
+            water_step(&w, 1.f / 60.f);
+            water_draw(&w, eye);
+            {
+                int d, same = -1;
+                for (d = 0; d < glcap.n_draws; d++)
+                    if (glcap.draws[d].tex == big->gl_tex) {
+                        const vtx_t *drawn = (const vtx_t *)glcap.draws[d].vptr;
+                        unsigned int k; same = 1;
+                        for (k = 0; k < big->nverts; k++)
+                            if (drawn[k].y != big->verts[k].y
+                                || drawn[k].u != big->verts[k].u) same = 0;
+                        break;
+                    }
+                ck(same == 1, "the slice carries the ANIMATED vertices",
+                   "%u vertices compared", big->nverts);
+            }
+        }
+        water_free(&w);
+        col_free(&bed);
+    }
+
+    /* --- the particle pool ------------------------------------------------ */
+    {
+        static const char *tex[] = {"dust"};
+        scene_t *s = make_scene(tex, 1);
+        fx_t fx;
+        const float right[3] = {1.f, 0.f, 0.f}, up[3] = {0.f, 1.f, 0.f};
+        const float eye[3] = {0.f, 0.f, -30.f};
+        const void *seen[N_PTR_FRAMES];
+        size_t ext[N_PTR_FRAMES];
+        int f, nf = 0, i;
+
+        fx_init(&fx, s);
+        /* Enough live particles to cross the line: over 195 of them, which is
+           what beach_1 reaches with the player and three opponents. Poked in
+           directly -- the emitter's own rate is part 6's subject, not this. */
+        for (i = 0; i < 400; i++) {
+            fx.p[i].used = 1;
+            fx.p[i].life = 10.f;
+            fx.p[i].age = 0.f;
+            fx.p[i].sx = fx.p[i].sy = 0.2f;
+            fx.p[i].grow = 1.f;
+            fx.p[i].a = 255;
+            fx.p[i].x = (float)(i % 20);
+            fx.p[i].z = (float)(i / 20);
+        }
+        fx.n_live = 400;
+        ck(400 * 6 * (int)sizeof(vtx_t) > 32768,
+           "the fixture's plume is over the line", "%d B",
+           400 * 6 * (int)sizeof(vtx_t));
+
+        for (f = 0; f < N_PTR_FRAMES; f++) {
+            gl_cap_reset();
+            fx_draw(&fx, eye, right, up);
+            if (glcap.n_draws > 0 && nf < N_PTR_FRAMES) {
+                seen[nf] = glcap.draws[0].vptr;
+                ext[nf] = glcap.draws[0].vbytes;
+                nf++;
+            }
+        }
+        ck(nf == N_PTR_FRAMES, "the plume drew every frame", "%d of %d",
+           nf, N_PTR_FRAMES);
+        if (nf == N_PTR_FRAMES)
+            ck_ring("fx", seen, ext, nf);
+        (void)i;
+    }
+}
+
 int main(void)
 {
     printf("RC Cars -- visual subsystem harness\n");
@@ -7321,6 +7573,7 @@ int main(void)
     part15_blend();
     part16_carnormals();
     part16b_col5();
+    part17_clientptr();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -800,17 +800,40 @@ void fx_draw(const fx_t *fx, const float eye[3],
        2048 * 6 * 28 = 344 KB, so this buffer does cross that line, and out of
        BSS the GPU would be handed an address it cannot see. Same reasoning in
        trace.c and envmap.c; see SCENE VERTEX BUFFERS in scene.h for how the two
-       halves of this change fit together. */
-    static vtx_t *v;
-    static unsigned char *col;
+       halves of this change fit together.
+
+       AND ROTATED PER FRAME, which is the other half of the same rule and was
+       missing. Crossing that 32 KB line does not only mean the pointer must be
+       in mapped memory, it means the BYTES must still be there when GXM reads
+       them -- at flush, after the swap. One buffer refilled the next frame is
+       read while the GPU is still drawing the last one, which is what drew the
+       big characters as exploding spikes until char.c got its skin ring.
+       Measured over the line on beach_1 with the app's own four emitters: 242
+       live particles, 40,656 B. See FX_DRAW_RINGS for the numbers and for why
+       trace.c and envmap.c are deliberately NOT changed with this -- their
+       worst measured draw is 16.1 KB and 12.9 KB, both under the line. */
+    static vtx_t *v_ring[FX_DRAW_RINGS];
+    static unsigned char *col_ring[FX_DRAW_RINGS];
+    static unsigned int ring;
+    vtx_t *v;
+    unsigned char *col;
     int i, nv = 0;
 
     if (!fx->enabled)
         return;
-    if (!v) {
-        v = malloc(sizeof(*v) * FX_MAX_PARTICLES * 6);
-        col = malloc((size_t)FX_MAX_PARTICLES * 6 * 4);
+    if (!v_ring[0]) {
+        int r;
+        for (r = 0; r < FX_DRAW_RINGS; r++) {
+            v_ring[r] = malloc(sizeof(**v_ring) * FX_MAX_PARTICLES * 6);
+            col_ring[r] = malloc((size_t)FX_MAX_PARTICLES * 6 * 4);
+        }
     }
+    /* Next buffer, so this frame does not write over the one the GPU may still
+       be reading. Advanced before the fill and not after, so a frame that
+       returns early below still leaves the previous frame's buffer alone. */
+    ring = (ring + 1u) % (unsigned)FX_DRAW_RINGS;
+    v = v_ring[ring];
+    col = col_ring[ring];
     if (!v || !col)
         return;
 

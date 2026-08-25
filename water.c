@@ -192,13 +192,21 @@ void water_free(water_t *w)
        has usually already released the scene these arrays were sized against,
        and reading the new batch count would walk off the end of the old ones. */
     for (i = 0; i < w->n_alloc; i++) {
+        int r;
         if (w->damp)       free(w->damp[i]);
         if (w->coast_rgba) free(w->coast_rgba[i]);
         if (w->surf_rgba)  free(w->surf_rgba[i]);
+        for (r = 0; r < WATER_DRAW_RINGS; r++)
+            if (w->vring[r]) free(w->vring[r][i]);
     }
     free(w->damp);
     free(w->coast_rgba);
     free(w->surf_rgba);
+    {
+        int r;
+        for (r = 0; r < WATER_DRAW_RINGS; r++)
+            free(w->vring[r]);
+    }
     memset(w, 0, sizeof(*w));
 }
 
@@ -238,6 +246,21 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
             w->coast_rgba[i] = malloc((size_t)b->nverts * 4);
         if (b->flags & BATCH_WATER)
             w->surf_rgba[i] = malloc((size_t)b->nverts * 4);
+        /* A draw ring only where the draw is big enough for vitaGL to hand GXM
+           this array instead of copying it -- three batches over the ten tracks.
+           See water_t.vring. The gate is the batch's own size, so nothing has to
+           be kept in step with it. `surf_rgba` needs no ring: it is written once,
+           here, and never again; `coast_rgba` IS rewritten every frame but no
+           coast batch on any track comes near the line. */
+        if ((size_t)b->nverts * sizeof(vtx_t) > WATER_CLIENT_PTR_LIMIT) {
+            int r;
+            for (r = 0; r < WATER_DRAW_RINGS; r++) {
+                if (!w->vring[r])
+                    w->vring[r] = calloc(scene->n_batches, sizeof(vtx_t *));
+                if (w->vring[r])
+                    w->vring[r][i] = malloc((size_t)b->nverts * sizeof(vtx_t));
+            }
+        }
     }
     build_damping(w, col);
 
@@ -515,12 +538,35 @@ static void animate_coast(water_t *w, unsigned int bi)
     }
 }
 
-static void draw_batch(const batch_t *b)
+/* The vertices to hand GXM for batch `bi`: this frame's ring slice where the
+ * batch has one, and the batch's own array where it does not. The animation
+ * still runs in place into b->verts -- that keeps the array every host harness
+ * reads back the animated one, and keeps the scene's ownership of it intact
+ * (main.c releases the scene before water_free) -- so the ring costs one copy
+ * per frame on the three batches that need it, against the per-vertex sine
+ * animate_surface is already paying on the same vertices. */
+static const vtx_t *draw_verts(water_t *w, unsigned int bi)
+{
+    const batch_t *b = &w->scene->batches[bi];
+    vtx_t *slice = w->vring[w->ring] ? w->vring[w->ring][bi] : NULL;
+
+    if (!slice)
+        return b->verts;
+    memcpy(slice, b->verts, (size_t)b->nverts * sizeof(vtx_t));
+    return slice;
+}
+
+static void draw_batch_v(const batch_t *b, const vtx_t *v)
 {
     glBindTexture(GL_TEXTURE_2D, b->gl_tex);
-    glVertexPointer(3, GL_FLOAT, sizeof(vtx_t), &b->verts[0].x);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(vtx_t), &b->verts[0].u);
+    glVertexPointer(3, GL_FLOAT, sizeof(vtx_t), &v[0].x);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(vtx_t), &v[0].u);
     glDrawElements(GL_TRIANGLES, b->nidx, GL_UNSIGNED_SHORT, b->idx);
+}
+
+static void draw_batch(const batch_t *b)
+{
+    draw_batch_v(b, b->verts);
 }
 
 void water_draw(water_t *w, const float eye[3])
@@ -528,6 +574,10 @@ void water_draw(water_t *w, const float eye[3])
     scene_t *s = w->scene;
     unsigned int i;
     int j;
+
+    /* Next slice, so this frame does not write over the one the GPU may still be
+       reading two frames back. See water_t.vring. */
+    w->ring = (w->ring + 1u) % (unsigned)WATER_DRAW_RINGS;
 
     /* --- the sea surface: BLENDED, with the depth-driven alpha above ------
        Depth writes stay ON: it is a single layer with no self-overlap, and the
@@ -542,7 +592,7 @@ void water_draw(water_t *w, const float eye[3])
             continue;
         animate_surface(w, i);
         glColorPointer(4, GL_UNSIGNED_BYTE, 0, w->surf_rgba[i]);
-        draw_batch(b);
+        draw_batch_v(b, draw_verts(w, i));
     }
     glDisableClientState(GL_COLOR_ARRAY);
     glDisable(GL_BLEND);

@@ -39,6 +39,30 @@
    per system. The port shares one pool between the two, so it is sized once. */
 #define FX_MAX_PARTICLES 2048
 
+/*
+ * How many frames of DRAW buffer to keep, and why there has to be more than one.
+ *
+ * The pool's draw is one glDrawArrays over up to FX_MAX_PARTICLES * 6 vertices,
+ * and the custom vitaGL (SAFER_DRAW_SPEEDHACK) stops copying a draw's vertices
+ * into its own mapped temp once the draw passes 32 KB: past that line GXM is
+ * handed the app's pointer and reads it AT FLUSH, which is after the swap. So a
+ * single buffer refilled the next frame is read while the GPU is still drawing
+ * the last one -- the exact mechanism that drew the big characters as exploding
+ * spikes before char.c got its skin ring (see CHR_SKIN_RINGS, and known-issues).
+ *
+ * MEASURED, not assumed: the line is 32768 / 28 = 1170 vertices = 195 live
+ * particles. With the app's own arrangement -- ONE shared pool and one emitter
+ * per car, the player plus three opponents -- three seconds off beach_1's grid
+ * peaks at 242 live particles, 40,656 B in one draw, over the line on 46 frames
+ * of 480. The other nine tracks stay under (beach_2 22 particles, country_4 67),
+ * so it is beach_1's sand that does it, and beach_1 is the first track.
+ *
+ * Three, because vitaGL's own circular vertex pool is one arena per display
+ * buffer (gxm_display_buffer_count, 3 by default) reset at swap for the buffer
+ * coming round again, so three is what says "the GPU is done with it".
+ */
+#define FX_DRAW_RINGS 3
+
 /* Which system emitted a particle. The engine keeps the two pools apart
    entirely; the port shares one, so a particle has to say where it came from.
    Only ONE thing reads it -- the ZIgnoreRad hide test, which belongs to the

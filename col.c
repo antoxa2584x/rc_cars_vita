@@ -34,6 +34,7 @@ int col_load(const char *path, col_t *c)
     char magic[4];
     unsigned int ncell, nref;
     int v2, v3, v4, v5;
+    long fsize, hdr_bytes;
 
     memset(c, 0, sizeof(*c));
     if (!f)
@@ -57,17 +58,80 @@ int col_load(const char *path, col_t *c)
     v4 = v5 || memcmp(magic, "COL4", 4) == 0;
     v3 = v4 || memcmp(magic, "COL3", 4) == 0;
     v2 = v3 || memcmp(magic, "COL2", 4) == 0;
-    rd(f, &c->minx, 4); rd(f, &c->minz, 4); rd(f, &c->cell, 4);
-    rd(f, &c->nx, 4); rd(f, &c->nz, 4); rd(f, &c->ntris, 4);
-    if (v2) rd(f, &c->default_surf, 4);
+    /* magic, minx/minz/cell, nx/nz/ntris, and COL2+'s default_surf */
+    hdr_bytes = 4 + 12 + 12 + (v2 ? 4 : 0);
+    if (!rd(f, &c->minx, 4) || !rd(f, &c->minz, 4) || !rd(f, &c->cell, 4)
+        || !rd(f, &c->nx, 4) || !rd(f, &c->nz, 4) || !rd(f, &c->ntris, 4)
+        || (v2 && !rd(f, &c->default_surf, 4)))
+        { fclose(f); col_free(c); return 0; }
+
+    /* EVERY COUNT ABOVE IS FILE DATA, AND THE ARRAYS BELOW ARE SIZED AND THEN
+     * INDEXED ON IT. That is the same rule ai_init's record array needed, one
+     * module over, and this is the loader it was missing from: none of the three
+     * mandatory reads was checked and neither was any of their allocations, so a
+     * .col whose header outran its own body reported SUCCESS and handed the
+     * queries a grid of uninitialised heap. Measured, before: a 32-byte file cut
+     * to just its header came back from col_load as 1, with ntris 35,677 and
+     * 1,708 cells, every array allocated and not one of them read.
+     *
+     * Two ways that went wrong beyond the garbage. `nref` is read back out of
+     * `start[]` -- so on a short read it is uninitialised, and the size of the
+     * next allocation is then whatever was on the heap. And the vertical-bounds
+     * loop below dereferences `tris[idx[k] * 9]` with `idx[k]` straight out of
+     * the file: a .col whose last `start[]` entry says 0x40000000 references
+     * SEGVs in col_load itself (deterministic, ASan, col.c's ref_ylo loop).
+     *
+     * So: bound each count by what the file can actually hold before allocating,
+     * check every read and every allocation, and validate the grid references
+     * once here rather than in the queries -- col_sphere walks `idx[]` tens of
+     * thousands of times a tick and must not pay for this.
+     *
+     * The OPTIONAL arrays below keep their existing graceful degradation: a
+     * missing material, water, engine-class or lightmap array is a duller car or
+     * a drier track, not a broken one. It is the three the queries cannot run
+     * without that become hard failures. */
+    fseek(f, 0, SEEK_END);
+    fsize = ftell(f);
+    fseek(f, hdr_bytes, SEEK_SET);
+    if (fsize < hdr_bytes || c->nx == 0 || c->nz == 0 || c->ntris == 0
+        || c->cell <= 0.f
+        /* nx*nz must not wrap, and each array must fit in what is left */
+        || c->nx > COL_MAX_DIM || c->nz > COL_MAX_DIM
+        || (unsigned long long)c->ntris * 9u * sizeof(float)
+           > (unsigned long long)(fsize - hdr_bytes)) {
+        fclose(f);
+        col_free(c);
+        return 0;
+    }
+
     c->tris = malloc((size_t)c->ntris * 9 * sizeof(float));
-    rd(f, c->tris, (size_t)c->ntris * 9 * sizeof(float));
+    if (!c->tris || !rd(f, c->tris, (size_t)c->ntris * 9 * sizeof(float)))
+        { fclose(f); col_free(c); return 0; }
     ncell = c->nx * c->nz + 1;
-    c->start = malloc(ncell * sizeof(unsigned int));
-    rd(f, c->start, ncell * sizeof(unsigned int));
+    c->start = malloc((size_t)ncell * sizeof(unsigned int));
+    if (!c->start || !rd(f, c->start, (size_t)ncell * sizeof(unsigned int)))
+        { fclose(f); col_free(c); return 0; }
+    /* Now that start[] has really been read, its last entry is the reference
+       count -- and it still has to fit in the file. */
     nref = c->start[ncell - 1];
-    c->idx = malloc((nref ? nref : 1) * sizeof(unsigned int));
-    rd(f, c->idx, (size_t)nref * sizeof(unsigned int));
+    if ((unsigned long long)nref * sizeof(unsigned int)
+        > (unsigned long long)(fsize - ftell(f)))
+        { fclose(f); col_free(c); return 0; }
+    c->idx = malloc((size_t)(nref ? nref : 1) * sizeof(unsigned int));
+    if (!c->idx || (nref && !rd(f, c->idx, (size_t)nref * sizeof(unsigned int))))
+        { fclose(f); col_free(c); return 0; }
+    /* The prefix offsets and the references they name, checked ONCE. A cell whose
+       range runs backwards or past the end, or a reference naming a triangle that
+       does not exist, is an out-of-bounds read in the hottest loop in the port. */
+    {
+        unsigned int k;
+        for (k = 0; k < ncell; k++)
+            if (c->start[k] > nref || (k && c->start[k] < c->start[k - 1]))
+                { fclose(f); col_free(c); return 0; }
+        for (k = 0; k < nref; k++)
+            if (c->idx[k] >= c->ntris)
+                { fclose(f); col_free(c); return 0; }
+    }
     if (v2 && c->ntris) {
         c->surf = malloc(c->ntris);
         /* A truncated material array is not worth failing the whole track over:

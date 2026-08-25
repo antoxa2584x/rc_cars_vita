@@ -178,6 +178,17 @@
  * between are runtime globals at 0x14ef3d4/e0/e4 rather than anything in a
  * config file. water.c keeps the port's symmetric HeightOn..HeightOff map. */
 
+/* One draw buffer per display buffer, because vitaGL's own circular vertex pool
+   is one arena per display buffer (gxm_display_buffer_count, 3 by default) reset
+   at swap for the buffer coming round again -- so three is what says "the GPU is
+   done with it". Same constant and same reason as CHR_SKIN_RINGS. */
+#define WATER_DRAW_RINGS 3
+
+/* The draw size past which vitaGL hands GXM the client pointer instead of
+   copying the vertices (SAFER_DRAW_SPEEDHACK). Above it a buffer may not be
+   rewritten until the GPU has been round the display buffers. */
+#define WATER_CLIENT_PTR_LIMIT (32u * 1024u)
+
 #define WATER_MAX_WAVES 32
 #define WATER_MAX_SPAWN 8
 
@@ -221,6 +232,35 @@ typedef struct {
        is what put a hard teal edge where the reference has sand showing through. */
     unsigned char **coast_rgba;
     unsigned char **surf_rgba;
+
+    /* THE DRAW RING, and only for the batches that need one.
+     *
+     * water.c rewrites an animated batch's vertices every frame -- that is why
+     * BATCH_ANY_WATER never gets a VBO -- and hands glDrawElements the batch's
+     * own array. Past 32 KB in one draw the custom vitaGL
+     * (SAFER_DRAW_SPEEDHACK) stops copying those vertices into its own mapped
+     * temp and gives GXM the client pointer, which it reads AT FLUSH, after the
+     * swap. So the next frame's rewrite lands in memory the GPU is still
+     * reading: a torn or one-frame-stale swell. Same mechanism as the exploding
+     * characters before char.c's skin ring (CHR_SKIN_RINGS) and as FX_DRAW_RINGS.
+     *
+     * MEASURED over the ten shipped tracks, so this is confined to what actually
+     * crosses rather than applied to every animated batch: exactly THREE do, and
+     * all three are the sea surface itself -- beach_1 batch 43 at 7,007 verts =
+     * 196,196 B (six times the line), country_3 batch 39 at 51,492 B and
+     * beach_4 batch 27 at 47,012 B. Every other animated batch on every track is
+     * under (beach_3's biggest is 19,880 B), and trace.c's worst draw is 16.1 KB
+     * and envmap.c's 12.9 KB, which is why neither of those is changed.
+     *
+     * The gate is a PROPERTY -- the batch's own vertex bytes against the
+     * library's threshold -- not a list of batch names to keep in step.
+     *
+     * NULL per batch where none is needed, and then the draw reads b->verts
+     * exactly as before. water-owned, so water_free needs nothing from the
+     * scene: main.c releases the scene BEFORE calling water_free, which is why
+     * b->verts is animated in place and copied out rather than repointed. */
+    vtx_t **vring[WATER_DRAW_RINGS];
+    unsigned int ring;
 
     GLuint wave_tex;
     wave_t waves[WATER_MAX_WAVES];

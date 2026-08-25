@@ -398,7 +398,7 @@ Host harnesses, none of which needs the Vita toolchain. **`rm` the binary first*
 -- two of these lines had gone stale and did not link at all, and a failed link
 leaves the previous binary sitting there to answer for it:
 
-    rm -f rb_test vis_test carparts_test menu_test ui_test meshalign \
+    rm -f rb_test vis_test carparts_test menu_test settings_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
           colprof flipped antheight aitest chrfloat curb hudshot
 
@@ -454,6 +454,17 @@ leaves the previous binary sitting there to answer for it:
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
+    gcc -I. -O2 rccars_re/settings_test.c settings.c menu.c rlog.c \
+        contact.c rb.c collide.c -lm -o settings_test
+                            # the SETTINGS FILE -- ux0:data/rccars/settings.txt.
+                            # menu.c is on the line for menu_init, which is where
+                            # every default the file may omit comes from, and
+                            # rlog.c because settings.c says what it read; the
+                            # model tags along behind menu.c as it does for
+                            # menu_test. Runs on files in the current directory
+                            # through settings_set_path and removes them again.
+                            # 64 checks; 21 of 23 mutants die, and the two that
+                            # live are named in the file's own header.
     gcc -I. -Itestgl -O2 rccars_re/ui_test.c ui.c hud.c countdown.c \
         race_ui.c dirarrow.c msg.c -lm -o ui_test
                             # menu drawing, the !HIT! banner, the 3-2-1-GO race

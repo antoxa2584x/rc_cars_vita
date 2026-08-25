@@ -96,6 +96,15 @@ typedef struct {
        mode, and where its alpha came from. All of it is state the transition
        bands depend on and none of it is visible in a vertex. */
     GLenum depth_func;
+    /* The VERTEX POINTER this draw was handed, and how many bytes of it the draw
+       spans. Recorded because the rule that matters most here does not live in
+       the API at all: past 32 KB the custom vitaGL stops copying a draw's
+       vertices and gives GXM this pointer, read at flush -- so two draws sharing
+       a range, or one frame's range being rewritten while the GPU still holds
+       the last, is a bug no capture of the BYTES can see. chartest part 14
+       learned this for the characters; fx.c and water.c need the same. */
+    const void *vptr;
+    size_t vbytes;
     GLuint unit1_tex;
     GLenum unit1_env, unit1_a_src;
     const void *unit1_uv;

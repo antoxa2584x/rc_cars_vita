@@ -137,7 +137,10 @@ and unused.
       checkpoint it passed
 - [x] Place, against the field, on a progress measure both sides count the same
       way — the latched checkpoint index, not a projection onto the spine
-- [ ] Wrong-way detection
+- [x] Wrong-way detection — the timer rises while the car faces away from the
+      next checkpoint and falls three times as fast when it turns back, and the
+      banner is the message layer's own slot 2, held for the 5.5 s the poster's
+      recovered hold asks for
 - [ ] A finish. `FINISH` is recovered, packed and addressable in the countdown's
       own artwork, and nothing raises it because there is nothing to end
 - [ ] Results and standings screens
@@ -205,7 +208,9 @@ and unused.
 
 - [ ] Player profile in `ux0:data/` — only the log is written there today
 - [ ] Best laps and ghosts — the install has a `GhostRecords/` folder to learn the format from
-- [ ] Settings persistence, so texture colours and camera choices survive a restart
+- [x] Settings persistence, so texture colours and camera choices survive a
+      restart — the menu's rows are written to `ux0:data/` and read back before
+      the first load, since the two texture rows are consumed at upload time
 - [ ] Multiple profiles, as the original's `Players/` does
 
 #### Graphics
@@ -214,8 +219,18 @@ and unused.
 - [x] **Surface transitions** — where two ground textures meet the artists
       authored a blend band, a second base texture and an alpha mask per face.
       3,608 faces over nine tracks, drawn rather than butted at a hard line
-- [ ] Fix the one batch of 77 with no texture — visible black patches
-- [ ] Wall collision; ground queries are all there is today
+- [x] The one untextured batch per track is **not** a packing gap and is not
+      drawn. Every one of those meshes is named `CONSTR*` — the level authors'
+      constraint helper geometry, which the engine gives its own `constr` debug
+      toggle — and they carry no texture id at all, so there is nothing to
+      resolve. Checked across all ten tracks: every texture name a track
+      references does resolve to a file
+- [ ] A collision **proxy** that covers the car. The queries were never the gap:
+      `col_sphere` returns walls, ceilings and overhangs, and `col_ground_at` is
+      the downward-only one. What is thin is the shape — 13 spheres for a
+      four-wheel car, only the roof pair fitted to the shell — plus the lack of
+      an inside test, which is what lets a car enter something thicker than those
+      radii and then sit in it
 - [ ] Better shadows than one projected silhouette
 - [ ] Richer particles and surface effects on top of the existing dust and tyre marks
 - [ ] Push texture quality — the pack ships three full sets and the port pins one
@@ -226,15 +241,17 @@ and unused.
 
 <br>
 
-- One batch of 77 has no texture, showing as black patches.
-- No wall collision — ground queries only.
 - The race has no end: laps count up and nothing raises `FINISH`.
-- No wrong-way detection, so a car driven backwards simply stops making progress.
+- The collision **proxy** does not cover the car, though the queries do: a car
+  can be driven into anything thicker than the proxy's own sphere radii and then
+  rest inside it, because `col_sphere` is a closest-point test and a sphere
+  buried deeper than its radius is closest to nothing.
 - The opponents replay recorded laps rather than driving; the original's second,
   simulated mode is recovered and not transcribed.
 - The character behaviour machines are the port's own, on the game's constants —
   the engine's own character AI is not recovered.
-- Nothing is saved but the log. Every setting is back to its default on restart.
+- No player profile, best laps or ghosts yet — the menu's own settings persist,
+  but nothing about a race does.
 - `CenterMassOY` is recovered and used (the com sits 0.0000 / 0.0323 / 0.0323 m
   above the model origin), but the body collision proxy's roof stations and its X
   offset are still fitted rather than read from the game's data.
@@ -242,6 +259,14 @@ and unused.
   a runtime switch for it ("Texture colours" in the menu), defaulting to the
   hardware-correct packing.
 - The app crashes on exit — teardown only.
+- **Almost every number in these notes is a HOST measurement.** The app itself
+  runs on hardware and two profiling sessions came off it — they are what found
+  the frame's 69% memcpy and then the collision queries — but the correctness
+  suites are host builds, and two of the target's rules are invisible to them: the
+  32 KB threshold past which vitaGL hands GXM a client pointer instead of copying
+  the vertices, and what a Cortex-A9 charges for a VFP divide. Fixes resting on
+  either are reasoned from the library's own source and the generated ARM code
+  rather than confirmed on a Vita.
 
 </details>
 
@@ -269,6 +294,7 @@ race_ui.c hud.c       the HUD: minimap, place, clocks, gauges, !HIT!
 countdown.c           3, 2, 1, GO!
 mix.c audio.c sfx.c   mixer thread, sceAudioOut, positional sound
 menu.c ui.c font.h    in-game menu
+settings.c            the menu's rows, saved to ux0:data/ and read back at boot
 rlog.c                the memory-card log, off the game thread
 *_data.h tracks.h     generated tables — regenerate, do not hand-edit
 rccars_re/            submodule: the packers, generators and host harnesses
@@ -347,10 +373,20 @@ Packaging notes that cost time once already:
   `arm-vita-eabi-gcc: No such file or directory`. Two statements;
 - Vita3K needs `libshacccg.suprx` at `ur0:data/external/`.
 
-`physics.c`, `rb.c`, `contact.c`, `collide.c`, `rbcar.c`, `cam.c` and `carani.c`
-are compiled with `-fno-fast-math -ffp-contract=off`. This is not tidiness: the
-original runs x87 at PC=53 over float32 state, which ARM reproduces exactly only
-if operation order is preserved, and `-ffast-math` permits reassociation.
+`physics.c`, `rb.c`, `contact.c`, `collide.c`, `col.c`, `rbcar.c`, `cam.c`,
+`carani.c` and `ai.c` are compiled with `-O3 -fno-fast-math -ffp-contract=off`.
+This is not tidiness: the original runs x87 at PC=53 over float32 state, which ARM
+reproduces exactly only if operation order is preserved, and `-ffast-math` permits
+reassociation.
+
+`col.c` is on that list because every contact point, face normal and surface
+height the modules above integrate is computed there — leave it off and the rule
+stops one call short of the numbers it is about. It was off, and it showed: all
+four collision harnesses differ between the two builds, the car ending 4 cm higher
+after seven seconds at beach_2's kerb. The `-O3` is not a relaxation either —
+order preservation is a property of `-fno-fast-math -ffp-contract=off` at every
+optimisation level, and under them `-O3` is bit-identical to `-O2` across every
+numeric column of the ten real race starts, while being 26% faster.
 
 </details>
 

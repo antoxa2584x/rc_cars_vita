@@ -146,8 +146,15 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
     fseek(f, 0, SEEK_END);
     size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (size <= (long)(12 + AI_RECORD_BYTES) || n_file == 0
-        || n_file > AI_MAX_OPPONENTS) {
+    /* The header's opponent count is FILE DATA and the record array below is
+     * indexed on it, so the file has to be big enough to hold that many
+     * records -- not merely one. The sample BLOCKS were bounded in the loop and
+     * the record array was not, which is the same rule missed one level up:
+     * a .aip claiming five opponents with two records' worth of bytes read past
+     * the blob at the memcpy below (ASan heap-buffer-overflow, ai.c:188). The
+     * n_file bound is tested first so the multiply cannot overflow. */
+    if (n_file == 0 || n_file > AI_MAX_OPPONENTS
+        || size < (long)(12 + (long)n_file * AI_RECORD_BYTES)) {
         rlog("ai: %s has %u opponents in %ld bytes -- ignoring\n",
              path, n_file, size);
         fclose(f);

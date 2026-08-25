@@ -70,6 +70,7 @@
 #include "dirarrow.h"
 #include "msg.h"
 #include "menu.h"
+#include "settings.h"
 #include "ai.h"
 #include "carparts.h"
 #include "audio.h"
@@ -1007,6 +1008,15 @@ int main(void)
        Car1). load_car/load_track then build everything from those. */
     menu_init(&menu, 0, TRACKS[0].car);
 
+    /* THEN LAST LAUNCH'S CHOICES OVER THE TOP, before anything is loaded: the
+       track and the car below come out of the menu, and the two texture rows are
+       read at UPLOAD time, so a quality restored after the first load would show
+       nothing until something forced a reload. A missing or unreadable file
+       leaves menu_init's defaults exactly as they are. */
+    settings_load(&menu);
+    scene_set_tex_quality(menu.tex_quality);
+    scene_set_tex_swap_rb(menu.tex_swap_rb);
+
     /* Audio comes up BEFORE the first load: load_track and load_car page the
        track's ambient bed and the car's motor family into the bank, and both
        are no-ops until sfx_init has run. Neither call is fatal -- every sfx
@@ -1069,9 +1079,19 @@ int main(void)
              SF_BIG_TEX, !!t.font_big, SF_SMALL_TEX, !!t.font_small);
     }
 
-    if (!load_track(0)) {
-        sceKernelExitProcess(0);
-        return 0;
+    /* menu.track, not 0: it is where the saved settings left off, and the menu
+       row has to agree with what is on screen. A track that will not load falls
+       back to the first one rather than taking the app down -- the index is
+       already clamped into range, so a failure here means an asset this build
+       does not have, which is not the settings file's fault to die of. */
+    if (!load_track(menu.track)) {
+        if (menu.track == 0 || !load_track(0)) {
+            sceKernelExitProcess(0);
+            return 0;
+        }
+        rlog("[rccars] settings: track %d would not load -- fell back to 0\n",
+             menu.track);
+        menu.track = 0;
     }
     load_car(menu.car);          /* optional -- the track alone is still useful */
     respawn();
@@ -1191,6 +1211,26 @@ unsigned int acc_ticks = 0;
         /* START opens the menu; it owns the button from here, so the app quits
            from the menu's Quit row rather than by pressing START. */
         menu_input(&menu, pad.buttons, prev_buttons);
+        /* THE ONLY CARD WRITE THE GAME THREAD MAKES -- rlog's go out on their
+           own thread, for the reason rlog.h gives at length -- and it happens on
+           the frame the menu goes away, which is the only frame where there is
+           anything new to write: nothing outside the menu can change a persisted
+           value. The save also compares against what it last read or wrote, so a
+           menu opened just to read the tyre multipliers writes nothing at all.
+           Quit is included because the Quit row leaves the menu open on its way
+           out.
+         *
+           What the write costs lands in the NEXT frame's dt, ~50 ms of it, and
+           that is deliberate rather than free: it is the same thing a track
+           change already does with seconds, and the `dt > 0.1f` clamp above is
+           what absorbs both. Once, on a menu close, against a car that has been
+           standing still behind a frozen world. */
+        {
+            static int menu_was_open;
+            if (menu_was_open && (!menu.open || menu.req_quit))
+                settings_save_if_changed(&menu);
+            menu_was_open = menu.open;
+        }
         if (menu.req_quit)
             break;
         if (menu.req_track >= 0) {

@@ -79,6 +79,16 @@ extern col_prof_t col_prof;
 #define COL_PROF(f, n)  ((void)0)
 #endif
 
+/* The largest nx or nz col_load will accept, and it is a WRAP guard first and a
+ * sanity bound second: `nx * nz + 1` is unsigned-int arithmetic, so without a
+ * cap a header claiming 0x10000 x 0x10000 cells allocates one entry and then the
+ * queries index a grid the loader thinks is enormous. Measured on the ten
+ * shipped grids: the worst single dimension is urban_2's 77 (5,698 cells) and
+ * the worst cell count is the same track's. 4096 is two orders of magnitude of
+ * headroom on that and eight orders below the wrap -- `pack_col.py --cell` can
+ * subdivide a long way before it matters. */
+#define COL_MAX_DIM 4096u
+
 int  col_load(const char *path, col_t *c);
 
 /* Material of the surface under (x,z) nearest at or below y. Falls back to the

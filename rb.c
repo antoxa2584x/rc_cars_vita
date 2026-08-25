@@ -959,8 +959,33 @@ float rb_car_tick(rb_car *c, float dt)
                would leave `remaining` unspent and let the loop retry the same
                blocked advance until its budget ran out -- a stall rather than a
                wall. The body simply does not get there. */
-            rb_euler_step(c, y0, lo, y1);
-            rb_car_set_state(c, y1);
+            /* AND `lo == 0` IS THE COMMON CASE, NOT THE EDGE ONE: measured over
+               `curb` -- the only harness in which this gate fires at all -- the
+               bisection runs 13,807 times and **13,460 of them (97.5%) end with
+               `lo` still at zero**, i.e. no part of the advance was safe.
+               Stepping by zero is a no-op by construction
+               (`yout = 0 * ydot + y0`), so the pose to commit is y0 itself, and
+               going through rb_euler_step to reach it evaluates a WHOLE
+               derivative in order to multiply it by zero: a full
+               rb_car_accum_forces, which is the suspension solve, the contact
+               solve and their sphere queries -- the cost this port has twice
+               found to BE the frame (`vita-port.md`). 13,460 of them in one
+               harness run.
+
+               It also divided by zero. rb_contact_solve's slide-cancel term is
+               `s / dt`, so dt = 0 gave +-inf, which its own clamp then pulled
+               back to the tyre limit -- harmless in the shipped build only
+               because contact.c is one of the translation units held at
+               -fno-fast-math (CMakeLists.txt), so the inf is IEEE and the
+               comparisons behave. Under -ffast-math the clamp is not guaranteed
+               to catch it. Caught by UBSan on `curb`; the fix is not to guard
+               the division, it is not to ask for a derivative nobody uses. */
+            if (lo > 0.0f) {
+                rb_euler_step(c, y0, lo, y1);
+                rb_car_set_state(c, y1);
+            } else {
+                rb_car_set_state(c, y0);
+            }
             toi = 1;
         }
 
