@@ -33,7 +33,7 @@ int col_load(const char *path, col_t *c)
     FILE *f = fopen(path, "rb");
     char magic[4];
     unsigned int ncell, nref;
-    int v2, v3, v4;
+    int v2, v3, v4, v5;
 
     memset(c, 0, sizeof(*c));
     if (!f)
@@ -45,11 +45,16 @@ int col_load(const char *path, col_t *c)
        and a COL1 or COL2 grid reports no water anywhere (no water drag, which is
        what the port did before the grid carried it). COL4 adds the ENGINE's own
        surface class per triangle; without it col_surface_at answers 0 and the
-       tyre marks fall back to one flat strength, which is what they had. */
+       tyre marks fall back to one flat strength, which is what they had. COL5
+       adds how bright the level's own LIGHTMAP is on each triangle; without it
+       col_light_at has no opinion anywhere, which leaves the car's light at 1.0
+       -- exactly how it looked before carlight.c existed. */
     if (memcmp(magic, "COL1", 4) && memcmp(magic, "COL2", 4)
-        && memcmp(magic, "COL3", 4) && memcmp(magic, "COL4", 4))
+        && memcmp(magic, "COL3", 4) && memcmp(magic, "COL4", 4)
+        && memcmp(magic, "COL5", 4))
         { fclose(f); return 0; }
-    v4 = memcmp(magic, "COL4", 4) == 0;
+    v5 = memcmp(magic, "COL5", 4) == 0;
+    v4 = v5 || memcmp(magic, "COL4", 4) == 0;
     v3 = v4 || memcmp(magic, "COL3", 4) == 0;
     v2 = v3 || memcmp(magic, "COL2", 4) == 0;
     rd(f, &c->minx, 4); rd(f, &c->minz, 4); rd(f, &c->cell, 4);
@@ -93,6 +98,14 @@ int col_load(const char *path, col_t *c)
             c->eng_surf = NULL;
         }
     }
+    if (v5 && c->eng_surf) {
+        /* And the same discipline again, one array further along. */
+        c->light = malloc(c->ntris);
+        if (c->light && !rd(f, c->light, c->ntris)) {
+            free(c->light);
+            c->light = NULL;
+        }
+    }
     fclose(f);
 
     /* The vertical bounds index -- see col_t. Two floats per grid REFERENCE, not
@@ -128,6 +141,7 @@ void col_free(col_t *c)
     free(c->surf);
     free(c->water_y);
     free(c->eng_surf);
+    free(c->light);
     free(c->ref_ylo);
     free(c->ref_yhi);
     memset(c, 0, sizeof(*c));
@@ -274,6 +288,62 @@ int col_surface_at(const col_t *c, float x, float y, float z)
             cls = e;
     }
     return cls;
+}
+
+float col_light_at(const col_t *c, float x, float y, float z)
+{
+    int cx, cz;
+    unsigned int cell, k;
+    float best = -1e30f, top;
+    float lit = -1.f;
+
+    if (!c->light || !c->ntris)
+        return -1.f;
+    cx = (int)((x - c->minx) / c->cell);
+    cz = (int)((z - c->minz) / c->cell);
+    if (cx < 0 || cz < 0 || (unsigned)cx >= c->nx || (unsigned)cz >= c->nz)
+        return -1.f;
+    cell = (unsigned)cz * c->nx + (unsigned)cx;
+
+    /* THE TOPMOST FACE THAT HAS AN OPINION, which is not the rule col_surface_at
+       above uses and the difference is the point. The engine samples the ONE face
+       the contact is on, so what this has to answer is "the face you can see" --
+       the highest one at or below the query. Where that face carries no lightmap
+       (a decal: the sand transitions and the checkpoint markings are 21% of
+       beach_1's triangles and none of them is lit) the search continues DOWN
+       through the 5 cm band to the surface underneath, which is the face whose
+       lighting the decal is painted on top of. Taking the minimum over the band
+       the way the surface class does would let one unlit sliver hold the car
+       bright over a shadowed road. */
+    for (k = c->start[cell]; k < c->start[cell + 1]; k++) {
+        const float *t = &c->tris[(size_t)c->idx[k] * 9];
+        float ty;
+        if (tri_y_at(t, x, z, &ty) && ty <= y + 0.25f && ty > best)
+            best = ty;
+    }
+    if (best < -1e29f)
+        return -1.f;
+    top = -1e30f;
+    for (k = c->start[cell]; k < c->start[cell + 1]; k++) {
+        unsigned int ti = c->idx[k];
+        const float *t = &c->tris[(size_t)ti * 9];
+        float ty;
+        /* The same Y-first reject and the same band as col_surface_at, valid for
+           the same reason: `best' is the highest face at or below y + 0.25. */
+        if (!tri_y_reach(c, k, best - 0.025f, 0.035f))
+            continue;
+        if (!tri_y_at(t, x, z, &ty))
+            continue;
+        if (ty > y + 0.25f || ty < best - 0.05f)
+            continue;
+        if (c->light[ti] == COL_LIGHT_NONE)
+            continue;
+        if (ty > top) {
+            top = ty;
+            lit = (float)c->light[ti] * (1.f / 255.f);
+        }
+    }
+    return lit;
 }
 
 int col_ground_at(const col_t *c, float x, float z, float ceil_y,

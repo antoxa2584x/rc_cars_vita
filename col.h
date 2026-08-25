@@ -33,6 +33,14 @@ typedef struct {
        that turns on carSurfaceDrag's deep-sand branch and is a handling change,
        not a visual one. */
     unsigned char *eng_surf;
+    /* COL5: how bright the LEVEL'S OWN LIGHTMAP is on each triangle, 0..254,
+       COL_LIGHT_NONE where that face has no lightmap layer. This is the quantity
+       FUN_004572c0 samples per contact and FUN_00531ff0 averages over the four
+       wheels to darken the car -- baked per triangle here because this port's
+       collision is not its render mesh. NULL on any pre-COL5 grid, and then
+       col_light_at has no opinion and the car's light sits at 1.0. See
+       carlight.h and pack_col.py's LIGHTMAP note. */
+    unsigned char *light;
     /* COL3: the water surface height per cell, COL_NO_WATER where the cell has
        none. NULL on an older grid, and then there is no water anywhere -- which
        is exactly what this port did before the grid carried it. See pack_col.py's
@@ -52,6 +60,9 @@ typedef struct {
 
 /* pack_col.py's NO_WATER sentinel. */
 #define COL_NO_WATER  (-1.0e30f)
+
+/* pack_col.py's LIGHT_NONE: this triangle's face carries no lightmap. */
+#define COL_LIGHT_NONE 255
 
 /* Query counters, for colprof.c only, and OFF unless COL_PROFILE is defined:
    the loops they would sit in are the hottest code in the sim, which is the
@@ -80,6 +91,12 @@ int  col_material_at(const col_t *c, float x, float y, float z);
    contact, which is what FUN_00534fc0 does and is what lets a decal defer to
    the floor it is laid on. */
 int  col_surface_at(const col_t *c, float x, float y, float z);
+
+/* How bright the level's lightmap is on the surface under (x, z) at about y,
+   0..1, or a NEGATIVE number for "no opinion" -- no grid, no face there, or the
+   face has no lightmap. Feeds carlight_step, one call per wheel that is touching
+   the ground, which is where the engine's own four samples come from. */
+float col_light_at(const col_t *c, float x, float y, float z);
 
 /* Water surface height at (x, z). Returns 0 and leaves *y untouched where there
    is none. Backs rb_world.water -- which is what makes carSurfaceDrag's water

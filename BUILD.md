@@ -407,7 +407,7 @@ leaves the previous binary sitting there to answer for it:
         -lm -o rb_test                                             # physics + rig
     gcc -I. -Itestgl -O2 vis_test.c scene.c shadow.c water.c checkpoint.c \
         col.c carani.c rb.c contact.c collide.c antenna.c envmap.c trace.c fx.c \
-        sun.c ai.c rbcar.c rlog.c -lm -o vis_test                   # rendering
+        sun.c ai.c rbcar.c rlog.c carlight.c -lm -o vis_test        # rendering
                             # ai.c is on this line for part 14, the OPPONENTS'
                             # dust and smoke. The two fields fx reads off a car
                             # and the replay does not record -- the wheel contact
@@ -418,12 +418,14 @@ leaves the previous binary sitting there to answer for it:
                             # .col grid and reads the particles back through
                             # testgl, the same recorder the rest of the file uses.
     gcc -I. -Itestgl -O2 rccars_re/carparts_test.c carparts.c scene.c \
-        carani.c rb.c contact.c collide.c rlog.c -o carparts_test -lm  # upgrade parts
+        carani.c rb.c contact.c collide.c rlog.c carlight.c \
+        -o carparts_test -lm                           # upgrade parts
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c rlog.c -lm -o proptest                # the knockable props
     gcc -I. -Itestgl -O2 rccars_re/chartest.c char.c scene.c col.c \
-        carani.c rb.c contact.c collide.c rbcar.c rlog.c -lm -o chartest
+        carani.c rb.c contact.c collide.c rbcar.c rlog.c carlight.c \
+        -lm -o chartest
                             # the tracks' people, animals and road cars. scene.c
                             # is on this line for scene_read_texture, which the
                             # .chr texture table goes through so that quality,
@@ -435,22 +437,38 @@ leaves the previous binary sitting there to answer for it:
                             # character is placed entirely through glTranslatef /
                             # glRotatef / glScalef, and a stub that discarded
                             # them could see the vertices and not where they went.
+    gcc -I. -O2 rccars_re/carlight_test.c carlight.c contact.c rb.c \
+        collide.c -lm -o carlight_test
+                            # the CAR'S OWN LIGHT: the direction, light_car.bspl,
+                            # the level's chase off the lightmap under the wheels,
+                            # the two intensities, the LOD fade, and what reaches
+                            # the RENDERER as a vertex colour. No GL at all --
+                            # carlight.c is pure arithmetic, which is the whole
+                            # reason the shading is on the CPU (carlight.h).
+                            # contact.c/rb.c/collide.c are on
+                            # the line for ONE symbol, rb_curve_eval: the curve is
+                            # checked against the port's OTHER transcription of
+                            # 0x0040f830 rather than against itself. 28 checks;
+                            # 3 of 3 mutants die. See docs/render-car.md.
     gcc -I. -O2 rccars_re/menu_test.c menu.c contact.c rb.c collide.c \
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
     gcc -I. -Itestgl -O2 rccars_re/ui_test.c ui.c hud.c countdown.c \
-        race_ui.c -lm -o ui_test
+        race_ui.c dirarrow.c msg.c -lm -o ui_test
                             # menu drawing, the !HIT! banner, the 3-2-1-GO race
-                            # start, and the IN-RACE HUD -- the minimap, the place
-                            # badge, the two clocks and the two gauges. All four
-                            # of those files are on this line because they draw
-                            # THROUGH ui.c, so the same recorder reads back what
+                            # start, the IN-RACE HUD -- the minimap, the place
+                            # badge, the two clocks and the two gauges -- and the
+                            # DIRECTION ARROW with its WRONG WAY banner. All five
+                            # of those files -- six with msg.c -- are on this line
+                            # because they draw THROUGH ui.c, so the same recorder reads back what
                             # really went on screen -- which CELL of which atlas,
                             # at the recovered size, in the recovered band, at the
                             # recovered angle, over the recovered sweep.
-                            # 250 checks; 25 of 25 mutants die.
-    gcc -I. -Itestgl -O2 rccars_re/hudshot.c ui.c race_ui.c -lm -o hudshot
+                            # 414 checks; 38 of 38 mutants die on part 17 and
+                            # 27 of 27 on part 18.
+    gcc -I. -Itestgl -O2 rccars_re/hudshot.c ui.c race_ui.c dirarrow.c \
+        msg.c -lm -o hudshot
                             # NOT a test: it PRINTS the HUD's triangles, and
                             # rccars_re/hudshot.py composites them over the game's
                             # real .csi art into a 960x544 PNG. ui_test asserts
@@ -460,7 +478,12 @@ leaves the previous binary sitting there to answer for it:
                             # the minimap: the car goes at the race start out of
                             # tracks.h (the .sb files) and the transform comes out
                             # of the exe, so an arrow landing ON the painted
-                            # ribbon is two independent sources agreeing.
+                            # ribbon is two independent sources agreeing. It also
+                            # draws the DIRECTION ARROW, which is the one element
+                            # whose shape is not a rectangle -- a perspective
+                            # projection of two chevrons cut into a grid of quads,
+                            # and "does that look like an arrow pointing left" is
+                            # not a question ui_test can answer.
                             #
                             #   ./hudshot 4 | python3 rccars_re/hudshot.py \
                             #       /tmp/hud.png --track 4
@@ -472,7 +495,7 @@ leaves the previous binary sitting there to answer for it:
                             #
                             #   python3 rccars_re/mapcheck.py
     gcc -I. -Itestgl -O2 rccars_re/cpground.c scene.c checkpoint.c col.c \
-        carani.c rb.c contact.c collide.c rbcar.c rlog.c \
+        carani.c rb.c contact.c collide.c rbcar.c rlog.c carlight.c \
         rccars_re/glstub_host.c -lm -o cpground
                             # a probe: what the checkpoint GROUND probe finds at
                             # each candidate ceiling. col_ground_at returns the
@@ -482,12 +505,23 @@ leaves the previous binary sitting there to answer for it:
                             # roof, putting the respawn and the marker on top of
                             # it. This is what sized CP_GROUND_CEIL.
     gcc -I. -Itestgl -O2 rccars_re/placechk.c scene.c checkpoint.c col.c \
-        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c carlight.c \
         rccars_re/glstub_host.c -lm -o placechk
                             # also a probe: the PLACING's two inputs on every real
                             # track -- monotonic AND moving. The second half is
                             # what caught three wrong fixes, since a frozen
                             # progress measure never goes backwards.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/progchk.c scene.c checkpoint.c col.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c carlight.c \
+        rccars_re/glstub_host.c -lm -o progchk
+                            # and the third question placechk cannot ask: how far
+                            # OUT is it? A measure can be monotonic, cover exactly
+                            # a lap, and still be 100 m wrong at every instant in
+                            # between -- which is what shipped. Drives the player
+                            # along a recorded lap, where the truth is known
+                            # exactly, scores BOTH sides of the placing against
+                            # the road, and runs the RULE IT REPLACED beside it on
+                            # the same frames as its own control. Exits non-zero.
     gcc -I. -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \
@@ -516,19 +550,19 @@ leaves the previous binary sitting there to answer for it:
         carani.c prop.c rlog.c -lm -o colprof   # where the SIM time goes
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/flipped.c scene.c carani.c col.c rb.c rbcar.c contact.c \
-        collide.c rlog.c rccars_re/glstub_host.c \
+        collide.c rlog.c carlight.c rccars_re/glstub_host.c \
         -lm -o flipped                  # a car on its ROOF, on the real grids
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/aitest.c ai.c col.c rb.c rbcar.c contact.c collide.c \
-        carani.c scene.c rlog.c rccars_re/glstub_host.c \
+        carani.c scene.c rlog.c carlight.c rccars_re/glstub_host.c \
         -lm -o aitest        # the AI opponents, on the real .aip and .col files
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
-        contact.c collide.c rlog.c rccars_re/glstub_host.c \
+        contact.c collide.c rlog.c carlight.c rccars_re/glstub_host.c \
         -lm -o antheight             # where the proxy is vs where the car is
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/chrfloat.c char.c scene.c col.c carani.c rb.c contact.c \
-        collide.c rbcar.c rlog.c rccars_re/glstub_host.c \
+        collide.c rbcar.c rlog.c carlight.c rccars_re/glstub_host.c \
         -lm -o chrfloat        # where the characters and their paths actually
                                # ARE, against the real grids. A probe, not a
                                # test -- it prints, it does not assert, and
@@ -615,11 +649,12 @@ Three of those lines were wrong and it cost real bugs:
 packed cars, so they must be run from `rccars_vita/` with `assets/` populated.
 `carparts_test` is the one that would catch a repack that dropped `--extra-tex`.
 
-`vis_test` joined that list when the tyre marks were fitted to the tyres that
-make them — a synthetic fixture carries no rig and so takes the fallback width,
-which is exactly the path the bug was NOT in. It loads all three cars, hence the
-`rbcar.c` on its link line (it needs a real `rb_car` to bind a rig to a mesh).
-A missing car is a FAILED check, not a skip.
+`vis_test` joined that list over the tyre marks' width, and stayed on it when
+that width stopped being measured off a mesh: the mark is now the engine's own
+constant, and the only way to see that its INKED band matches the tyre is to
+measure the tyre — off the real packed wheel meshes. It loads all three cars,
+hence the `rbcar.c` on its link line (it needs a real `rb_car` to bind a rig to
+a mesh). A missing car is a FAILED check, not a skip.
 
 `vsc_check.py` is the other half, and it is what catches a repack that dropped
 `--envmap`: it now reads VSC7 and asserts a car has env-mapped batches, that one

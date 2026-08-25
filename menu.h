@@ -47,6 +47,7 @@ enum {
     MENU_VOL_MUSIC,
     MENU_TEXQUAL,
     MENU_TEXORDER,
+    MENU_CARLIGHT,
     MENU_RESTART,
     MENU_RESUME,
     MENU_QUIT,
@@ -127,6 +128,13 @@ typedef struct {
        and blue, which is what Vita3K needs because it reads GXM's U5U6U5_RGB
        the other way round. See scene.h; needs a reload, like tex_quality. */
     int tex_swap_rb;
+
+    /* The car's own directional light and the lightmap that dims it under cover
+       -- carlight.h. 1 by default, because it is what the original does; the row
+       exists because it is the one thing here that changes how the CAR looks
+       rather than the world, and A/B against the flat old appearance is the only
+       way to judge it. No reload: it is GL state and a per-frame step. */
+    int car_light;
 
     int vol_sfx;        /* 0..MENU_VOL_STEPS */
     int vol_music;

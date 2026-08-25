@@ -247,17 +247,31 @@ void race_ui_start(race_ui_t *r)
     r->lap_hold = -1.f;
     r->hold_left = 0.f;
     r->blink_t = 0.f;
+    /* A new race has no best lap. Cleared here rather than in race_ui_init so a
+       track change gets a fresh one too -- main.c calls this on every entry into
+       a race, which is the same reason countdown_start is called there. */
+    r->best_lap = 0.f;
     r->running = 1;
 }
 
-void race_ui_lap(race_ui_t *r)
+int race_ui_lap(race_ui_t *r)
 {
+    int best;
     if (!r || !r->running)
-        return;
+        return 0;
+    /* The best lap, decided BEFORE the clock is reset and off the reading the
+       line is being crossed with -- which is the same number the lap-time line
+       is about to hold and blink, so the banner and the clock can never disagree
+       about what the lap took. */
+    best = (r->t_lap > 0.f) && (r->best_lap <= 0.f || r->t_lap < r->best_lap);
+    if (best)
+        r->best_lap = r->t_lap;
+
     r->lap_hold = r->t_lap;
     r->hold_left = HUD_LAP_BLINK;
     r->blink_t = 0.f;
     r->t_lap = 0.f;
+    return best;
 }
 
 void race_ui_stop(race_ui_t *r)

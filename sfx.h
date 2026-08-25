@@ -72,10 +72,18 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
    The music keeps playing -- that is the menu's business, not this one's. */
 void sfx_pause(int paused);
 
+/* THE MOTOR IS A LATCH, and it is the engine's, not a port model: the car makes
+   no engine noise at all until it is driven, and cuts out again after four
+   seconds standing still with neither accelerate nor brake held. Call this when
+   the car is put on the grid, which is what leaves the 3-2-1 silent. The whole
+   rule, with the addresses, is over ENG_OFF_TIME in sfx.c. */
+void sfx_engine_off(void);
+
 /* One-shots the game raises rather than sfx_update inferring them. */
 void sfx_ui(sfx_ui_t which);
 void sfx_checkpoint(void);      /* cp */
 void sfx_wrongway(void);        /* cp_wrongway */
+void sfx_cp_beside(void);       /* cp_beside -- see dirarrow.h */
 void sfx_prestart(void);        /* prestart */
 /* cp_start -- the WHOLE 3-2-1-GO, four beeps 1.0000 s apart in one 4.44 s wav.
    Raise it ONCE, at the top of the countdown, and the beeps land on 3, 2, 1 and
@@ -184,6 +192,13 @@ void sfx_ai_silence(void);
  * m/s; anything under PROP_MIN_SPEED is a nudge and is ignored, and it
  * rate-limits itself the same way the prop cue does. */
 void sfx_car_hit(float speed);
+
+/* A guard's burst: one round leaving the muzzle (positional, `bullet`) and one
+   landing on the player's car (`car_cdt_bullet`, on the car like every other
+   car_cdt_*). Both wavs ship and snd.dat names both; see sfx.c for the radii,
+   which are the only part of this the data does not give. */
+void sfx_bullet(const float pos[3]);
+void sfx_bullet_hit(void);
 
 /* Master levels, 0..1. Persisted by the menu. */
 void sfx_volumes(float sfx, float music);

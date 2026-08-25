@@ -472,25 +472,26 @@ float carani_wheel_plane_y(const carani_t *r)
     return n ? (float)(sum / (double)n) : 0.0f;
 }
 
-/* The tuning's tyre width. See carani.h for why this exists at all, why it is
-   the grip ratio rather than a table, and why it lives in exactly one place. */
+/* The tuning's tyre width -- FUN_0050bde0's own table, indexed by the tyre
+   level. See carani.h for where the engine applies it and for what makes an
+   absolute node scale safe to use as a multiplier here.
+
+   No "nothing loaded" guard: this reads no tuning at all, so a car with an
+   empty .crs gets the same 0.95 as one with a full one. The level is clamped
+   rather than passed through, because the engine's own callers bounds-check it
+   before the lookup and never reach the 100.0 the lookup returns otherwise. */
 float carani_tire_width(const rb_car *c)
 {
+    static const float tab[4] = CARANI_TIRE_WIDTH_TABLE;
     int lvl;
-    double base, up;
 
     if (!c)
-        return 1.0f;
-    /* tune.tire_upgrade is tire[8..11], four entries -- the same range
-       rb_tire_grip guards, which returns no grip at all outside it. */
+        return tab[0];
+    /* tire_upgrade is phys+0xe45c, 0..3 -- the same field the mark reads. */
     lvl = c->tire_upgrade;
     if (lvl < 0) lvl = 0;
     if (lvl > 3) lvl = 3;
-    base = (double)c->tune.tire_upgrade[0];
-    up = (double)c->tune.tire_upgrade[lvl];
-    if (base <= (double)EPS || up <= (double)EPS)
-        return 1.0f;                  /* no tuning loaded: draw it as modelled */
-    return (float)(1.0 + (double)CARANI_TIRE_WIDTH_GAIN * (up / base - 1.0));
+    return tab[lvl];
 }
 
 /* Compose `local` down the part tree and derive the draw matrices. Parents
@@ -672,14 +673,16 @@ static void wheels_local(carani_t *r, const rb_car *c, float steer, float width,
        degrees. spin_sign is which way that axle points in model space; see
        carani.h.
 
-       The width is a scale premultiplied the way 0x0040c9a0 mode 1 does it, so
-       it scales the node's basis rows and leaves its origin alone: the tyre
-       grows SYMMETRICALLY about the wheel node, which is where the contact patch
-       and therefore the mark is. Growing outboard only would slide the tread off
-       its own mark. It is applied to `local` so it composes normally, which is
-       safe because the wheel nodes are leaves -- none of the three shipped cars
-       packs anything with a WHEEL_* parent, and rb_test pins that by checking
-       the axles and springs do not move when the width does. */
+       The width is a scale premultiplied the way 0x0040c9a0 mode 1 does it,
+       because that is what FUN_0050be40 calls -- it scales the node's basis rows
+       and leaves its origin alone, so the tyre grows SYMMETRICALLY about the
+       wheel node, which is where the contact patch and therefore the mark is.
+       The engine sets that row to an absolute length; premultiplying is the same
+       thing only because every shipped wheel node's local scale is 1.0 (see
+       carani.h). It is applied to `local` so it composes normally, which is safe
+       because the wheel nodes are leaves -- none of the three shipped cars packs
+       anything with a WHEEL_* parent, and rb_test pins that by checking the
+       axles and springs do not move when the width does. */
     for (i = 0; i < c->nwheels && i < RB_MAX_WHEELS; i++) {
         if (r->wheel[i] < 0)
             continue;

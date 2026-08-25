@@ -48,7 +48,8 @@ void envmap_init(envmap_t *e, const scene_t *track)
     e->enabled = (e->tex != 0);
 }
 
-void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9])
+void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9],
+                 float level)
 {
     /* Heap, not BSS: a car body batch can pass the 32 KB (1,170-vertex) mark at
        which vitaGL's SAFER_DRAW_SPEEDHACK hands GXM this pointer instead of
@@ -61,6 +62,8 @@ void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9])
     e->n_tris = 0;
     if (!e->enabled || !car)
         return;
+    if (level < 0.f) level = 0.f;
+    if (level > 1.f) level = 1.f;   /* the level runs to 1.019; the colour cannot */
     if (!v)
         v = malloc(sizeof(*v) * ENV_MAX_VERTS);
     if (!v)
@@ -140,7 +143,13 @@ void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9])
             glPushMatrix();
             glMultMatrixf(car->rig.draw[b->part]);
         }
-        glColor4f(1.f, 1.f, 1.f, a);
+        /* GREYED BY THE CAR'S LIGHT LEVEL, which is the engine's own: the env
+           pass FUN_00507ba0 reads the same *(car+0xe8)+0xe824 the body light
+           does and builds a colour out of it at 0x00507bcc. A sky reflection
+           has no business being bright inside a tunnel, and the alpha is left
+           alone -- the level changes how bright the reflection is, not how much
+           of the paint it covers. 1.0 restores the old appearance exactly. */
+        glColor4f(level, level, level, a);
         glVertexPointer(3, GL_FLOAT, sizeof(vtx_t), &v[0].x);
         glTexCoordPointer(2, GL_FLOAT, sizeof(vtx_t), &v[0].u);
         glDrawElements(GL_TRIANGLES, b->nidx, GL_UNSIGNED_SHORT, b->idx);

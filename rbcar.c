@@ -405,6 +405,14 @@ void rbcar_clock_reset(rbcar_clock *k)
 int rbcar_step_frame(rb_car *c, rbcar_clock *k, float throttle, float brake,
                      float steer, int boost, float frame_dt)
 {
+    return rbcar_step_frame_cb(c, k, throttle, brake, steer, boost, frame_dt,
+                               0, 0);
+}
+
+int rbcar_step_frame_cb(rb_car *c, rbcar_clock *k, float throttle, float brake,
+                        float steer, int boost, float frame_dt,
+                        void (*per_tick)(void *ctx), void *ctx)
+{
     int ticks = 0, clipped = 0;
 
     if (frame_dt > 0.f)
@@ -424,6 +432,10 @@ int rbcar_step_frame(rb_car *c, rbcar_clock *k, float throttle, float brake,
         k->acc -= RBCAR_TICK_DT;
         rbcar_step(c, throttle, brake, steer, boost, RBCAR_TICK_DT);
         ticks++;
+        /* The rest of the world, on the pose THIS tick ended on -- see the note
+           on this function in rbcar.h. */
+        if (per_tick)
+            per_tick(ctx);
     }
     return clipped ? -1 : ticks;
 }

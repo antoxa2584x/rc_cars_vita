@@ -152,7 +152,43 @@
  *
  * NOT recovered. The engine has a race module that owns this and the port does
  * not have it; see the header comment for what the engine's own checkpoint data
- * turned out to be and why none of it answers this. */
+ * turned out to be and why none of it answers this.
+ *
+ * *** AND IT IS RECOVERED NOW, AND IT IS 1.60 m. ***
+ *
+ * `FUN_004ea8d0' is the engine's own pass test, and it is a radius after all --
+ * the STRAIGHT-LINE 3D distance from the car to the marker of checkpoint
+ * `record+0x4c', against one of two immediates chosen by `phys+0x50':
+ *
+ *     phys+0x50 == 1   ->  2.88 m   (0x554930)
+ *     otherwise        ->  1.60 m   (0x554934)
+ *
+ * and `phys+0x50 == 0' is the LOCALLY CONTROLLED PLAYER CAR (PHYSICS.md,
+ * carJump). So the player gets the TIGHT 1.60 m and everyone else 2.88 m. Inside
+ * it the checkpoint advances -- `(index + 1) % n', with index 0 ticking the lap
+ * through FUN_004eaa20 -- and for player 0 or 1 it fires message-system cue
+ * 0x25d, which the shipped bank names `cp'.
+ *
+ * THE 1.60 IS AN EXTRAORDINARY CONFIRMATION OF THE MEASUREMENT ABOVE. This file
+ * chose 5 m off two bounds, the lower of which is "1.58 m, the worst distance at
+ * which any of the 30 recorded laps passes any of its checkpoints" -- measured
+ * from the shipped .aip recordings, which know nothing about this immediate. The
+ * engine's radius is 1.60 m. The artists placed the markers so that the racing
+ * line passes just inside the engine's own radius, with two centimetres to
+ * spare, and the port measured the same number from the other side.
+ *
+ * SO THE 5 m BELOW IS NOW A DELIBERATE DEPARTURE rather than a guess, and it is
+ * 3.1x the engine's. It has NOT been changed, and the reason is that the two
+ * numbers answer different questions: 1.60 m is what the engine demands of a car
+ * on rails, and this port's strict ordering (see below) makes a missed
+ * checkpoint stall the arrow until the player goes back for it. Adopting 1.60
+ * would be a real difficulty change, so it is a decision and not a fix. What it
+ * costs either way is measured: at 5 m all 30 recorded laps pass all 150
+ * checkpoints; at 1.60 they would pass with 2 cm of margin, and a human who
+ * wanders more than a racing line would miss constantly. See known-issues.md.
+ *
+ * There is a SECOND radius pair in the same record, and that one IS transcribed
+ * -- see dirarrow.h: 4 m in and 5 m out drives the `cp_beside' cue. */
 #define CP_TRIGGER_RAD 5.f
 
 /* How far past its closest approach the car has to get before the pass fires,
@@ -246,6 +282,80 @@ typedef struct {
      * spine (FUN_004ea120 -> FUN_004eb630 = spine_len * (lap - 1) + this). */
     float cum[CP_MAX][CP_MAX_POINTS];
     float spine_len;
+
+    /* WHERE EACH CHECKPOINT REALLY FALLS ROUND A LAP, in the placing's own
+     * metres: `fraction of a lap * spine_len`, so station[0] is 0 and a lap ends
+     * at spine_len. THE PROGRESS MEASURE USES THIS AND NOT cum[], and the two are
+     * different questions however alike they look.
+     *
+     * cum[] is arc length along the CHECKPOINT POLYLINE, and that polyline is not
+     * the road -- it is 1.4 to 2.1 times longer than the lap and wanders up to
+     * 84 m off it (see cp_lap_progress). So its stations are not where the
+     * checkpoints are: measured against the recorded laps they are 39.0 m out on
+     * average and 142 m at worst, on tracks 643 to 955 m round. An opponent's
+     * progress is uniform in road distance, so with the player laid out on cum[]
+     * the two sides of the placing were not comparing the same metres -- an error
+     * bigger than the whole of the interpolation it sat behind.
+     *
+     * FITTED FROM THE RECORDINGS by ai_cp_fractions and installed by
+     * cp_set_stations, because the shipped laps are the only description of the
+     * road this port has. cp_init sets these to cum[k][0], which is what shipped
+     * before and what a track with no usable recording still gets. */
+    float station[CP_MAX];
+
+    /* ONE LAP OF ROAD, metres -- the mean of the recordings' own lap lengths, and
+     * spine_len when nothing has been fitted. It is the exchange rate between a
+     * distance measured on the ground and the placing's metres, in which one lap
+     * is spine_len whatever the road actually measures. Only cp_restart needs it,
+     * to put the grid's few metres short of the line into the right scale. */
+    float road_len;
+
+    /* AND EACH STRETCH'S OWN ROAD LENGTH, metres -- station[k] to station[k+1]
+       measured on the ground, which the same fit hands over for free. It is what
+       lets the fraction be exactly linear in distance driven; 0 means unfitted
+       and cp_prog_step falls back to normalising itself. seg_road[n-1] is the
+       closing stretch, back to the line. */
+    float seg_road[CP_MAX];
+
+    /* THE ARC THE RACE START PROJECTS TO, on the CLOSING stretch of the spine.
+     *
+     * Latched by cp_restart, which is the one call that knows where a race
+     * begins, and it has to be the stretch-restricted projection rather than
+     * cp_spine_dist_near: the grid is 2.3 to 20.5 m from the start/finish marker
+     * on all ten tracks and the whole-spine query answers with a point hundreds
+     * of metres away on five of them (urban_2 grid -> arc 550 of 874, country_1
+     * -> 152 of 913), because a start line is exactly where a track passes
+     * nearest to itself.
+     *
+     * It exists so the player's progress can have the SAME ORIGIN as every
+     * opponent's. An opponent's is metres walked along its own recording from
+     * sample 0, which is its grid slot; the player's would otherwise be metres
+     * from the LINE, leaving it 0.5 to 20.5 m short of the field for the whole
+     * race. cp_lap_origin is that difference. cp_init sets this to spine_len, so
+     * the offset is 0 until a race is actually started. */
+    float grid_arc;
+
+    /* THE PLAYER'S PROGRESS ALONG THE SPINE, metres, 0 .. spine_len, CARRIED
+     * FORWARD -- an increment applied once a frame by cp_step, never a position
+     * re-derived from scratch. That is the whole shape of the fix: the engine
+     * reads a distance stored on each racer's record (FUN_004ea7b0) and every
+     * opponent in this port already had one (metres walked along its own recorded
+     * polyline); the player had nothing of the sort and was re-projected from
+     * zero every frame instead. cp_lap_progress reads this and nothing else.
+     *
+     * `prog_x`/`prog_z` are where the car was when it was last advanced, which is
+     * what the dead reckoning differences against. `prog_ok` is 0 after a reset:
+     * cp_restart and cp_resync SAY where the progress is (the grid, or the marker
+     * of the checkpoint a dead car is put back on) and the next cp_step only
+     * seeds the anchor, so a teleport is never dead-reckoned as driving. */
+    float prog;
+    /* The odometer the fraction is built from -- road metres driven since `last`
+       was latched -- and the position it was last advanced against.
+       cp_cursor_step zeroes the odometer on a pass, which is the re-anchor. */
+    float prog_odo;
+    float prog_x, prog_z;
+    int   prog_ok;
+
     int next;                     /* the checkpoint being headed for */
     int lap;
 
@@ -410,20 +520,81 @@ int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg);
 int cp_spine_dist_near(const checkpoints_t *c, float x, float y, float z,
                        float hint, float *dist, int *cp);
 
-/* HOW FAR ROUND THE LAP, 0 at the start/finish line and rising to `spine_len`,
- * anchored on the LATCHED checkpoint index rather than on a projection.
+/* HOW FAR ROUND THE LAP, in metres, measured from the GRID rather than from the
+ * line -- so `cp_lap_origin(c)` at the start/finish and `spine_len + that` a lap
+ * later. The placing's player-side input; ai.c lifts it by the lap count.
  *
- * `last` cannot flicker -- it is a state machine that only ever advances on a
- * pass -- and the distance to `next` is continuous, so this is monotonic between
- * crossings and jumps only at one. That is what makes it comparable with an
- * opponent's own recorded progress, which is the whole point: the placing
- * compares the two.
+ * IT IS CARRIED FORWARD, not re-derived from a position each frame -- which is
+ * what the engine does (FUN_004ea7b0 reads a distance stored on each racer's
+ * record) and what every opponent in this port already had (metres walked along
+ * its own recorded polyline). cp_step advances it once a frame from the car's own
+ * motion; this only reads what that left, so asking twice in a frame is free and
+ * cannot double-count. The rule is in cp_prog_step -- an odometer since the last
+ * checkpoint against the straight line to the next, mapped onto the stretch's two
+ * spine stations, re-anchored exactly at every crossing by the latch.
  *
- * Before the FIRST crossing of a race the car is short of the line with nothing
- * latched, and the answer is 0 -- which is the truth: it has driven none of the
- * lap. -> 0 and leaves `*out` alone with no spine. */
+ * IT DOES NOT PROJECT ONTO THE SPINE, and that is the finding worth keeping:
+ * THE CHECKPOINT SPINE IS NOT A CENTRELINE. Measured against the first
+ * opponent's recorded lap on each of the ten tracks, its points sit 9 to 27 m
+ * from the racing line on average and up to 84 m from it at worst, and the
+ * polyline is 1.4 to 2.1 times LONGER than the lap it describes (beach_1: a
+ * 460 m lap, a 643 m spine). So a nearest-point-on-the-spine answer is not a
+ * position on the track and a step along its tangent is not a step along the
+ * road. Both were built and measured before this was: see cp_prog_step.
+ *
+ * WHAT THIS REPLACES, and the bug that was reported: the answer used to be
+ * `station(last) + span * (1 - |car - next| / span)' -- a straight line to the
+ * next MARKER against an arc span. Held against the true road fraction of each
+ * stretch, over a driven lap on all ten tracks, that was wrong by 49 to 99 m on
+ * average where this rule is wrong by 8 to 60 m, and it was wrong in the way that
+ * shows: with 4 to 7 checkpoints a lap the spans are 32 to 286 m and a chord to a
+ * marker 200 m away barely moves over the first half of one. On urban_2 it sat at
+ * 0 for the opening 4.6 s, stepped 45 m at the line, then STALLED for 200 frames
+ * and ran BACKWARDS while the car drove forwards, then jumped 156 m in one frame
+ * at the next crossing. The place on screen could only change 5 times a lap,
+ * which is what "it updates too late" is. This rule freezes on no frame of any of
+ * the ten and never steps backwards.
+ *
+ * A CAR THAT MISSES `next` still clamps at the end of the stretch and stays there
+ * until it goes back and gets it -- the same strict-order policy as the arrow,
+ * for the same reason (see "A RADIUS CAN BE MISSED" above), and the same answer
+ * the old rule gave when its `t` clamped at 1.
+ *
+ * BEFORE THE FIRST CROSSING of a race the stretch is the closing one and the
+ * answer is metres driven from the grid, starting at 0 -- which is where every
+ * opponent's own measure starts too, so the field is level on the grid instead of
+ * the player reading last until it reaches the line. Reporting the raw arc there
+ * would be a whole lap's worth and ai.c would count a phantom lap at the line.
+ *
+ * -> 0 and leaves `*out` alone with no spine. */
 int cp_lap_progress(const checkpoints_t *c, float x, float y, float z,
                     float *out);
+
+/* METRES FROM THE GRID TO THE START/FINISH LINE: `spine_len - grid_arc`, 0.5 to
+ * 20.5 m on the ten shipped tracks, and 0 until cp_restart has latched a grid.
+ *
+ * cp_lap_progress's answers are offset by it so that the player's origin is its
+ * grid slot, which is where an opponent's recording -- and so an opponent's
+ * progress -- begins. Exposed because a caller that divides the answer back into
+ * a fraction of its stretch has to subtract it again; main.c's direction arrow is
+ * the one that does. */
+float cp_lap_origin(const checkpoints_t *c);
+
+/* INSTALL THE TRUE CHECKPOINT STATIONS, fitted from the shipped recordings by
+ * ai_cp_fractions -- see checkpoints_t.station for why cum[] is not them.
+ *
+ * `frac` is `n` fractions of a lap, ascending, with frac[0] == 0; `lap_len` is
+ * one lap of road in metres. Both come straight out of ai_cp_fractions.
+ *
+ * -> 1 when they are installed, 0 when they are rejected and cum[] is kept: `n`
+ * has to be this track's checkpoint count, the fractions have to be strictly
+ * increasing inside [0, 1), and `lap_len` has to be positive. Rejecting rather
+ * than repairing is deliberate -- a station table that is subtly wrong is worse
+ * than the arc lengths, which are at least in the right order.
+ *
+ * CALL IT AFTER THE OPPONENTS ARE LOADED AND BEFORE cp_restart, which reads
+ * `road_len` to place the grid. main.c's load_track does both in that order. */
+int cp_set_stations(checkpoints_t *c, const float *frac, int n, float lap_len);
 
 /* Metres along the closed spine at (x, z). The nearest sample over the WHOLE
    spine -- see cp_spine_dist_near for why that flickers, and prefer it wherever
@@ -437,7 +608,18 @@ int cp_progress(const checkpoints_t *c, float x, float z, float *out_s);
    after everything else, and it leaves GL state as it found it. */
 void cp_draw(checkpoints_t *c, const float eye[3]);
 
-/* Metres along the spine from the car to the next checkpoint's centre. */
+/* STRAIGHT-LINE metres from the car to the next checkpoint's marker, in 3D.
+ *
+ * This comment said "along the spine" for as long as the function existed and
+ * the code has never done that -- it is `length(cp[next].p[0] - car)'. Written
+ * out because the difference decides callers: this is the APPROACH distance the
+ * engine measures (FUN_004eb550, which is 3D), and dirarrow.c wants a distance in
+ * XZ against a radius in the plane and so does NOT use this -- on a track with a
+ * checkpoint under a bridge the height would go into the comparison.
+ *
+ * cp_lap_progress used to be built on it, as a chord against an arc span, and
+ * that was the placing bug -- see there. It is no longer a progress measure and
+ * must not be used as one. */
 float cp_dist_to_next(const checkpoints_t *c, float x, float y, float z);
 
 /* Progress along the closed spine at (x, y, z), WITHIN a lap: `dist` metres from

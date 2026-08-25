@@ -15,6 +15,7 @@
 static const char *const ROW_LABEL[MENU_ROWS] = {
     "Track", "Car", "Skin", "Tires", "Resonator", "Booster",
     "Sound volume", "Music volume", "Texture quality", "Texture colours",
+    "Car lighting",
     "Restart at race start", "Resume", "Quit"
 };
 
@@ -41,6 +42,8 @@ void menu_init(menu_t *m, int track, int car)
        the engine is the thing the player is steering by. */
     m->vol_sfx = MENU_VOL_STEPS;
     m->vol_music = 7;
+    /* On: it is what the original does. See carlight.h. */
+    m->car_light = 1;
 }
 
 static int clampi(int v, int lo, int hi)
@@ -98,6 +101,11 @@ static void adjust(menu_t *m, int d)
     case MENU_TEXORDER:
         m->tex_swap_rb = !m->tex_swap_rb;
         m->req_reload = 1;
+        break;
+    /* Two values as well, and no reload: main.c hands it to carlight_set_enabled
+       every frame. */
+    case MENU_CARLIGHT:
+        m->car_light = !m->car_light;
         break;
     default: break;
     }
@@ -217,6 +225,14 @@ static void row_value(const menu_t *m, int row, char *out, int n)
         snprintf(out, n, "< %s >",
                  m->tex_swap_rb ? "R/B swapped (for Vita3K)"
                                 : "standard (for real hardware)");
+        break;
+    case MENU_CARLIGHT:
+        /* The two ends named by what they look like, with the engine's own two
+           intensities on the ON side -- 138 and 128 of 255 are what make the lit
+           and unlit sides of one shell a factor of two apart. */
+        snprintf(out, n, "< %s >",
+                 m->car_light ? "sun + shade (ambient 138, direct 128)"
+                              : "off (flat, as before)");
         break;
     default:
         out[0] = 0;

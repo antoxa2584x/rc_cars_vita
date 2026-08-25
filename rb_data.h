@@ -216,21 +216,46 @@ static const rb_car_data RB_CARS[3] = {
 };
 
 /* Camera, from Settings/Camera.crs via physLoadCamera (0x004f9da0).
- * The conversions are that function's own clamped affine maps. */
+ * The conversions are that function's own clamped affine maps. The five raw
+ * values are the ones actually stored in Settings/Camera.crs (chunk 0x3025 of
+ * each 0x0220 record; the key names are XOR 0x25).
+ *
+ * The four CDT_* keys are NOT in Camera.crs -- physLoadCamera reads them with
+ * the FLOAT getter 0x00404950, so they come from the slider declarations in
+ * Settings/Camera.ini, which carry `Mask float` and an FValues range:
+ *
+ *     CDT_AngleUp               raw 28 of 1..100 -> 10..80    = 29.09 deg
+ *     CDT_AngleUpSpeed          raw 25 of 1..100 -> 10..90    = 29.39 deg/s
+ *     CDT_AngleUp_DIR_ADD       raw 66 of 1..100 -> 0..20     = 13.13 deg
+ *     CDT_AngleUp_SPEED_DIR_ADD raw 151 (clamped) -> 0.01..10 = 10.0 deg/s
+ */
 typedef struct {
     float dist_xz;     /* defDistXZ, metres behind */
     float dist_y;      /* defDistY, metres above */
     float acc_dist_y;  /* accDistY, vertical pull-back per second */
     float acc_alpha;   /* accAlpha, yaw pull-back scale */
-    float vis_turn;    /* VisTurn, degrees of look-into-turn */
+    /* VisTurn. NOT a look-into-turn: 0x00501180 rotates the view direction and
+       the up vector about the camera's RIGHT axis by this many degrees, every
+       frame, with no reference to the steering. It is a constant aim pitch-UP,
+       which is what drops the car below the centre of the frame. See cam.c. */
+    float vis_turn;
+    float cdt_angle_up;        /* CDT_AngleUp, degrees the eye lifts when the
+                                  car->eye segment is blocked */
+    float cdt_angle_up_speed;  /* CDT_AngleUpSpeed, degrees per second */
+    float cdt_dir_add;         /* CDT_AngleUp_DIR_ADD, extra aim pitch at full lift */
+    float cdt_dir_add_speed;   /* CDT_AngleUp_SPEED_DIR_ADD, degrees per second */
 } rb_camera_data;
 
 static const rb_camera_data RB_CAMERA = {
-    /* dist_xz    */ 0.792929f,   /* raw 30 */
-    /* dist_y     */ 0.363636f,   /* raw 30 */
-    /* acc_dist_y */ 0.100000f,   /* raw 1 */
-    /* acc_alpha  */ 0.494949f,   /* raw 50 */
-    /* vis_turn   */ 11.818181f    /* raw 70 */
+    /* dist_xz            */ 0.792929f,   /* raw 30 */
+    /* dist_y             */ 0.363636f,   /* raw 30 */
+    /* acc_dist_y         */ 0.100000f,   /* raw 1 */
+    /* acc_alpha          */ 0.494949f,   /* raw 50 */
+    /* vis_turn           */ 11.818181f,  /* raw 70 */
+    /* cdt_angle_up       */ 29.090908f,  /* raw 28 */
+    /* cdt_angle_up_speed */ 29.393940f,  /* raw 25 */
+    /* cdt_dir_add        */ 13.131313f,  /* raw 66 */
+    /* cdt_dir_add_speed  */ 10.000000f   /* raw 151, clamped to 100 */
 };
 
 #endif

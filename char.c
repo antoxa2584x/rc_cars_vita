@@ -587,14 +587,30 @@ static void drop(const chr_t *c, chr_inst_t *in)
         in->y = y;
 }
 
-static const char *const CLIP_IDLE[] = { "stand", "Stand", "flight_idle",
+/*
+ * WHICH CLIP MEANS WHAT, and the ENGINE'S OWN TABLES SAY -- see char_data.h's
+ * "THE REACTION" for the three of them and the flag decoders that index them.
+ * The lists here are ordered so the first name that a model carries is the one
+ * the engine would have picked for that state, which matters most for the
+ * Seagull: it has FIVE clips and two of them are airborne.
+ *
+ *   `look_around` is the Seagull's GROUND idle (one-shot, chaining to `walk`),
+ *   not `flight_idle`, which is what it holds in the AIR. Reading it the other
+ *   way is what stood a gull on the sand with its wings out for as long as this
+ *   file has existed, and it is why "the seagull has no walk animation" -- the
+ *   walk was there and the bird was hardly ever in it.
+ */
+static const char *const CLIP_IDLE[] = { "stand", "Stand", "look_around",
                                          "hide", NULL };
 static const char *const CLIP_WALK[] = { "walk", "Walk", "WALK", "run", NULL };
 static const char *const CLIP_RUN[] = { "run", "runQuick", "Walk", "WALK",
                                         NULL };
-static const char *const CLIP_ACT[] = { "attack", "shoot", "HIT", "hide",
-                                        "Brosok", NULL };
-static const char *const CLIP_HURT[] = { "Hurt", "Pendal", "HIT", NULL };
+static const char *const CLIP_ACT[] = { "attack", "HIT", "hide", NULL };
+static const char *const CLIP_HURT[] = { "Hurt", "HIT", NULL };
+/* The two reactions, and the Guard's own names for them. It has no throw. */
+static const char *const CLIP_KICK[] = { "Pendal", "kick", NULL };
+static const char *const CLIP_THROW[] = { "Brosok", NULL };
+static const char *const CLIP_SHOOT[] = { "shoot", NULL };
 
 static void set_clip(chr_inst_t *in, const chr_model_t *m, int clip, float rate)
 {
@@ -605,6 +621,64 @@ static void set_clip(chr_inst_t *in, const chr_model_t *m, int clip, float rate)
         in->clip_t = 0.0f;
     }
     in->clip_rate = rate;
+    in->once = 0;
+}
+
+/*
+ * A ONE-SHOT CLIP. The engine's animation tables mark Brosok, Pendal, Hurt and
+ * the guard's shoot as play-through and chain each back to Stand when it ends
+ * (0x50f6c0 sets the flag and the successor for states 2, 3 and 4; 0x51ad50 for
+ * the guard's 1); everything else loops. So the cursor has to STOP at the
+ * duration rather than wrap, because the whole reaction is timed off it -- the
+ * sole connects 0.65 s in and the car leaves the hand at 2.0 s, and a wrapped
+ * cursor would fire both again every cycle.
+ *
+ * RATE 1.0 AND NOTHING ELSE. Every animation in the engine is advanced by the
+ * constant at 0x554390, which is 1.0 -- 0x50f7d0 and 0x513820 both load it and
+ * both compute an index they then throw away. That is what makes the recovered
+ * cursors readable as seconds against the clip durations out of the .chr
+ * (Pendal 3.000, Brosok 4.700, the guard's kick 3.000 and shoot 1.500).
+ */
+static void set_clip_once(chr_inst_t *in, const chr_model_t *m, int clip)
+{
+    if (clip < 0 || (unsigned)clip >= m->n_clips)
+        return;
+    if (in->clip != clip) {
+        in->clip = clip;
+        in->clip_t = 0.0f;
+    }
+    in->clip_rate = 1.0f;
+    in->once = 1;
+}
+
+int chr_clip_done(const chr_t *c, unsigned int inst)
+{
+    const chr_inst_t *in;
+    const chr_model_t *m;
+    if (!c || inst >= c->n_inst)
+        return 0;
+    in = &c->inst[inst];
+    m = &c->model[in->model];
+    if (!in->once || in->clip < 0 || (unsigned)in->clip >= m->n_clips)
+        return 0;
+    return in->clip_t >= m->clip[in->clip].duration;
+}
+
+/*
+ * A ROLL OF THE DICE, AND THE ENGINE HAS ONE WHERE THIS FILE DID NOT.
+ *
+ * 0x510f40 asks rand()/32768 whether to throw the car or kick it and 0x52de30
+ * asks it three times for the burst's sweep axis, so two of the recovered
+ * decisions are genuinely random and there was nothing here to be random with --
+ * every other machine in this file is deterministic on purpose. This is a
+ * per-instance 32-bit LCG (Numerical Recipes' constants), advanced only where
+ * the engine advances its own: same sequence for the same sequence of
+ * decisions, which is what a fixture needs to be able to drive both branches.
+ */
+static float rnd01(chr_inst_t *in)
+{
+    in->rnd = in->rnd * 1664525u + 1013904223u;
+    return (float)((in->rnd >> 16) & 0x7fff) * (1.0f / 32768.0f);
 }
 
 /*
@@ -760,6 +834,30 @@ void char_reset(chr_t *c)
         in->leg = 0;
         in->hit_cool = 0.0f;
         in->event = CHR_EV_NONE;
+        /*
+         * AND THE REACTION, WHICH MUST NOT SURVIVE A RESTART. `carry` is the
+         * dangerous one: char_carrier is what tells main.c to put the car in
+         * this instance's hand instead of simulating it, so a race restarted
+         * while someone was mid-throw would hand the new car straight back to
+         * him. `rnd` is seeded from the instance's index rather than left at
+         * zero so two Guards on one track do not spray identically -- and
+         * seeded rather than randomised, so a restart is reproducible.
+         */
+        in->react = CHR_RX_NONE;
+        in->react_t = 0.0f;
+        in->react_hit = 0;
+        in->once = 0;
+        in->carry = 0;
+        in->carry_q[0] = in->carry_q[1] = in->carry_q[2] = in->carry_q[3] = 0.0f;
+        in->shots = (int)CHR_BURST_NSHOOTS;      /* no burst in the air */
+        in->shot_t = 0.0f;
+        in->sweep[0] = in->sweep[1] = in->sweep[2] = 0.0f;
+        in->w_dwell = 0.0f;
+        in->w_count = 0;
+        in->w_have = 0;
+        in->w_seen = 0;
+        in->imp_kind = CHR_IMP_NONE;
+        in->rnd = 0x9e3779b9u + i * 2654435761u;
         in->clip = -1;
         in->clip_rate = 1.0f;
         in->clip_t = 0.0f;
@@ -933,6 +1031,355 @@ static int walk_to(chr_t *c, chr_inst_t *in, float speed, float reach,
 }
 
 /*
+ * WHERE A NAMED JOINT IS IN THE WORLD, posed. Same three lines the Dog's BONES
+ * proxy uses and in the same order char_draw builds on the matrix stack: the
+ * model-space joint out of chr_pose, times the instance's scale, its yaw (plus
+ * the model's own yaw_off) and its position. Returns 0 if the model has no such
+ * node -- which for LHANDeff cannot happen on a person, because 0x50f460 FAILS
+ * THE WHOLE INSTANCE when either hand effector is missing.
+ */
+static int bone_world(chr_t *c, unsigned int idx, const char *name, float o[3])
+{
+    chr_inst_t *in;
+    const chr_model_t *m;
+    int b;
+    float cy, sy, lx, ly, lz;
+
+    if (!c || idx >= c->n_inst)
+        return 0;
+    in = &c->inst[idx];
+    m = &c->model[in->model];
+    b = chr_part_index(m, name);
+    if (b < 0 || b >= CHR_MAX_PARTS)
+        return 0;
+    chr_pose(c, idx);
+    cy = cosf((in->yaw + m->yaw_off) * DEG);
+    sy = sinf((in->yaw + m->yaw_off) * DEG);
+    lx = c->world[b][12] * in->scale;
+    ly = c->world[b][13] * in->scale;
+    lz = c->world[b][14] * in->scale;
+    o[0] = in->x + cy * lx + sy * lz;
+    o[1] = in->y + ly;
+    o[2] = in->z - sy * lx + cy * lz;
+    return 1;
+}
+
+/*
+ * CAN IT LIFT THE CAR OVER ITS HEAD? 0x510ea0, and it is a real question about
+ * the world rather than a coin toss: the engine puts a sphere of radius 1.5 at
+ * CHR_REACT_LIFT_UP (2.2 m) above the person and asks the world whether
+ * anything is in it. Under a pier deck or a bridge there is, and the person
+ * kicks instead of throwing.
+ *
+ * The engine's query is worldSphereQuery with kind 4 -- a sphere -- and the
+ * port's equivalent is col_sphere against the same shipped grid, so this is the
+ * one clause here that changes with the collision data rather than with a
+ * constant. The radius is the engine's own 0x3fc00000, written out here beside
+ * the site because it is pushed as part of the query struct rather than loaded
+ * from .data and read_react cannot reach it.
+ */
+#define CHR_LIFT_RADIUS 1.5f        /* 0x3fc00000, built at 0x510f0b */
+
+static int can_lift(const chr_t *c, const chr_inst_t *in)
+{
+    float p[3];
+    if (!c->col)
+        return 1;                   /* no grid loaded: do not veto the throw */
+    p[0] = in->x;
+    p[1] = in->y + CHR_REACT_LIFT_UP;
+    p[2] = in->z;
+    return !col_sphere(c->col, p, CHR_LIFT_RADIUS, NULL, 0, NULL);
+}
+
+/*
+ * THE DECISION -- 0x510f40, and it is the whole of "the NPCs react to cars".
+ *
+ * Two ways in, and the person has to be roughly level with the car for either:
+ *
+ *   - the car is INSIDE CHR_REACT_NEAR (0.8 m). Then it always reacts, whichever
+ *     way it happens to be facing. A guard kicks. A person rolls: over
+ *     CHR_REACT_THROW_P (0.2) it kicks, and under it tries to pick the car up
+ *     and throw it -- falling back to the kick when there is no headroom;
+ *   - or the car is coming AT it: within CHR_REACT_CONE (25 degrees) of the
+ *     person's own forward, inside CHR_REACT_FAR (4 m), doing more than
+ *     CHR_REACT_CAR_SPEED (4.1667 m/s, which is exactly 15 km/h). That one is
+ *     always the kick, and it is not open to a guard.
+ *
+ * -> CHR_RX_NONE, CHR_RX_KICK or CHR_RX_GRAB.
+ */
+static int react_decide(const chr_t *c, chr_inst_t *in, const float car[3],
+                        float car_speed, int is_guard)
+{
+    float d2, d;
+
+    if (fabsf(car[1] - in->y) > CHR_REACT_DY)
+        return CHR_RX_NONE;
+    d2 = dist2_xz(in->x, in->z, car[0], car[2]);
+    d = sqrtf(d2);
+    if (d < CHR_REACT_NEAR) {
+        if (is_guard)
+            return CHR_RX_KICK;
+        if (rnd01(in) > CHR_REACT_THROW_P)
+            return CHR_RX_KICK;
+        return can_lift(c, in) ? CHR_RX_GRAB : CHR_RX_KICK;
+    }
+    if (is_guard)
+        return CHR_RX_NONE;
+    if (d < CHR_REACT_FAR && car_speed > CHR_REACT_CAR_SPEED) {
+        float want = face(in->x, in->z, car[0], car[2]);
+        if (fabsf(wrap180(want - in->yaw)) < CHR_REACT_CONE)
+            return CHR_RX_KICK;
+    }
+    return CHR_RX_NONE;
+}
+
+/*
+ * AND WHAT IT DOES ABOUT IT -- 0x511470 (the kick), 0x5111f0 (the grab) and
+ * 0x510b90 (the carry and the release), which share one shape:
+ *
+ *   turn onto the car at CHR_REACT_TURN_RATE while the clip runs;
+ *   past CHR_REACT_WINDUP, if the car has got further than the reaction's own
+ *   reach (1.1 m for the kick, 1.4 m for the grab), give up;
+ *   otherwise, at the clip cursor the engine names, LAND it.
+ *
+ * The wind-up runs in step with the cursor because the clip is raised on the
+ * same frame the decision fires, which is why the engine can afford to keep both
+ * and test them separately.
+ *
+ * -> nonzero while it is busy, so nothing else in the machine runs.
+ */
+static int step_react(chr_t *c, unsigned int idx, const float car[3],
+                      const float car_fwd[3], float car_speed, float dt)
+{
+    chr_inst_t *in = &c->inst[idx];
+    const chr_model_t *m = &c->model[in->model];
+    int is_guard = (in->place->kind == CHR_KIND_GUARD);
+    float d, dur;
+    int clip;
+
+    if (in->react == CHR_RX_NONE)
+        return 0;
+
+    /* The carry is the one state that does not care where the car is: it IS
+       where the car is. Everything else tracks it. */
+    if (in->react != CHR_RX_CARRY)
+        turn_to(in, face(in->x, in->z, car[0], car[2]), CHR_REACT_TURN_RATE, dt);
+    in->speed = 0.0f;
+    in->react_t += dt;
+    d = sqrtf(dist2_xz(in->x, in->z, car[0], car[2]));
+    clip = in->clip;
+    dur = (clip >= 0 && (unsigned)clip < m->n_clips) ? m->clip[clip].duration
+                                                     : 0.0f;
+
+    switch (in->react) {
+    case CHR_RX_KICK:
+        if (in->react_t >= CHR_REACT_WINDUP && !in->react_hit
+            && d > CHR_REACT_KICK_LOST) {
+            in->react = CHR_RX_NONE;                /* it got away */
+            in->react_t = 0.0f;
+            break;
+        }
+        if (in->react_t >= CHR_REACT_WINDUP && !in->react_hit
+            && in->clip_t > CHR_REACT_KICK_T0 && in->clip_t < dur) {
+            /* THE SOLE CONNECTS. Away from the person, horizontally, plus
+               straight up -- 0x4f3470 normalises (car - person) in XZ only, so
+               the vertical part is entirely CHR_REACT_KICK_UP. */
+            float dx = car[0] - in->x, dz = car[2] - in->z;
+            float l = sqrtf(dx * dx + dz * dz);
+            if (l > 1e-6f) { dx /= l; dz /= l; }
+            else { dx = sinf(in->yaw * DEG); dz = cosf(in->yaw * DEG); }
+            in->imp_kind = CHR_IMP_KICK;
+            in->imp_point[0] = car[0];
+            in->imp_point[1] = car[1];
+            in->imp_point[2] = car[2];
+            in->imp_dv[0] = dx * CHR_REACT_KICK_AWAY;
+            in->imp_dv[1] = CHR_REACT_KICK_UP;
+            in->imp_dv[2] = dz * CHR_REACT_KICK_AWAY;
+            in->react_hit = 1;
+        }
+        if (chr_clip_done(c, idx)) {
+            in->react = CHR_RX_NONE;
+            in->react_t = 0.0f;
+        }
+        break;
+
+    case CHR_RX_GRAB:
+        if (in->react_t >= CHR_REACT_WINDUP && d > CHR_REACT_GRAB_LOST) {
+            in->react = CHR_RX_NONE;
+            in->react_t = 0.0f;
+            break;
+        }
+        if (in->react_t >= CHR_REACT_WINDUP
+            && in->clip_t > CHR_REACT_GRAB_T0 && in->clip_t < dur) {
+            /* IT LEAVES THE GROUND. The engine records the car's attitude in
+               the hand's own frame here (0x5111f0's two three-by-three loops)
+               so it keeps that attitude for the whole lift; char_carry_car
+               fills carry_q on the first frame it runs, because the car's
+               orientation is the caller's to read, not this file's. */
+            in->carry = 1;
+            in->carry_q[0] = 0.0f;      /* "not taken yet" -- see the carry */
+            in->react = CHR_RX_CARRY;
+        }
+        if (chr_clip_done(c, idx)) {
+            in->react = CHR_RX_NONE;
+            in->react_t = 0.0f;
+        }
+        break;
+
+    case CHR_RX_CARRY:
+        if (in->clip_t > CHR_REACT_LET_GO_T) {
+            /* AND IT LETS GO: along the person's own forward, and up. Faster
+               forward than up, which is the other way round from the kick --
+               a kick pops the car and a throw hurls it, and at 7.0 m/s it
+               leaves faster than the car's own 6.91 top speed. */
+            in->imp_kind = CHR_IMP_THROW;
+            in->imp_point[0] = car[0];
+            in->imp_point[1] = car[1];
+            in->imp_point[2] = car[2];
+            in->imp_dv[0] = sinf(in->yaw * DEG) * CHR_REACT_THROW_FWD;
+            in->imp_dv[1] = CHR_REACT_THROW_UP;
+            in->imp_dv[2] = cosf(in->yaw * DEG) * CHR_REACT_THROW_FWD;
+            in->carry = 0;
+            in->react = CHR_RX_NONE;
+            in->react_t = 0.0f;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    /* Whatever it is doing, it is doing it in its own clip: the state above only
+       ever ends by that clip finishing or by the car leaving. */
+    if (in->react == CHR_RX_KICK)
+        set_clip_once(in, m, clip_any(m, CLIP_KICK));
+    else if (in->react == CHR_RX_GRAB || in->react == CHR_RX_CARRY)
+        set_clip_once(in, m, clip_any(m, CLIP_THROW));
+    (void)is_guard;
+    return in->react != CHR_RX_NONE;
+}
+
+/* Begin a reaction. Separate from step_react so the two callers -- a person and
+   a guard -- start it identically, and so the fixture has one place to look. */
+static void react_enter(chr_inst_t *in, int what)
+{
+    in->react = what;
+    in->react_t = 0.0f;
+    in->react_hit = 0;
+}
+
+/*
+ * OPEN FIRE -- 0x51aa81 spawns a 'BRMN' at the guard's own position plus
+ * CHR_GUARD_MUZZLE, and 0x52de30 gives it its sweep: one random unit vector,
+ * scaled by Radius, whose sign the six rounds walk across.
+ */
+static void burst_start(chr_inst_t *in)
+{
+    float x = rnd01(in) - 0.5f, y = rnd01(in) - 0.5f, z = rnd01(in) - 0.5f;
+    float l = sqrtf(x * x + y * y + z * z);
+    if (l < 1e-6f) { x = 1.0f; y = 0.0f; z = 0.0f; l = 1.0f; }
+    in->sweep[0] = x / l * CHR_BURST_RADIUS;
+    in->sweep[1] = y / l * CHR_BURST_RADIUS;
+    in->sweep[2] = z / l * CHR_BURST_RADIUS;
+    in->shots = 0;
+    in->shot_t = 0.0f;
+}
+
+/*
+ * AND ONE ROUND A STEP WHILE IT HAS ANY LEFT -- 0x52da00.
+ *
+ * Six rounds CHR_BURST_TIMESHOOT apart, each aimed at where the car is GOING:
+ * its own position plus its heading times its speed IN KM/H times
+ * CHR_BULLET_LEAD x Offset -- the one place in this port where a recovered
+ * constant wants km/h -- plus a sweep that walks from +Radius to -Radius across
+ * the burst. So the burst crosses the car rather than tracking it, and a car
+ * that keeps moving is mostly missed.
+ *
+ * The FIRST round leaves at once: the engine seeds the last-fired index at -1
+ * (0x52de30) so index 0 is already a change. At most one a step, which is what
+ * the engine does too -- it fires when the index changes, not per unit of time.
+ */
+static void burst_step(chr_inst_t *in, const float car[3],
+                       const float car_fwd[3], float car_speed, float dt)
+{
+    int k;
+    if (in->shots >= (int)CHR_BURST_NSHOOTS)
+        return;
+    k = (int)(in->shot_t / CHR_BURST_TIMESHOOT);
+    if (k >= in->shots) {
+        float f = (float)in->shots / CHR_BURST_NSHOOTS;
+        float lead = car_speed * 3.6f * CHR_BURST_OFFSET * CHR_BULLET_LEAD;
+        float w = 1.0f - 2.0f * f;
+        in->imp_kind = CHR_IMP_SHOT;
+        in->imp_point[0] = in->x;
+        in->imp_point[1] = in->y + CHR_GUARD_MUZZLE;
+        in->imp_point[2] = in->z;
+        in->imp_aim[0] = car[0] + car_fwd[0] * lead + in->sweep[0] * w;
+        in->imp_aim[1] = car[1] + car_fwd[1] * lead + in->sweep[1] * w;
+        in->imp_aim[2] = car[2] + car_fwd[2] * lead + in->sweep[2] * w;
+        in->shots++;
+    }
+    in->shot_t += dt;
+}
+
+/*
+ * THE ATTENTION MACHINE -- 0x5357e0, shared by the Guard, the Dog, the Btr's
+ * tower and the Seagull, and its constants are the arguments at each creation
+ * site (char_data.h's CHR_WATCH_*).
+ *
+ * Two volumes: nothing happens at all unless a car is in the ACQUIRE one, and
+ * the target has to stay in the HOLD one. Then a dwell clock -- `first` before
+ * the first attack and `again` between later ones -- and after `count` attacks
+ * it drops the target and looks again.
+ *
+ *   0  nothing is in the acquire volume
+ *   1  it had a target and lost it, or it has none to take
+ *   2  tracking: turn onto the car and wait the dwell out
+ *   3  ATTACK, this step
+ *
+ * ONE CAR. The engine walks every '$CAR' and takes the nearest with the last
+ * one it attacked counted at DOUBLE distance, so it works round a field; the
+ * port's opponents are recorded replays with no rigid body for an impulse to act
+ * on, so this watches the player and the tie-break has nothing to break. Marked
+ * because it is a reduction of the original rather than the original.
+ */
+static int watch_step(chr_inst_t *in, const chr_watch_t *w, const float car[3],
+                      float dt)
+{
+    const chr_place_t *pl = in->place;
+    int acquire = !(pl->have & CHR_VOL_SIGHT)
+                  || chr_in_volume(&pl->sight, car[0], car[1], car[2]);
+    int hold = !(pl->have & CHR_VOL_HOME)
+               || chr_in_volume(&pl->home, car[0], car[1], car[2]);
+    float thr;
+
+    if (!acquire) {
+        in->w_have = 0;
+        return 0;
+    }
+    if (!in->w_have) {
+        if (!hold)
+            return 1;
+        in->w_have = 1;
+        in->w_dwell = 0.0f;
+        in->w_count = 0;
+        return 2;
+    }
+    if (!hold) {
+        in->w_have = 0;
+        return 1;
+    }
+    in->w_dwell += dt;
+    thr = in->w_count == 0 ? w->first : w->again;
+    if (in->w_dwell < thr)
+        return 2;
+    in->w_dwell = 0.0f;
+    if (++in->w_count > w->count)
+        in->w_have = 0;
+    return 3;
+}
+
+/*
  * THE DOG. char_data.h gives it a vision cone (ConeAngle 45 degrees), two
  * radii (RadNear 0.35 m all round, RadFar_Far 3.0 m inside the cone), a reach
  * (RadReach 0.30 m), an attack that lasts TimeAttack 1.5 s and AniSpeed 4.0.
@@ -1013,99 +1460,192 @@ static void step_dog(chr_t *c, chr_inst_t *in, const chr_model_t *m,
 }
 
 /*
- * THE SEAGULL. SpeedRun 0.21 m/s on the ground, SpeedFlight 0.25 m/s in the
- * air, FlightHeight 1.5 m, VertAngleMax 45 degrees, TimeIdle 0.22 s,
- * TimeTurn 2.57 s. Its brief is an inhabitVolume it pecks around in, a
- * visibilityVolume that startles it, and a flightDir marker it leaves along.
+ * THE SEAGULL -- 0x512b30, RECOVERED, and it is a four-state machine whose every
+ * clip choice this file used to get wrong.
  *
- * The machine is the port's; the five clips it picks between are the model's
- * own (flight_idle, look_around, walk, start_flight, flight).
+ * The state lives in one field and IS the animation flag word: 0x512760 hands it
+ * straight to 0x5135d0, which decodes it through 0x5137c0 against the clip table
+ * at 0x573e84, [start_flight, flight_idle, look_around, walk, flight]:
+ *
+ *   1  LOOK AROUND -- stand still for TimeTurn (2.57 s), playing `look_around`
+ *   2  WALK        -- to a point in the inhabitVolume at SpeedRun (0.21 m/s),
+ *                     playing `walk`, until within CHR_GULL_ARRIVE (0.25 m)
+ *   16 STARTLED    -- `start_flight` for TimeIdle (0.22 s)
+ *   4  FLY         -- to the flightDir marker at SpeedFlight (0.25 m/s), playing
+ *                     `flight`, climbing at VertAngleMax (45 deg) scaled down
+ *                     linearly to level as it reaches FlightHeight (1.5 m)
+ *
+ * THREE THINGS THIS FILE HAD WRONG, and together they are the whole of "the
+ * seagull has no walk animation and its flight is too slow":
+ *
+ *   - `flight_idle` was the ground idle. It is an AIRBORNE clip; the ground idle
+ *     is `look_around`, and a gull standing with its wings spread reads as a
+ *     bird with no walk cycle at all;
+ *   - TimeIdle and TimeTurn were SWAPPED. TimeTurn is how long it looks around
+ *     (2.57 s) and TimeIdle is the startle before it goes up (0.22 s), so the
+ *     bird used to idle for a fifth of a second and then spend two and a half
+ *     seconds crouched in `start_flight` -- eleven times too long, and that is
+ *     the slow takeoff;
+ *   - every clip ran at stride_rate. The engine advances EVERY animation at the
+ *     constant 1.0 (0x513820 loads 0x554390, as 0x50f7d0 does for the people),
+ *     so a 0.7 s walk cycle is a 0.7 s walk cycle. stride_rate exists for the
+ *     Dog, whose ground speed has to come from somewhere; the gull's is a
+ *     recovered constant and its clips are authored to match.
+ *
+ * What startles it is not the visibilityVolume: that is only the gate that lets
+ * the machine run at all (0x513040). The trigger is 0x513100 -- a 'PEOP', a
+ * 'DOG$' or a '$CAR' within CHR_GULL_STARTLE (4.0 m), in XZ. Only the car is
+ * tested here, because that is the only one of the three this signature is
+ * handed; the people and the dogs on the same beach are in c->inst and cost a
+ * loop, so they are tested too.
  */
+static int gull_startled(const chr_t *c, const chr_inst_t *self,
+                         const float car[3])
+{
+    unsigned int i;
+    float r2 = CHR_GULL_STARTLE * CHR_GULL_STARTLE;
+
+    if (dist2_xz(self->x, self->z, car[0], car[2]) < r2)
+        return 1;
+    for (i = 0; i < c->n_inst; i++) {
+        const chr_inst_t *o = &c->inst[i];
+        if (o == self)
+            continue;
+        /* 'PEOP' and 'DOG$' -- the two other kinds 0x513100 looks for. */
+        if (o->place->kind != CHR_KIND_WALKER && o->place->kind != CHR_KIND_DOG)
+            continue;
+        if (dist2_xz(self->x, self->z, o->x, o->z) < r2)
+            return 1;
+    }
+    return 0;
+}
+
 static void step_seagull(chr_t *c, chr_inst_t *in, const chr_model_t *m,
                          const float car[3], float dt)
 {
     const chr_place_t *pl = in->place;
-    int startled = (pl->have & CHR_VOL_SIGHT)
-                   && chr_in_volume(&pl->sight, car[0], car[1], car[2]);
+    /* THE GATE, 0x513040: a car inside the visibilityVolume, or the gull does
+       nothing at all. An instance with no volume authored is always awake. */
+    int awake = !(pl->have & CHR_VOL_SIGHT)
+                || chr_in_volume(&pl->sight, car[0], car[1], car[2]);
+
+    if (!awake) {
+        in->speed = 0.0f;
+        set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
+        return;
+    }
+
+    /* The startle test runs in the two GROUND states only, which is what
+       0x512b30 does: the check sits under `if (state == 1 || state == 2)`. */
+    if ((in->state == CHR_ST_IDLE || in->state == CHR_ST_GO)
+        && gull_startled(c, in, car)) {
+        in->state = CHR_ST_ACT;
+        in->timer = CHR_SEAGULL_TIMEIDLE;
+        set_clip(in, m, chr_clip_index(m, "start_flight"), 1.0f);
+    }
 
     switch (in->state) {
+    case CHR_ST_ACT:                        /* startled: start_flight */
+        in->speed = 0.0f;
+        in->timer -= dt;
+        if (in->timer <= 0.0f) {
+            in->state = CHR_ST_FLY;
+            in->event = CHR_EV_TAKEOFF;
+            /* Where it goes: its own flightDir marker. Nothing recovered brings
+               it back -- 0x512b30 has no state past 4 -- but a bird that leaves
+               for good empties the track a lap at a time, so the port turns it
+               round once it is out of the volume that woke it. Marked; the
+               duration is the walk timer's, not an invented one. */
+            in->timer = CHR_SEAGULL_TIMETURN * 4.0f;
+        }
+        break;
+
     case CHR_ST_FLY: {
         float want = (pl->have & CHR_MARK_A)
                          ? face(in->x, in->z, pl->mark_a.x, pl->mark_a.z)
                          : in->yaw;
-        float climb;
+        float g = ground(c, in->x, in->z, in->y, in->y + 50.0f);
+        float h = in->y - g;
+        float pitch, climb, dy, step;
+        /* VertAngleMax at ground level, falling linearly to level flight at
+           FlightHeight and staying level above it -- 0x512eee..0x512f4d. */
+        if (h < 0.0f)
+            pitch = CHR_SEAGULL_VERTANGLEMAX;
+        else if (h <= CHR_SEAGULL_FLIGHTHEIGHT)
+            pitch = CHR_SEAGULL_VERTANGLEMAX
+                    * (1.0f - h / CHR_SEAGULL_FLIGHTHEIGHT);
+        else
+            pitch = 0.0f;
         turn_to(in, want, 45.0f, dt);
-        /* Rise to FlightHeight above the ground under it, no steeper than
-           VertAngleMax. */
-        climb = CHR_SEAGULL_SPEEDFLIGHT * tanf(CHR_SEAGULL_VERTANGLEMAX * DEG);
-        {
-            float g = ground(c, in->x, in->z, in->y, in->y + 50.0f);
-            float want_y = g + CHR_SEAGULL_FLIGHTHEIGHT;
-            float dy = want_y - in->y;
-            float step = climb * dt;
-            if (dy > step) dy = step;
-            if (dy < -step) dy = -step;
-            in->y += dy;
-        }
-        in->x += sinf(in->yaw * DEG) * CHR_SEAGULL_SPEEDFLIGHT * dt;
-        in->z += cosf(in->yaw * DEG) * CHR_SEAGULL_SPEEDFLIGHT * dt;
+        climb = CHR_SEAGULL_SPEEDFLIGHT * tanf(pitch * DEG);
+        step = CHR_SEAGULL_SPEEDFLIGHT * dt;
+        dy = climb * dt;
+        in->y += dy;
+        in->x += sinf(in->yaw * DEG) * step;
+        in->z += cosf(in->yaw * DEG) * step;
         in->speed = CHR_SEAGULL_SPEEDFLIGHT;
+        in->pitch = pitch;
         set_clip(in, m, chr_clip_index(m, "flight"), 1.0f);
         in->timer -= dt;
-        /* Once it is out of sight and the car has moved on, it is back where
-           it started -- a bird that flies off for good leaves the track
-           emptier every lap. */
-        if (in->timer <= 0.0f && !startled) {
+        if (in->timer <= 0.0f && !gull_startled(c, in, car)) {
             in->x = pl->x;
             in->z = pl->z;
+            in->pitch = 0.0f;
             drop(c, in);
             in->state = CHR_ST_IDLE;
-            in->timer = CHR_SEAGULL_TIMEIDLE;
+            in->timer = CHR_SEAGULL_TIMETURN;
         }
         break;
     }
-    case CHR_ST_ACT:                        /* start_flight, then away */
-        in->timer -= dt;
-        in->speed = 0.0f;
-        if (in->timer <= 0.0f) {
-            in->state = CHR_ST_FLY;
-            in->timer = CHR_SEAGULL_TIMETURN * 4.0f;
-            in->event = CHR_EV_TAKEOFF;
-        }
-        break;
-    case CHR_ST_GO:
-        if (startled) {
-            in->state = CHR_ST_ACT;
-            in->timer = CHR_SEAGULL_TIMETURN;
-            set_clip(in, m, chr_clip_index(m, "start_flight"), 1.0f);
-            break;
-        }
-        if (walk_to(c, in, CHR_SEAGULL_SPEEDRUN, 0.15f, 90.0f, dt)) {
+
+    case CHR_ST_GO:                         /* walking to its wander target */
+        if (walk_to(c, in, CHR_SEAGULL_SPEEDRUN, CHR_GULL_ARRIVE, 90.0f, dt)) {
             in->state = CHR_ST_IDLE;
-            in->timer = CHR_SEAGULL_TIMEIDLE;
-        }
-        set_clip(in, m, clip_any(m, CLIP_WALK),
-                 stride_rate(m, clip_any(m, CLIP_WALK), in->speed));
-        break;
-    default:
-        in->speed = 0.0f;
-        if (startled) {
-            in->state = CHR_ST_ACT;
             in->timer = CHR_SEAGULL_TIMETURN;
-            set_clip(in, m, chr_clip_index(m, "start_flight"), 1.0f);
-            break;
         }
+        set_clip(in, m, clip_any(m, CLIP_WALK), 1.0f);
+        break;
+
+    default:                                /* look_around, for TimeTurn */
+        in->speed = 0.0f;
         set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
         in->timer -= dt;
         if (in->timer <= 0.0f) {
-            /* Somewhere else in the volume it was given. Deterministic -- it
-               walks the four corners in turn -- because nothing here has a
-               random number generator and a bird that picks the same four
-               spots is indistinguishable from one that does not. */
+            /*
+             * A point in the inhabitVolume, AWAY FROM THE CAR -- 0x513200 takes
+             * the volume's centre and its two edge vectors, picks the quadrant
+             * whose cross products with (car - centre) are both negative, and
+             * lands somewhere random in it. So a disturbed gull walks off rather
+             * than wandering into the road.
+             *
+             * This file used to walk the four corners in turn and say it did so
+             * because nothing here had a random number generator. There is one
+             * now (rnd01), and the engine's own rule is cheaper than the
+             * substitute was.
+             */
             if (pl->have & CHR_VOL_HOME) {
-                in->leg = (in->leg + 1) & 3;
-                in->tx = (pl->home.qx[in->leg] + pl->x) * 0.5f;
-                in->tz = (pl->home.qz[in->leg] + pl->z) * 0.5f;
+                float cx = 0.0f, cz = 0.0f;
+                float ex, ez, fx, fz, u, w;
+                int k;
+                for (k = 0; k < 4; k++) {
+                    cx += pl->home.qx[k];
+                    cz += pl->home.qz[k];
+                }
+                cx *= 0.25f; cz *= 0.25f;
+                /* The two half-edges out of the centre, as 0x513200 builds them
+                   from corners 0..3 in traversal order. */
+                ex = (pl->home.qx[1] - pl->home.qx[0]) * 0.5f;
+                ez = (pl->home.qz[1] - pl->home.qz[0]) * 0.5f;
+                fx = (pl->home.qx[3] - pl->home.qx[0]) * 0.5f;
+                fz = (pl->home.qz[3] - pl->home.qz[0]) * 0.5f;
+                u = (fz * (car[0] - cx) - fx * (car[2] - cz)) < 0.0f ? 1.0f
+                                                                    : -1.0f;
+                w = (ez * (car[0] - cx) - ex * (car[2] - cz)) < 0.0f ? 1.0f
+                                                                    : -1.0f;
+                u *= rnd01(in);
+                w *= rnd01(in);
+                in->tx = cx + u * fx + w * ex;
+                in->tz = cz + u * fz + w * ez;
             } else {
                 in->tx = pl->x;
                 in->tz = pl->z;
@@ -1170,57 +1710,80 @@ static void step_burrow(chr_t *c, chr_inst_t *in, const chr_model_t *m,
 }
 
 /*
- * THE GUARD. TimeFollow 1.0 s to come round onto the car, TimeAttack 1.5 s an
- * attack lasts, TimeFollowEx 4.02 s it keeps watching after losing sight, and
- * ExVolumeDelta 3.0 m the watched volume grows by once it has engaged. Its
- * brief is a visibilityVolume and a guardVolume, and it has no speed constant
- * of any kind -- so it stands its post and turns.
+ * THE GUARD -- 0x51a950, and it SHOOTS. All of it was in the shipped data while
+ * these notes recorded the guard as a man who stands and turns:
+ *
+ *   people.sb gives him a `shoot` clip (1.5 s) and a `kick` (3.0 s) and the
+ *   exe's clip table at 0x574bec puts them in that order; Settings ships
+ *   burst_mng.ini + .crs, bullet_dust.crs, bullet_smoke.crs, bullet_explode.crs
+ *   and a `bullet_footprint`; and 0x51aa81 pushes the 4CC 'BRMN' -- the burst
+ *   manager -- spawning one at the guard's own position plus CHR_GUARD_MUZZLE.
+ *
+ * What drives it is the shared attention machine, NOT guard.ini: all four of
+ * that file's keys are loaded (0x51aaa0, TimeFollow / TimeAttack / TimeFollowEx /
+ * ExVolumeDelta) and NOTHING IN THE IMAGE READS ANY OF THEM. Searched by
+ * scanning .text for every dword inside their own range, which finds the dog's
+ * two neighbours' readers either side of them and none of theirs. They are dead
+ * keys, like `CollisionLen` and `SpeedAngMaxREL`; the numbers the guard actually
+ * runs on are the watcher's, pushed at 0x51a670 -- 0.15 s to the first attack,
+ * 1.25 s between later ones, 2 attacks before it looks for another car.
+ *
+ * The close-range kick is tried EVERY step, ahead of the dwell: a car inside
+ * CHR_REACT_NEAR gets booted whatever the watcher is counting.
  */
-static void step_guard(chr_t *c, chr_inst_t *in, const chr_model_t *m,
-                       const float car[3], float dt)
+/* Back to `stand`, but never over the top of a one-shot that is still running:
+   the shoot clip is 1.5 s against a 0.5 s burst, so the guard is still lowering
+   its rifle for a second after the last round. */
+static void guard_idle(chr_t *c, unsigned int idx)
 {
+    chr_inst_t *in = &c->inst[idx];
+    const chr_model_t *m = &c->model[in->model];
+    if (in->once && !chr_clip_done(c, idx))
+        return;
+    set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
+}
+
+static void step_guard(chr_t *c, unsigned int idx, const float car[3],
+                       const float car_fwd[3], float car_speed, float dt)
+{
+    static const chr_watch_t W = CHR_WATCH_GUARD;
+    chr_inst_t *in = &c->inst[idx];
+    const chr_model_t *m = &c->model[in->model];
     const chr_place_t *pl = in->place;
-    int inside = 0;
+    int v = watch_step(in, &W, car, dt);
 
-    (void)c;
-    if (pl->have & CHR_VOL_SIGHT)
-        inside = chr_in_volume(&pl->sight, car[0], car[1], car[2]);
-    if (!inside && (pl->have & CHR_VOL_HOME))
-        inside = chr_in_volume(&pl->home, car[0], car[1], car[2]);
-    /* ExVolumeDelta: once engaged the watched area is bigger, so a car circling
-       the edge is not picked up and dropped every second. Applied as a plain
-       radius about the guard, which is the only thing a delta can mean without
-       the volume-growing code. */
-    if (!inside && in->timer > 0.0f) {
-        float d2 = dist2_xz(in->x, in->z, car[0], car[2]);
-        float r = CHR_GUARD_EXVOLUMEDELTA;
-        inside = d2 <= r * r;
-    }
-
+    in->w_seen = v;
     in->speed = 0.0f;
-    if (inside) {
-        in->timer = CHR_GUARD_TIMEFOLLOWEX;
-        turn_to(in, face(in->x, in->z, car[0], car[2]),
-                180.0f / CHR_GUARD_TIMEFOLLOW, dt);
-        in->seen = 1;
-    } else {
-        if (in->timer > 0.0f) {
-            in->timer -= dt;
-            turn_to(in, face(in->x, in->z, car[0], car[2]),
-                    180.0f / CHR_GUARD_TIMEFOLLOW, dt);
-        } else {
-            turn_to(in, wrap180(pl->yaw), 60.0f, dt);
-        }
-        in->seen = 0;
+    in->seen = (v >= 2);
+
+    /* A burst already in the air keeps firing whatever the guard does next: it
+       is a separate object with its own clock. */
+    burst_step(in, car, car_fwd, car_speed, dt);
+
+    if (v < 2) {
+        /* Back to the post it was authored facing. Nothing recovered sets this
+           rate -- the engine leaves an idle guard's yaw alone entirely -- so it
+           is the port's, and slow enough to read as standing down. */
+        turn_to(in, wrap180(pl->yaw), 60.0f, dt);
+        guard_idle(c, idx);
+        return;
     }
 
-    /* An engaged guard cycles its shoot clip; otherwise it stands. */
-    if (in->seen) {
-        int sh = chr_clip_index(m, "shoot");
-        set_clip(in, m, sh >= 0 ? sh : clip_any(m, CLIP_IDLE), 1.0f);
-    } else {
-        set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
+    {
+        int r = react_decide(c, in, car, car_speed, 1);
+        if (r != CHR_RX_NONE) {
+            react_enter(in, r);
+            return;
+        }
     }
+    turn_to(in, face(in->x, in->z, car[0], car[2]), CHR_REACT_TURN_RATE, dt);
+    if (v == 3) {
+        burst_start(in);
+        set_clip_once(in, m, clip_any(m, CLIP_SHOOT));
+        in->event = CHR_EV_SHOOT;
+        return;
+    }
+    guard_idle(c, idx);
 }
 
 /*
@@ -1340,10 +1903,10 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
     unsigned int i;
     float zero[3] = { 0.0f, 0.0f, 0.0f };
 
-    (void)car_fwd;
     if (!c || !c->n_inst || dt <= 0.0f)
         return;
     if (!car) car = zero;
+    if (!car_fwd) car_fwd = zero;
     c->n_stepped = 0;
 
     for (i = 0; i < c->n_inst; i++) {
@@ -1352,8 +1915,9 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
         float dx, dy, dz;
         /*
          * A REPLAYER IS NEVER CULLED. CHR_STEP_DIST bounds the invented state
-         * machines -- the Dog's cone, the Seagull's takeoff, the Crab's shuttle,
-         * the Guard's watch -- because those are what a character does ABOUT the
+         * machines and the recovered reactions -- the Dog's cone, the Seagull's
+         * four states, the Crab's shuttle, the Guard's attention machine and the
+         * kick -- because those are what a character does ABOUT the
          * car and they cost a volume test and a walk each. A recorded path is
          * neither: it is where that character IS at time t, it costs a cursor
          * step and a lerp, and the engine's own layer is stepped once per frame
@@ -1368,13 +1932,21 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
          * need a state that only the machines above can enter.
          */
         int replay = (in->place->kind == CHR_KIND_PATH
-                      || in->place->kind == CHR_KIND_WALKER);
+                      || in->place->kind == CHR_KIND_WALKER
+                      /* and a reaction in progress, for the same reason a
+                         replayer is exempt: it holds a clock, and culling it
+                         would freeze a person mid-swing with the car in the
+                         air. It cannot happen from CHR_STEP_DIST alone -- the
+                         reaction only starts within 4 m -- but a thrown car
+                         travels, and the carry moves the car with the hand. */
+                      || in->react != CHR_RX_NONE);
 
         dx = in->x - car[0];
         dy = in->y - car[1];
         dz = in->z - car[2];
         in->dist2 = dx * dx + dy * dy + dz * dz;
         in->event = CHR_EV_NONE;
+        in->imp_kind = CHR_IMP_NONE;
         in->solid_hit = 0;
         if (!replay && in->dist2 > CHR_STEP_DIST * CHR_STEP_DIST)
             continue;
@@ -1420,12 +1992,62 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
                 in->hit_cool = CHR_HIT_COOL;
                 set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
             }
+        } else if (step_react(c, i, car, car_fwd, car_speed, dt)) {
+            /*
+             * IT IS KICKING, THROWING OR SHOOTING, and nothing else runs while
+             * it is -- which is also what stops a WALKER's recorded path: the
+             * engine advances that replay only while the animation state is
+             * Stand or Walk (0x510422 tests exactly those two before calling
+             * 0x511b50), so a person who plants a boot in the car stops walking
+             * for the length of the clip and picks the recording up where it
+             * left off. Both halves of that fall out of this branch.
+             */
+        } else if (in->place->kind == CHR_KIND_WALKER && in->once
+                   && !chr_clip_done(c, i)) {
+            /* A one-shot clip still playing out: the swing has landed and the
+               leg is coming down. The decision is not re-taken until it ends,
+               which is what keeps a person from re-grabbing a car it has just
+               thrown while the Brosok clip still has 2.7 s to run.
+               THE GUARD IS NOT HELD LIKE THIS: its shoot clip is one-shot too,
+               and the engine spawns the burst as a SEPARATE object -- the guard
+               goes on tracking and its attention machine goes on counting while
+               the rounds leave, so it has to keep being stepped. */
         } else {
-            switch (in->place->kind) {
+            /*
+             * A FINISHED ONE-SHOT CHAINS BACK TO STAND, and it has to happen
+             * HERE -- before the decision -- rather than as a tidy-up after it.
+             *
+             * The engine's animation table gives Brosok, Pendal and Hurt a
+             * successor (0x50f6c0) and 0x50f570's tail switches to it when the
+             * clip ends; and 0x50f700 only restarts a clip when the STATE
+             * changes. So without the chain a second kick is not a change --
+             * the state is already Pendal -- its cursor stays parked at the
+             * clip's end, and the connect test (`cursor > 0.65 AND < duration`)
+             * can never be true again. The reaction fired exactly once per
+             * instance per race and then ping-ponged in and out of the state
+             * every frame, which is what this looked like from the harness: one
+             * good kick, and then nothing while a car sat on the man's feet.
+             */
+            if (in->once && chr_clip_done(c, i))
+                set_clip(in, m, clip_any(m, CLIP_IDLE), 1.0f);
+            /* THE TWO KINDS THE ENGINE'S REACTION REACHES: 'PEOP' (the Man, the
+               Woman and the RepairMan) and 'GUAM' (the Guard). 0x511690 is the
+               people's and 0x51a950 the guard's, and both go through 0x510f40. */
+            if (in->place->kind == CHR_KIND_WALKER) {
+                int r = react_decide(c, in, car, car_speed, 0);
+                if (r != CHR_RX_NONE) {
+                    react_enter(in, r);
+                    in->event = CHR_EV_SWING;
+                }
+            }
+            if (in->react != CHR_RX_NONE)
+                ;                       /* it starts on the next step */
+            else switch (in->place->kind) {
             case CHR_KIND_DOG:     step_dog(c, in, m, car, dt); break;
             case CHR_KIND_SEAGULL: step_seagull(c, in, m, car, dt); break;
             case CHR_KIND_BURROW:  step_burrow(c, in, m, car, dt); break;
-            case CHR_KIND_GUARD:   step_guard(c, in, m, car, dt); break;
+            case CHR_KIND_GUARD:   step_guard(c, i, car, car_fwd, car_speed,
+                                                dt); break;
             case CHR_KIND_WALKER:
             case CHR_KIND_PATH:    advance_path(c, in, m, dt); break;
             default: break;
@@ -1438,11 +2060,20 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
         if (in->clip >= 0 && (unsigned)in->clip < m->n_clips) {
             float d = m->clip[in->clip].duration;
             in->clip_t += dt * in->clip_rate;
-            if (d > 1e-4f)
+            if (d <= 1e-4f)
+                in->clip_t = 0.0f;
+            else if (in->once) {
+                /* A ONE-SHOT STOPS at its own end rather than wrapping -- the
+                   engine's animation table marks Brosok, Pendal, Hurt and the
+                   guard's shoot that way and chains each back to Stand when it
+                   gets there. The whole reaction is timed off this cursor, so a
+                   wrap would fire the swing again every cycle. */
+                if (in->clip_t > d)
+                    in->clip_t = d;
+            } else {
                 while (in->clip_t >= d)
                     in->clip_t -= d;
-            else
-                in->clip_t = 0.0f;
+            }
         }
     }
 }
@@ -1476,12 +2107,17 @@ void char_dump(const chr_t *c, const float eye[3])
                           !id ? "!" : ((c->tex_px && ti < c->n_tex
                                        && !c->tex_px[ti]) ? "?" : ""));
         }
+        /* `rx` is the reaction and `w` the attention machine's verdict, because
+           "why is that guard not shooting" and "why did he only kick once" are
+           both questions a screenshot cannot answer and both are one field. */
         rlog("[rccars]   %-20s %-10s var%d at (%.1f %.1f %.1f) %.1f m %s "
-             "batches=%u clip=%s%s\n",
+             "batches=%u clip=%s%s rx=%d%s w=%d%s\n",
              in->place->name, m->name, in->variant, in->x, in->y, in->z, d,
              in->drawn ? "DRAWN" : "culled", m->n_batches,
              (in->clip >= 0 && (unsigned)in->clip < m->n_clips)
-                 ? m->clip[in->clip].name : "-", slots);
+                 ? m->clip[in->clip].name : "-", slots,
+             in->react, in->carry ? "+CARRY" : "", in->w_seen,
+             in->shots < (int)CHR_BURST_NSHOOTS ? "+FIRING" : "");
     }
 }
 
@@ -1941,4 +2577,312 @@ void char_draw(chr_t *c, const float eye[3])
     }
 
     glEnable(GL_ALPHA_TEST);
+}
+
+/* --------------------------------------------------- the reaction's forces --- */
+
+/*
+ * SEGMENT AGAINST ONE SPHERE. The engine's bullet is a ray into
+ * worldRayQuery plus an OBB test on the car built out of its own half-extents
+ * (0x508290 assembles the box from phys+0x5708..0x571c and 0x508e70 intersects
+ * it). The port tests the car's OWN COLLISION PROXY instead -- rb_gather_spheres,
+ * the same set every wheel and body contact already uses -- because that set is
+ * shipped, fitted to the drawn mesh, and the thing a bullet ought to agree with.
+ * Marked as a substitution of shape, not of numbers.
+ *
+ * -> the nearest t in [0, 1] at which the segment enters the sphere, or -1.
+ */
+static float seg_sphere(const float a[3], const float b[3], const float s[4])
+{
+    float d[3], m[3], A, B, C, disc, t;
+    d[0] = b[0] - a[0]; d[1] = b[1] - a[1]; d[2] = b[2] - a[2];
+    m[0] = a[0] - s[0]; m[1] = a[1] - s[1]; m[2] = a[2] - s[2];
+    A = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if (A < 1e-12f)
+        return -1.0f;
+    B = 2.0f * (m[0] * d[0] + m[1] * d[1] + m[2] * d[2]);
+    C = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] - s[3] * s[3];
+    disc = B * B - 4.0f * A * C;
+    if (disc < 0.0f)
+        return -1.0f;
+    disc = sqrtf(disc);
+    t = (-B - disc) / (2.0f * A);
+    if (t < 0.0f)
+        t = (-B + disc) / (2.0f * A);
+    if (t < 0.0f || t > 1.0f)
+        return -1.0f;
+    return t;
+}
+
+int char_car_react(chr_t *c, rb_car *car)
+{
+    unsigned int i;
+    int n = 0;
+
+    if (!c || !car || !c->n_inst)
+        return 0;
+
+    for (i = 0; i < c->n_inst; i++) {
+        chr_inst_t *in = &c->inst[i];
+        float j[3];
+
+        if (in->imp_kind == CHR_IMP_NONE)
+            continue;
+
+        if (in->imp_kind == CHR_IMP_SHOT) {
+            /*
+             * ONE ROUND. It has to reach the car before it reaches the world,
+             * or the guard is shooting through a wall: col_segment answers the
+             * second question and the proxy the first, and the nearer wins.
+             *
+             * The engine's ray runs CHR_BULLET_REACH times the distance to the
+             * aim point or CHR_BULLET_MIN, whichever is longer -- so it carries
+             * PAST the aim, which is what lets a burst aimed ahead of a car
+             * still hit a car that has not got there.
+             */
+            float from[3], to[3], dir[3], len, reach, best = 2.0f;
+            float cs[RB_MAX_SPHERES][4];
+            int nc, k, kbest = -1;
+
+            memcpy(from, in->imp_point, sizeof from);
+            dir[0] = in->imp_aim[0] - from[0];
+            dir[1] = in->imp_aim[1] - from[1];
+            dir[2] = in->imp_aim[2] - from[2];
+            len = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+            if (len < 1e-4f)
+                continue;
+            reach = len * CHR_BULLET_REACH;
+            if (reach < CHR_BULLET_MIN)
+                reach = CHR_BULLET_MIN;
+            to[0] = from[0] + dir[0] / len * reach;
+            to[1] = from[1] + dir[1] / len * reach;
+            to[2] = from[2] + dir[2] / len * reach;
+
+            /*
+             * AND IT IS TESTED AGAINST THE PROXY'S ENCLOSING SPHERE, not
+             * against the thirteen spheres themselves.
+             *
+             * THE PORT'S, and it is a substitution the numbers force. The
+             * engine builds an oriented BOX out of the car's own half-extents
+             * (0x508290 assembles it from phys+0x5708..0x5710 and 0x508e70
+             * intersects the ray with it) and the port does not carry those
+             * three floats at all -- nothing in rb_data.h needs them, because
+             * every other consumer of the car's shape uses the sphere set.
+             *
+             * But a ray CANNOT use that set: rb_gather_spheres is four wheels
+             * of r 0.072 and nine body spheres of r 0.051 spread over a 0.42 m
+             * car, so it is mostly holes. A segment dropped straight down
+             * through the car's own centre of mass passes between all thirteen
+             * -- measured, and it is what a first version of this did, reporting
+             * a guard who could not hit a stationary car from directly above it.
+             * The enclosing sphere of the same set is derived from the same
+             * shipped data, is about 0.21 m on all three cars, and is the right
+             * order for a 0.42 m body; it is generous at the corners, which for
+             * a burst that sprays over four metres is not the term that decides
+             * anything.
+             */
+            nc = rb_gather_spheres(car, cs);
+            if (nc > 0) {
+                float hull[4];
+                hull[0] = car->body.x[0];
+                hull[1] = car->body.x[1];
+                hull[2] = car->body.x[2];
+                hull[3] = 0.0f;
+                for (k = 0; k < nc; k++) {
+                    float dx = cs[k][0] - hull[0];
+                    float dy = cs[k][1] - hull[1];
+                    float dz = cs[k][2] - hull[2];
+                    float r = sqrtf(dx * dx + dy * dy + dz * dz) + cs[k][3];
+                    if (r > hull[3]) hull[3] = r;
+                }
+                best = seg_sphere(from, to, hull);
+                kbest = best >= 0.0f ? 0 : -1;
+            }
+            if (kbest < 0)
+                continue;
+            {
+                /* Stop the segment at the car and ask whether the world was in
+                   the way of THAT much of it. */
+                float hit[3];
+                hit[0] = from[0] + (to[0] - from[0]) * best;
+                hit[1] = from[1] + (to[1] - from[1]) * best;
+                hit[2] = from[2] + (to[2] - from[2]) * best;
+                if (c->col && col_segment(c->col, from, hit))
+                    continue;
+                /* IT LANDS: away from where it hit, and up. Same routine, same
+                   law, different two numbers -- 0x508560 pushes 6.5 and 3.25
+                   where the kick pushes 4.0 and 7.0. */
+                {
+                    float dx = car->body.x[0] - hit[0];
+                    float dz = car->body.x[2] - hit[2];
+                    float l = sqrtf(dx * dx + dz * dz);
+                    if (l > 1e-6f) { dx /= l; dz /= l; }
+                    else { dx = 0.0f; dz = 0.0f; }
+                    in->imp_dv[0] = dx * CHR_BULLET_AWAY;
+                    in->imp_dv[1] = CHR_BULLET_UP;
+                    in->imp_dv[2] = dz * CHR_BULLET_AWAY;
+                    memcpy(in->imp_point, hit, sizeof in->imp_point);
+                }
+            }
+        }
+
+        if (in->imp_kind == CHR_IMP_THROW) {
+            /*
+             * THE RELEASE SETS the momentum rather than adding to it, and zeroes
+             * the angular part -- 0x4f3690, which is why a thrown car leaves
+             * without the spin the lift gave it.
+             */
+            car->body.P[0] = in->imp_dv[0] * car->body.mass;
+            car->body.P[1] = in->imp_dv[1] * car->body.mass;
+            car->body.P[2] = in->imp_dv[2] * car->body.mass;
+            car->body.L[0] = car->body.L[1] = car->body.L[2] = 0.0f;
+            rb_update_inv_inertia_world(&car->body);
+            car->body.v[0] = in->imp_dv[0];
+            car->body.v[1] = in->imp_dv[1];
+            car->body.v[2] = in->imp_dv[2];
+            car->body.w[0] = car->body.w[1] = car->body.w[2] = 0.0f;
+            n++;
+            continue;
+        }
+
+        /* And a kick or a round is an IMPULSE at the car's own origin: 0x4f3470
+           multiplies the velocity change by the mass and hands it to 0x4756c0,
+           which is rb_apply_impulse. */
+        j[0] = in->imp_dv[0] * car->body.mass;
+        j[1] = in->imp_dv[1] * car->body.mass;
+        j[2] = in->imp_dv[2] * car->body.mass;
+        rb_apply_impulse(car, in->imp_point, j);
+        n++;
+    }
+    return n;
+}
+
+int char_carrier(const chr_t *c)
+{
+    unsigned int i;
+    if (!c)
+        return -1;
+    for (i = 0; i < c->n_inst; i++)
+        if (c->inst[i].carry)
+            return (int)i;
+    return -1;
+}
+
+/* The 3x3 of a matrix, columns normalised, as a quaternion (w, x, y, z). A
+   joint matrix can carry a scale -- the people's ROOT is authored at 0.04 -- so
+   the axes have to be normalised before the trace form means anything. */
+static void mat_to_quat(const float m[16], float q[4])
+{
+    float a[9];
+    float tr, s;
+    int k;
+    for (k = 0; k < 3; k++) {
+        float l = sqrtf(m[k * 4 + 0] * m[k * 4 + 0] + m[k * 4 + 1] * m[k * 4 + 1]
+                        + m[k * 4 + 2] * m[k * 4 + 2]);
+        if (l < 1e-8f) l = 1.0f;
+        a[k * 3 + 0] = m[k * 4 + 0] / l;
+        a[k * 3 + 1] = m[k * 4 + 1] / l;
+        a[k * 3 + 2] = m[k * 4 + 2] / l;
+    }
+    tr = a[0] + a[4] + a[8];
+    if (tr > 0.0f) {
+        s = sqrtf(tr + 1.0f) * 2.0f;
+        q[0] = 0.25f * s;
+        q[1] = (a[5] - a[7]) / s;
+        q[2] = (a[6] - a[2]) / s;
+        q[3] = (a[1] - a[3]) / s;
+    } else if (a[0] > a[4] && a[0] > a[8]) {
+        s = sqrtf(1.0f + a[0] - a[4] - a[8]) * 2.0f;
+        q[0] = (a[5] - a[7]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (a[3] + a[1]) / s;
+        q[3] = (a[6] + a[2]) / s;
+    } else if (a[4] > a[8]) {
+        s = sqrtf(1.0f + a[4] - a[0] - a[8]) * 2.0f;
+        q[0] = (a[6] - a[2]) / s;
+        q[1] = (a[3] + a[1]) / s;
+        q[2] = 0.25f * s;
+        q[3] = (a[7] + a[5]) / s;
+    } else {
+        s = sqrtf(1.0f + a[8] - a[0] - a[4]) * 2.0f;
+        q[0] = (a[1] - a[3]) / s;
+        q[1] = (a[6] + a[2]) / s;
+        q[2] = (a[7] + a[5]) / s;
+        q[3] = 0.25f * s;
+    }
+    rb_quat_normalize(q);
+}
+
+void char_carry_car(chr_t *c, rb_car *car)
+{
+    int idx = char_carrier(c);
+    chr_inst_t *in;
+    const chr_model_t *m;
+    int b;
+    float hand[3], hq[4], mm[16], cy, sy, ry[16];
+
+    if (!c || !car || idx < 0)
+        return;
+    in = &c->inst[idx];
+    m = &c->model[in->model];
+
+    /*
+     * IT RIDES THE LEFT HAND. 0x50f460 looks up LHANDeff and RHANDeff by name on
+     * every person and FAILS THE WHOLE INSTANCE if either is missing, and the
+     * carry (0x510b90) reads the left one: the car's world transform is that
+     * node's own, times the attitude recorded at the grab.
+     */
+    b = chr_part_index(m, "LHANDeff");
+    if (b < 0 || b >= CHR_MAX_PARTS || !bone_world(c, (unsigned)idx, "LHANDeff",
+                                                   hand))
+        return;
+
+    /* The joint's rotation in the world: the instance's yaw about the model's,
+       which is the same composition char_draw pushes on the matrix stack. */
+    cy = cosf((in->yaw + m->yaw_off) * DEG);
+    sy = sinf((in->yaw + m->yaw_off) * DEG);
+    memset(ry, 0, sizeof ry);
+    ry[0] = cy;  ry[2] = -sy;
+    ry[5] = 1.0f;
+    ry[8] = sy;  ry[10] = cy;
+    ry[15] = 1.0f;
+    rb_mat4_mul(c->world[b], ry, mm);
+    mat_to_quat(mm, hq);
+
+    if (in->carry_q[0] == 0.0f && in->carry_q[1] == 0.0f
+        && in->carry_q[2] == 0.0f && in->carry_q[3] == 0.0f) {
+        /* First frame of the lift: record the car's attitude in the hand's own
+           frame, q_rel = conj(q_hand) * q_car, so it keeps it for the whole
+           lift the way the engine's two stored rows do. */
+        float ci[4];
+        ci[0] = hq[0]; ci[1] = -hq[1]; ci[2] = -hq[2]; ci[3] = -hq[3];
+        rb_quat_mul(ci, car->body.q, in->carry_q);
+        rb_quat_normalize(in->carry_q);
+    }
+
+    rb_quat_mul(hq, in->carry_q, car->body.q);
+    rb_quat_normalize(car->body.q);
+    car->body.x[0] = hand[0];
+    car->body.x[1] = hand[1];
+    car->body.x[2] = hand[2];
+    /*
+     * Nothing integrates while it is up there -- 0x4f3640 sets the engine's own
+     * two held flags and 0x4f3700 writes the pose straight in.
+     *
+     * AND THE REST CLAMP CANNOT FIRE UNDERNEATH IT, which is worth writing down
+     * because it is a coincidence of two recovered numbers rather than a
+     * guarantee: rb_car_at_rest wants rest_slow_t past 2.0 s AND rest_ground_t
+     * past 1.0 s of continuous contact, and a carry is exactly
+     * CHR_REACT_LET_GO_T - CHR_REACT_GRAB_T0 = 1.4 s long with the car a metre
+     * in the air the whole time. So the slow timer never reaches its threshold
+     * and the ground timer is held at zero. If either constant ever moves, a
+     * released car could come out of the hand already clamped to a dead stop.
+     */
+    car->body.P[0] = car->body.P[1] = car->body.P[2] = 0.0f;
+    car->body.L[0] = car->body.L[1] = car->body.L[2] = 0.0f;
+    car->body.v[0] = car->body.v[1] = car->body.v[2] = 0.0f;
+    car->body.w[0] = car->body.w[1] = car->body.w[2] = 0.0f;
+    car->body.force[0] = car->body.force[1] = car->body.force[2] = 0.0f;
+    car->body.torque[0] = car->body.torque[1] = car->body.torque[2] = 0.0f;
+    rb_update_inv_inertia_world(&car->body);
 }

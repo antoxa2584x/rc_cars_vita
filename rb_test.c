@@ -271,6 +271,14 @@ static float dist3(const float a[3], const float b[3])
     return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
+/* The length of basis row `row` of wheel `w`'s REST matrix -- the car's own
+   model scale, which lives on an ancestor and which nothing in the rig scales. */
+static float rest_row(const carani_t *r, int w, int row)
+{
+    const float *m = r->part[r->wheel[w]].rest + row * 4;
+    return sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+}
+
 static void rig_pt(const carani_t *r, int p, float x, float y, float z, float o[3])
 {
     const float *m = r->world[p];
@@ -375,21 +383,57 @@ static void rig_checks(void)
     ck(L >= 0 && R >= 0 && c.wheel[L].mount[0] > 0.f && c.wheel[R].mount[0] < 0.f,
        "front pair resolved left(+X)/right(-X) by geometry, not by index");
 
-    /* 1. everything at rest draws exactly where it was baked */
+    /* 1. everything at rest draws exactly where it was baked -- everything
+          except the WHEELS, which carry the tyre table's own axle scale from
+          the moment the upgrades are applied and are 0.95 wide at rest, not
+          1.0. That is checked here rather than excused: a wheel's draw matrix
+          at rest has to be a pure scale by carani_tire_width along its own
+          axle, and the identity across it. */
     {
-        float worst = 0.f;
+        float worst = 0.f, w_worst = 0.f;
         int wi = 0, k;
         c.steer = 0.f;
+        c.tire_upgrade = 0;
         for (i = 0; i < 4; i++) c.wheel[i].spin = 0.f;
         carani_update(&rig, &c);
-        for (i = 0; i < rig.n; i++)
+        for (i = 0; i < rig.n; i++) {
+            int is_wheel = 0;
+            for (k = 0; k < 4; k++)
+                if (rig.wheel[k] == i) is_wheel = 1;
+            if (is_wheel)
+                continue;
             for (k = 0; k < 16; k++) {
                 float e = fabsf(rig.draw[i][k] - ((k % 5 == 0) ? 1.f : 0.f));
                 if (e > worst) { worst = e; wi = i; }
             }
+        }
         printf("at rest: worst draw matrix deviation from identity %.2e (%s)\n",
                worst, rig.part[wi].name);
-        ck(worst < 1e-5f, "an unmoved rig draws as the identity");
+        ck(worst < 1e-5f,
+           "an unmoved rig draws as the identity, the tyres apart");
+        {
+            float want = carani_tire_width(&c);
+            for (i = 0; i < 4; i++) {
+                float hub[3], ax[3], tr[3], e;
+                if (rig.wheel[i] < 0) continue;
+                rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 0.f, hub);
+                rig_pt(&rig, rig.wheel[i], 0.f, 0.f, 1.f, ax);
+                rig_pt(&rig, rig.wheel[i], 0.07f, 0.f, 0.f, tr);
+                /* world[] carries the car's own model scale as well -- 1.05
+                   on the Overkill, and on an ANCESTOR, which is exactly what
+                   the engine does not touch -- so each probe is measured
+                   against that node's rest row, not against 1. */
+                e = fabsf(dist3(ax, hub) - want * rest_row(&rig, i, 2));
+                if (e > w_worst) w_worst = e;
+                e = fabsf(dist3(tr, hub) - 0.07f * rest_row(&rig, i, 0));
+                if (e > w_worst) w_worst = e;
+            }
+            printf("at rest: tyre axle span %.4f (want %.4f), worst error "
+                   "%.2e\n", (double)want, (double)want, (double)w_worst);
+            ck(w_worst < 1e-5f,
+               "and a resting tyre is exactly the tuning's width across its "
+               "axle, and unchanged around it");
+        }
     }
 
     /* 2. steering: the drawn wheel must turn by exactly the body steer angle,
@@ -572,15 +616,16 @@ static void rig_checks(void)
     }
 
     /* 8. the tuning's tyre width (carani_tire_width; see carani.h -- the
-          original does not do this, the port does).
+          engine's own table at 0x005738c8, applied to the wheel nodes by
+          FUN_0050be40).
 
-          The mapping itself is deliberately NOT asserted against
-          tune.tire_upgrade here: that is its own definition, and a check
-          against the thing it is guarding has passed everything four times in
-          this port. What is asserted is what the mapping cannot move -- that
-          the scale reaches the wheel node along its AXLE and nowhere else, that
-          the tread radius is untouched, and that no part which is not a wheel
-          feels it at all (which is also what pins the wheel nodes as leaves). */
+          The four numbers are NOT asserted against themselves here. What is
+          asserted is what they cannot move -- that the scale reaches the wheel
+          node along its AXLE and nowhere else, that the tread radius is
+          untouched, and that no part which is not a wheel feels it at all
+          (which is also what pins the wheel nodes as leaves) -- plus the one
+          consequence that separates the table from what the port used to
+          derive: a STOCK tyre is drawn narrower than it was modelled. */
     {
         float wid[4], hub0[3], hub1[3], ax0[3], ax1[3], tr0[3], tr1[3];
         float axle0[3], spr0[3], kn0[3], axle1[3], spr1[3], kn1[3];
@@ -601,12 +646,18 @@ static void rig_checks(void)
                 mono = 0.f;
         }
         putchar('\n');
-        ck(fabsf(wid[0] - 1.f) < 1e-6f,
-           "the stock tyre is drawn at the width it was modelled at");
+        /* 0.95, not 1.0. The engine sets the node's axle row to an absolute
+           length and stock is the shortest of the four, so a stock tyre is
+           drawn NARROWER than the mesh was modelled -- which is what the port
+           got wrong, and it got it wrong in the direction that made the mark
+           under it look narrow too. */
+        ck(wid[0] < 1.f && wid[0] > 0.5f,
+           "a stock tyre is drawn narrower than it was modelled");
         ck(mono != 0.f, "each tuning level fits a wider tyre than the last");
-        /* A band, not the value: under 1.05 nobody could see it, and at 2.0 the
-           Overkill's 78 mm tyre would be wider than its own 140 mm diameter. */
-        ck(wid[3] > 1.05f && wid[3] < 2.0f,
+        /* A band, not the value: under 1.05 of stock nobody could see the
+           progression, and at 2.0 the Overkill's 78 mm tyre would be wider than
+           its own 140 mm diameter. */
+        ck(wid[3] / wid[0] > 1.05f && wid[3] / wid[0] < 2.0f,
            "the top tyre is visibly but not absurdly wider than stock");
 
         c.tire_upgrade = 0;
@@ -640,8 +691,8 @@ static void rig_checks(void)
                 + dist3(hub1, hub0);
         printf("level 0 -> 3: axle span x%.4f (want x%.4f), tread radius "
                "%.4f -> %.4f, rest of the rig moved %.2e m\n",
-               (double)(z1 / z0), (double)wid[3], r0, r1, still);
-        ck(fabsf(z1 / z0 - wid[3]) < 1e-4f,
+               (double)(z1 / z0), (double)(wid[3] / wid[0]), r0, r1, still);
+        ck(fabsf(z1 / z0 - wid[3] / wid[0]) < 1e-4f,
            "the drawn wheel widens along its axle by exactly that factor");
         ck(fabsf(r1 - r0) < 1e-5f,
            "a wider tyre is not a bigger one -- the tread radius is unchanged");
@@ -2895,7 +2946,10 @@ int main(void)
         ck(cm.dist > RB_CAMERA.dist_xz * 1.4f, "camera pulls back with speed");
         ck(cm.dist < RB_CAMERA.dist_xz * 2.0f, "pull-back stays bounded");
 
-        /* yaw lag: swing the car and the camera must trail, inside 20 degrees */
+        /* Yaw lag at a rate the follower can hold. The car is turned at
+           0.02 rad/frame = 68.8 deg/s, inside camFollowStep's 99 deg/s, so the
+           trail settles where the eased pull-back matches it:
+           68.8 = 99 * (lag/20)^2 -> 16.7 degrees, just inside the window. */
         {
             float worst = 0.f, yq[RB_STATE_N];
             int k;
@@ -2913,9 +2967,11 @@ int main(void)
                     if (fabs(e) > worst) worst = (float)fabs(e);
                 }
             }
-            printf("yawing car: worst camera lag = %.2f deg (slack window is 20)\n", worst);
+            printf("car yawed at 68.8 deg/s: worst camera lag = %.2f deg"
+                   " (eased equilibrium is 16.7)\n", worst);
             ck(worst > 0.5f, "camera yaw actually lags the car");
-            ck(worst < 21.0f, "yaw lag stays inside the 20 degree slack window");
+            ck(worst > 10.0f && worst < 21.0f,
+               "at 68.8 deg/s the trail settles near the eased equilibrium");
         }
 
         /* Sustained turn, measured through the real GL view matrix.
@@ -2929,7 +2985,7 @@ int main(void)
         {
             rb_car t;
             cam_t  tc;
-            float worst_off = 0.f, worst_lag = 0.f;
+            float worst_off = 0.f, worst_lag = 0.f, peak_w = 0.f;
             int behind = 0, mirrored = 0;
             car_init(&t);
             t.world = &FLAT_WORLD;
@@ -2939,6 +2995,10 @@ int main(void)
                 float st = (i < 60) ? 0.0f : 1.0f;
                 rbcar_step(&t, 0.6f, 0.0f, st, 0, 1.0f / 60.0f);
                 cam_update(&tc, &t, st, 1.0f / 60.0f);
+                {
+                    float wd = fabsf(t.body.w[1]) * 57.295776f;
+                    if (wd > peak_w) peak_w = wd;
+                }
                 {
                     const float D = 0.017453292f;
                     float h = tc.yaw * D;
@@ -2953,34 +3013,112 @@ int main(void)
                     for (k = 0; k < 3; k++) rm[k] = pc[k] - t.m[0 + k];  /* -X = right */
                     gl_xform(ec, V, pc);
                     gl_xform(er, V, rm);
-                    if (ec[2] >= 0.f) behind = 1;
-                    if (er[0] <= ec[0]) mirrored = 1;
-                    if (fabsf(ec[0]) > worst_off) worst_off = fabsf(ec[0]);
                     lag = (double)tc.yaw - rbcar_yaw_deg(&t);
                     while (lag > 180.0)  lag -= 360.0;
                     while (lag < -180.0) lag += 360.0;
                     if (fabs(lag) > worst_lag) worst_lag = (float)fabs(lag);
+                    /* These three are the mirrored-yaw-convention checks, and
+                       they only mean anything while the camera is still behind
+                       the car. Past 60 degrees of trail it is looking at the
+                       flank, so of course the right side crosses the centre --
+                       that is the camera working, not the convention failing.
+                       The convention bug showed up on the first frame of the
+                       turn, long inside this gate. */
+                    if (fabs(lag) < 60.0) {
+                        if (ec[2] >= 0.f) behind = 1;
+                        if (er[0] <= ec[0]) mirrored = 1;
+                        if (fabsf(ec[0]) > worst_off) worst_off = fabsf(ec[0]);
+                    }
                 }
             }
-            printf("7 s full-lock turn: worst |eye-space x|=%.4f, trail=%.2f deg, "
-                   "car behind camera=%s, right side mirrored=%s\n",
-                   worst_off, worst_lag, behind ? "YES" : "no",
+            printf("7 s full-lock turn: worst |eye-space x|=%.4f, peak car yaw rate"
+                   " %.0f deg/s, trail=%.2f deg, car behind camera=%s,"
+                   " right side mirrored=%s\n",
+                   worst_off, peak_w, worst_lag, behind ? "YES" : "no",
                    mirrored ? "YES" : "no");
             ck(!behind,   "car stays in front of the camera through a turn");
             ck(!mirrored, "car's right side stays on screen-right");
-            ck(worst_off < 0.05f, "car stays centred in the view");
-            ck(worst_lag < 25.0f, "camera trail stays inside the slack window");
+            ck(worst_off < 0.05f, "car stays horizontally centred in the view");
+            ck(worst_lag > 90.0f,
+               "a 176 deg/s car does out-turn the follower's 99 deg/s");
+
+            /* The trail is NOT clamped to the slack window -- that was the port's
+               own invention and it welded the view to the tail. camFollowStep
+               closes at 99 deg/s (30 while the car spins past 180 deg/s) and
+               nothing else bounds it, so a car turning faster than that does get
+               away from the view. What must hold is that it comes BACK: release
+               the steering and the trail has to unwind. */
+            {
+                float after;
+                int k;
+                for (k = 0; k < 180; k++) {          /* 3 s running straight */
+                    rbcar_step(&t, 0.6f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
+                    cam_update(&tc, &t, 0.0f, 1.0f / 60.0f);
+                }
+                {
+                    double e = (double)tc.yaw - rbcar_yaw_deg(&t);
+                    while (e > 180.0)  e -= 360.0;
+                    while (e < -180.0) e += 360.0;
+                    after = (float)fabs(e);
+                }
+                printf("   3 s after the stick is released: trail=%.2f deg\n", after);
+                ck(after < 2.0f, "the trail unwinds once the car stops turning");
+            }
         }
 
-        /* look-into-turn: VisTurn should shift the yaw with steering */
+        /* VisTurn: NOT a look-into-turn. 0x00501180 rotates the aim about the
+           camera's right axis by a constant 11.82 degrees, every frame, with the
+           stick nowhere in it. So the stick must not move the camera, and the aim
+           must sit VisTurn degrees above the line to the car. */
         {
             cam_t c2, c3;
+            float aimed;
             cam_init(&c2, &c); cam_init(&c3, &c);
             for (i = 0; i < 240; i++) cam_update(&c2, &c, 0.0f, 1.0f / 60.0f);
             for (i = 0; i < 240; i++) cam_update(&c3, &c, 1.0f, 1.0f / 60.0f);
-            printf("VisTurn: yaw %+.2f straight vs %+.2f at full steer (config %.2f)\n",
-                   c2.yaw, c3.yaw, RB_CAMERA.vis_turn);
-            ck(fabs(c3.yaw - c2.yaw) > 1.0f, "steering leans the camera into the turn");
+            printf("VisTurn: yaw %+.2f straight vs %+.2f at full steer"
+                   " -- the stick must not appear here\n", c2.yaw, c3.yaw);
+            ck(fabs(c3.yaw - c2.yaw) < 1e-3f,
+               "the steering stick does not move the camera round the car");
+
+            aimed = atan2f(c2.height, c2.dist) * 57.295776f;
+            printf("   aim: %.2f deg down at the car, %.2f deg after VisTurn"
+                   " (config %.2f)\n", aimed, cam_pitch_deg(&c2), RB_CAMERA.vis_turn);
+            ck(fabs((aimed - cam_pitch_deg(&c2)) - RB_CAMERA.vis_turn) < 0.01f,
+               "the aim is tilted UP by exactly VisTurn");
+            ck(cam_pitch_deg(&c2) < aimed - 5.0f,
+               "the car therefore sits below the centre of the frame");
+        }
+
+        /* The obstacle lift, 0x00500e60: block the line from the car to the eye
+           and the eye has to climb over it. The harness plane is the only
+           geometry there is, so tip it up behind the car to make the segment
+           cross it. */
+        {
+            rb_car g;
+            cam_t  gc;
+            float lifted, level;
+            car_init(&g);
+            g.world = &FLAT_WORLD;
+            g.body.x[1] = g.wheel[0].radius + g.wheel[0].len;
+            rb_car_update_matrix(&g);
+            cam_init(&gc, &g);
+            for (i = 0; i < 60; i++) cam_update(&gc, &g, 0.0f, 1.0f / 60.0f);
+            level = gc.height;
+            /* A vertical plane through the car, normal along -Z. The car sits
+               exactly on it and the eye is 0.79 m behind, so the sight line
+               crosses it -- and with no Y component w_ground declines to answer,
+               which keeps the ground clamp out of this measurement. */
+            TILT_N[0] = 0.0f; TILT_N[1] = 0.0f; TILT_N[2] = -1.0f;
+            for (i = 0; i < 60; i++) cam_update(&gc, &g, 0.0f, 1.0f / 60.0f);
+            lifted = gc.height;
+            printf("obstacle lift: height %.4f clear -> %.4f blocked"
+                   " (CDT_AngleUp %.1f deg at %.1f deg/s)\n",
+                   level, lifted, RB_CAMERA.cdt_angle_up,
+                   RB_CAMERA.cdt_angle_up_speed);
+            ck(lifted > level + 0.05f, "a blocked sight line lifts the eye");
+            ck(gc.cdt_dir_add > 1.0f, "and carries its own extra aim tilt");
+            TILT_N[0] = 0.0f; TILT_N[1] = 1.0f; TILT_N[2] = 0.0f;
         }
     }
 

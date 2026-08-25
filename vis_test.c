@@ -35,6 +35,7 @@
 #include "carani.h"       /* carani_tire_width -- the mark follows the tyre */
 #include "rb_data.h"      /* RB_CARS[].tune, the game's own upgrades.ini rows */
 #include "rbcar.h"        /* rbcar_init, to bind a real car's rig to its mesh */
+#include "carlight.h"
 #include "envmap.h"
 #include "sfx.h"          /* SURF_*, the material classes the grid carries */
 #include "ai.h"           /* a REAL opponent, for part 14 */
@@ -148,10 +149,59 @@ typedef struct {
 } glcap_upload;
 static glcap_upload uploads[GLCAP_MAX_UPLOADS];
 static int n_uploads;
+/* LEVEL-0 PIXELS, kept for the lightmap atlases -- part 16b samples one and
+   compares it against the byte pack_col.py baked per collision triangle, which
+   is the only end-to-end check that the two agree about which way up v runs.
+   Copied, because scene.c frees its staging buffer after the upload. */
+#define GLCAP_MAX_KEPT 160
+#define GLCAP_KEPT_BYTES (64u * 1024u * 1024u)
+static struct { GLuint tex; int w, h; unsigned short *px; } kept[GLCAP_MAX_KEPT];
+static int n_kept;
+static unsigned int kept_bytes;
+
+/* Drop the lot. Called at the top of the one part that reads them, so its own
+   scene's uploads are the only ones in the table -- otherwise the slots fill
+   with whatever earlier parts happened to load first, which is how this was
+   written the first time and why it found nothing. */
+void glcap_texels_free(void)
+{
+    int i;
+    for (i = 0; i < n_kept; i++)
+        free(kept[i].px);
+    n_kept = 0;
+    kept_bytes = 0;
+}
+
+const unsigned short *glcap_texels(GLuint tex, int *w, int *h)
+{
+    int i;
+    for (i = 0; i < n_kept; i++)
+        if (kept[i].tex == tex) {
+            if (w) *w = kept[i].w;
+            if (h) *h = kept[i].h;
+            return kept[i].px;
+        }
+    return NULL;
+}
+
 void glTexImage2D(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b,
                   GLenum f, GLenum ty, const void *p)
 {
-    (void)t;(void)i;(void)b;(void)f;(void)p;
+    (void)t;(void)i;(void)b;(void)f;
+    if (l == 0 && p && ty == GL_UNSIGNED_SHORT_5_6_5
+        && n_kept < GLCAP_MAX_KEPT && w > 0 && h > 0 && (long)w * h <= 512L * 512L
+        && kept_bytes + (unsigned)(w * h * 2) <= GLCAP_KEPT_BYTES) {
+        unsigned short *c = malloc((size_t)w * h * 2);
+        if (c) {
+            kept_bytes += (unsigned)(w * h * 2);
+            memcpy(c, p, (size_t)w * h * 2);
+            kept[n_kept].tex = cur_tex;
+            kept[n_kept].w = w;
+            kept[n_kept].h = h;
+            kept[n_kept].px = c;
+            n_kept++;
+        }
+    }
     if (n_uploads < GLCAP_MAX_UPLOADS) {
         uploads[n_uploads].tex = cur_tex;
         uploads[n_uploads].level = l;
@@ -256,6 +306,23 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
     gl_buf[id - 1].size = (size_t)size;
     if (gl_buf[id - 1].data && data)
         memcpy(gl_buf[id - 1].data, data, (size_t)size);
+}
+
+/* NOT a no-op, for the reason the buffer emulation exists at all: the car's
+   per-vertex light is uploaded through here every frame, and part 16 reads it
+   back out of the buffer the draw is bound to. A stub that dropped it would
+   check the shading against the zeros glBufferData left. */
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                     const void *data)
+{
+    GLuint id = glcap_buf_bound[buf_slot(target)];
+    if (!id || id > GLCAP_MAX_BUFFERS || !gl_buf[id - 1].alive)
+        return;
+    if (!gl_buf[id - 1].data || !data)
+        return;
+    if ((size_t)(offset + size) > gl_buf[id - 1].size)
+        return;
+    memcpy((char *)gl_buf[id - 1].data + offset, data, (size_t)size);
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint *ids)
@@ -3772,15 +3839,16 @@ static int drive_trace(trace_t *tr, rb_car *c, int steps, float step_m,
     return drive_trace2(tr, c, steps, step_m, curve_deg, 0);
 }
 
-/* Half a wheel batch's width, measured INDEPENDENTLY of mesh_half_width: half
-   its plain model-space X extent, with no node origin and no dot product at all.
-   Every wheel node on all three cars has a rest Z row of (+-k, 0, 0) -- the axle
-   really is model +-X -- so this has to agree, and it agrees by a different
-   route, which is the point of having it here.
+/* Half a wheel batch's width: half its plain model-space X extent. Every wheel
+   node on all three cars has a rest Z row of (+-k, 0, 0) -- the axle really is
+   model +-X -- so this measures the tyre across its axle without needing the
+   node at all.
 
-   It also has to be an EXTENT and not a distance from the node: the Buggy's
-   front wheel mesh is 6.7 mm off its own node, and a version of this written
-   as max|x - node_x| would have agreed with the same mistake in trace.c. */
+   It has to be an EXTENT and not a distance from the node: the Buggy's front
+   wheel mesh is 6.7 mm off its own node, and max|x - node_x| would call that
+   tyre 29% wider than it is. Nothing in trace.c measures a tyre any more -- the
+   engine's mark width is a constant -- so this is now the ONLY measure of one,
+   and it is what the inked-band check is held against. */
 static float batch_half_x(const scene_t *s, int part)
 {
     float lo = 1e30f, hi = -1e30f;
@@ -3926,28 +3994,25 @@ static void part7_trace(void)
        "polygonOffset %.0f, %.0f", glcap.draws[0].pol_factor,
        glcap.draws[0].pol_units);
 
-    /* ---- and as wide as the tyre the TUNING fitted --------------------
+    /* ---- and as wide as the TUNING's tyre ----------------------------
      *
-     * The port's own, not the original's -- carani.h carries the argument and is
-     * the single place a tyre upgrade becomes a width, precisely so the drawn
-     * tyre and the mark under it cannot drift apart.
+     * FUN_0052f310 reads the car's tyre level out of phys+0xe45c and hands
+     * FUN_0050bde0's table entry to FUN_0052f990 as the half-width's multiplier
+     * -- the same entry FUN_0050be40 puts on the wheel node's axle. So the mark
+     * and the tyre widen together, by construction, and carani_tire_width is
+     * the port's single copy of that.
      *
-     * Which is why this does NOT check the mark against carani_tire_width. That
-     * is the function's own definition, and a check against the thing it guards
-     * has passed everything four times in this port already. It checks against
-     * the game's DATA instead: RB_CARS[0].tune.tire_upgrade is the Overkill's
-     * upgrades.ini [TIRES] row, and each level's mark must be wider than stock
-     * by that level's own grip ratio. Change the mapping and every one of the
-     * three ratios moves off its table entry.
+     * Which is why this checks the COUPLING and not the four numbers: it asserts
+     * that the drawn quad is exactly 2 * 0.05 * that call, so a mark that stops
+     * reading the tyre table -- goes back to measuring a mesh, picks up a gain,
+     * misses the level -- fails here whatever the table says.
      *
-     * `fake_car` memsets the car, so the loop above ran with no tuning at all
-     * and carani_tire_width's "nothing loaded" guard returned 1 -- that is the
-     * stock width every check above was written against, and level 0 with a real
-     * table has to reproduce it exactly.
+     * `fake_car` memsets the car, so tire_upgrade is 0 and every check above ran
+     * at the stock 95 mm.
      */
     {
         float wid[4];
-        int lv, ok_ratio = 1, ok_mono = 1;
+        int lv, ok_val = 1, ok_mono = 1;
 
         for (lv = 0; lv < 4; lv++) {
             fake_car(&c, 3.f, 0.f);
@@ -3957,32 +4022,26 @@ static void part7_trace(void)
             gl_cap_reset();
             trace_draw(&tr, eye);
             wid[lv] = mark_width_max();
+            if (fabsf(wid[lv] - 2.f * 0.05f * carani_tire_width(&c)) > 1e-5f)
+                ok_val = 0;
         }
         printf("mark width by tuning level: %.1f %.1f %.1f %.1f mm\n",
                wid[0] * 1000.f, wid[1] * 1000.f, wid[2] * 1000.f,
                wid[3] * 1000.f);
-        for (lv = 1; lv < 4; lv++) {
-            float want = RB_CARS[0].tune.tire_upgrade[lv]
-                         / RB_CARS[0].tune.tire_upgrade[0];
-            if (fabsf(wid[lv] / wid[0] - want) > 1e-3f)
-                ok_ratio = 0;
+        for (lv = 1; lv < 4; lv++)
             if (wid[lv] <= wid[lv - 1])
                 ok_mono = 0;
-        }
         ck(fabsf(wid[0] - wmax) < 1e-5f,
            "a stock tyre marks exactly as wide as it always did",
            "%.2f mm against %.2f mm", wid[0] * 1000.f, wmax * 1000.f);
         ck(ok_mono, "every tuning level leaves a wider mark than the last",
            "%.2f %.2f %.2f %.2f mm", wid[0] * 1000.f, wid[1] * 1000.f,
            wid[2] * 1000.f, wid[3] * 1000.f);
-        ck(ok_ratio,
-           "each mark is wider by that level's own grip ratio from "
-           "upgrades.ini [TIRES]",
-           "x%.4f x%.4f x%.4f against x%.4f x%.4f x%.4f",
-           wid[1] / wid[0], wid[2] / wid[0], wid[3] / wid[0],
-           RB_CARS[0].tune.tire_upgrade[1] / RB_CARS[0].tune.tire_upgrade[0],
-           RB_CARS[0].tune.tire_upgrade[2] / RB_CARS[0].tune.tire_upgrade[0],
-           RB_CARS[0].tune.tire_upgrade[3] / RB_CARS[0].tune.tire_upgrade[0]);
+        ck(ok_val,
+           "and every one of them is FUN_0052f990's `param_9 * 0.05`, with "
+           "param_9 the tyre table's own entry",
+           "%.2f %.2f %.2f %.2f mm", wid[0] * 1000.f, wid[1] * 1000.f,
+           wid[2] * 1000.f, wid[3] * 1000.f);
         /* Still a tyre mark and not a paint roller: the widest one is under a
            whole wheel diameter, the same bound the stock check uses. */
         ck(wid[3] < 0.0718f * 2.f,
@@ -3993,27 +4052,37 @@ static void part7_trace(void)
         fake_car(&c, 3.f, 0.f);
     }
 
-    /* ---- and as wide as the tyre, on the REAL packed cars -------------
+    /* ---- one width, and never narrower than the tyre, on the REAL cars --
      *
-     * The width used to be TRACE_WIDTH_FRAC of the wheel's PHYSICS radius,
-     * which is not the tyre's width and is not in any fixed proportion to it.
-     * Measured against the drawn wheels that came out at 92% of the Overkill's
-     * tyre, 76% of the Buggy's rear and 107% of its front -- a mark WIDER than
-     * the tyre that made it -- and 74% of the Hummer's, which is what "the marks
-     * are about three quarters of the tyre" was. No single fraction fixes three
-     * cars that disagree in both directions, so trace_init measures each wheel
-     * off its own mesh.
+     * The engine measures no tyre for this: FUN_0052f310 hands FUN_0052f990 the
+     * TABLE entry for the car's tyre level and the half-width is that times
+     * 0.05, so every car and every wheel lays the same 95 mm at level 0. The
+     * port used to fit each wheel to its own packed mesh, which is where "the
+     * marks are smaller than the wheels are wide" came from -- the mesh width is
+     * the whole quad, and the texture inks only the middle 78% of it, so the
+     * mark came out at four fifths of the tyre by construction.
      *
-     * The fixtures above cannot see any of this: they carry no rig, so they take
-     * the fallback. This needs the real cars, and a missing one is a FAILED
-     * check rather than a quiet skip -- rb_test's rig section spent months
-     * printing "SKIPPED" into a wall of passing output.
+     * So the two things checked here are the two the mesh fit got wrong: that
+     * one car's four wheels (and three cars between them) lay ONE width, and
+     * that the INKED part of that width is not narrower than the tyre above it.
+     * The second needs the real meshes -- it is the complaint itself, measured.
+     *
+     * A missing car is a FAILED check rather than a quiet skip: rb_test's rig
+     * section spent months printing "SKIPPED" into a wall of passing output.
      */
     {
         static const char *files[3] = {
             "assets/car1.vsc", "assets/car2.vsc", "assets/car3.vsc"
         };
         static const char *names[3] = { "Overkill", "Buggy", "Hummer" };
+        /* Columns of t_halfdry_tire2_1 that are not flat 128, over its 64: 50,
+           or 0.78 -- the outer eighth of the quad is neutral on every side and
+           paints nothing at all. That is the texture this drives on, since a
+           car out of rbcar_init is on stock tyres. (The other three ink 0.67,
+           0.75 and 0.73.) Measured off the shipped PNGs; nothing in the port
+           reads it, which is why it is typed here and not in trace.h. */
+        const float ink = 0.78f;
+        float mark_w[3] = { 0.f, 0.f, 0.f };
         int ci;
 
         for (ci = 0; ci < 3; ci++) {
@@ -4021,8 +4090,8 @@ static void part7_trace(void)
             rb_car rc;
             rb_world cw;
             trace_t t2;
-            int wi, ok_fit = 1, ok_wide = 1, n = 0;
-            float worst = 0.f;
+            int wi, d, i2;
+            float lo = 1e9f, hi = 0.f, tyre_lo = 1e9f, tyre_hi = 0.f;
 
             if (!scene_load(files[ci], &cs)) {
                 ck(0, "the packed car loads (run from rccars_vita/)",
@@ -4034,108 +4103,70 @@ static void part7_trace(void)
             carani_bind(&cs.rig, &rc);
             trace_init(&t2, &cs);
 
-            printf("%-9s mark half-width per wheel:", names[ci]);
+            /* The tyre as DRAWN: the packed mesh's own extent along the axle,
+               times the scale carani_update puts on that axle. */
             for (wi = 0; wi < rc.nwheels && wi < RB_MAX_WHEELS; wi++) {
-                float want = batch_half_x(&cs, cs.rig.wheel[wi]);
-                float old = rc.wheel[wi].radius * 0.5f;
-                if (want <= 0.f)
-                    continue;
-                n++;
-                printf(" %.4f", t2.half_w[wi]);
-                /* 1e-5, not 1e-6: the two routes normalise differently and the
-                   node scales are 1.05, 0.90 and -1.17, so they land ~2e-6
-                   apart on values of 0.03 to 0.04. Anything a wrong measure
-                   could do here is three orders of magnitude bigger. */
-                if (fabsf(t2.half_w[wi] - want) > 1e-5f)
-                    ok_fit = 0;
-                if (fabsf(old / want - 1.f) > worst)
-                    worst = fabsf(old / want - 1.f);
-                /* a mark is a tyre's width, not a car's */
-                if (t2.half_w[wi] > rc.wheel[wi].radius * 1.5f)
-                    ok_wide = 0;
+                float t = batch_half_x(&cs, cs.rig.wheel[wi]) * 2.f
+                          * carani_tire_width(&rc);
+                if (t <= 0.f) continue;
+                if (t < tyre_lo) tyre_lo = t;
+                if (t > tyre_hi) tyre_hi = t;
             }
-            printf("  (the old radius rule was off by up to %.0f%%)\n",
-                   worst * 100.f);
-            ck(n == rc.nwheels, "every wheel found the tyre that makes its mark",
-               "%d of %d", n, rc.nwheels);
-            ck(ok_fit, "and is fitted to that tyre's own width, off the mesh",
-               "%s", names[ci]);
-            ck(ok_wide, "and is a tyre's width, not a body's", "%s", names[ci]);
 
-            /* End to end: the fitted width has to reach the drawn vertex, and
-               the fixtures above cannot show that because they have no rig and
-               take the fallback.
-
-               Bound to a consequence rather than to half_w: the BUGGY's front
-               tyre is genuinely narrower than its rear (0.0230 against 0.0306 in
-               the mesh), so it must leave TWO mark widths in that ratio, while
-               the other two cars leave one. A version that fits per car instead
-               of per wheel passes every check above and dies here. */
-            {
-                float lo = 1e9f, hi = 0.f, want_lo = 1e9f, want_hi = 0.f;
-                int d, i2;
-                /* A car fresh out of rbcar_init is in the air, and trace_step
-                   correctly ignores a wheel that is not touching. Put the first
-                   four down -- those are the ones drive_trace2 moves, so the
-                   Hummer's middle pair stays up and out of this. */
-                for (wi = 0; wi < RB_MAX_WHEELS; wi++) {
-                    rc.hit[wi].active = (wi < 4);
-                    rc.hit[wi].in_water = 0;
-                    rc.hit[wi].normal[0] = 0.f;
-                    rc.hit[wi].normal[1] = 1.f;
-                    rc.hit[wi].normal[2] = 0.f;
+            /* A car fresh out of rbcar_init is in the air, and trace_step
+               correctly ignores a wheel that is not touching. Put the first four
+               down -- those are the ones drive_trace2 moves, so the Hummer's
+               middle pair stays up and out of this. */
+            for (wi = 0; wi < RB_MAX_WHEELS; wi++) {
+                rc.hit[wi].active = (wi < 4);
+                rc.hit[wi].in_water = 0;
+                rc.hit[wi].normal[0] = 0.f;
+                rc.hit[wi].normal[1] = 1.f;
+                rc.hit[wi].normal[2] = 0.f;
+            }
+            drive_trace(&t2, &rc, 240, 0.05f, 2.f);
+            gl_cap_reset();
+            trace_draw(&t2, eye);
+            for (d = 0; d < glcap.n_draws; d++)
+                for (i2 = glcap.draws[d].first;
+                     i2 + 5 < glcap.draws[d].first + glcap.draws[d].count;
+                     i2 += 6) {
+                    float dx = glcap.pos[i2 + 1][0] - glcap.pos[i2][0];
+                    float dy = glcap.pos[i2 + 1][1] - glcap.pos[i2][1];
+                    float dz = glcap.pos[i2 + 1][2] - glcap.pos[i2][2];
+                    float ww = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (ww < lo) lo = ww;
+                    if (ww > hi) hi = ww;
                 }
-                drive_trace(&t2, &rc, 240, 0.05f, 2.f);
-                gl_cap_reset();
-                trace_draw(&t2, eye);
-                for (d = 0; d < glcap.n_draws; d++)
-                    for (i2 = glcap.draws[d].first;
-                         i2 + 5 < glcap.draws[d].first + glcap.draws[d].count;
-                         i2 += 6) {
-                        float dx = glcap.pos[i2 + 1][0] - glcap.pos[i2][0];
-                        float dy = glcap.pos[i2 + 1][1] - glcap.pos[i2][1];
-                        float dz = glcap.pos[i2 + 1][2] - glcap.pos[i2][2];
-                        float ww = sqrtf(dx * dx + dy * dy + dz * dz);
-                        if (ww < lo) lo = ww;
-                        if (ww > hi) hi = ww;
-                    }
-                for (wi = 0; wi < 4 && wi < rc.nwheels; wi++) {
-                    if (t2.half_w[wi] <= 0.f) continue;
-                    if (t2.half_w[wi] * 2.f < want_lo) want_lo = t2.half_w[wi] * 2.f;
-                    if (t2.half_w[wi] * 2.f > want_hi) want_hi = t2.half_w[wi] * 2.f;
-                }
-                printf("%-9s draws marks %.1f to %.1f mm; its tyres are "
-                       "%.1f to %.1f mm\n", names[ci], lo * 1000.f, hi * 1000.f,
-                       want_lo * 1000.f, want_hi * 1000.f);
-                ck(fabsf(lo - want_lo) < 1e-5f && fabsf(hi - want_hi) < 1e-5f,
-                   "and every drawn quad is the width of the tyre above it",
-                   "%s: %.4f-%.4f against %.4f-%.4f", names[ci], lo, hi,
-                   want_lo, want_hi);
-                ck((ci == 1) ? hi > lo * 1.2f : fabsf(hi - lo) < 1e-5f,
-                   ci == 1 ? "the Buggy's narrower front tyre leaves a narrower "
-                             "mark than its rear"
-                           : "a car with one tyre width leaves one mark width",
-                   "%.4f and %.4f", lo, hi);
-            }
+            mark_w[ci] = hi;
 
-            /* An UNBOUND rig points every wheel at part 0 -- __root__, the whole
-               car -- and measuring that would give the mark the half-width of
-               the model. main.c reaches exactly that state: load_car builds the
-               trace before respawn() binds the rig. */
-            if (ci == 0) {
-                trace_t t3;
-                int all_zero = 1;
-                memset(cs.rig.wheel, 0, sizeof cs.rig.wheel);
-                trace_init(&t3, &cs);
-                for (wi = 0; wi < RB_MAX_WHEELS; wi++)
-                    if (t3.half_w[wi] != 0.f)
-                        all_zero = 0;
-                ck(all_zero,
-                   "an unbound rig measures nothing rather than the car body",
-                   "half_w[0] = %.4f", t3.half_w[0]);
-            }
+            printf("%-9s draws marks %.1f to %.1f mm (%.1f mm inked); its "
+                   "tyres are %.1f to %.1f mm\n", names[ci], lo * 1000.f,
+                   hi * 1000.f, hi * ink * 1000.f, tyre_lo * 1000.f,
+                   tyre_hi * 1000.f);
+            ck(hi > 0.f && fabsf(hi - lo) < 1e-5f,
+               "every wheel on the car lays one width, whatever its tyre",
+               "%s: %.4f to %.4f", names[ci], lo, hi);
+            /* The quad is oversized ON PURPOSE and the inked band is what the
+               eye sees, so that band is what has to match the tyre: 0.98 of it
+               on the Overkill, 0.98 on the Hummer, 1.28 on the Buggy (whose
+               tyres are the narrowest of the three and which still gets the same
+               95 mm as everyone else). The band is wide enough to hold all
+               three and tight enough that the mesh fit this replaced -- which
+               made the quad the tyre and so the INK 0.78 of it, on every car --
+               fails it three times over. */
+            ck(lo * ink > tyre_hi * 0.9f && hi * ink < tyre_hi * 1.5f,
+               "and the inked part of it is the width of the tyre above it",
+               "%s: %.1f mm inked against %.1f mm of tyre, x%.2f", names[ci],
+               lo * ink * 1000.f, tyre_hi * 1000.f, lo * ink / tyre_hi);
             scene_release(&cs);
         }
+        ck(mark_w[0] > 0.f && fabsf(mark_w[1] - mark_w[0]) < 1e-5f
+           && fabsf(mark_w[2] - mark_w[0]) < 1e-5f,
+           "and all three cars lay the same width, because the engine reads a "
+           "table and not a mesh",
+           "%.1f %.1f %.1f mm", mark_w[0] * 1000.f, mark_w[1] * 1000.f,
+           mark_w[2] * 1000.f);
     }
 
     /* ---- the tread runs ALONG the trail, not across it ---------------
@@ -4397,7 +4428,7 @@ static void part8_envmap(void)
     /* ---- the sphere map, measured through the actual transform -------- */
     body = add_env_quad(car, ENV_BODY, toward);
     gl_cap_reset();
-    envmap_draw(&e, car, ident);
+    envmap_draw(&e, car, ident, 1.f);
     ck(glcap.n_draws == 1 && near(glcap.draws[0].color[3],
                                   envmap_alpha(ENV_BODY), 1e-4f),
        "an env batch draws once, at its class's alpha",
@@ -4414,13 +4445,13 @@ static void part8_envmap(void)
        exactly the class of bug the mirrored-yaw note in CLAUDE.md is about. */
     memcpy(body->nrm, rightn, sizeof(float) * 3);
     gl_cap_reset();
-    envmap_draw(&e, car, ident);
+    envmap_draw(&e, car, ident, 1.f);
     ck(glcap.uv[glcap.draws[0].first][0] > 0.9f,
        "a surface facing view right samples the right of the map",
        "u %.3f", glcap.uv[glcap.draws[0].first][0]);
     memcpy(body->nrm, upn, sizeof(float) * 3);
     gl_cap_reset();
-    envmap_draw(&e, car, ident);
+    envmap_draw(&e, car, ident, 1.f);
     ck(glcap.uv[glcap.draws[0].first][1] < 0.1f,
        "a surface facing view up samples the top of the map",
        "v %.3f", glcap.uv[glcap.draws[0].first][1]);
@@ -4435,14 +4466,14 @@ static void part8_envmap(void)
             for (ci = 0; ci < 3; ci++)
                 n3[r * 3 + ci] = m[r * 4 + ci];
         gl_cap_reset();
-        envmap_draw(&e, car, n3);
+        envmap_draw(&e, car, n3, 1.f);
         u0 = glcap.uv[glcap.draws[0].first][0];
         body_matrix(m, 90.f, 0.f, 0.f, 0.f);
         for (r = 0; r < 3; r++)
             for (ci = 0; ci < 3; ci++)
                 n3[r * 3 + ci] = m[r * 4 + ci];
         gl_cap_reset();
-        envmap_draw(&e, car, n3);
+        envmap_draw(&e, car, n3, 1.f);
         u1 = glcap.uv[glcap.draws[0].first][0];
         ck(near(u0, 0.5f, 1e-4f) && fabsf(u1 - u0) > 0.4f,
            "the highlight slides across the body as the car turns",
@@ -4468,7 +4499,7 @@ static void part8_envmap(void)
         b->nrm = NULL;                                       /* packed pre-VSC7 */
     }
     gl_cap_reset();
-    envmap_draw(&e, car, ident);
+    envmap_draw(&e, car, ident, 1.f);
     ck(glcap.n_draws == 1 && e.n_batches == 1,
        "only a classified batch WITH normals gets a glance",
        "%d draws of 3 batches", glcap.n_draws);
@@ -4483,7 +4514,7 @@ static void part8_envmap(void)
         car->rig.draw[1][0] = car->rig.draw[1][5] = car->rig.draw[1][10] =
             car->rig.draw[1][15] = 1.f;
         gl_cap_reset();
-        envmap_draw(&e, car, ident);
+        envmap_draw(&e, car, ident, 1.f);
         ck(glcap.n_draws == 2 && mat_max_depth >= 1 && mat_depth == 0
            && !mat_underflow,
            "a rigged env part draws under its own matrix, balanced",
@@ -4492,7 +4523,7 @@ static void part8_envmap(void)
     }
 
     set_world_state();
-    envmap_draw(&e, car, ident);
+    envmap_draw(&e, car, ident, 1.f);
     /* envmap_draw does not touch the colour array or the depth bias, but it does
        turn blending on, the alpha test off and depth writes off -- and it leaves
        a glColor4f behind, which would tint everything drawn after it. */
@@ -6523,6 +6554,28 @@ static void part14_aifx(void)
                         t4.ctx = &k4; t4.spine = vt_spine;
                         t4.lap_progress = vt_progress;
                         t4.spine_len = k4.spine_len;
+                        /* AS THE APP DOES, and in the app's order: fit the
+                           checkpoint stations off the recordings, install them,
+                           and only then restart -- cp_restart reads road_len to
+                           place the grid. A harness that skips either measures
+                           the spine's arc lengths and the degenerate pre-start
+                           branch rather than what ships. The player here is
+                           driven along the first opponent's recording, so its
+                           race starts where that recording does. */
+                        {
+                            float mk[CP_MAX][3], fr[CP_MAX], ll = 0.f;
+                            int m = k4.n < CP_MAX ? k4.n : CP_MAX, j;
+                            for (j = 0; j < m; j++) {
+                                mk[j][0] = k4.cp[j].p[0][0];
+                                mk[j][1] = k4.cp[j].p[0][1];
+                                mk[j][2] = k4.cp[j].p[0][2];
+                            }
+                            if (ai_cp_fractions(&a4, (const float (*)[3])mk, m,
+                                                fr, &ll))
+                                cp_set_stations(&k4, fr, m, ll);
+                        }
+                        cp_restart(&k4, pc->s[0].p[0], pc->s[0].p[1],
+                                   pc->s[0].p[2]);
                         for (q = 0; q < AI_MAX_OPPONENTS; q++) oprev[q] = -1e9f;
                         pc = &a4.car[0];
                         /* 12000 ticks -- 200 s. The slowest track's player-side
@@ -6572,14 +6625,20 @@ static void part14_aifx(void)
                    "an opponent's progress never goes backwards -- it is its own "
                    "recorded path length walked, exact by construction",
                    "%d backward steps", oback);
-                /* The player's is BOUNDED, not zero: it is anchored on the
-                   latched checkpoint index and steps at a crossing, because the
-                   fraction between two checkpoints is a straight-line distance
-                   against an arc span. 25 m against the 426 m the projection used
-                   to jump. known-issues.md. */
-                ck(pworst < 25.f,
-                   "and the player's steps back by less than 25 m -- down from "
-                   "the projection's 426",
+                /* AND NEITHER DOES THE PLAYER'S, which is now the same kind of
+                   quantity: an odometer carried forward between checkpoints and
+                   re-anchored at each one (cp_prog_step), not a straight line to
+                   the next marker against an arc span.
+                
+                   THIS BOUND USED TO BE 25 m and it was met at 22.7 m, which is
+                   the measurement the old rule left behind -- 0 to 6 steps back
+                   per 200 s on six of the ten tracks. It is 0 on all ten now, so
+                   the bound is exact rather than generous; a check that has slack
+                   its subject does not need cannot fail for the right reason. */
+                ck(pback == 0,
+                   "and neither does the PLAYER's -- an odometer carried forward "
+                   "and re-anchored at each checkpoint, where the old chord rule "
+                   "stepped back 22.7 m",
                    "%d steps, worst %.1f m", pback, pworst);
             }
 
@@ -6899,6 +6958,349 @@ static void part15_blend(void)
     scene_release(&s);
 }
 
+
+/*
+ * 16. THE CAR'S NORMALS, and the lit draw path.
+ *
+ * scene_set_build_normals fills in a normal for every batch the .vsc does not
+ * carry one for -- the wheels, the pipes, everything that is not the glance's --
+ * scene_shade turns them into a grey per vertex, and scene_set_lighting binds
+ * that as a colour array. All three are invisible on screen except as shading,
+ * which is exactly the kind of thing this harness exists for: the recorder keeps
+ * the colour submitted with each vertex, so a flat car, a dark car or a RAINBOW
+ * one is a number here rather than a screenshot.
+ *
+ * See carlight.h. The LIGHT itself is carlight_test's; this is the geometry.
+ */
+static void part16_carnormals(void)
+{
+    static const char *files[3] = {
+        "assets/car1.vsc", "assets/car2.vsc", "assets/car3.vsc"
+    };
+    static const char *names[3] = { "Overkill", "Buggy", "Hummer" };
+    int ci;
+
+    printf("-- 16: the car's vertex normals and the lit pass\n");
+    for (ci = 0; ci < 3; ci++) {
+        scene_t cs;
+        unsigned int b, packed = 0, built = 0, no_nrm = 0;
+        int bad_len = 0, degenerate = 0;
+        float worst_len = 0.f;
+
+        scene_set_build_normals(1);
+        if (!scene_load(files[ci], &cs)) {
+            scene_set_build_normals(0);
+            ck(0, "the packed car loads (run from rccars_vita/)", "%s",
+               files[ci]);
+            continue;
+        }
+        scene_set_build_normals(0);
+
+        for (b = 0; b < cs.n_batches; b++) {
+            const batch_t *bt = &cs.batches[b];
+            unsigned int v;
+            if (!bt->nverts || !bt->nidx)
+                continue;
+            if (!bt->nrm) { no_nrm++; continue; }
+            if (bt->nrm_built) built++; else packed++;
+            for (v = 0; v < bt->nverts; v++) {
+                const float *n = &bt->nrm[v * 3];
+                const float L = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+                if (fabsf(L - 1.f) > 1e-3f) bad_len++;
+                if (fabsf(L - 1.f) > worst_len) worst_len = fabsf(L - 1.f);
+                /* pack_vsc.py's and scene.c's shared answer for a vertex no
+                   triangle references: straight up. Counted, not failed -- a
+                   car has a few, and what would be wrong is a ZERO. */
+                if (n[0] == 0.f && n[1] == 1.f && n[2] == 0.f) degenerate++;
+            }
+        }
+        ck(no_nrm == 0, "every drawable batch of the car has normals",
+           "%s: %u without, %u built + %u packed", names[ci], no_nrm, built,
+           packed);
+        ck(built > 0 && packed > 0,
+           "and the packed ones are LEFT ALONE -- both kinds are present",
+           "%s: %u built, %u packed (the glance's)", names[ci], built, packed);
+        ck(bad_len == 0, "all of them unit length",
+           "%s: %d off, worst %.2e", names[ci], bad_len, (double)worst_len);
+        printf("   %-9s %u batches, %u built + %u packed, %d vertices took the "
+               "up fallback\n", names[ci], cs.n_batches, built, packed,
+               degenerate);
+
+        /* THE DRAW, and this is the half that would have caught the bug that
+           shipped: lit through GL's own fixed-function lighting, the car came out
+           in fine-grained RAINBOW NOISE on the target (carlight.h says why), and
+           no check in this file could see it -- the shading was happening inside
+           vitaGL. On the CPU it is a colour per vertex, submitted, and readable
+           right here. */
+        {
+            float L[3], La, Ld;
+            carlight_t cl;
+            int i, n_with = 0, n_without = 0;
+            unsigned char lo = 255, hi = 0;
+            carlight_reset(&cl);
+            carlight_terms(&cl, 0.87f, &La, &Ld);
+            carlight_dir(L);                /* the car unrotated: model == world */
+            scene_shade(&cs, L, La, Ld);
+            scene_cull_off();
+            scene_set_lighting(1);
+            gl_cap_reset();
+            scene_draw(&cs, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+            for (i = 0; i < glcap.n_verts; i++) {
+                if (!glcap.has_color[i]) { n_without++; continue; }
+                n_with++;
+                if (glcap.rgba[i][0] < lo) lo = glcap.rgba[i][0];
+                if (glcap.rgba[i][0] > hi) hi = glcap.rgba[i][0];
+            }
+            ck(glcap.n_verts > 0 && n_without == 0,
+               "the lit pass submits a colour for every vertex it draws",
+               "%s: %d with, %d without", names[ci], n_with, n_without);
+            /* GREY AND OPAQUE, every one of them. The rainbow was neither, and
+               this is the check that says so in one number. */
+            {
+                int not_grey = 0, not_opaque = 0;
+                for (i = 0; i < glcap.n_verts; i++) {
+                    const unsigned char *c = glcap.rgba[i];
+                    if (c[0] != c[1] || c[1] != c[2]) not_grey++;
+                    if (c[3] != 255) not_opaque++;
+                }
+                ck(not_grey == 0 && not_opaque == 0,
+                   "and every one of them is GREY and opaque",
+                   "%s: %d coloured, %d see-through of %d", names[ci],
+                   not_grey, not_opaque, glcap.n_verts);
+            }
+            /* The RANGE has to be the recovered one: nothing darker than the
+               ambient alone, nothing brighter than the saturated sum, and both
+               ends actually reached -- a car shaded to one flat value would pass
+               every check above. */
+            ck(lo >= (unsigned char)(La * 255.f) - 1
+               && hi <= 255 && hi - lo > 20,
+               "and they span the recovered range rather than sitting flat",
+               "%s: %d..%d, ambient floor %d", names[ci], lo, hi,
+               (int)(La * 255.f));
+            /* THE DIRECTION, measured through the same transform main.c uses: the
+               brightest vertex in the car must be one whose normal faces the sun,
+               and the darkest one must not. Which is what "the sun picks on the
+               shell" IS, and it is the one thing a wrong model-space light would
+               get wrong while still looking plausible. */
+            {
+                float best = -2.f, worst = 2.f;
+                unsigned int b2;
+                for (b2 = 0; b2 < cs.n_batches; b2++) {
+                    const batch_t *bt = &cs.batches[b2];
+                    unsigned int v;
+                    if (!bt->nrm || !bt->lit || bt->part > 0)
+                        continue;       /* body parts only: no part matrix */
+                    for (v = 0; v < bt->nverts; v++) {
+                        const float *nn = &bt->nrm[v * 3];
+                        const float dot = nn[0]*L[0] + nn[1]*L[1] + nn[2]*L[2];
+                        const unsigned char g = bt->lit[v * 4];
+                        if (g == hi && dot > best) best = dot;
+                        if (g == lo && dot < worst) worst = dot;
+                    }
+                }
+                ck(best > 0.9f && worst <= 0.01f,
+                   "the brightest vertices face the sun and the darkest do not",
+                   "%s: brightest N.L %.3f, darkest N.L %.3f", names[ci],
+                   (double)best, (double)worst);
+            }
+            scene_set_lighting(0);
+            gl_cap_reset();
+            scene_draw(&cs, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+            n_with = 0;
+            for (i = 0; i < glcap.n_verts; i++)
+                if (glcap.has_color[i]) n_with++;
+            ck(n_with == 0,
+               "and with lighting off, no colour array is enabled at all",
+               "%s: %d vertices took one", names[ci], n_with);
+
+            /* A RIGGED PART TURNS ITS OWN LIGHT. A wheel's normals are in the
+               wheel's space and it is drawn under rig.draw[], so scene_shade has
+               to rotate the light again per part -- and nothing above can see
+               that, because every check so far reads body batches whose matrix is
+               the identity. So: spin a wheel a quarter turn, re-shade, and the
+               wheel's greys have to MOVE. They cannot move if the part rotation
+               is dropped, which is the mutant this exists for. */
+            if (cs.has_rig) {
+                rb_car rcw;
+                rb_world cw;
+                int wb = -1, w;
+                memset(&cw, 0, sizeof cw);
+                rbcar_init(&rcw, ci, &cw, 0.f, 0.f, 0.f, 0.f);
+                carani_bind(&cs.rig, &rcw);
+                for (w = 0; w < rcw.nwheels && wb < 0; w++) {
+                    const int part = cs.rig.wheel[w];
+                    unsigned int b2;
+                    if (part <= 0)
+                        continue;
+                    for (b2 = 0; b2 < cs.n_batches; b2++)
+                        if ((int)cs.batches[b2].part == part
+                            && cs.batches[b2].nrm && cs.batches[b2].lit
+                            && cs.batches[b2].nverts > 8) {
+                            wb = (int)b2;
+                            break;
+                        }
+                }
+                if (wb < 0) {
+                    ck(0, "a wheel batch to turn the light through", "%s",
+                       names[ci]);
+                } else {
+                    unsigned char before[64];
+                    const batch_t *bt = &cs.batches[wb];
+                    unsigned int k, take = bt->nverts < 16 ? bt->nverts : 16;
+                    int moved = 0;
+                    for (w = 0; w < rcw.nwheels; w++)
+                        rcw.wheel[w].spin = 0.f;
+                    carani_update(&cs.rig, &rcw);
+                    scene_shade(&cs, L, La, Ld);
+                    for (k = 0; k < take; k++)
+                        before[k] = bt->lit[k * 4];
+                    for (w = 0; w < rcw.nwheels; w++)
+                        rcw.wheel[w].spin = 1.5707964f;      /* a quarter turn */
+                    carani_update(&cs.rig, &rcw);
+                    scene_shade(&cs, L, La, Ld);
+                    for (k = 0; k < take; k++)
+                        if (bt->lit[k * 4] != before[k])
+                            moved++;
+                    ck(moved > 0,
+                       "a spun wheel's own light turns with it",
+                       "%s: %d of %u vertices changed", names[ci], moved, take);
+                }
+            }
+        }
+        scene_release(&cs);
+    }
+
+    /* A TRACK MUST NOT PAY FOR ANY OF IT. scene_set_build_normals is off for
+       everything but the cars, so beach_1's 121 batches carry no normals -- and
+       that is the whole reason the flag exists rather than the loader always
+       building them. */
+    {
+        scene_t rt;
+        if (scene_load("assets/beach_1.vsc", &rt)) {
+            unsigned int b, with = 0;
+            for (b = 0; b < rt.n_batches; b++)
+                if (rt.batches[b].nrm) with++;
+            ck(with == 0, "a track loads with no vertex normals at all",
+               "%u of %u batches carry one", with, rt.n_batches);
+            scene_release(&rt);
+        } else {
+            printf("  note: assets/beach_1.vsc not present -- the track half of "
+                   "this part did not run\n");
+        }
+    }
+}
+
+
+/*
+ * 16b. COL5 AGAINST THE ATLAS THE RENDERER SAMPLES.
+ *
+ * pack_col.py bakes one brightness byte per collision triangle by sampling the
+ * .sb's embedded lightmap atlas at the triangle's own LM-UV centroid, and
+ * carlight.c turns that into how dark the car goes. The one thing that reading
+ * cannot check about itself is WHICH WAY UP v RUNS -- get it wrong and every
+ * value is plausible, wrong, and mirrored across the atlas. This project has
+ * shipped that bug twice already, on two different arrows (traps.md).
+ *
+ * So: sample the atlas the port ACTUALLY UPLOADED, at the LM UV of a lit
+ * vertex, and compare it with col_light_at at that vertex's own position. Two
+ * different files, two different code paths, one number. And then do it again
+ * with v flipped, which must come out WORSE -- otherwise the check cannot tell
+ * the two apart and proves nothing.
+ */
+static float lm_sample(const unsigned short *px, int w, int h, float u, float v)
+{
+    int x, y;
+    unsigned short t;
+    float r, g, b;
+    /* wrapped, the way pack_col.py's lightmap_at wraps */
+    x = (int)(u * w) % w; if (x < 0) x += w;
+    y = (int)(v * h) % h; if (y < 0) y += h;
+    t = px[y * w + x];
+    /* 565. The mean of the three is immune to scene.c's R/B swap, which is
+       another reason to compare on brightness rather than on a channel. */
+    r = (float)((t >> 11) & 0x1F) / 31.f;
+    g = (float)((t >> 5) & 0x3F) / 63.f;
+    b = (float)(t & 0x1F) / 31.f;
+    return (r + g + b) / 3.f;
+}
+
+static void part16b_col5(void)
+{
+    scene_t rt;
+    col_t cg;
+    unsigned int b;
+    int n = 0, flipped_worse = 0;
+    double sum = 0.0, sum_flip = 0.0;
+
+    printf("-- 16b: COL5's baked brightness against the uploaded atlas\n");
+    glcap_texels_free();          /* this scene's uploads and no others */
+    if (!col_load("assets/beach_1.col", &cg)) {
+        printf("  note: assets/beach_1.col not present -- part did not run\n");
+        return;
+    }
+    if (!cg.light) {
+        ck(0, "beach_1.col carries COL5's lightmap bytes",
+           "no `light' array -- repack with pack_col.py");
+        col_free(&cg);
+        return;
+    }
+    gl_cap_reset();
+    if (!scene_load("assets/beach_1.vsc", &rt)) {
+        printf("  note: assets/beach_1.vsc not present -- part did not run\n");
+        col_free(&cg);
+        return;
+    }
+
+    for (b = 0; b < rt.n_batches && n < 400; b++) {
+        const batch_t *bt = &rt.batches[b];
+        int w = 0, h = 0;
+        const unsigned short *px;
+        unsigned int v;
+        if (!bt->gl_lm || !bt->nverts)
+            continue;
+        px = glcap_texels(bt->gl_lm, &w, &h);
+        if (!px || w <= 0 || h <= 0)
+            continue;
+        /* Every 37th vertex, so the sample is spread over the batch rather than
+           taken from one corner of it. */
+        for (v = 0; v < bt->nverts && n < 400; v += 37) {
+            const vtx_t *vx = &bt->verts[v];
+            const float got = col_light_at(&cg, vx->x, vx->y + 0.02f, vx->z);
+            float want, want_flip;
+            if (got < 0.f)
+                continue;               /* no collision face there: water, sky */
+            want = lm_sample(px, w, h, vx->lu, vx->lv);
+            want_flip = lm_sample(px, w, h, vx->lu, 1.f - vx->lv);
+            sum += fabs((double)got - want);
+            sum_flip += fabs((double)got - want_flip);
+            n++;
+        }
+    }
+    if (n < 20) {
+        ck(0, "enough lit vertices to compare", "%d found", n);
+    } else {
+        const double mean = sum / n;
+        const double mean_flip = sum_flip / n;
+        flipped_worse = mean_flip > mean * 1.5;
+        /* 0.12 of 1.0. The two are not the same measurement -- COL5 is the
+           atlas at the TRIANGLE's UV centroid and this is the atlas at a
+           VERTEX's -- and beach_1's atlas is 512 px over the whole track, so
+           neighbouring texels differ. What a wrong reading looks like is the
+           flipped number beside it. */
+        ck(mean < 0.12, "the baked byte matches the atlas the renderer samples",
+           "%d vertices, mean |diff| %.3f", n, mean);
+        ck(flipped_worse,
+           "and sampling v the other way up is measurably worse -- so this "
+           "check can tell",
+           "upright %.3f vs flipped %.3f", mean, mean_flip);
+    }
+    printf("   (%d atlases kept from the load, %u KB)\n", n_kept,
+           kept_bytes / 1024u);
+    scene_release(&rt);
+    col_free(&cg);
+    glcap_texels_free();
+}
+
 int main(void)
 {
     printf("RC Cars -- visual subsystem harness\n");
@@ -6917,6 +7319,8 @@ int main(void)
     part13_sun();
     part14_aifx();
     part15_blend();
+    part16_carnormals();
+    part16b_col5();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

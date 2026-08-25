@@ -28,8 +28,8 @@
 #define MAP_POS_Y 79.0f
 
 /* The panel's side, in the same pixels. 0x4b79ea puts every outline point
-   through (u * 167.0 - 83.5) * 1/512, i.e. it centres u about 0.5 and
-   scales it to a half-extent of 83.5 -- so the panel is 167 px across in
+   through (u * 167.0 - 0.5) * 1/512, i.e. it centres u about 0.5 and
+   scales it to a half-extent of 0.5 -- so the panel is 167 px across in
    the authored frame. Measured off the game's OWN screenshot of its HUD
    (Textures.1/opt_cock_m_1.csi, the cockpit option preview): the silver
    frame there is 167 px tall and 182 wide, so the height closes to the
@@ -245,6 +245,267 @@ static const map_calib MAP_CALIB[MAP_N_TRACKS] = {
 #define HUD_DIAL_CX    87.f    /* the boost dial's ring centre */
 #define HUD_DIAL_CY   507.f
 #define HUD_DIAL_R_PX  92.f    /* its outer radius, same pixels */
+
+/* ------------------------------- the direction arrow and WRONG WAY */
+
+/* THE `DirectArrow' -- the engine's own next-corner arrow, and the
+   WRONG WAY banner that shares its updater. Both are recovered whole.
+
+   The arrow is TWO CHEVRONS in a scene of their own, drawn through a
+   camera of their own into a small square viewport at the bottom of the
+   screen. The pieces and where each came from:
+
+     RCCarsDB/cockpit.sb   the geometry -- nodes `extru9' and
+                           `extru9_3' under `navigation_arrows_1', the
+                           two names 0x4af44c looks up and the two the
+                           error string "can't locate extru9 and
+                           extru9_3 on cockpit arrow" names
+     Textures.1/coc_str_2  the art: a 128x128 grey chevron on alpha
+     Settings/arrow.ini    the camera and its viewport
+     Config.gm Cockpit/DirectArrow   whether it is shown at all (1)
+     RCCars.exe 0x4b1360   the eight sliders and what they are put through
+     RCCars.exe 0x4e8f00   the angle, the tint, the blink and the wrong way
+     RCCars.exe 0x4e94e0   what the drawer asks for, off a 44-byte record
+     RCCars.exe 0x4b0fa0   the draw, and 0x4b024e the banner's post */
+
+/* arrow.ini, through FUN_004b1360. NearPlane is raw * 0.001, the three
+   fractions raw * 0.01, pos_y/pos_z (raw - 200) * 0.01 and dir raw - 90.
+   AngleVert is used RAW, as the camera's vertical field of view, with an
+   aspect of exactly 1. */
+#define ARW_NEAR        0.0100f   /* NearPlane */
+#define ARW_FOV_Y       45.000f   /* AngleVert, degrees */
+
+/* WHERE IT SITS: FUN_004b1360 builds the camera's viewport as the rect
+   (CX - Len/2, CY - Len/2, Len, Len) in fractions of the screen, so Len
+   is the SIDE of a square centred on (CX, CY) -- 0.17 of the screen at
+   (0.5, 0.87), i.e. the bottom centre. FUN_00471380 turns that into pixels
+   and 0x4b115d clears it before the arrow is drawn into it. */
+#define ARW_CX          0.5000f   /* CX */
+#define ARW_CY          0.8700f   /* CY */
+#define ARW_LEN         0.1700f   /* Len */
+
+/* THE CAMERA. It sits at (0, pos_y, pos_z) and its axis is
+   (0, cos dir, sin dir) -- so it looks back along the NEGATIVE of that,
+   down at the chevrons lying in the y = 0.246 plane at the origin. The
+   generator checks that aim: the ray crosses y = 0 at z = +0.093, which is
+   inside the chevrons' own footprint, and that is what says `dir' is an
+   elevation rather than a heading.
+
+   dir is measured from the horizon, so the arrow's plane is seen at
+   51.0 degrees and a step ALONG z foreshortens on screen by cos dir =
+   0.7771 while a step along x does not. dirarrow.c uses exactly that.
+   */
+#define ARW_CAM_Y       1.1200f   /* pos_y */
+#define ARW_CAM_Z       1.0000f   /* pos_z */
+#define ARW_CAM_DIR     39.000f   /* dir, degrees above the horizon */
+
+/* THE TWO CHEVRONS, out of cockpit.sb: six vertices and four triangles
+   each, flat at one y, one behind the other along z. -z is AWAY from the
+   camera, so the apex being the most-negative z is what says they point
+   FORWARD -- the mesh settles it, not the art.
+
+   Each one's UV is an exact AFFINE function of (x, z) -- the generator
+   fits it and refuses a mesh where it is not -- so a chevron is ONE quad
+   with a UV rect and the V is carved by coc_str_2's own alpha. The rect
+   below comes out the chevron's own ink box in the art, which is a free
+   check on the whole reading. Note u runs BACKWARDS against x: the art is
+   sampled mirrored, and the chevron is symmetric so it does not show. */
+#define ARW_CHEV_N 2
+#define ARW_CHEV_X0   -0.2500f
+#define ARW_CHEV_X1    0.2500f
+#define ARW_CHEV_U0   0.87791f   /* at x = ARW_CHEV_X0 */
+#define ARW_CHEV_U1   0.12090f   /* at x = ARW_CHEV_X1 */
+#define ARW_CHEV_V0   0.03683f   /* at the APEX, z = ARW_CHEV_Z[i][0] */
+#define ARW_CHEV_V1   0.62657f   /* at the near edge, z = [i][1] */
+#define ARW_CHEV_Y     0.2460f
+static const float ARW_CHEV_Z[ARW_CHEV_N][2] = {
+    {  -0.4140f,  -0.0190f },   /* extru9 */
+    {  -0.1140f,   0.2810f },   /* extru9_3 */
+};
+#define ARW_CHEV_TEX "coc_str_2"
+
+/* THE ANGLE. FUN_00410150 flattens the car's forward and the direction
+   to the aim point into XZ, takes acos of their normalised dot and
+   returns DEGREES clamped to 0..180 -- so the engine's own target angle
+   is UNSIGNED and its arrow leans the same way for a left turn and a
+   right one. dirarrow.h gives it the sign and says why.
+
+   The shown angle CHASES that target through FUN_0040c580, a wrap-aware
+   move-towards on degrees with a 360 modulus, at ARW_SLEW degrees a
+   second -- times ARW_SNAP_MUL while a snap is latched, which clears when
+   the two are within ARW_ANG_EPS. FUN_0040cc60 then multiplies by pi/180
+   and builds a rotation about Y, which is why the degrees are degrees. */
+#define ARW_SLEW        90.000f   /* record +0x00, deg/s */
+#define ARW_SNAP_MUL    10.000f   /* 0x554490 */
+#define ARW_ANG_EPS      1.000f   /* 0x554390, deg */
+
+/* THE TINT, and it is the arrow's second reading. Both chevrons get one
+   D3DCOLOR built at 0x4b10d4 from the SMOOTHED progress p through the
+   current checkpoint-to-checkpoint segment:
+
+       R = min(512 * (1 - p), 255)   G = min(512 * p, 235)   B = 0   A = 255
+
+   so p = 0 is RED, p = 1/2 is YELLOW and p = 1 is GREEN -- red just after
+   a checkpoint, green as the next one comes up. The two ceilings really
+   are different (255 and 235) and are the exe's own `cmp' immediates.
+
+   p chases the raw fraction at ARW_CHASE per second, and the WRONG WAY
+   state forces the raw fraction to 0, which is what turns the arrow red
+   the moment the banner comes up. */
+#define ARW_TINT_FULL    512.0f   /* 0x5547f4 */
+#define ARW_TINT_R_CAP   255       /* 0x4b10e5 */
+#define ARW_TINT_G_CAP   235       /* 0x4b10fb */
+#define ARW_CHASE        1.000f   /* record +0x04, per second */
+
+/* THE BLINK. Record +0x10 counts down by dt; when it goes negative it is
+   set to ARW_STEADY, or to ARW_BLINK_CYCLE if the car is going the wrong
+   way or the follower's own +0x58 is under ARW_BLINK_NEAR. The arrow is
+   drawn while the counter is at or under ARW_BLINK_SHOW -- which is
+   exactly half of ARW_BLINK_CYCLE, so it is a 0.5 s cycle half on, and a
+   negative counter is on for good.
+
+   AND +0x58 IS IDENTIFIED: it is the CLOSEST the car has come to the
+   checkpoint it is heading for -- a running minimum, in metres, in 3D.
+   FUN_004eb550 computes the straight-line distance to checkpoint
+   `record+0x4c', writes it to +0x54, and folds it into +0x58 with a
+   min(); FUN_004ea8d0 resets +0x58 to ARW_MIN_INIT when the checkpoint
+   advances. This file used to say the field was unrecovered and that the
+   port was reading it as a distance on circumstantial grounds; the
+   reading was right and the DETAIL was not -- it is the minimum and not
+   the current distance, so once the car has been within ARW_BLINK_NEAR
+   the arrow keeps blinking until the checkpoint changes rather than
+   stopping as the car drives away.
+
+   THE SAME FUNCTION CARRIES A CUE THE PORT HAD NEVER RAISED. Once per
+   checkpoint (+0x5c latches it), when the minimum is under
+   ARW_BESIDE_IN and the CURRENT distance is back over ARW_BLINK_NEAR --
+   4 m in, 5 m out -- it fires message-system sound 0x25e, and the shipped
+   bank has exactly one name for that: `cp_beside.wav'. The id next to
+   it, 0x25d, is fired where a checkpoint is passed and is `cp'. */
+#define ARW_BLINK_SHOW    0.2500f   /* 0x554460 */
+#define ARW_BLINK_CYCLE   0.5000f   /* 0x4e9276 */
+#define ARW_STEADY       -1.0000f   /* 0x4e9258 */
+#define ARW_BLINK_NEAR    5.0000f   /* 0x554730, metres */
+#define ARW_BESIDE_IN     4.0000f   /* 0x5543f0, metres */
+#define ARW_MIN_INIT    2000000.0f   /* 0x4ea9c8, the min's sentinel */
+
+/* THE WRONG WAY. dot = (direction to the aim point) . (car forward),
+   both flattened to XZ. The timer rises by dt while dot < 0 and falls by
+   ARW_WRONG_DECAY * dt while dot >= 0, held inside [0, ARW_WRONG_CAP];
+   the banner is up while the timer is over ARW_WRONG_ON -- AND the car is
+   at least ARW_WRONG_NEAR from the checkpoint it last passed, which is
+   what keeps a pass from raising it. */
+#define ARW_WRONG_ON       6.000f   /* 0x554498, seconds */
+#define ARW_WRONG_CAP     12.000f   /* 0x554928 */
+#define ARW_WRONG_DECAY    3.000f   /* 0x5543f4 */
+#define ARW_WRONG_NEAR     8.000f   /* 0x55472c, metres */
+
+/* THE BANNER is message slot 2 of the ELEVEN-slot layer msg.h owns --
+   say so rather than the name: slot 2's texture index picks the THIRD
+   of the six textures 0x4af195 loads, which is msg_wrong_way. Its size
+   is the pair at 0x56d278 and its UV rect is the WHOLE texture, so unlike
+   msg_hits and msg_321_s_f this one is not an atlas.
+
+   0x4b024e posts it with a life of ARW_MSG_LIFE and animate = 1, every
+   frame the flag is up -- and the poster DROPS a post of the slot already
+   showing (0x4afbde), so the banner runs its life out and starts again
+   rather than being pinned at the start of its own grow-in. That is what
+   makes it PULSE. The grow-in is elapsed / max(life, ARW_MSG_GROW), about
+   the rect's own centre, and the colour is a flat white.
+
+   ARW_MSG_SND is the cue 0x4b0311 raises on the first frame of each post,
+   which is the port's cp_wrongway.
+
+   AND THE FOURTH ARGUMENT IS A HOLD-OVER, not an unread one -- this file
+   said no drawer read it and no drawer does; the RETIRE step at 0x4af28e
+   does. It runs `life -= dt' over the three player slots and clears the
+   slot when `life < -hold', while the drawer only draws while
+   `life > 0'. So slot 2 is SELECTED for 1.5 + 4 = 5.5 s and VISIBLE for
+   the first 1.5 of them: the banner shows, goes away for 4 s, and is
+   posted again -- one flash and one beep every 5.5 s, not every 1.5.
+   The countdown's four posts pass a hold of 0 (`xor ebp,ebp' at
+   0x4e1c2a), so those retire the instant their life runs out. */
+#define ARW_MSG_SLOT      2
+#define ARW_MSG_LIFE     1.500f   /* 0x4b0256 */
+#define ARW_MSG_HOLD     4.000f   /* 0x4b0251 */
+#define ARW_MSG_ANIM      1       /* 0x4b024e */
+#define ARW_MSG_SND     0x27c     /* 0x4b0312 */
+
+/* ------------------------------------- the engine's MESSAGE LAYER */
+
+/* THE WHOLE OF IT, and it is eleven slots over six textures. 0x4af195
+   loads the six by name into a handle table; FUN_004b11e0 draws ONE slot
+   over them per player, taking its size from 0x56d278, its UV rect from
+   0x56d328, its texture index from 0x56d2d0 and -- through the poster
+   FUN_004afbb0 -- its right to the screen from the priority at 0x56d2fc.
+
+   THE POSTER IS THE ARBITRATION, and it is three rules:
+     - a post of the slot ALREADY showing is DROPPED (0x4afbde), which is
+       what makes a message that is re-posted every frame pulse instead of
+       sitting pinned at the start of its own grow-in;
+     - a post is dropped when the showing slot's priority is strictly
+       HIGHER (0x4afbfc), so equal priorities replace each other;
+     - otherwise it takes the screen, with its life, its hold-over, its
+       animate flag and a one-shot sound latch.
+
+   The BAND is the player index: 0 the whole screen, 1 the top half, 2 the
+   bottom half, and the drawer's own yoff table (0x149dd44) is in the
+   zero-filled part of .data, so the three are exactly (1-h)/2, (0.5-h)/2
+   and (1.5-h)/2. A single player is 0.
+
+   The GROW-IN is `elapsed / max(life, MSG_GROW_FLOOR)' about the rect's
+   own centre (FUN_004b12b0), applied only when animate is 1, and the
+   colour is a flat white at every reading -- the original never fades a
+   message. */
+#define MSG_N_SLOTS  11
+#define MSG_N_TEX    6
+#define MSG_GROW_FLOOR  0.800f   /* 0x5544a0 */
+
+/* The six, in the order 0x4af195 loads them -- which IS the texture index
+   the slot table uses, so nothing downstream needs a second table. */
+static const char *const MSG_TEX_NAME[MSG_N_TEX] = {
+    "msg_low_signal",
+    "msg_pause",
+    "msg_wrong_way",
+    "msg_hits",
+    "msg_321_s_f",
+    "msg_bestlap",
+};
+
+/* Per slot: which of the six, its size as a fraction of the screen, its UV
+   rect, and its priority. `w' and `h' ENCODE THE ART'S ASPECT against the
+   4:3 frame they were authored in -- msg.c keeps h and derives w from the
+   pair, so a 16:9 panel does not stretch the word art 4/3 wider. */
+typedef struct {
+    int   tex;              /* index into MSG_TEX_NAME */
+    float w, h;             /* fractions of the authored 4:3 screen */
+    float u0, v0, u1, v1;   /* the cell, for the atlases */
+    int   prio;             /* higher wins; equal replaces */
+} msg_slot_def;
+static const msg_slot_def MSG_SLOT[MSG_N_SLOTS] = {
+    { 0, 0.64000f, 0.21333f, 0.0000f, 0.0000f, 1.0000f, 1.0000f, 0 },   /*  0 msg_low_signal */
+    { 1, 0.32000f, 0.21333f, 0.0000f, 0.0000f, 1.0000f, 1.0000f, 9 },   /*  1 msg_pause */
+    { 2, 0.64000f, 0.21333f, 0.0000f, 0.0000f, 1.0000f, 1.0000f, 0 },   /*  2 msg_wrong_way */
+    { 3, 0.32000f, 0.21333f, 0.0000f, 0.0000f, 1.0000f, 0.5000f, 3 },   /*  3 msg_hits */
+    { 3, 0.32000f, 0.21333f, 0.0000f, 0.5000f, 1.0000f, 1.0000f, 3 },   /*  4 msg_hits */
+    { 4, 0.16000f, 0.21333f, 0.0000f, 0.0000f, 0.2500f, 0.5000f, 0 },   /*  5 msg_321_s_f */
+    { 4, 0.16000f, 0.21333f, 0.0000f, 0.5000f, 0.2500f, 1.0000f, 0 },   /*  6 msg_321_s_f */
+    { 4, 0.09250f, 0.21333f, 0.2500f, 0.5000f, 0.3950f, 1.0000f, 0 },   /*  7 msg_321_s_f */
+    { 4, 0.38750f, 0.21333f, 0.3950f, 0.5000f, 1.0000f, 1.0000f, 5 },   /*  8 msg_321_s_f */
+    { 4, 0.48000f, 0.21333f, 0.2500f, 0.0000f, 1.0000f, 0.5000f, 0 },   /*  9 msg_321_s_f */
+    { 5, 0.64000f, 0.21333f, 0.0000f, 0.0000f, 1.0000f, 1.0000f, 0 },   /* 10 msg_bestlap */
+};
+
+/* The slots this port raises, by name rather than by number. The five over
+   msg_321_s_f are countdown.c's and the two over msg_hits are hud.c's;
+   those two files still draw their own and are not on msg.c yet. */
+#define MSG_LOW_SIGNAL  0
+#define MSG_PAUSE       1
+#define MSG_WRONG_WAY   2
+#define MSG_HIT         3
+#define MSG_GREAT_HIT   4
+#define MSG_FINISH      8
+#define MSG_BEST_LAP   10
 
 /* ------------------------------------------- the engine's own font */
 

@@ -219,6 +219,13 @@ int countdown_active(const countdown_t *c);
 /* Which cell of the atlas is up, or -1 for none. CD_CELL_* above. */
 int countdown_cell(const countdown_t *c);
 
+/* THE SAME THING AS A MESSAGE SLOT, in the engine's own numbering, or -1. The
+   five cells are slots 5, 6, 7, 9 and 8 -- note the order: GO is slot NINE and
+   FINISH slot EIGHT -- and this file's own cell indices are 0..4 in reading
+   order, so the two are not the same number and the map belongs here rather than
+   in whatever does the arbitrating. See msg.h. */
+int countdown_slot(const countdown_t *c);
+
 /* The recovered scale for whatever is up: 0 -> 1 over CD_GROW_TIME of the
    current message's life, then flat. 0 when nothing is up. */
 float countdown_scale(const countdown_t *c);

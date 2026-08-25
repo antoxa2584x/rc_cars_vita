@@ -30,6 +30,24 @@
 #define LIGHT_AMBIENT              138   /* CarLight AmbientI */
 #define LIGHT_DIRECT               128   /* CarLight DirectI */
 
+/* ---- the car's own light: carVisualBody 0x005077e0, and the LOD fade ---- */
+
+#define LIGHT_FADE_NEAR            2.000000f   /* LOD DistLOD1SwitchOn: full lighting closer than this, metres */
+#define LIGHT_FADE_FAR             4.303030f   /* + Delta12: flat (ambient 255, no light) beyond this */
+
+/* ---- car_lmshd: the lightmap under the wheels (FUN_00531ff0 / FUN_005323a0) ---- */
+
+#define LIGHT_LM_ALPHAVEL          1.270000f   /* car_lmshd alphavel/100: light level chase, per second */
+#define LIGHT_LM_DELTA             0.050000f   /* deltaalpha/100: dead band, below which nothing moves */
+#define LIGHT_LM_MAXDIST           25.000000f   /* maxdist: no camera within this of the car -> level 1.0, metres */
+/* Splines/light_car.bspl: lightmap brightness (0..255) -> the
+   car's light level (0..255). Clamped piecewise linear, the
+   engine's own 0x0040f830 -- so 0.623 at or below 112.6 and
+   1.019 at or above 200.9, a line between. Which is why a tunnel
+   darkens the car by a bit over a third and no more. */
+#define LIGHT_LM_CURVE_N 2
+#define LIGHT_LM_CURVE { {112.565773f, 158.859390f}, {200.891724f, 259.951721f} }
+
 /* ---- checkpoint markers: FUN_0052b370 (anim_cp), drawn by FUN_0052abc0 ---- */
 
 #define CP_SIZE                    1.460000f   /* half-extent of the billboard quad, metres */

@@ -107,6 +107,16 @@ int countdown_cell(const countdown_t *c)
     return CD_CELL_GO;
 }
 
+int countdown_slot(const countdown_t *c)
+{
+    /* CD_CELL_3, _2, _1, _GO, _FINISH -> the engine's slots. */
+    static const int TO_SLOT[5] = { 5, 6, 7, 9, 8 };
+    const int cell = countdown_cell(c);
+    if (cell < 0 || cell >= 5)
+        return -1;
+    return TO_SLOT[cell];
+}
+
 /* Seconds this message has been up, and how long it lives -- the two inputs the
    recovered ramp takes. */
 static void cd_phase(const countdown_t *c, float *elapsed, float *life)

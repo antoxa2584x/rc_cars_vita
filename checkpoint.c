@@ -126,6 +126,47 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
     c->passed = -1;
     c->last = -1;
     c->in_zone = 0;
+    /* THE LINE ITSELF until cp_restart latches a real one, which makes
+       cp_lap_origin 0 and leaves the progress measure with its origin on the
+       start/finish -- the answer a track that is loaded but not raced should
+       give, and the one a harness that never calls cp_restart gets. */
+    c->grid_arc = c->spine_len;
+    c->prog = c->spine_len;
+    c->prog_odo = 0.f;
+    c->prog_ok = 0;
+    /* THE ARC STATIONS UNTIL A RECORDING SAYS OTHERWISE. cp_set_stations
+       replaces them with where the checkpoints really fall round a lap; a track
+       with no usable recording keeps these, which is what shipped before the
+       distinction was measured. road_len = spine_len makes the exchange rate 1,
+       so cp_restart behaves as it did. */
+    for (k = 0; k < c->n; k++) {
+        c->station[k] = c->cum[k][0];
+        c->seg_road[k] = 0.f;           /* unfitted: normalise instead */
+    }
+    c->road_len = c->spine_len;
+}
+
+int cp_set_stations(checkpoints_t *c, const float *frac, int n, float lap_len)
+{
+    int k;
+
+    if (!c || !frac || n != c->n || n <= 0 || n > CP_MAX)
+        return 0;
+    if (!(lap_len > 1e-3f) || !(c->spine_len > 0.f))
+        return 0;
+    if (frac[0] != 0.f)
+        return 0;
+    for (k = 1; k < n; k++)
+        if (!(frac[k] > frac[k-1]) || !(frac[k] < 1.f))
+            return 0;
+
+    for (k = 0; k < n; k++) {
+        float hi = (k + 1 < n) ? frac[k+1] : 1.f;
+        c->station[k] = frac[k] * c->spine_len;
+        c->seg_road[k] = (hi - frac[k]) * lap_len;
+    }
+    c->road_len = lap_len;
+    return 1;
 }
 
 static float dist2_xz(const float *p, float x, float z)
@@ -133,6 +174,10 @@ static float dist2_xz(const float *p, float x, float z)
     float dx = p[0] - x, dz = p[2] - z;
     return dx * dx + dz * dz;
 }
+
+/* Defined down with the other progress code; declared here because cp_step, up
+   above it, is what advances it. */
+static void cp_prog_step(checkpoints_t *c, float x, float z);
 
 int cp_progress(const checkpoints_t *c, float x, float z, float *out_s)
 {
@@ -205,6 +250,13 @@ void cp_resync(checkpoints_t *c, float x, float y, float z)
     if (c->n <= 0)
         return;
     c->next = (c->last < 0) ? 0 : (c->last + 1) % c->n;
+    /* AND THE PROGRESS, SAID rather than projected. Every caller has just put the
+       car on the marker of `last` (cp_respawn_pose) or on the grid, and those are
+       exact answers where a projection is not -- see cp_prog_step. The anchor is
+       dropped so the teleport itself is not dead-reckoned as a lap of driving. */
+    c->prog = (c->last < 0) ? c->grid_arc : c->station[c->last];
+    c->prog_odo = 0.f;
+    c->prog_ok = 0;
 }
 
 void cp_restart(checkpoints_t *c, float x, float y, float z)
@@ -222,6 +274,30 @@ void cp_restart(checkpoints_t *c, float x, float y, float z)
        does NOT clear this, for the same reason it keeps the lap. */
     c->started = 0;
     cp_resync(c, x, y, z);
+    /* THE GRID, and this is the one call that knows where a race begins, which is
+       why the latch lives here and not in cp_init. A STRAIGHT LINE back from the
+       start/finish marker, not a projection: the grid is 2.3 to 20.5 m from that
+       marker on all ten tracks, so over that distance the chord IS the road, and
+       a projection onto the spine would answer with a point hundreds of metres
+       away on five of them -- a start line being exactly where a track passes
+       nearest to itself. cp_resync does NOT redo this: a drowning does not move
+       the grid. */
+    if (c->n > 0 && c->spine_len > 0.f) {
+        float dx = c->cp[0].p[0][0] - x, dz = c->cp[0].p[0][2] - z;
+        float d = (float)sqrt((double)dx * dx + (double)dz * dz);
+        /* d is ROAD metres and grid_arc is the placing's, in which one lap is
+           spine_len however long the road is -- so it is converted, not used
+           raw. The rate is 1 until a recording has been fitted. */
+        if (c->road_len > 1e-3f)
+            d *= c->spine_len / c->road_len;
+        if (d > c->spine_len) d = c->spine_len;
+        c->grid_arc = c->spine_len - d;
+    }
+    /* AFTER the latch, because cp_resync puts the progress ON the grid and reads
+       it from here. cp_restart's own cp_resync above ran before there was one. */
+    c->prog = c->grid_arc;
+    c->prog_odo = 0.f;
+    c->prog_ok = 0;
 }
 
 int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
@@ -291,15 +367,14 @@ int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
     return 1;
 }
 
-void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
+/* THE CURSOR: has the car passed `next`, and if so latch it. Split out of
+   cp_step only so that cp_step can advance the PROGRESS on every call whatever
+   this answers -- when the two shared a body, the early returns for "still
+   closing" and "nowhere near it" took the progress with them. */
+static void cp_cursor_step(checkpoints_t *c, float x, float z)
 {
     float d;
 
-    (void)y;
-    c->t += dt;
-    c->passed = -1;                    /* written every call: it is an EDGE */
-    if (!c->enabled || c->n <= 0)
-        return;
     if (c->next < 0 || c->next >= c->n)
         c->next = 0;
 
@@ -342,6 +417,26 @@ void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
     c->next = (c->next + 1) % c->n;
     c->in_zone = 0;
     c->zone_min = 0.f;
+    /* AND THE RE-ANCHOR. The odometer measures from the checkpoint last passed,
+       so passing one starts it again -- which is what makes cp_prog_step answer
+       with the new stretch's own station on this very frame, whatever the last
+       stretch had accumulated. See there. */
+    c->prog_odo = 0.f;
+}
+
+void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
+{
+    (void)y;
+    c->t += dt;
+    c->passed = -1;                    /* written every call: it is an EDGE */
+    if (!c->enabled || c->n <= 0)
+        return;
+
+    cp_cursor_step(c, x, z);
+    /* AFTER the cursor, and unconditionally: the stretch the progress is clamped
+       to is the one the latch names, so on the frame a checkpoint is passed the
+       progress must see the NEW stretch -- that is what re-anchors it. */
+    cp_prog_step(c, x, z);
 }
 
 /* The stitched polyline, as SEGMENTS. `i` walks 0 .. cp_spine_n(c)-1 and the
@@ -448,48 +543,197 @@ int cp_spine_dist(const checkpoints_t *c, float x, float y, float z,
     return cp_spine_dist_near(c, x, y, z, -1.f, dist, cp);
 }
 
+/* THE ARC OF (x, z) ON ONE CHECKPOINT-TO-CHECKPOINT STRETCH, `a` to `b`, where
+ * `b` is (a + 1) % n. Nearest point on the nearest segment OF THAT RUN ONLY.
+ *
+ * See cp_lap_progress in the header for why the run is restricted; briefly, it is
+ * the only way to get an answer that both moves every frame and cannot teleport.
+ *
+ * The result runs from cum[a][0] to cum[b][0], or to spine_len for the closing
+ * stretch -- NOT wrapped back to 0 the way cp_spine_dist_near wraps it, because a
+ * lap has to be able to end at its own length. Clamped to the stretch, so a car
+ * that has run past `b` without triggering it reports the end of the stretch and
+ * a car that has spun back behind `a` reports its start. */
+/* THE PLAYER'S PROGRESS, CARRIED FORWARD ONE FRAME. Called by cp_step, which is
+ * the once-a-frame call; cp_lap_progress only reads what this leaves. Doing it
+ * here rather than in the query is not tidiness -- main.c asks the question twice
+ * a frame (the placing and the direction arrow) and a query that advanced state
+ * would count the frame twice.
+ *
+ * IT USES THE CHECKPOINT MARKERS, THE CAR'S OWN MOTION, AND THE ROAD LENGTHS
+ * FITTED OFF THE RECORDINGS. Specifically it does NOT project onto the spine's
+ * polyline, which was the obvious fix and
+ * is unsound here: the "spine" is not a centreline. Measured against the first
+ * opponent's recorded lap on each of the ten tracks, its points sit 9 to 27 m
+ * from the racing line on average and up to 84 m from it at worst, and the
+ * polyline is 1.4 to 2.1 times LONGER than the lap it is supposed to describe
+ * (beach_1: a 460 m lap, a 643 m spine). A nearest-point-on-the-spine answer is
+ * therefore not a position on the track, and a step along its tangent is not a
+ * step along the road -- on beach_1 the tangent at the start line points SOUTH
+ * down a 71 m detour the car never drives, so dead reckoning ran backwards and
+ * pinned at zero for the whole stretch.
+ *
+ * WHAT IS SOUND is the pair of checkpoint markers bounding the stretch and the
+ * car's own displacement, so the fraction of the stretch is built from those:
+ *
+ *     odo  the road distance the car has driven since `last` was latched --
+ *          its own displacement, summed. It needs no idea of how long the road
+ *          between the two checkpoints is, which is exactly what makes it usable
+ *          on a track whose spine lies about that length.
+ *     d    the straight-line distance to `next` right now.
+ *     road this stretch's own length on the ground, out of the same fit that
+ *          placed the stations -- 0 when nothing has been fitted.
+ *     t    odo / max(road, odo + d). 0 at the checkpoint just passed, 1 at the
+ *          one being driven to, and see the code for which term owns which
+ *          regime: normally `road' wins and t is EXACTLY LINEAR in distance
+ *          driven, which is exactly what an opponent's progress is.
+ *
+ * ODO IS THE UNSIGNED DISTANCE and the signed one -- the displacement resolved
+ * along the bearing to `next` -- was tried first and is worse, which is worth
+ * recording because it is the more obviously correct of the two. It reads zero
+ * while the road leads AWAY from the next checkpoint before turning back to it,
+ * and that is not a rare shape: measured over the ten tracks it froze the answer
+ * for 34.5% of country_1's frames, 21.9% of beach_1's and 9.3% of beach_3's, and
+ * a frozen progress measure is the very bug being fixed. Unsigned freezes on none
+ * of the ten and was the better mean on nine of them.
+ *
+ * WHAT UNSIGNED COSTS is a car going the WRONG WAY: driving back down the stretch
+ * grows odo, so t creeps up instead of falling to zero rather than reading the
+ * retreat. Bounded by the stretch -- t cannot exceed 1, and the station beyond it
+ * cannot be reached without passing the checkpoint that ends it -- and the same
+ * bound the rule this replaced had. The wrong way has its own indicator
+ * (dirarrow.c) and this is not it.
+ *
+ * `t` then maps onto the stretch's own two STATIONS -- where the checkpoints
+ * really fall round a lap, fitted off the recordings, NOT the spine's cum[] arc
+ * lengths, which are 38.6 m out on average. See checkpoints_t.station; that
+ * distinction is worth more than everything above it.
+ *
+ * THE LATCH RE-ANCHORS IT EXACTLY at every crossing: cp_cursor_step zeroes the
+ * odometer on a pass, so t is 0 and the answer is the new stretch's own station,
+ * whatever the previous stretch had accumulated. Error is bounded by one stretch
+ * and reset 4 to 7 times a lap; it cannot accumulate over a race.
+ */
+static void cp_prog_step(checkpoints_t *c, float x, float z)
+{
+    const float *m;
+    float dx, dz, d, t = 0.f, from, to;
+    int a, b;
+
+    if (c->n <= 0 || !(c->spine_len > 0.f))
+        return;
+
+    /* `next` IS (last + 1) % n by the state machine's own identity, so this is
+       one stretch and not a guess; with nothing latched the car is on the grid,
+       heading for the line, and the stretch it is on begins at the grid. */
+    b = (c->next >= 0 && c->next < c->n) ? c->next : 0;
+    a = (c->last >= 0 && c->last < c->n) ? c->last : -1;
+    from = (a < 0) ? c->grid_arc : c->station[a];
+    to = (b == 0) ? c->spine_len : c->station[b];
+    if (to < from)
+        to = from;
+
+    m = c->cp[b].p[0];
+    dx = m[0] - x;
+    dz = m[2] - z;
+    d = (float)sqrt((double)dx * dx + (double)dz * dz);
+
+    /* The first step after a reset only seeds the anchor: cp_restart and
+       cp_resync have already said where the progress is, and a frame that
+       differenced against a stale position would count the teleport itself as
+       driving. */
+    if (!c->prog_ok) {
+        c->prog_odo = 0.f;
+        c->prog_ok = 1;
+    } else {
+        float mx = x - c->prog_x, mz = z - c->prog_z;
+        c->prog_odo += (float)sqrt((double)mx * mx + (double)mz * mz);
+    }
+    c->prog_x = x;
+    c->prog_z = z;
+
+    if (c->prog_odo > 0.f) {
+        /* THE STRETCH'S OWN ROAD LENGTH against the odometer, with the straight
+         * line to `next` as the floor under the denominator. One expression, and
+         * each term owns a regime:
+         *
+         *   NORMALLY `road' wins, because a car on the road has driven `odo' of
+         *   it and the chord `d' cuts the rest short, so `odo + d' stays under
+         *   `road'. Then t is odo/road -- EXACTLY LINEAR IN DISTANCE DRIVEN,
+         *   which is exactly what an opponent's progress is, and the whole point
+         *   of measuring both sides the same way. Mean error against the road
+         *   fell from 27.5 m to 15.9 m when this replaced the self-normalising
+         *   form, and the worst case from 120 m to 45 m.
+         *
+         *   ON AN OVERSHOOT `odo + d' wins and t stays under 1 and keeps moving.
+         *   Without that floor the fraction clamps at 1 the moment a car drives
+         *   further than the fitted stretch -- a wide line, or a lap that is not
+         *   the one the recording drove -- and STALLS there until the checkpoint
+         *   triggers: 205 frames on country_3, 3.4 s of a frozen place, which is
+         *   the very bug this all fixes.
+         *
+         *   UNFITTED, `road' is 0 and the floor is all there is, which is the
+         *   self-normalising rule a track with no usable recording gets.
+         */
+        float road = (a < 0)
+                     ? (c->spine_len - c->grid_arc) * (c->road_len / c->spine_len)
+                     : c->seg_road[a];
+        float den = c->prog_odo + d;
+        if (road > den) den = road;
+        if (den > 1e-3f) {
+            t = c->prog_odo / den;
+            if (t > 1.f) t = 1.f;
+        } else {
+            t = 1.f;
+        }
+    }
+
+    c->prog = from + (to - from) * t;
+}
+
 int cp_lap_progress(const checkpoints_t *c, float x, float y, float z,
                     float *out)
 {
-    float from, to, span, d, t;
-    int prev;
+    float arc;
 
-    (void)y;
+    /* The position is not read: cp_step advanced the progress with it already,
+       once, this frame. The arguments stay so the call reads at the site as what
+       it is -- and so that a caller which has not been moved onto cp_step still
+       compiles rather than silently asking a different question. cp_resync's
+       do the same. */
+    (void)x; (void)y; (void)z;
     if (!c || c->n <= 0 || c->spine_len <= 0.f)
         return 0;
 
-    /* Nothing latched yet: the car is on the grid, short of the line, and has
-       driven none of the lap. Not "nearly a whole lap", which is what an arc
-       position would say there and what made every car look a lap ahead at the
-       start. */
-    if (c->last < 0) {
-        if (out)
-            *out = 0.f;
-        return 1;
-    }
+    arc = c->prog;
 
-    prev = c->last;
-    from = c->cum[prev][0];
-    /* The arc at `next`. Wrapping to the whole spine rather than to 0, so the
-       stretch from the last checkpoint to the line comes out as the end of the
-       lap and not as the start of one. */
-    to = (c->next == 0) ? c->spine_len : c->cum[c->next][0];
-    span = to - from;
-    if (!(span > 1e-3f)) {
-        if (out)
-            *out = from;
-        return 1;
-    }
-    /* Fraction of the way from `last` to `next`, by straight-line distance to
-       `next` against the span -- continuous, and clamped so a car that has
-       wandered cannot report progress it has not made. */
-    d = cp_dist_to_next(c, x, y, z);
-    t = 1.f - d / span;
-    if (t < 0.f) t = 0.f;
-    else if (t > 1.f) t = 1.f;
+    /* THE ORIGIN MOVED TO THE GRID, which is where every opponent's own measure
+     * starts -- an opponent's is metres walked from its recording's first sample,
+     * and that is its grid slot, not the line.
+     *
+     * Before the first crossing the car is on a lap it has not begun, so the same
+     * offset carries a spine length off it. The two meet exactly at the line and
+     * the first crossing costs nothing: `prog' runs grid_arc -> spine_len over
+     * the opening stretch, so the answer runs 0 -> origin; the crossing puts
+     * `prog' back to 0 on the new stretch and the answer stays at origin. */
+    arc += c->spine_len - c->grid_arc;
+    if (c->last < 0)
+        arc -= c->spine_len;
+
     if (out)
-        *out = from + span * t;
+        *out = arc;
     return 1;
+}
+
+/* The offset cp_lap_progress applies, on its own: `spine_len - grid_arc`, and 0
+   before cp_restart has latched a grid, because cp_init leaves grid_arc at
+   spine_len. See the header -- main.c's direction arrow divides the progress
+   back into a fraction of its own stretch and has to take this off first. */
+float cp_lap_origin(const checkpoints_t *c)
+{
+    if (!c || c->n <= 0 || c->spine_len <= 0.f)
+        return 0.f;
+    return c->spine_len - c->grid_arc;
 }
 
 float cp_dist_to_next(const checkpoints_t *c, float x, float y, float z)

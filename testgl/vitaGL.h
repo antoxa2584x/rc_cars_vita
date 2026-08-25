@@ -274,12 +274,17 @@ extern int    glcap_unit_enabled[2];
 #define GL_ARRAY_BUFFER          0x8892
 #define GL_ELEMENT_ARRAY_BUFFER  0x8893
 #define GL_STATIC_DRAW           0x88E4
+/* The car's per-vertex light is rewritten every frame -- see scene_shade. */
+#define GL_DYNAMIC_DRAW          0x88E8
 
 typedef long GLsizeiptr;
+typedef long GLintptr;
 
 void glGenBuffers(GLsizei n, GLuint *out);
 void glBindBuffer(GLenum target, GLuint id);
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                     const void *data);
 void glDeleteBuffers(GLsizei n, const GLuint *ids);
 
 /* What is bound right now, so a test can assert scene_draw left nothing behind.

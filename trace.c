@@ -12,22 +12,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* FALLBACK half-width, for a scene with no rig to measure. FUN_0052f990 builds
- * its two edge vertices as `pos +- param_9 * 0.05 * lat`, and param_9 comes from
- * FUN_0052f310, which is not recovered -- so the width is the port's either way.
- * This is the wheel's own physics radius, which is where it came from before the
- * mesh was measured.
+/* HALF the mark's width is `param_9 * 0.05`, and this is the 0.05 --
+ * FUN_0052f990 builds its two edge vertices as `pos +- param_9 * 0.05 * lat`
+ * at 0x0052fb14 and 0x0052fb3a.
  *
- * It is a fallback and not the rule because the physics radius is not the tyre's
- * WIDTH and the two are not in any fixed proportion. Against the drawn wheels it
- * came out at 92% of the Overkill's tyre, 76% of the Buggy's rear and **107%**
- * of its front -- a mark wider than the tyre that made it -- and 74% of the
- * Hummer's, which is what "the marks are about three quarters of the tyre" was.
- * A single fraction cannot fix three cars that disagree in both directions, so
- * mesh_half_width measures each wheel instead and this is only reached by a car
- * packed without --rig, and by the synthetic fixtures.
- */
-#define TRACE_WIDTH_FRAC 0.5f
+ * param_9 arrives from FUN_0052f310 as FUN_0050bb30(car), which is
+ * FUN_0050bde0(car->tire_upgrade) -- the tyre-width table at 0x005738c8, the
+ * same one that sets how wide the WHEEL is drawn. So a mark is 95 mm across on
+ * stock tyres and 135 mm on the best set, the SAME on every car and every wheel:
+ * the engine never measures a tyre for this. See carani.h.
+ *
+ * The port used to measure each wheel's own mesh instead, which is where "tyre
+ * marks are smaller than the wheels are wide" came from. It is narrower than
+ * the engine's number on every car -- 78 mm against 95 on the Overkill, 46 and
+ * 61 on the Buggy, 80 on the Hummer -- and the shortfall lands where it shows,
+ * because the texture only INKS the middle 78% of the quad (its outer eighth is
+ * flat 128 on all four marks) and only the middle ~53% is the dark tread. At the
+ * engine's width that inked band comes out at 74 mm against a drawn tyre of 70
+ * (Overkill) and 65 (Hummer): the mark reads as exactly the width of the tyre,
+ * which is what the oversized quad is FOR. */
+#define TRACE_WIDTH_UNIT 0.05f
 
 /* Off the surface along its normal, for the same reason shadow.c lifts its
  * decal: two coplanar surfaces z-fight per pixel. Smaller than SHADOW_LIFT
@@ -83,66 +87,6 @@ static void gl_trace_env(int on)
     }
 }
 
-/* Half the width of the tyre on rig part `part`, off the packed mesh: half the
- * EXTENT of that wheel's vertices along the node's local +Z -- which is the
- * axle, the same axis carani_update rolls and widens the wheel about. Model
- * space, so it is the width the wheel is DRAWN at before the tuning scales it.
- *
- * Half the extent and not the largest offset from the node, because a wheel mesh
- * is not always centred on its own node: the Buggy's front wheel sits 6.7 mm
- * inboard of its, and the largest offset would call that 0.0297 against a tyre
- * that is really 0.0459 wide -- 29% too wide. (The mark is still drawn centred
- * on the contact point, so on that one wheel it is offset from the tread by
- * those 6.7 mm. Centring it on the mesh instead would offset it from the patch
- * the car actually rolls on, which is worse and is also not what the tread
- * leaves.)
- *
- * The widest point of these tyres is the shoulder, at 0.5 to 0.9 of the radius,
- * not the crown -- they are round in section. Taking a crown band instead would
- * make the mark 84% of the tyre on the Overkill and 72% on the Buggy, which is
- * the complaint this replaced, arrived at from the other side. The silhouette is
- * what the eye compares the mark against, so the silhouette is what it uses.
- */
-static float mesh_half_width(const scene_t *s, int part)
-{
-    const carani_t *r = &s->rig;
-    const float *rest;
-    float ax[3], org[3], n, lo = 1e30f, hi = -1e30f;
-    unsigned int b;
-    int k;
-
-    if (part < 0 || part >= r->n)
-        return 0.f;
-    /* It really has to be a wheel. An UNBOUND rig.wheel[] is all zeroes, which
-       points at part 0 -- __root__, the whole car body -- and measuring that
-       would hand the mark a half-width of the entire model. */
-    if (strncmp(r->part[part].name, "WHEEL_", 6) != 0)
-        return 0.f;
-    rest = r->part[part].rest;
-    ax[0] = rest[8]; ax[1] = rest[9]; ax[2] = rest[10];
-    n = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
-    if (n < 1e-6f)
-        return 0.f;
-    for (k = 0; k < 3; k++)
-        ax[k] /= n;
-    org[0] = rest[12]; org[1] = rest[13]; org[2] = rest[14];
-
-    for (b = 0; b < s->n_batches; b++) {
-        const batch_t *bt = &s->batches[b];
-        unsigned int v;
-        if ((int)bt->part != part || !bt->verts)
-            continue;
-        for (v = 0; v < bt->nverts; v++) {
-            float d = (bt->verts[v].x - org[0]) * ax[0]
-                    + (bt->verts[v].y - org[1]) * ax[1]
-                    + (bt->verts[v].z - org[2]) * ax[2];
-            if (d < lo) lo = d;
-            if (d > hi) hi = d;
-        }
-    }
-    return hi > lo ? (hi - lo) * 0.5f : 0.f;
-}
-
 void trace_init(trace_t *tr, const scene_t *src)
 {
     int i;
@@ -164,16 +108,6 @@ void trace_init(trace_t *tr, const scene_t *src)
             tr->w[i].cap = TRACE_RING;
     }
     tr->enabled = (tr->n_tex > 0);
-    trace_fit_tyres(tr, src);
-}
-
-void trace_fit_tyres(trace_t *tr, const scene_t *src)
-{
-    int i;
-
-    for (i = 0; i < RB_MAX_WHEELS; i++)
-        tr->half_w[i] = (src && src->has_rig)
-                        ? mesh_half_width(src, src->rig.wheel[i]) : 0.f;
 }
 
 void trace_clear(trace_t *tr)
@@ -386,12 +320,13 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
         for (k = 0; k < 3; k++)
             lat[k] /= len;
 
-        /* As wide as the tyre above it, and as wide as the TUNING made that
-           tyre -- carani_tire_width is the one place a level becomes a width,
-           so the two cannot drift apart. */
-        half_w = (tr->half_w[w] > 0.f ? tr->half_w[w]
-                                      : c->wheel[w].radius * TRACE_WIDTH_FRAC)
-                 * carani_tire_width(c);
+        /* FUN_0052f990's `param_9 * 0.05`, with param_9 the tyre table's own
+           entry for this car's tyre level -- the one place a level becomes a
+           width, and the same call carani_update scales the drawn wheel by, so
+           the mark and the tyre cannot drift apart. Not measured off the tyre:
+           the engine's number is a constant and is wider than any of the three
+           cars' tyres, deliberately (see TRACE_WIDTH_UNIT). */
+        half_w = TRACE_WIDTH_UNIT * carani_tire_width(c);
         /* What this surface takes. FUN_0052f310 calls the classifier at
            0x0052f4f8 and indexes the jump table at 0x0052f6dc with the class it
            returns; classes 0, 4, 6 and 8 -- default, grass, metal and stone --

@@ -224,43 +224,49 @@ void carani_rest(carani_t *r);
  * the only thing tying rb_data.h's mount_y to main.c's draw offset. */
 float carani_wheel_plane_y(const carani_t *r);
 
-/* Dials the whole tyre-width effect without touching the derivation below. 1.0
-   is the contact-patch argument taken at face value. */
-#define CARANI_TIRE_WIDTH_GAIN 1.0f
+/* The four tyre widths, at 0x005738c8, read by FUN_0050bde0(level) -- which
+   returns 100.0 for a level outside 0..3, a guard both its callers make
+   unreachable by bounds-checking the level first. */
+#define CARANI_TIRE_WIDTH_TABLE { 0.950000f, 1.070000f, 1.250000f, 1.350000f }
 
-/* How wide the tyre is at the car's current tuning level, as a multiple of the
- * width it was modelled at. 1.0 at level 0, and 1.0 for a car with no tuning.
+/* How wide the tyre is at the car's tuning level, as the SCALE the engine puts
+ * on the wheel node's own axle row -- 0.95 at level 0, not 1.0.
  *
- * THE ORIGINAL DOES NOT VARY TYRE WIDTH. That is said first because three
- * separate pieces of the shipped art were checked for one and none of them
- * carries it:
+ * RECOVERED, and this file used to open by saying the original does not vary
+ * tyre width at all. It does, from a typed table, and the same table sets the
+ * width of the mark the tyre leaves:
  *
- *   - the wheel textures tire<f>_1..4 share their first 144 atlas columns
- *     byte-for-byte -- the sidewall and the hub -- and differ only in the tread
- *     strip, which occupies the same columns in all four;
- *   - the mark textures t_halfdry_tire2_1..4 have ink spans of 0.78, 0.69, 0.75
- *     and 0.75 of their 64 px width: authoring noise, not a progression;
- *   - the shop icons upgr_tires<tread>_<car> show three tread patterns on the
- *     same carcass.
+ *   - FUN_0050be40(model, modelIndex, tireLevel) looks the wheel nodes up BY
+ *     NAME out of three tables -- PTR_s_WHEEL_FRONT_LEFT_00572fcc, _005731b8
+ *     and _005733f0, four entries, four, and SIX for the Hummer -- reads each
+ *     node's local matrix with FUN_00407200, and calls
+ *     FUN_0040c9a0(m, 1, 1, (1/sz) * table[level], 1). Mode 1 multiplies the
+ *     three basis ROWS, so that sets the node's Z row length to table[level]
+ *     exactly and leaves its origin, its X and its Y alone;
+ *   - FUN_0050bb60 is what calls it, and the level it passes is the argument
+ *     its own error string calls "Car: wrong tire number", stored at
+ *     phys+0xe454+model*0xb0 +0x8 -- rb_car.tire_upgrade, phys+0xe45c;
+ *   - the mark reads the same field through FUN_0050bb30 and hands the same
+ *     table entry to FUN_0052f990 as `param_9`, whose half-width is
+ *     `param_9 * 0.05`. See trace.c.
  *
- * and there is one wheel mesh per car, drawn under one node per wheel. So a tyre
- * upgrade in RC Cars changes the grip multiplier (upgrades.ini [TIRES], which
- * rb_tire_grip reads) and the tread picture, and nothing else. The width is the
- * port's own.
+ * The SCALE IS ABSOLUTE, not a multiplier -- the engine divides out whatever
+ * the node already had. It is applied here as a multiplier only because every
+ * wheel node in all three shipped cars has a local scale of exactly 1.0 (the
+ * 1.05 / 0.90 / 1.17 each car carries is on an ANCESTOR, and the engine never
+ * touches that), so the two coincide. carani_bind's fixture asserts the 1.0.
  *
- * It is not a typed table either. Grip at a fixed load and friction coefficient
- * goes with the contact patch, and at a fixed tyre diameter the patch goes with
- * the width -- so the width follows the game's OWN per-car grip ratio,
- * tune.tire_upgrade[level] / tune.tire_upgrade[0]. That is 1.00 / 1.13 / 1.22 /
- * 1.33 on the Overkill, 1.00 / 1.15 / 1.29 / 1.49 on the Buggy and 1.00 / 1.08 /
- * 1.15 / 1.29 on the Hummer, each straight out of its own upgrades.ini row, with
- * no number typed in here.
+ * The three pieces of art this file used to cite as proof that no width varies
+ * were read correctly and prove nothing about it: the tyre atlases really do
+ * share their sidewall columns, the mark textures really do have ink spans of
+ * 0.78 / 0.69 / 0.75 / 0.75, and the shop icons really do show one carcass. A
+ * tyre upgrade is one mesh drawn at four widths, so no artwork could have
+ * carried it. The grip ratio the width used to be derived from is still real
+ * and still what rb_tire_grip reads; it just is not this.
  *
  * This is the ONE place a level becomes a width: carani_update scales the drawn
- * wheel by it and trace.c scales the mark by it, so the mark cannot stop being
- * as wide as the tyre that made it. rb_test and vis_test assert that RATIO
- * rather than either value -- a check against the mapping would only be a check
- * against itself, which has passed everything four times in this port already.
+ * wheel by it and trace.c multiplies the mark's 0.05 m by it, exactly as the
+ * engine's two callers of FUN_0050bde0 do.
  */
 float carani_tire_width(const rb_car *c);
 

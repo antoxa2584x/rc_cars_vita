@@ -230,6 +230,14 @@ typedef struct {
     float t_lap;
     float lap_hold;
     float hold_left;
+
+    /* THE BEST LAP SO FAR, seconds, or 0 before any lap has been finished.
+       Here because this file already owns the lap clock, and nothing else in the
+       port measures a lap in seconds. It is what raises message slot 10
+       (`msg_bestlap'), which is one of the two slots the engine ships art and a
+       priority for and whose own post has not been found -- see msg.h. Cleared
+       by race_ui_start, so a restart does not carry a time over. */
+    float best_lap;
     float blink_t;
     int   running;
 
@@ -258,8 +266,13 @@ void race_ui_set_track(race_ui_t *r, int track, unsigned int map_tex);
 void race_ui_start(race_ui_t *r);
 
 /* A lap line was crossed. The lap clock's reading is held and blinked for
-   HUD_LAP_BLINK seconds and the clock restarts. */
-void race_ui_lap(race_ui_t *r);
+   HUD_LAP_BLINK seconds and the clock restarts.
+
+   -> 1 when the lap just finished is the BEST so far, which is what posts
+   message slot 10. The very first completed lap counts as a best: it is, and the
+   alternative is a banner that can never appear on a two-lap run. -> 0 when the
+   clock was not running, so nothing is claimed for a lap that was not timed. */
+int race_ui_lap(race_ui_t *r);
 
 /* The race is over: the clocks stop where they are. */
 void race_ui_stop(race_ui_t *r);

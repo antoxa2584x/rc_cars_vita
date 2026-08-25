@@ -26,6 +26,11 @@ static double ease_curve(double rest, double edge, double ease, double v)
  *   otherwise                      -> clamp into [rest-slack_lo, rest+slack_hi],
  *                                     approach at max_speed, then pull back
  *                                     toward rest at (eased) accel
+ *
+ * Note what the second line does NOT say: outside the window the step is only
+ * the approach, limited by max_speed, and the pull-back block is skipped
+ * entirely. On the yaw follower that is 99 deg/s and no more, which is the whole
+ * reason the view can be left behind by a car that turns faster than that.
  */
 static float follow_step(const cam_follow *f, float current, float dt)
 {
@@ -78,11 +83,44 @@ static void yaw_forward(float yaw_deg, float out[3])
     out[2] = (float)-cos(r);
 }
 
-/* The view yaw whose F(v) is the car's forward (body local +Z). */
+/* camRefFrame, 0x00500840. The frame the whole camera is expressed in is the
+ * car's position with WORLD up and the car's forward FLATTENED to horizontal --
+ * which is why the view never rolls or pitches with the body.
+ *
+ * The special case is the one line of it that matters: when the car's forward is
+ * within 30 degrees of world up -- nose in the air off a jump, or standing on its
+ * tail -- the flattened forward is numerical noise and the yaw would spin. The
+ * engine then takes the body-space direction 0.5*(local +Z) - 0.5*(local +Y),
+ * i.e. 45 degrees down from the nose, through the car's matrix instead, and
+ * flattens THAT. `m` is row-vector row-major, so row 1 is the body up and row 2
+ * the body forward.
+ */
 static float car_yaw_deg(const rb_car *c)
 {
-    return atan2f(-c->m[8], -c->m[10]) * RAD2DEG;
+    float fx = c->m[8], fy = c->m[9], fz = c->m[10];
+
+    if (fy > 0.8660254f) {            /* cos 30 deg, against world up (0,1,0) */
+        fx = 0.5f * c->m[8]  - 0.5f * c->m[4];
+        fy = 0.5f * c->m[9]  - 0.5f * c->m[5];
+        fz = 0.5f * c->m[10] - 0.5f * c->m[6];
+        if (fx * fx + fz * fz < 1e-12f)   /* still degenerate: keep the old yaw */
+            return atan2f(-c->m[8], -c->m[10]) * RAD2DEG;
+    }
+    (void)fy;
+    return atan2f(-fx, -fz) * RAD2DEG;
 }
+
+/* The port's own two bounds on the ground clamp below, and the reason they
+ * exist: the original probes a 10 metre COLUMN (0x00535130) and asks how far the
+ * point is below whatever it lands on. rb_world.ground cannot say that -- it
+ * takes a ceiling, and an unbounded ceiling resolves to an overpass, which is the
+ * trap rb.h already documents for the race starts. So the probe is allowed to
+ * look a little above the eye, and the surface it finds is rejected outright if
+ * it is high enough above the car to be a roof rather than the slope the camera
+ * is sitting on. These are 1:10 models: a bridge with four metres of real
+ * clearance is 0.4 m here, so the margins have to be small. */
+#define CAM_GROUND_LOOKUP 0.30f     /* how far above the eye the probe may see */
+#define CAM_GROUND_MAX_UP 0.75f     /* above the car, past which it is a roof */
 
 void cam_init(cam_t *cam, const rb_car *c)
 {
@@ -109,7 +147,9 @@ void cam_init(cam_t *cam, const rb_car *c)
     cam->f_height.ease      = 0.0f;
 
     /* Block C, 0x014c48d0, with camSetupTargets' overrides: rest 0, slack +-20
-       degrees, ease exponent 2.0. accel and rate are set per frame. */
+       degrees, ease exponent 2.0. accel and rate are set per frame. (The loaded
+       block says +-90 and 1.2; camSetupTargets overwrites [2],[3] and [6] every
+       frame, so the loaded values are never the ones in force.) */
     cam->f_yaw.rest      = 0.0f;
     cam->f_yaw.dead      = 0.0f;
     cam->f_yaw.slack_lo  = 20.0f;
@@ -118,9 +158,14 @@ void cam_init(cam_t *cam, const rb_car *c)
     cam->f_yaw.max_speed = RB_CAMERA.acc_alpha * 200.0f;
     cam->f_yaw.ease      = 2.0f;
 
+    /* Block D, the aim, is the engine's default descriptor DAT_00564810 =
+       {0, 0, 2e6, 2e6, 2e6, 2e6, 0}: rest 0 with an infinite rate, so it snaps.
+       There is no state to keep for it -- the camera simply points at the car. */
+
     cam->yaw    = car_yaw_deg(c);
     cam->dist   = RB_CAMERA.dist_xz;
     cam->height = RB_CAMERA.dist_y;
+    cam->pitch  = atan2f(cam->height, cam->dist) * RAD2DEG - RB_CAMERA.vis_turn;
     {
         float f[3];
         yaw_forward(cam->yaw, f);
@@ -136,12 +181,19 @@ void cam_update(cam_t *cam, const rb_car *c, float steer, float dt)
     float cyaw, want_dist, target, fwd[3];
     double speed, wsp, extra, d_dist, d_height, d_yaw;
     double dx, dy, dz, horiz, yaw_err;
+    const rb_world *w;
+
+    /* VisTurn is not a steering term -- see the note over the aim below -- so
+       nothing here reads the stick any more. The parameter stays for the
+       harnesses and for main.c. */
+    (void)steer;
 
     if (!cam->valid) {
         cam_init(cam, c);
         return;
     }
 
+    w = c->world;
     cyaw = car_yaw_deg(c);
 
     speed = sqrt((double)c->body.v[0] * c->body.v[0]
@@ -171,7 +223,9 @@ void cam_update(cam_t *cam, const rb_car *c, float steer, float dt)
     cam->f_dist.rest = want_dist;
 
     /* camSetupTargets again: a car spinning faster than 180 deg/s gets a hard
-       30/s yaw rate, otherwise accAlpha * 200. */
+       30/s yaw rate, otherwise accAlpha * 200. Note which way that cuts -- in a
+       spin the camera is told to follow LESS, so the car whirls in front of a
+       view that stays roughly where it was. That is deliberate. */
     wsp = sqrt((double)c->body.w[0] * c->body.w[0]
                + (double)c->body.w[1] * c->body.w[1]
                + (double)c->body.w[2] * c->body.w[2]) * RAD2DEG;
@@ -179,23 +233,17 @@ void cam_update(cam_t *cam, const rb_car *c, float steer, float dt)
                                           : (float)((double)RB_CAMERA.acc_alpha * 200.0);
     cam->f_yaw.max_speed = cam->f_yaw.accel;
 
-    /* current geometry: where the camera actually is relative to the car */
+    /* current geometry: where the camera actually is relative to the car.
+       This is camFollow's own opening move -- express the eye in the reference
+       frame and run the followers on the three components of it. */
     dx = (double)c->body.x[0] - cam->pos[0];
     dy = (double)cam->pos[1] - c->body.x[1];
     dz = (double)c->body.x[2] - cam->pos[2];
     horiz = sqrt(dx * dx + dz * dz);
 
-    /* yaw error, wrapped to +-180: how far the camera has fallen behind the
-       heading it should be looking along. VisTurn leans it into the corner. */
-    /* VisTurn leans the view INTO the corner, i.e. toward where the car is
-       going, which REDUCES the trail rather than adding to it.
-       `steer` is the stick, positive = right. In the renderer's yaw convention a
-       right turn DECREASES yaw (F(v) = (-sin v, 0, -cos v): v=0 is -Z, v=90 is -X,
-       so increasing v swings left), so the lean subtracts. Get this backwards and
-       the lean and the 20 degree slack land on the same side of the car: 31.8
-       degrees off the tail instead of 8.18. */
-    yaw_err = (double)cam->yaw
-              - (double)(cyaw - steer * RB_CAMERA.vis_turn);
+    /* The trail: how far round the car the eye has been left, wrapped to +-180.
+       Purely geometric, with nothing in it from the controls. */
+    yaw_err = (double)cam->yaw - (double)cyaw;
     while (yaw_err > 180.0)  yaw_err -= 360.0;
     while (yaw_err < -180.0) yaw_err += 360.0;
 
@@ -206,28 +254,20 @@ void cam_update(cam_t *cam, const rb_car *c, float steer, float dt)
     cam->dist   = (float)(horiz + d_dist);
     cam->height = (float)(dy + d_height);
 
-    /* Yaw, and the one place the car-frame formulation needs a hand.
-     *
-     * camFollowStep only ever returns an offset limited by its own max_speed --
-     * accAlpha * 200, i.e. about 99 deg/s. In the original that is enough, because
-     * camFollow rebuilds the camera relative to its PREVIOUS frame, so the
-     * geometry is already converging on the car and the follower merely damps it.
-     * Working in the car's frame instead makes the follower the only thing that
-     * tracks at all, and a car at full lock yaws far faster than 99 deg/s -- a
-     * 0.3 m wheelbase at 6 m/s gives several hundred. The lag then grows without
-     * bound: measured at 30 deg after one second of turning, 94 deg after five,
-     * by which point the camera is looking at the car from in front.
-     *
-     * The slack window is the original's own statement of how far the view may
-     * trail, so enforce it as a hard bound. Inside +-20 degrees the follower's
-     * easing is what shapes the motion, exactly as before.
-     */
+    /* The trail is NOT clamped to the slack window, and this file used to clamp
+       it. camFollowStep's window is a window on the PULL-BACK, not a bound on
+       the value: outside it the follower still only closes at max_speed, so a
+       car that turns faster than 99 deg/s does leave the view behind, and a car
+       spinning past 180 deg/s leaves it behind at 30 deg/s. Clamping made the
+       camera rigidly welded to the tail through exactly the manoeuvres -- hard
+       corners, spins, a landing that snaps the nose round -- where the original
+       swings wide and takes a second to come back. */
     {
         double lag = yaw_err + d_yaw;
-        double lim = cam->f_yaw.slack_hi;
-        if (lag >  lim) lag =  lim;
-        if (lag < -lim) lag = -lim;
-        cam->yaw = (float)((double)cyaw - steer * RB_CAMERA.vis_turn + lag);
+        double v = (double)cyaw + lag;
+        while (v > 180.0)  v -= 360.0;
+        while (v < -180.0) v += 360.0;
+        cam->yaw = (float)v;
     }
 
     if (cam->dist < 0.05f)
@@ -237,10 +277,106 @@ void cam_update(cam_t *cam, const rb_car *c, float steer, float dt)
     cam->pos[0] = (float)((double)c->body.x[0] - (double)fwd[0] * cam->dist);
     cam->pos[1] = (float)((double)c->body.x[1] + cam->height);
     cam->pos[2] = (float)((double)c->body.x[2] - (double)fwd[2] * cam->dist);
+
+    /* ------------------------------------------------------------------------
+     * camPost, 0x00501180 -- the half of the chain these notes said was "not
+     * transcribed". It is registered as the camera's per-frame hook by
+     * 0x00500760 (which also sets the near and far planes, 0.1 and 500), and it
+     * runs on the eye and basis camFollow just produced, in this order.
+     * ------------------------------------------------------------------------ */
+
+    /* 1. The obstacle lift, 0x00500e60 over camSightBlocked 0x00500d60. If the
+     *    segment from 0.15 m above the car to 0.06 m below the eye crosses
+     *    geometry, the eye ORBITS UP around the car -- over the wall, the kerb,
+     *    the bank behind it -- toward CDT_AngleUp (29.1 deg) at CDT_AngleUpSpeed
+     *    (29.4 deg/s), and releases the same way when the view clears.
+     *
+     *    The original rotates the eye->car direction about the camera's right
+     *    axis and re-places the eye at car - dist*dir, which leaves the radius
+     *    alone. In the yaw-only frame this file works in, that is exactly raising
+     *    the eye's elevation angle at constant radius. */
+    {
+        int blocked = 0;
+        if (w && w->segment) {
+            float a[3], b[3];
+            a[0] = c->body.x[0];
+            a[1] = c->body.x[1] + 0.15f;
+            a[2] = c->body.x[2];
+            b[0] = cam->pos[0];
+            b[1] = cam->pos[1] - 0.06f;
+            b[2] = cam->pos[2];
+            blocked = w->segment(w->ctx, a, b);
+        }
+        cam->cdt_angle = rb_move_towards(cam->cdt_angle,
+                                         blocked ? RB_CAMERA.cdt_angle_up : 0.0f,
+                                         RB_CAMERA.cdt_angle_up_speed, dt);
+        if (cam->cdt_angle > 1e-04f) {
+            double r = sqrt((double)cam->dist * cam->dist
+                            + (double)cam->height * cam->height);
+            double e = atan2((double)cam->height, (double)cam->dist)
+                       + (double)cam->cdt_angle * DEG2RAD;
+            if (e > 1.55334306) e = 1.55334306;   /* 89 deg, so dist stays real */
+            cam->dist   = (float)(r * cos(e));
+            cam->height = (float)(r * sin(e));
+            if (cam->dist < 0.05f) cam->dist = 0.05f;
+            cam->pos[0] = (float)((double)c->body.x[0] - (double)fwd[0] * cam->dist);
+            cam->pos[1] = (float)((double)c->body.x[1] + cam->height);
+            cam->pos[2] = (float)((double)c->body.x[2] - (double)fwd[2] * cam->dist);
+        }
+    }
+
+    /* 2. THE AIM, and the one thing in this file that was outright wrong.
+     *
+     *    VisTurn is not a look-into-turn and never was. camPost rotates the view
+     *    direction -- and the up vector with it -- about the camera's RIGHT axis
+     *    by `_DAT_014c48ec + <the lift's addition>` every single frame, with no
+     *    reference to the steering, the stick, or the body's yaw rate. Rotating
+     *    about the right axis is a PITCH, so VisTurn is a constant 11.82 degrees
+     *    of aim tilted UP, and the direction is fixed by the other user of the
+     *    same axis: the obstacle lift rotates by -CDT_AngleUp to raise the eye,
+     *    so +VisTurn raises the aim.
+     *
+     *    That is where the framing comes from. Aimed dead at the car the view is
+     *    24.6 degrees down at rest and 15.1 flat out; tilted up by VisTurn it is
+     *    12.8 and 3.3, so the car sits low in the frame and the track ahead fills
+     *    it. Pointing at the car instead -- which is what this file did -- puts
+     *    the car in the centre and the sky where the corner should be.
+     *
+     *    The aim is taken BEFORE the ground clamp below, because camPost is:
+     *    0x00500e60 re-derives the direction from the lifted eye, the clamp then
+     *    moves the eye and does NOT re-derive it. */
+    {
+        float a = cam->cdt_angle, add;
+        if (a <= 0.0f || RB_CAMERA.cdt_angle_up < 1e-06f)
+            add = 0.0f;
+        else if (a <= RB_CAMERA.cdt_angle_up)
+            add = RB_CAMERA.cdt_dir_add * a / RB_CAMERA.cdt_angle_up;
+        else
+            add = RB_CAMERA.cdt_dir_add;
+        cam->cdt_dir_add = rb_move_towards(cam->cdt_dir_add, add,
+                                           RB_CAMERA.cdt_dir_add_speed, dt);
+        cam->pitch = atan2f(cam->height, cam->dist) * RAD2DEG
+                     - RB_CAMERA.vis_turn - cam->cdt_dir_add;
+    }
+
+    /* 3. The ground clamp. The original probes 0.07 m under the eye and, if that
+     *    point is inside the surface, lifts the eye clear of it -- which is what
+     *    keeps the view out of the hill on a crest and off the inside of a bank.
+     *    See the two margins over CAM_GROUND_LOOKUP for what the port has to do
+     *    differently and why. */
+    if (w && w->ground) {
+        float gy, n[3];
+        if (w->ground(w->ctx, cam->pos[0], cam->pos[2],
+                      cam->pos[1] + CAM_GROUND_LOOKUP, &gy, n)
+            && gy <= c->body.x[1] + CAM_GROUND_MAX_UP
+            && cam->pos[1] - 0.07f < gy) {
+            cam->pos[1] = gy + 0.14f;
+            cam->height = (float)((double)cam->pos[1] - c->body.x[1]);
+        }
+    }
 }
 
 float cam_pitch_deg(const cam_t *cam)
 {
-    /* look down at the car */
-    return atan2f(cam->height, cam->dist) * RAD2DEG;
+    return cam->pitch;
 }

@@ -8,8 +8,10 @@
 
 #include "scene.h"
 
+#include "carlight.h"
 #include "rlog.h"
 
+#include <math.h>        /* sqrtf, for the built vertex normals */
 #include <stddef.h>      /* offsetof, for the vertex-buffer attribute offsets */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +32,13 @@ void scene_set_tex_quality(int skip_levels)
 }
 
 int scene_tex_quality(void) { return tex_skip; }
+
+/* Build a vertex normal for every batch that arrives without one -- see
+   scene_set_build_normals in scene.h. Only the cars want it: nothing lights a
+   track, and a track is 47,000 triangles of normals nobody would read. */
+static int build_nrm;
+
+void scene_set_build_normals(int on) { build_nrm = on ? 1 : 0; }
 
 /* Exchange the two 5-bit fields of every 565 texel at upload -- see scene.h. */
 static int tex_swap_rb;
@@ -309,6 +318,20 @@ int scene_load(const char *path, scene_t *s)
             else
                 fseek(f, (long)(sizeof(float) * 3 * b->nverts), SEEK_CUR);
         }
+        /* THE REST OF THE CAR'S NORMALS. Only the env batches carry one in the
+           file (VSC7 writes them for the glance and nothing else), and the light
+           needs one on every batch it draws -- a wheel with no normal array
+           takes GL's current normal and shades flat. Same algorithm as
+           pack_vsc.py's `vertex_normals': area-weighted, accumulated per INDEX,
+           so a UV seam inside a batch splits the normal exactly the way the
+           packed ones are already split. Doing it here rather than in the packer
+           keeps the .vsc files and the installed assets untouched -- see
+           carlight.h. */
+        if (build_nrm && !b->nrm && b->nverts && b->nidx) {
+            b->nrm = calloc(b->nverts, sizeof(float) * 3);
+            if (b->nrm)
+                b->nrm_built = 1;
+        }
         /* And the blend's two UV sets, on the same rule as the normals: after
            the vertices, before the indices, and only on a batch that has them.
            A reader that took them unconditionally would shift every batch after
@@ -321,6 +344,45 @@ int scene_load(const char *path, scene_t *s)
                 fseek(f, (long)(sizeof(blend_uv_t) * b->nverts), SEEK_CUR);
         }
         rd(f, b->idx, sizeof(unsigned short) * b->nidx);
+        /* The built normals, now that the triangles are here. Area-weighted:
+           the cross product of two edges is twice the triangle's area, so
+           accumulating it unnormalised weights each face by its size, which is
+           what pack_vsc.py does and what the packed ones already are. */
+        if (b->nrm_built) {
+            unsigned int t;
+            for (t = 0; t + 2 < b->nidx; t += 3) {
+                const unsigned short ia = b->idx[t];
+                const unsigned short ib = b->idx[t + 1];
+                const unsigned short ic = b->idx[t + 2];
+                const vtx_t *pa, *pb, *pc;
+                float e1[3], e2[3], c[3];
+                int k;
+                if (ia >= b->nverts || ib >= b->nverts || ic >= b->nverts)
+                    continue;
+                pa = &b->verts[ia]; pb = &b->verts[ib]; pc = &b->verts[ic];
+                e1[0] = pb->x - pa->x; e1[1] = pb->y - pa->y; e1[2] = pb->z - pa->z;
+                e2[0] = pc->x - pa->x; e2[1] = pc->y - pa->y; e2[2] = pc->z - pa->z;
+                c[0] = e1[1] * e2[2] - e1[2] * e2[1];
+                c[1] = e1[2] * e2[0] - e1[0] * e2[2];
+                c[2] = e1[0] * e2[1] - e1[1] * e2[0];
+                for (k = 0; k < 3; k++) {
+                    b->nrm[ia * 3 + k] += c[k];
+                    b->nrm[ib * 3 + k] += c[k];
+                    b->nrm[ic * 3 + k] += c[k];
+                }
+            }
+            for (unsigned int v = 0; v < b->nverts; v++) {
+                float *n = &b->nrm[v * 3];
+                const float L = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (L < 1e-12f) {
+                    /* A degenerate or unreferenced vertex. Up, which is
+                       pack_vsc.py's answer for the same case. */
+                    n[0] = 0.f; n[1] = 1.f; n[2] = 0.f;
+                } else {
+                    n[0] /= L; n[1] /= L; n[2] /= L;
+                }
+            }
+        }
         b->gl_tex = (b->tex < s->n_tex) ? s->tex_ids[b->tex] : 0;
         b->gl_lm = (b->lm_tex < s->n_tex) ? s->tex_ids[b->lm_tex] : 0;
         b->gl_tex2 = (b->tex2 < s->n_tex) ? s->tex_ids[b->tex2] : 0;
@@ -421,6 +483,27 @@ int scene_load(const char *path, scene_t *s)
                                  (GLsizeiptr)(sizeof(blend_uv_t) * b->nverts),
                                  b->buv, GL_STATIC_DRAW);
                     buf_bytes += sizeof(blend_uv_t) * b->nverts;
+                }
+            }
+            /* And the light's own colour buffer, if this batch can be shaded.
+               It has to be buffer-backed for the reason the blend UVs are: one
+               client pointer among the enabled attributes turns vitaGL's
+               is_full_vbo off and every stream gets memcpy'd again -- the exact
+               cost SCENE VERTEX BUFFERS exists to remove. GL_DYNAMIC_DRAW
+               because scene_shade rewrites it every frame; vitaGL orphans the
+               allocation when the GPU is still reading the old one, so a
+               per-frame glBufferSubData is the intended pattern there. The
+               normals themselves stay in main memory: nothing draws them, the
+               shading READS them. */
+            if (b->gl_vbo && b->nrm) {
+                b->lit = malloc((size_t)b->nverts * 4);
+                glGenBuffers(1, &b->gl_vbo_lit);
+                if (b->lit && b->gl_vbo_lit) {
+                    memset(b->lit, 0xFF, (size_t)b->nverts * 4);
+                    glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_lit);
+                    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(b->nverts * 4),
+                                 b->lit, GL_DYNAMIC_DRAW);
+                    buf_bytes += b->nverts * 4;
                 }
             }
         }
@@ -538,6 +621,64 @@ static void lm_bind(GLuint tex, const batch_t *b)
 /* Six clip planes, inward-facing, in model space. Valid only while cull_on. */
 static float cull_plane[6][4];
 static int cull_on;
+
+/* Whether draw_pass binds a normal array. Set around the car's own passes by
+   main.c (scene_set_lighting), because GL takes the normal from the array only
+   while one is enabled and from the current normal otherwise -- see carlight.h.
+   It stays a scene.c global rather than a batch flag for the reason cull_on is
+   one: it changes per PASS, not per batch. */
+static int light_on;
+
+void scene_set_lighting(int on) { light_on = on ? 1 : 0; }
+
+void scene_shade(scene_t *s, const float L_model[3],
+                 float ambient, float direct)
+{
+    unsigned int i;
+
+    if (!s || !L_model)
+        return;
+    for (i = 0; i < s->n_batches; i++) {
+        batch_t *b = &s->batches[i];
+        float L[3];
+        if (!b->nrm || !b->lit || !b->nverts)
+            continue;
+        L[0] = L_model[0]; L[1] = L_model[1]; L[2] = L_model[2];
+        /* A RIGGED PART carries its normals in its own space and is drawn under
+           its own matrix, so the light has to come the other way through that
+           matrix. rig.draw[] is row-vector, so its rows are the part's axes in
+           model space and the component of L along each row is L in the part's
+           space -- the same composition envmap.c does by hand for the glance,
+           and the same one that put the sphere map on the springs.
+           Row 3 is the translation and is not a direction: 4-strided rows, three
+           components each. */
+        if (s->has_rig && b->part > 0 && (int)b->part < s->rig.n) {
+            const float *pm = s->rig.draw[b->part];
+            int r;
+            for (r = 0; r < 3; r++)
+                L[r] = L_model[0] * pm[r * 4 + 0]
+                     + L_model[1] * pm[r * 4 + 1]
+                     + L_model[2] * pm[r * 4 + 2];
+            /* A part matrix can carry a SCALE -- the car nodes' are 1.05, 0.90
+               and -1.17 (rb_test's own numbers) -- and a scaled direction skews
+               the dot product. Renormalise rather than trusting it. */
+            {
+                const float len = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+                if (len > 1e-9f) { L[0] /= len; L[1] /= len; L[2] /= len; }
+            }
+        }
+        carlight_shade(ambient, direct, L, b->nrm, b->nverts, b->lit);
+        if (b->gl_vbo_lit) {
+            glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_lit);
+            glBufferSubData(GL_ARRAY_BUFFER, 0,
+                            (GLsizeiptr)(b->nverts * 4), b->lit);
+        }
+    }
+    /* Never leave one bound -- the rule scene_load's own tail states: every
+       other module in the port draws from client pointers, which a bound buffer
+       silently reinterprets as offsets. */
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
 static scene_stats_t stats;
 
 void scene_cull_off(void) { cull_on = 0; }
@@ -637,6 +778,24 @@ static void draw_pass(const scene_t *s, unsigned int mask, unsigned int match,
            the moment gl*Pointer is called, not at the draw (vitaGL does the same,
            ffp.c stores ffp_vertex_attrib_vbo there). Binding after would leave the
            attributes pointing at whatever was bound previously. */
+        /* THE LIGHT FIRST, because it lives in a buffer of its own and the
+           binding is captured at the pointer call -- the same rule the comment
+           below states, which is why this cannot go after gl_vbo is bound. */
+        if (light_on) {
+            if (b->lit) {
+                glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo_lit);
+                glColorPointer(4, GL_UNSIGNED_BYTE, 0,
+                               b->gl_vbo_lit ? (const void *)0
+                                             : (const void *)b->lit);
+                glEnableClientState(GL_COLOR_ARRAY);
+            } else {
+                /* A batch with no normals -- which cannot happen on a scene
+                   loaded with scene_set_build_normals -- draws unlit rather than
+                   reading a colour array nobody filled. */
+                glDisableClientState(GL_COLOR_ARRAY);
+                glColor4f(1.f, 1.f, 1.f, 1.f);
+            }
+        }
         glBindBuffer(GL_ARRAY_BUFFER, b->gl_vbo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->gl_ibo);
         lm_bind(b->gl_lm, b);
@@ -645,6 +804,8 @@ static void draw_pass(const scene_t *s, unsigned int mask, unsigned int match,
         glTexCoordPointer(2, GL_FLOAT, sizeof(vtx_t), VTX_AT(b, u));
         glDrawElements(GL_TRIANGLES, b->nidx, GL_UNSIGNED_SHORT,
                        b->gl_ibo ? (const void *)0 : (const void *)b->idx);
+        if (light_on)
+            glDisableClientState(GL_COLOR_ARRAY);
         if (rigged)
             glPopMatrix();
     }
@@ -918,6 +1079,10 @@ int scene_keep_rest(batch_t *b)
         glDeleteBuffers(1, &b->gl_ibo);
         b->gl_ibo = 0;
     }
+    if (b->gl_vbo_lit) {
+        glDeleteBuffers(1, &b->gl_vbo_lit);
+        b->gl_vbo_lit = 0;
+    }
     if (b->rest)
         return 1;
     b->rest = malloc(sizeof(vtx_t) * b->nverts);
@@ -951,10 +1116,13 @@ void scene_release(scene_t *s)
             glDeleteBuffers(1, &s->batches[i].gl_ibo);
         if (s->batches[i].gl_vbo_buv)
             glDeleteBuffers(1, &s->batches[i].gl_vbo_buv);
+        if (s->batches[i].gl_vbo_lit)
+            glDeleteBuffers(1, &s->batches[i].gl_vbo_lit);
         free(s->batches[i].verts);
         free(s->batches[i].idx);
         free(s->batches[i].rest);
         free(s->batches[i].nrm);
+        free(s->batches[i].lit);
         free(s->batches[i].buv);
     }
     free(s->batches);

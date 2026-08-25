@@ -79,7 +79,11 @@ void envmap_init(envmap_t *e, const scene_t *track);
    MODEL-space normal into VIEW space, row-vector like everything else here: the
    caller has it, because it is the same product it built the modelview from.
    The modelview must still be the car's when this is called. */
-void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9]);
+/* `level' is the car's own light level (carlight.h), 0..1: the glance is drawn
+   at that grey, which is what the engine's env pass does with the same field.
+   1.0 is the appearance this had before the light existed. */
+void envmap_draw(envmap_t *e, const scene_t *car, const float n3[9],
+                 float level);
 
 /* The alpha a class is drawn at, 0..1. Split out so the test can check the four
    against the recovered bytes without a GL context. */

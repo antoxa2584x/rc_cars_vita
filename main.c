@@ -66,6 +66,9 @@
 #include "hud.h"
 #include "countdown.h"
 #include "race_ui.h"
+#include "carlight.h"
+#include "dirarrow.h"
+#include "msg.h"
 #include "menu.h"
 #include "ai.h"
 #include "carparts.h"
@@ -86,6 +89,12 @@
 #endif
 #if MENU_SKINS != CARPARTS_SKINS
 #error "menu.h's MENU_SKINS and carparts.h's CARPARTS_SKINS disagree"
+#endif
+/* And ai.h mirrors checkpoint.h's checkpoint count for the same shape of reason:
+   ai.c must stay clear of checkpoint.h, which pulls in scene.h and therefore GL
+   -- that is why the spine reaches the AI behind a callback at all (ai_track). */
+#if AI_MAX_CP != CP_MAX
+#error "ai.h's AI_MAX_CP and checkpoint.h's CP_MAX disagree"
 #endif
 
 #define SCR_W 960
@@ -177,6 +186,36 @@ static countdown_t countdown;
    hud_data.h for where every number in it came from. */
 static race_ui_t race_ui;
 
+/* THE DIRECTION ARROW and the WRONG WAY banner -- the engine's own `DirectArrow'
+   and message slot 2, both recovered whole out of Settings/arrow.ini,
+   RCCarsDB/cockpit.sb and the race module. Off show_vis for the same reason as
+   the three above: this is the race telling the player which way the track goes.
+   See dirarrow.h, and hud_data.h's arrow block for where each number came
+   from. */
+static dirarrow_t dir_arrow;
+
+/* THE CAR'S OWN LIGHT, one per car, because the engine's own field is per car:
+   the level lives at *(car+0xe8) + 0xe824 and car+0xe8 is the car's OWN physics
+   record. See carlight.h for the whole model. */
+static carlight_t car_lit;
+static carlight_t ai_lit[AI_MAX_OPPONENTS];
+/* For the log line, so a frame can say what the lightmap under the wheels
+   actually was without TRIANGLE being held down. */
+static int lit_samples;
+/* Camera-to-car distance, for the LOD fade. Measured where the eye is known and
+   read again at draw time, rather than recomputed there: the two must be the
+   same number or the fade would disagree with the level it scales. */
+static float car_cam_dist;
+static float ai_cam_dist[AI_MAX_OPPONENTS];
+
+/* THE ENGINE'S OWN MESSAGE LAYER -- eleven slots over six textures, with the
+   recovered priority table doing the arbitrating. It owns the two slots nothing
+   else did (PAUSE and BEST LAP) and the WRONG WAY banner; hud.c's two hit
+   banners and countdown.c's five countdown cells still draw their own geometry
+   but are arbitrated through msg_arbitrate all the same, so only one message
+   ever reaches the screen. See msg.h. */
+static msg_t msgs;
+
 /* The three effects the car itself throws off, all the game's own as well: the
    wheel dust and exhaust smoke (fx.c, car_dustx / exhausted_gas), the tyre marks
    (trace.c, car_trace) and the body's env-map glance (envmap.c, CarEnvMap).
@@ -231,6 +270,35 @@ static vehicle_t veh;
 /* The game's own model, transcribed: rb.c + contact.c + collide.c. It is the
    ONLY model now -- the physics.c placeholder is no longer reachable. */
 static rb_car rc;
+
+/* WHAT ELSE ADVANCES ON A PHYSICS TICK. rbcar_step_frame_cb runs this after
+ * every 1/60 tick it spends, so the props and the opponents see the pose the
+ * car has just reached rather than the one it ends the whole frame on -- see
+ * rbcar.h, and the Cola can that was driven through at anything under 60 fps.
+ *
+ * Everything it touches is file scope already; the struct carries only what has
+ * to come back out, which is the frame's hardest opponent contact for the sound.
+ * The characters are deliberately NOT here: the engine steps that layer once per
+ * FRAME with dt (0x4fc685) and that is transcribed, not convenient. */
+static struct { float bump; } tick_world;
+
+static void tick_world_step(void *ctx)
+{
+    float h;
+
+    (void)ctx;
+    prop_step(&props, &rc, RBCAR_TICK_DT);
+    /* ONE TICK AT A TIME and never ticks*dt in one go: ai_step's acceleration
+       limit and cursor walk are written for a 1/60 tick, and handing it 2/60
+       would quietly halve the resolution of both. */
+    ai_step(&ai, cps.enabled ? &ai_tr : NULL, rc.body.x[0], rc.body.x[1],
+            rc.body.x[2], cps.lap, RBCAR_TICK_DT);
+    /* Solid opponents, immediately after the step so the contact sees the pose
+       it just wrote. */
+    h = ai_collide_player(&ai, &rc, RBCAR_TICK_DT);
+    if (h > tick_world.bump)
+        tick_world.bump = h;
+}
 static cam_t  rcam;
 /* The model's timestep is decoupled from the frame rate -- see rbcar.h. The
    counter only exists to stop a sustained overload filling the log. */
@@ -391,16 +459,24 @@ static void place_car(float x, float z, float ref_y, float yaw)
     trace_clear(&traces);
     /* And the HIT pop, which belongs to a collision that is now in the past. */
     hud_reset(&hud);
+    /* And the direction arrow: a teleport is not driving the wrong way, so the
+       timer, the banner and the blink go, and the arrow SNAPS to its new heading
+       instead of sweeping up to 180 degrees at ARW_SLEW while the player is
+       already moving. See dirarrow_reset. */
+    dirarrow_reset(&dir_arrow);
+    /* And the car's own light level, which is the engine's own answer to the same
+       question: FUN_005320de puts it back to 1.0 with the latch down, so the next
+       step SNAPS to whatever the car has been put on rather than chasing 1.27 a
+       second across a tunnel mouth. */
+    carlight_reset(&car_lit);
+    /* And whatever message was on screen: it belonged to where the car was. */
+    msg_reset(&msgs);
 
     /* the pose mirror the HUD and the free-fly camera read */
     vehicle_init(&veh, cur_car, x, gy + 0.06f, z, yaw);
 
     if (car.has_rig)
         carani_bind(&car.rig, &rc);
-    /* Only now does an rb wheel index name a mesh node, so only now can the
-       marks be fitted to the tyres that make them -- load_car built the trace
-       before this ran. See trace_fit_tyres. */
-    trace_fit_tyres(&traces, &car);
 
     /* The engine's own reset cue. Also the one place the loops are guaranteed
        to be re-evaluated against a car that has just teleported. */
@@ -441,11 +517,23 @@ static void respawn(void)
        car change, a texture-quality reload and the menu's Restart row. */
     countdown_start(&countdown);
     sfx_countdown();
+    /* ...and the motor is SILENT over it. The engine keeps a per-car "the motor
+       is sounding" flag and clears it whenever the car is not audible, so a car
+       just placed on the grid has no engine noise until it is driven; the
+       countdown holds the controls, so nothing starts it until GO. Not raised on
+       a checkpoint respawn, which does not recreate the car -- there the latch's
+       own four-second timeout is what the original does. See sfx.h. */
+    sfx_engine_off();
     /* Both clocks back to zero. They tick on the same dt the physics banks, so
        the three seconds the countdown holds the car for are NOT on the race
        clock: main.c spends no ticks while countdown_holding() is true, and this
        is stepped in the same block. */
     race_ui_start(&race_ui);
+    /* And the arrow, for the same reason: a new race is not a car that has been
+       driving the wrong way, and the snap this asks for is what puts the chevrons
+       on the first corner before GO instead of a second into the lap. Idempotent
+       with respawn()'s own call. */
+    dirarrow_reset(&dir_arrow);
 
     rlog("[rccars] start: %s  (%d,%d,%d) cm  yaw=%d deg  car=%s\n",
                   TRACKS[cur_track].name,
@@ -503,10 +591,10 @@ static int ai_spine(void *ctx, float x, float y, float z, float hint,
                               dist, cp);
 }
 
-/* ai_track.lap_progress: how far round the lap the PLAYER is, anchored on the
-   latched checkpoint index. A separate query from the projection above because
-   the projection is not a sound progress measure on these tracks -- see
-   checkpoint.h at cp_spine_dist_near and cp_lap_progress. */
+/* ai_track.lap_progress: how far round the lap the PLAYER is, projected onto the
+   stretch the latched checkpoint index names. A separate query from the whole-
+   spine projection above because that one is not a sound progress measure on
+   these tracks -- see checkpoint.h at cp_spine_dist_near and cp_lap_progress. */
 static int ai_lap_progress(void *ctx, float x, float y, float z, float *out)
 {
     return cp_lap_progress((const checkpoints_t *)ctx, x, y, z, out);
@@ -543,6 +631,31 @@ static void load_ai(int idx)
                  1 /* normal */, 0 /* single race */))
         return;
 
+    /* THE PLAYER'S SIDE OF THE PLACING, PUT IN THE OPPONENTS' METRES -- and this
+     * is the one place the two subsystems have to meet, which is why it is here
+     * and not inside either of them. An opponent's progress is uniform in road
+     * distance; the player's is laid out on the checkpoints, and where those
+     * really fall round a lap is a question only the recorded laps can answer.
+     * ai.c owns the recordings, checkpoint.c owns the markers, and neither may
+     * include the other (ai_track's own note says why), so the markers go out and
+     * the fractions come back. Rejected fits leave cum[] in place.
+     *
+     * BEFORE the first cp_restart, which reads cps.road_len to place the grid --
+     * load_track calls this and respawn() calls that, in that order. */
+    {
+        float mk[CP_MAX][3], frac[CP_MAX], lap_len = 0.f;
+        int n = cps.n < CP_MAX ? cps.n : CP_MAX;
+        for (i = 0; i < n; i++) {
+            mk[i][0] = cps.cp[i].p[0][0];
+            mk[i][1] = cps.cp[i].p[0][1];
+            mk[i][2] = cps.cp[i].p[0][2];
+        }
+        if (!ai_cp_fractions(&ai, (const float (*)[3])mk, n, frac, &lap_len)
+            || !cp_set_stations(&cps, frac, n, lap_len))
+            rlog("[rccars] checkpoint stations: no usable fit, keeping the "
+                 "spine's arc lengths\n");
+    }
+
     /* One scene per model the roster actually asks for, and no more: a car .vsc
        is 3.7 to 4.2 MB, so loading all three when the field uses two is 4 MB of
        heap for nothing. */
@@ -552,10 +665,16 @@ static void load_ai(int idx)
         if (c < 0 || c > 2 || ai_model[c])
             continue;
         snprintf(path, sizeof(path), "app0:assets/car%d.vsc", c + 1);
+        /* A normal on every batch, not just the glance's -- carlight.h. On for
+           the cars and off again immediately, because a track does not want
+           47,000 triangles of normals nobody reads. */
+        scene_set_build_normals(1);
         if (!scene_load(path, &ai_scene[c])) {
+            scene_set_build_normals(0);
             rlog("[rccars] ai: cannot load %s -- opponent invisible\n", path);
             continue;
         }
+        scene_set_build_normals(0);
         /* Bind the rig ONCE per model. carani_bind resolves the wheel mapping
            from the mount positions, which are the model's, so every opponent on
            this model shares the binding -- and draw_ai re-animates it per car
@@ -671,8 +790,10 @@ static int load_car(int idx)
 
     snprintf(path, sizeof(path), "app0:assets/car%d.vsc", idx + 1);
     scene_release(&car);
+    scene_set_build_normals(1);           /* see the AI loader above */
     if (!scene_load(path, &car))
         rlog("[rccars] cannot load %s\n", path);
+    scene_set_build_normals(0);
 
     cur_car = idx;
     /* The motor family is per-car -- three channels' worth of loops, and the
@@ -752,6 +873,7 @@ static int glance_batches, glance_tris;
 static void draw_ai(const float eye[3], float vpitch, float vyaw)
 {
     int i;
+    int lit_ai = 0;
 
     ai_drawn = 0;
     ai_glance_batches = ai_glance_tris = 0;
@@ -775,6 +897,7 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
         if (dx * dx + dz * dz > AI_DRAW_DIST * AI_DRAW_DIST)
             continue;
         sc = &ai_scene[c];
+        lit_ai = 0;
 
         if (sc->has_rig)
             carani_update(&sc->rig, &a->rb);
@@ -786,6 +909,26 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
         /* MODEL space -> BODY space, per CAR: rbcar_com_oy, not anything read
            off `sc->rig` -- two opponents on one model share that rig. */
         glTranslatef(0.f, -rbcar_com_oy(c), 0.f);
+        /* LIT with ITS OWN level and ITS OWN camera distance, exactly as the
+           player's is. Which for most of the field means flat: the LOD fade is
+           done by 4.30 m (carlight.h), so an opponent alongside is shaded and one
+           down the road is not -- the engine's own ramp, not a saving.
+           SHADED HERE rather than once per model: two opponents can share one
+           scene_t, and they share neither a light level nor a camera distance. */
+        /* PAST THE FADE, DON'T SHADE AT ALL. At LIGHT_FADE_FAR the two terms are
+           ambient 1.0 and direct 0, which is a colour of 255 everywhere -- i.e.
+           the unlit texture, which is exactly what drawing with no colour array
+           gives. So the far half of the field costs nothing, and skipping the
+           shade has to skip the BINDING with it: two opponents share one
+           scene_t, and a near one has just written its own light into it. */
+        lit_ai = ai_cam_dist[i] < LIGHT_FADE_FAR && carlight_enabled();
+        if (lit_ai) {
+            float La, Ld, Lm[3];
+            carlight_terms(&ai_lit[i], ai_cam_dist[i], &La, &Ld);
+            carlight_model_dir(ai_matrix(&ai, i), Lm);
+            scene_shade(sc, Lm, La, Ld);
+            scene_set_lighting(1);
+        }
         scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
         /* The pipes and boosters, exactly as for the player: OPAQUE, and only
            the alpha-test reference dropped, because their ARGB4444 alpha sits
@@ -793,6 +936,8 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
         glAlphaFunc(GL_GREATER, 0.f);
         scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
         glAlphaFunc(GL_GREATER, 0.5f);
+        if (lit_ai)
+            scene_set_lighting(0);
         /* THE GLANCE, exactly as for the player and for the same reason: over
          * the paint AND the exhaust, inside the same matrix push, because it
          * re-draws that very geometry.
@@ -816,7 +961,7 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
         if (show_vis) {
             float n3[9];
             env_normal_matrix(ai_matrix(&ai, i), vpitch, vyaw, n3);
-            envmap_draw(&envmap, sc, n3);
+            envmap_draw(&envmap, sc, n3, ai_lit[i].level);
             ai_glance_batches += envmap.n_batches;
             ai_glance_tris += envmap.n_tris;
         }
@@ -938,6 +1083,37 @@ int main(void)
        a scene that failed to load or on one packed before --extra-tex msg_hits,
        and hud.c then falls back to the compiled-in font. */
     hud_init(&hud, scene_tex(&props_scene, "msg_hits"));
+    /* THE DIRECTION ARROW's chevron. It rides in props.vsc for the same three
+       reasons everything else on the HUD does -- load-once scene, belongs to no
+       track and no car, binding never renewed -- and is 0 on a scene packed
+       without it, at which point the arrow is left out (a chevron is not a word,
+       so there is nothing to fall back to). ARW_CHEV_TEX is the name
+       gen_hud_data.py read the geometry out of, so the header and the packer
+       cannot name two different files. The WRONG WAY banner is message slot 2
+       and its texture is bound with the other five, below. */
+    {
+        dirarrow_tex at;
+        at.arrow = scene_tex(&props_scene, ARW_CHEV_TEX);
+        dirarrow_init(&dir_arrow, &at);
+        rlog("[rccars] hud: %s %s\n", ARW_CHEV_TEX,
+             at.arrow ? "bound (the game's own direction arrow)" : "NOT PACKED");
+    }
+    /* THE MESSAGE LAYER's six textures, in the order 0x4af195 loads them --
+       which IS the index the recovered slot table uses, so MSG_TEX_NAME is the
+       only place the order is written down. All six ride in props.vsc for the
+       same three reasons the rest of the HUD does; a 0 draws that slot's
+       fallback word, or nothing where there is no word for it. */
+    {
+        unsigned int mt[MSG_N_TEX];
+        int i;
+        for (i = 0; i < MSG_N_TEX; i++)
+            mt[i] = scene_tex(&props_scene, MSG_TEX_NAME[i]);
+        msg_init(&msgs, mt);
+        rlog("[rccars] msg:");
+        for (i = 0; i < MSG_N_TEX; i++)
+            rlog(" %s=%d", MSG_TEX_NAME[i], !!mt[i]);
+        rlog("\n");
+    }
     rlog("[rccars] hud: msg_hits %s\n",
          hud.tex ? "bound (the game's own HIT banner)"
                  : "NOT PACKED -- falling back to the built-in font");
@@ -1006,6 +1182,11 @@ unsigned int acc_ticks = 0;
         float dt = (float)((double)(t1.tick - tf.tick) / hz);
         tf = t1;
         if (dt > 0.1f) dt = 0.1f;      /* don't integrate through a hitch */
+        /* KEPT before the menu zeroes dt further down. Only the message layer
+           reads it, and only so PAUSE can keep its own life topped up while the
+           world is frozen -- everything else in the app is meant to stop with
+           dt, which is the whole point of freezing it that way. */
+        const float frame_dt = dt;
 
         /* START opens the menu; it owns the button from here, so the app quits
            from the menu's Quit row rather than by pressing START. */
@@ -1022,6 +1203,11 @@ unsigned int acc_ticks = 0;
             menu.req_car = -1;
             respawn();
         }
+        /* The car's light needs no reload: the row is GL state and a per-frame
+           step, so it is handed over every frame and takes effect on the next
+           one. carlight.c keeps the level chasing either way, so switching it
+           back on does not start from a cold 1.0. */
+        carlight_set_enabled(menu.car_light);
         if (menu.req_reload) {
             /* Texture quality is chosen at UPLOAD time, so nothing already on
                the GPU changes by itself -- both scenes have to come back in. */
@@ -1142,13 +1328,128 @@ unsigned int acc_ticks = 0;
         /* Checkpoint 0 IS the start/finish line (checkpoint.c), so its crossing
            is the lap -- the same edge cps.lap counts on. The lap clock's reading
            is held and blinked for the shipped timeLapBlinkInSec and restarts. */
-        if (cps.passed == 0)
-            race_ui_lap(&race_ui);
+        if (cps.passed == 0 && race_ui_lap(&race_ui)) {
+            /* BEST LAP -- message slot 10, the game's own `BestLap' word art,
+               which nothing had ever raised. Its own post is not recovered, so
+               the life is msg.h's and said to be. */
+            msg_post(&msgs, MSG_BEST_LAP, MSG_BEST_LIFE, 0.f, 1);
+            rlog("[rccars] best lap %.2f s\n", (double)race_ui.best_lap);
+        }
         race_ui_step(&race_ui, dt);
+
+        /* THE DIRECTION ARROW and the WRONG WAY test. Every input is a plain
+           number, the way hud.c's and race_ui.c's are -- dirarrow.c never sees
+           checkpoint.h. See dirarrow.h for the model and hud_data.h for where
+           each constant came from. */
+        {
+            dirarrow_in ai_in;
+            memset(&ai_in, 0, sizeof ai_in);
+            ai_in.valid = (cps.enabled && cps.n > 0 && cps.spine_len > 0.f);
+            if (ai_in.valid) {
+                /* THE CHECKPOINT AHEAD, and the one behind it. The engine takes
+                   its aim point off the path follower's next waypoint and falls
+                   back to checkpoint `follower + 0x4c' when there is none
+                   (0x4e90bb); the port's player has no follower, so the fallback
+                   IS the rule here rather than a substitute for it. The one
+                   behind is (next - 1) wrapping to the last, which is the
+                   engine's own expression at 0x4e91c1 -- and it is not `cps.last',
+                   because before the first crossing that is -1. */
+                const int nx = cps.next;
+                const int pv = (nx + cps.n - 1) % cps.n;
+                const float *a = cps.cp[nx].p[0];
+                const float *b = cps.cp[pv].p[0];
+                float from, to, span, prog = 0.f;
+
+                ai_in.car_x = veh.x;
+                ai_in.car_z = veh.z;
+                /* +180 for the same reason race_ui's block below states it:
+                   veh.yaw is the RENDERER's view yaw, 180 degrees from where the
+                   car points. */
+                ai_in.car_yaw = (veh.yaw + 180.f) * 0.017453292519943295f;
+                ai_in.aim_x = a[0];
+                ai_in.aim_z = a[2];
+                ai_in.prev_x = b[0];
+                ai_in.prev_z = b[2];
+
+                /* THE APPROACH. cp_dist_to_next is exactly right here and it
+                   is 3D, which is what FUN_004eb550 measures -- this was an XZ
+                   distance while the field it feeds was still a guess, and the
+                   guess is now recovered. dirarrow.c keeps the running MINIMUM
+                   itself and needs the index to know when to reset it, so what
+                   goes in is the current distance and `next'. */
+                ai_in.cp_dist = cp_dist_to_next(&cps, veh.x, veh.y, veh.z);
+                ai_in.cp_index = nx;
+
+                /* HOW FAR THROUGH THE SEGMENT, off the same progress measure
+                   the placing uses -- a projection onto the stretch the LATCH
+                   says the car is on, so it moves with the car and still cannot
+                   flicker (ui.md). Its answer is `station(last) + span * t' with
+                   the origin moved to the grid, so the two stations and
+                   cp_lap_origin divide t back out rather than the rule being
+                   written a second time here. */
+                if (cp_lap_progress(&cps, veh.x, veh.y, veh.z, &prog)) {
+                    prog -= cp_lap_origin(&cps);
+                    /* station[], not cum[]: the progress is laid out on where the
+                       checkpoints really fall round a lap, so dividing it back
+                       out has to use the same stations or the fraction is wrong
+                       by the difference between the two (39 m on average). */
+                    from = (cps.last < 0) ? 0.f : cps.station[cps.last];
+                    to = (nx == 0) ? cps.spine_len : cps.station[nx];
+                    span = to - from;
+                    if (span > 1e-3f)
+                        ai_in.seg_frac = (prog - from) / span;
+                }
+                /* BEFORE THE FIRST CROSSING the stretch really is the closing
+                   one and `prog' is a small NEGATIVE number -- the grid is 2.3 to
+                   20.5 m short of the line -- so against a `from' of 0 this comes
+                   out just under 0, the red end of the tint. Same answer as
+                   before and for a better reason; it lasts the second or two
+                   before cp_0 is crossed and is left alone rather than given a
+                   rule of its own. */
+            }
+            dirarrow_step(&dir_arrow, &ai_in, dt);
+            /* WRONG WAY -- posted EVERY FRAME the flag is up, which is what the
+               engine does: the poster drops a post of the slot already showing,
+               so this is one flash and one beep per 5.5 s (1.5 s of life and a
+               4.0 s hold-over) rather than one a frame. See msg.h. */
+            if (dirarrow_wrong(&dir_arrow))
+                msg_post(&msgs, MSG_WRONG_WAY, ARW_MSG_LIFE, ARW_MSG_HOLD,
+                         ARW_MSG_ANIM);
+            /* cp_beside -- shipped, named, packed, and never loaded until the
+               engine's own trigger for it was read. One per checkpoint, as the
+               car leaves a marker it actually reached. */
+            if (dirarrow_beside_cue(&dir_arrow)) {
+                sfx_cp_beside();
+                rlog("[rccars] beside cp %d (closest %.2f m)\n",
+                     dir_arrow.cp_seen + 1, (double)dir_arrow.cp_min);
+            }
+        }
         /* The start light. dt is 0 while the menu is up, so it holds where it is
            along with everything else -- and since it is what gates the physics
            ticks, the car stays on the line for as long as the menu is open. */
         countdown_step(&countdown, dt);
+
+        /* PAUSE -- message slot 1, priority 9, the highest in the recovered
+           table by a wide margin, so nothing takes the screen off it. HELD
+           rather than re-posted: a re-post of the showing slot is dropped, so
+           posting every frame would make it pulse, and a pause banner that
+           blinks is not a pause banner. See msg_hold, which is the port's.
+
+           Stepped with the REAL frame time, not `dt' -- dt is 0 while the menu
+           is up, which is exactly when this has to keep its life topped up. */
+        if (menu.open) {
+            if (!msg_post(&msgs, MSG_PAUSE, MSG_PAUSE_LIFE, 0.f, 1))
+                msg_hold(&msgs, MSG_PAUSE, MSG_PAUSE_LIFE);
+        }
+        msg_step(&msgs, menu.open ? frame_dt : dt);
+        /* ONE SOUND, on slot 2, which is where the engine hangs its only one
+           (0x4b0301 compares the slot with 2 before playing it). cp_wrongway has
+           been in the bank since audio.c was written with nothing to raise it. */
+        if (msg_cue(&msgs) == MSG_WRONG_WAY) {
+            sfx_wrongway();
+            rlog("[rccars] WRONG WAY (%.1f s facing away, cp %d)\n",
+                 (double)dir_arrow.wrong_t, cps.next + 1);
+        }
         if (countdown.go)
             rlog("[rccars] GO\n");
 
@@ -1237,8 +1538,26 @@ unsigned int acc_ticks = 0;
                     rbcar_clock_reset(&phys_clock);
                     ticks = 0;
                 } else {
-                    ticks = rbcar_step_frame(&rc, &phys_clock, thr, brk, lx,
-                                             vin.boost, dt);
+                    /* THE PROPS AND THE OPPONENTS ADVANCE INSIDE THE TICK LOOP,
+                     * one tick at a time, on the pose the car has just reached.
+                     *
+                     * They used to run after it, once for the whole frame, and
+                     * a frame is up to RBCAR_MAX_CATCHUP ticks: everything that
+                     * collides with the car was therefore tested against the
+                     * pose the car ENDED the frame on, and the 11 to 35 cm it
+                     * covered getting there was never sampled. A Cola can is
+                     * 4.4 cm of proxy -- it was driven straight through, and at
+                     * 20 fps it was missed on every approach line tried. See
+                     * rbcar_step_frame_cb in rbcar.h for the measurement.
+                     *
+                     * ONE tick is 11 cm at the car's own top speed whatever the
+                     * frame rate, which is the whole point of the fixed
+                     * timestep; this just extends it to the things the car runs
+                     * into. */
+                    tick_world.bump = 0.f;
+                    ticks = rbcar_step_frame_cb(&rc, &phys_clock, thr, brk, lx,
+                                                vin.boost, dt, tick_world_step,
+                                                &tick_world);
                 }
                 sceRtcGetCurrentTick(&t_p1);
                 acc_phys += (double)(t_p1.tick - t_p0.tick) / hz;
@@ -1251,7 +1570,6 @@ unsigned int acc_ticks = 0;
                    "Frame pacing" exists to stop. */
                 if (ticks > 0) {
                     int pi;
-                    prop_step(&props, &rc, ticks * RBCAR_TICK_DT);
                     /* The characters advance on the same banked time, and for
                        the same reason. What they read of the car is where it is
                        and how fast: the Dog's vision cone, the Guard's volume
@@ -1281,6 +1599,47 @@ unsigned int acc_ticks = 0;
                            bank for a car hitting a person and inventing one is
                            not this change's business. */
                         char_car_solid(&chars, &rc, NULL);
+                        /*
+                         * AND THEY KICK IT, THROW IT AND SHOOT AT IT. char_step
+                         * decided; this is the only thing that touches the car.
+                         * After char_car_solid deliberately: a swing is not a
+                         * contact and must not be pushed out of one.
+                         */
+                        {
+                            int nr = char_car_react(&chars, &rc);
+                            unsigned int ri;
+                            for (ri = 0; nr && ri < chars.n_inst; ri++)
+                                if (chars.inst[ri].imp_kind == CHR_IMP_SHOT)
+                                    /* car_cdt_bullet -- NOT positional: it is
+                                       the player's own car, which is where the
+                                       engine keeps every car_cdt_* cue.
+                                       sfx_bullet, the report at the muzzle, is
+                                       raised off CHR_EV_SHOOT below.
+
+                                       A kick and a throw get NO cue of their
+                                       own. The engine raises a message instead
+                                       (0x4ad140 with string 0x4e87, and 0x4e86
+                                       for a round) and the port has neither
+                                       string; the character's own voice out of
+                                       CHR_EV_SWING and a car in the air are
+                                       what the player gets, which is more
+                                       acknowledgement than the props had. */
+                                    sfx_bullet_hit();
+                        }
+                        /*
+                         * AND WHILE SOMEONE IS HOLDING IT, THE CAR IS NOT
+                         * SIMULATED -- it is wherever that person's left hand
+                         * is. The engine flips two flags on the car (0x4f3640)
+                         * and writes the pose straight in every frame
+                         * (0x4f3700); here the car's own step above has already
+                         * run and this overwrites its result, which reaches the
+                         * same place: char_carry_car zeroes both momenta, so
+                         * each frame the car starts at rest at last frame's hand
+                         * and the millimetre of gravity it picks up is thrown
+                         * away by the snap.
+                         */
+                        if (char_carrier(&chars) >= 0)
+                            char_carry_car(&chars, &rc);
                         /* char.c raises a cue and this decides what it sounds
                            like -- the same split menu.c keeps from sfx.c. Each
                            is an edge, so a dog barking at a parked car barks
@@ -1303,36 +1662,36 @@ unsigned int acc_ticks = 0;
                                    everything else sounds like a man", which gave
                                    a squashed CRAB a man's voice -- the crab has
                                    an animation for being hit and no sound to go
-                                   with it. See char.c's chr_model_wav. */
+                                   with it. See char.c's chr_model_wav.
+
+                                   FIVE cues reach this now, not three: a Dog
+                                   starting an attack, a Seagull taking off,
+                                   anything run over, a person starting a KICK or
+                                   a THROW, and a Guard opening fire. The last two
+                                   are the port's choice of WHAT to raise -- the
+                                   engine puts a message on screen for them
+                                   (0x4ad140 with string 0x4e87) and no sound at
+                                   all -- and they are the model's own voice
+                                   rather than an invented one, which is the rule
+                                   this comment already existed to enforce. */
                                 sfx_char_wav(chr_model_wav(&chars, ci), p, 1.f);
+                                /* AND A GUARD OPENING FIRE HAS ITS OWN CUE ON
+                                   TOP OF ITS VOICE: `bullet`, which snd.dat
+                                   names and Sound/bullet.wav ships. One report
+                                   per burst rather than per round -- the six are
+                                   0.1 s apart and sfx_bullet rate-limits under
+                                   that, so the burst reads as a burst. */
+                                if (chars.inst[ci].event == CHR_EV_SHOOT)
+                                    sfx_bullet(p);
                             }
                         }
                     }
-                    /* The opponents advance on the same banked ticks, but ONE AT
-                       A TIME rather than on ticks*dt in one go: ai_step's
-                       acceleration limit and cursor walk are written for a 1/60
-                       tick, and handing it 2/60 would quietly halve the
-                       resolution of both. It is cheap enough to loop -- a
-                       polyline walk and a spline lookup per car. */
-                    float ai_bump = 0.f;
-                    for (pi = 0; pi < ticks; pi++) {
-                        float h;
-                        ai_step(&ai, cps.enabled ? &ai_tr : NULL,
-                                rc.body.x[0], rc.body.x[1], rc.body.x[2],
-                                cps.lap, RBCAR_TICK_DT);
-                        /* Solid opponents. Immediately after the step so the
-                           contact sees the pose it just wrote, and inside the
-                           tick loop so a bump is resolved at the rate the
-                           physics runs at rather than once a frame. */
-                        h = ai_collide_player(&ai, &rc, RBCAR_TICK_DT);
-                        if (h > ai_bump)
-                            ai_bump = h;
-                    }
                     /* One cue per frame however many ticks touched, the way the
                        prop hits are one cue per event -- sfx_car_hit rate-limits
-                       itself on top. */
-                    if (ai_bump > 0.f)
-                        sfx_car_hit(ai_bump);
+                       itself on top. tick_world_step collected the hardest
+                       closing speed across the frame's ticks. */
+                    if (tick_world.bump > 0.f)
+                        sfx_car_hit(tick_world.bump);
                     /* Every prop the car just STARTED touching makes its own
                        noise -- stone.sb names a wav per model, see prop_data.h
                        and sfx_prop_hit. prop_t.hit is an EDGE (prop.h) and
@@ -1480,8 +1839,11 @@ unsigned int acc_ticks = 0;
 
             if (use_rb) {
                 /* The game's own follow camera: 0.79 m behind and 0.36 m above,
-                   pulled back with speed and throttle, with the yaw lagging
-                   inside a 20-degree slack window. See cam.c. */
+                   pulled back with speed and throttle, the yaw trailing at no
+                   more than 99 deg/s (30 in a spin), the eye lifted over
+                   anything between it and the car and kept out of the ground,
+                   and the AIM tilted up by VisTurn's 11.82 degrees so the car
+                   sits low in the frame. See cam.c. */
                 cam_update(&rcam, &rc, lx, dt);
 
                 /* the right stick orbits on top of it */
@@ -1550,6 +1912,36 @@ unsigned int acc_ticks = 0;
                          sc ? sc->n_batches : 0u,
                          (sc && sc->has_rig) ? 1 : 0);
                 }
+                /* THE LIGHT UNDER EACH WHEEL, because "the car is too dark"
+                   and "the car does not darken" are the same question asked from
+                   opposite sides and neither can be answered from a screenshot.
+                   Per wheel: whether it is on the ground, and what the level's
+                   lightmap says there. -1.00 means the .col has no byte for that
+                   ground -- an old grid, or a face with no lightmap layer. */
+                {
+                    int wi;
+                    float la, ld, dirv[3];
+                    carlight_terms(&car_lit, car_cam_dist, &la, &ld);
+                    carlight_dir(dirv);
+                    rlog("[rccars] car light: %s  level %.3f (raw %.2f from %d "
+                         "wheels)  ambient %.3f  direct %.3f  cam %.2f m  "
+                         "sun (%.3f %.3f %.3f)  grid %s\n",
+                         carlight_enabled() ? "on" : "OFF",
+                         (double)car_lit.level, (double)car_lit.raw,
+                         car_lit.n_samples, (double)la, (double)ld,
+                         (double)car_cam_dist,
+                         (double)dirv[0], (double)dirv[1], (double)dirv[2],
+                         col.light ? "COL5" : "pre-COL5 (no lightmap bytes)");
+                    for (wi = 0; wi < rc.nwheels && wi < RB_MAX_WHEELS; wi++)
+                        rlog("[rccars]   wheel %d %s  lm %.2f\n", wi,
+                             rc.hit[wi].active ? "down" : "air ",
+                             (double)(rc.hit[wi].active
+                                      ? col_light_at(&col,
+                                                     rc.hit[wi].point[0],
+                                                     rc.hit[wi].point[1],
+                                                     rc.hit[wi].point[2])
+                                      : -1.f));
+                }
                 rlog("[rccars] ---- end of inventory ----\n");
             }
 
@@ -1606,8 +1998,15 @@ unsigned int acc_ticks = 0;
                             top = 0.5f;
                         near_enough = ai_within(&ai, i, eye3[0], eye3[1],
                                                 eye3[2], SFX_AI_RMAX);
+                        /* ...and SILENT over the 3-2-1, for the same reason the
+                           player's is: the engine's motor latch is per car, so
+                           the whole grid is quiet until it is driven. Held off
+                           here rather than by a latch of their own because an
+                           opponent never stands still long enough in a race for
+                           the four-second timeout to be the thing that does it. */
                         sfx_ai_motor(i, a->rb.body.x, a->speed / top,
-                                     near_enough && !menu.open);
+                                     near_enough && !menu.open
+                                     && !countdown_holding(&countdown));
                     }
                 }
             }
@@ -1615,6 +2014,71 @@ unsigned int acc_ticks = 0;
             /* The checkpoint cue used to live here, once a second inside the
                audio block, hung off `next` having changed since the last frame.
                It is up beside cp_step now, on the crossing edge cp_step raises. */
+        }
+
+        /* THE CAR'S OWN LIGHT: one lightmap sample per wheel that is on the
+         * ground, then the engine's own chase toward it. carlight.h has the
+         * whole model and where every number came from; col_light_at is the
+         * query, out of the byte pack_col.py bakes per collision triangle.
+         *
+         * Stepped whether or not `show_vis' is on. SQUARE turns the car's four
+         * EFFECTS off and the light is not one of them -- the menu's "Car
+         * lighting" row is what turns this off, and with it off the step still
+         * runs and costs five grid lookups, which is nothing and keeps the level
+         * warm for the frame it goes back on.
+         *
+         * THE OPPONENTS GET THE SAME FOUR WHEELS. An AI car's contacts are
+         * synthesised rather than solved -- ai_fake_contacts puts the patch one
+         * radius down the strut from the recorded suspension -- but `active' and
+         * `point' are both there and fx.c already emits dust at them, so there
+         * is no reason to ask a coarser question here. What they do NOT get is
+         * the airborne fallback, and that is the engine's own restriction:
+         * 0x005321b1 takes it only for the cars FUN_004870c0(0) and (1) return,
+         * i.e. the two players. An opponent in the air keeps the level it had. */
+        if (use_rb) {
+            /* One car's four wheels, in the order carlight_step wants them.
+               Returns how many are on the ground; a wheel whose ground carries
+               no lightmap byte comes back negative and does not vote. */
+            struct { float s[RB_MAX_WHEELS]; } lm;
+            int k;
+            const float dx = rc.body.x[0] - ex;
+            const float dy = rc.body.x[1] - ey;
+            const float dz = rc.body.x[2] - ez;
+            int n = 0;
+            car_cam_dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            for (k = 0; k < rc.nwheels && k < RB_MAX_WHEELS; k++)
+                if (rc.hit[k].active)
+                    lm.s[n++] = col_light_at(&col, rc.hit[k].point[0],
+                                             rc.hit[k].point[1],
+                                             rc.hit[k].point[2]);
+            /* The player's airborne branch: one sample at the car's own
+               position, a centimetre up (0x005321db's own +0.01). The engine
+               gets there through a 1.5 m sphere query; col_light_at's downward
+               search over the cell is the same question asked the way this port
+               asks it. */
+            carlight_step(&car_lit, car_cam_dist, lm.s, n,
+                          col_light_at(&col, rc.body.x[0], rc.body.x[1] + 0.01f,
+                                       rc.body.x[2]), dt);
+            lit_samples = car_lit.n_samples;
+            for (k = 0; k < ai.n && k < AI_MAX_OPPONENTS; k++) {
+                const rb_car *arb = &ai.car[k].rb;
+                const float ax = arb->body.x[0] - ex;
+                const float ay = arb->body.x[1] - ey;
+                const float az = arb->body.x[2] - ez;
+                int w, an = 0;
+                ai_cam_dist[k] = sqrtf(ax * ax + ay * ay + az * az);
+                /* Skip the sampling entirely for a car the gate will answer 1.0
+                   for anyway -- 25 m out, four grid lookups a car a frame. */
+                if (ai_cam_dist[k] < LIGHT_LM_MAXDIST) {
+                    for (w = 0; w < arb->nwheels && w < RB_MAX_WHEELS; w++)
+                        if (arb->hit[w].active)
+                            lm.s[an++] = col_light_at(&col,
+                                                      arb->hit[w].point[0],
+                                                      arb->hit[w].point[1],
+                                                      arb->hit[w].point[2]);
+                }
+                carlight_step(&ai_lit[k], ai_cam_dist[k], lm.s, an, -1.f, dt);
+            }
         }
 
         /* The dust, the smoke and the tyre marks. All three read the wheel
@@ -1837,6 +2301,17 @@ unsigned int acc_ticks = 0;
                 glRotatef(-veh.roll, 0.f, 0.f, 1.f);
             }
             antenna_apply(&antenna);
+            /* LIT, both passes, and only these two -- the glance below wants its
+               own colour and the world wants none. scene_shade fills each batch's
+               colour buffer out of its normals and the sun in MODEL space;
+               scene_set_lighting is what binds them. */
+            if (carlight_enabled()) {
+                float La, Ld, Lm[3];
+                carlight_terms(&car_lit, car_cam_dist, &La, &Ld);
+                carlight_model_dir(rbcar_matrix(&rc), Lm);
+                scene_shade(&car, Lm, La, Ld);
+                scene_set_lighting(1);
+            }
             scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
             /* The exhaust last, OPAQUE, and with only the ALPHA-TEST REFERENCE
              * moved.
@@ -1865,6 +2340,7 @@ unsigned int acc_ticks = 0;
             glAlphaFunc(GL_GREATER, 0.f);
             scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
             glAlphaFunc(GL_GREATER, 0.5f);
+            scene_set_lighting(0);   /* harmless when it was never turned on */
             /* The glance goes on last, over the paint and the exhaust both --
                EnvMapUpgrades exists precisely because the bolt-on pipe is
                env-mapped too. Inside the same matrix push, because it re-draws
@@ -1872,7 +2348,7 @@ unsigned int acc_ticks = 0;
             if (show_vis && use_rb) {
                 float n3[9];
                 env_normal_matrix(rbcar_matrix(&rc), vpitch, vyaw, n3);
-                envmap_draw(&envmap, &car, n3);
+                envmap_draw(&envmap, &car, n3, car_lit.level);
                 /* Snapshot: draw_ai runs envmap_draw again per opponent and
                    envmap_draw resets its own counters, so the log would report
                    the last opponent's glance as the player's. */
@@ -2024,18 +2500,41 @@ unsigned int acc_ticks = 0;
             race_ui_draw(&race_ui, &st, SCR_W, SCR_H);
         }
 
-        /* HIT, over the world and UNDER the menu -- the menu dims everything
-           behind it, and a word floating over a paused game reads as part of the
-           menu. Its own ortho pass, bracketed by hud_draw itself. */
-        hud_draw(&hud, SCR_W, SCR_H);
+        /* THE DIRECTION ARROW's chevrons -- not a message, and not arbitrated:
+           they sit in arrow.ini's own square at the bottom of the screen and
+           overlap nothing. The WRONG WAY banner that used to be drawn here with
+           them is message slot 2 and goes through the layer below. Its own ortho
+           pass, bracketed by dirarrow_draw itself. */
+        dirarrow_draw(&dir_arrow, SCR_W, SCR_H);
 
-        /* 3, 2, 1, GO! -- likewise over the world and under the menu, and AFTER
-           the HIT banner because the two sit in different vertical bands (band 0
-           against band 1, both the drawer's own) and there is nothing to arbitrate
-           between them. The original has a priority table for exactly that
-           (0x56d2fc, the countdown at 0 and the hit slots at 3) and a queue to
-           apply it to; two messages that cannot overlap need neither. */
-        countdown_draw(&countdown, SCR_W, SCR_H);
+        /* THE MESSAGE LAYER, and ONE message reaches the screen.
+         *
+         * This used to be two unconditional draws with a comment saying that two
+         * messages which cannot overlap need no arbitration. There are five now
+         * -- PAUSE, WRONG WAY and BEST LAP through msg.c, the two hit banners
+         * through hud.c and the five countdown cells through countdown.c -- and
+         * three of them share band 0, so they can and do overlap. The engine has
+         * one message per player and a priority table to pick it (0x56d2fc:
+         * PAUSE 9, FINISH 5, the hit slots 3, everything else 0), and that table
+         * is what decides here.
+         *
+         * hud.c and countdown.c still draw their own geometry -- see msg.h for
+         * why each is held off the layer -- so this hands their SLOT numbers to
+         * the arbiter and then calls whichever one won. Each brackets its own
+         * ortho pass, as before. */
+        {
+            const int want[3] = { msg_contender(&msgs), hud_slot(&hud),
+                                  countdown_slot(&countdown) };
+            const int win = msg_arbitrate(want, 3);
+            if (win >= 0) {
+                if (win == want[0])
+                    msg_draw(&msgs, SCR_W, SCR_H);
+                else if (win == want[1])
+                    hud_draw(&hud, SCR_W, SCR_H);
+                else
+                    countdown_draw(&countdown, SCR_W, SCR_H);
+            }
+        }
 
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)
@@ -2174,6 +2673,18 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                                 oddly" has nothing behind it. See ai.h. */
                              (int)(ai.car[best].bump * 100.f),
                              ai.car[best].airborne ? "  airborne" : "");
+                /* AND WHETHER IT IS STEERING, because `bump` alone cannot tell a
+                   car that was knocked off its line from one that CHOSE to leave
+                   it -- which is the first question about any oddity now that
+                   both are possible. Only when it is, so a quiet field stays
+                   quiet in the log. See ai.h, "the steering decision". */
+                if (ai.car[best].steer_side != 0)
+                    rlog("[rccars] ai: %s is going %s round something --"
+                         " wants %d cm across, holding %d deg\n",
+                         ai.car[best].name,
+                         ai.car[best].steer_side > 0 ? "left" : "right",
+                         (int)(ai.car[best].steer_want * 100.f),
+                         (int)ai.car[best].steer_cmd);
             }
             if (chars.n_inst) {
                 /* The characters, once a second, for the reason the AI line
@@ -2249,6 +2760,26 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                               "glance=%d batches %d tris on %d drawn\n",
                               ai_fx_emitted, ai.n,
                               ai_glance_batches, ai_glance_tris, ai_drawn);
+                /* THE CAR'S LIGHT, with the numbers that would otherwise be
+                   invisible: the lightmap the wheels are actually standing on,
+                   how many of them answered, the level it has chased to, and the
+                   two greys that reach GL. "The car does not darken" is then a
+                   line to read rather than a guess -- raw=-1.00 means the grid
+                   has no lightmap byte for this ground (a pre-COL5 .col, or a
+                   face with no lightmap layer), and samples=0 means no wheel was
+                   on the ground at all. */
+                {
+                    float la, ld;
+                    carlight_terms(&car_lit, car_cam_dist, &la, &ld);
+                    rlog("[rccars] carlight %s  lm raw=%.2f (%d wheels)  "
+                                  "level=%.3f  ambient=%.3f direct=%.3f  "
+                                  "cam=%.2f m\n",
+                                  carlight_enabled() ? "on" : "OFF",
+                                  (double)car_lit.raw, lit_samples,
+                                  (double)car_lit.level,
+                                  (double)la, (double)ld,
+                                  (double)car_cam_dist);
+                }
             }
             t0 = t1;
             frames = 0;

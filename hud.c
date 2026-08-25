@@ -7,6 +7,7 @@
 
 #include "hud.h"
 #include "ui.h"
+#include "hud_data.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -80,6 +81,13 @@ int hud_is_great(const hud_t *h)
     if (!hud_active(h))
         return 0;
     return h->speed >= HUD_GREAT_SPEED || h->count >= HUD_GREAT_COUNT;
+}
+
+int hud_slot(const hud_t *h)
+{
+    if (!hud_active(h))
+        return -1;
+    return hud_is_great(h) ? MSG_GREAT_HIT : MSG_HIT;
 }
 
 void hud_draw(const hud_t *h, int screen_w, int screen_h)

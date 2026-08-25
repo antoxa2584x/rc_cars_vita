@@ -228,6 +228,28 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
         a->duration    = f32[1];
         a->body_dy     = f32[2];
         a->s = (const ai_sample *)(blob + u32[2]);
+        /* THE LEAD-IN, walked once: the polyline from sample 0 to the sample the
+           replay rejoins at. What is left of `path_len` is one lap. See
+           ai_car.lap_len for the measurements and for the bug it fixes. */
+        {
+            int j;
+            double run = 0.0;
+            for (j = 1; j <= a->cycle_start && j < a->n; j++) {
+                double dx = a->s[j].p[0] - a->s[j-1].p[0];
+                double dy = a->s[j].p[1] - a->s[j-1].p[1];
+                double dz = a->s[j].p[2] - a->s[j-1].p[2];
+                run += sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            a->lead_in = (float)run;
+            a->lap_len = a->path_len - a->lead_in;
+            /* A profile whose cycle starts at 0, or a hand-edited one whose
+               lead-in swallows the path: the whole polyline is the lap, which is
+               what this did before the distinction existed. */
+            if (!(a->lap_len > 1e-3f)) {
+                a->lead_in = 0.0f;
+                a->lap_len = a->path_len;
+            }
+        }
         /* FUN_004fd6b0 indexes the spline family by the opponent's own slot and
            falls back to slot 0 outside 0..4. Keep the FILE's slot, not the
            surviving-car index: the curves get progressively stronger down the
@@ -258,9 +280,10 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
     for (i = 0; i < (unsigned)ai->n; i++) {
         const ai_car *a = &ai->car[i];
         rlog("  slot %d %-10s %-16s car %d  %d samples  cycle %d  %.0f m"
-             "  %.1f s  b%d r%d t%d\n",
+             " (lead %.1f + lap %.0f)  %.1f s  b%d r%d t%d\n",
              a->slot, a->name, a->path, a->car, a->n, a->cycle_start,
-             a->path_len, a->duration, a->boost, a->reson, a->tires);
+             a->path_len, a->lead_in, a->lap_len,
+             a->duration, a->boost, a->reson, a->tires);
     }
     return ai->n;
 }
@@ -592,6 +615,388 @@ static void ai_bump_clamp(ai_car *a)
     }
 }
 
+/* ------------------------------------------------------- the steering decision
+ *
+ * See ai.h, "the steering decision", for what this is and what it deliberately
+ * is not. Everything here writes `steer_want`, `steer_cmd` and their hysteresis
+ * and NOTHING ELSE -- the replay, the cursor, the lap and the rubber band are
+ * out of reach from this file section by construction.
+ */
+
+/* FUN_00410150: the signed angle between two vectors, in DEGREES, both flattened
+ * into XZ. acos of the normalised dot, negated when cross(a, b).y < 0.
+ *
+ * With the port's own convention (+X is LEFT) a POSITIVE angle means `b` is to
+ * the left of `a`, and a positive steer angle points the wheels left, so the
+ * sign crosses into the controller unchanged. */
+static float ai_signed_angle(const float a[3], const float b[3])
+{
+    double ax = a[0], az = a[2], bx = b[0], bz = b[2];
+    double la = sqrt(ax * ax + az * az), lb = sqrt(bx * bx + bz * bz);
+    double d, ang;
+
+    if (la < 1e-6 || lb < 1e-6)
+        return 0.0f;
+    d = (ax * bx + az * bz) / (la * lb);
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    ang = acos(d) * (180.0 / 3.14159265358979);
+    if (az * bx - ax * bz < 0.0)          /* cross(a, b).y */
+        ang = -ang;
+    return (float)ang;
+}
+
+/* The point `m` metres further along the recorded polyline than the cursor is --
+ * FUN_004fda90's lookahead, walked on the same metric ai_advance walks and
+ * wrapping at the same `cycle_start` ai_advance wraps at, so the point ahead of
+ * a car about to close its lap is on the lap and not off the end of the array.
+ *
+ * READ ONLY: it takes a copy of (cursor, u) and never writes them back. -> 0 on
+ * a profile too short to have a segment. */
+static int ai_path_ahead(const ai_car *a, float m, float out[3])
+{
+    int c = a->cursor, guard = 0;
+    float u = a->u;
+
+    if (!a->s || a->n < 2)
+        return 0;
+    if (c < 1)
+        c = 1;
+    for (;;) {
+        float seg = seg_len(a, c);
+        float rem = (1.0f - u) * seg;
+
+        if (m <= rem || guard > a->n) {
+            float t = (seg > AI_EPS) ? u + m / seg : 1.0f;
+            const float *p0 = a->s[c - 1].p, *p1 = a->s[c].p;
+            int k;
+            if (t > 1.0f) t = 1.0f;
+            for (k = 0; k < 3; k++)
+                out[k] = p0[k] + (p1[k] - p0[k]) * t;
+            return 1;
+        }
+        m -= rem;
+        u = 0.0f;
+        c++;
+        if (c >= a->n)
+            c = a->cycle_start > 0 ? a->cycle_start : 1;
+        guard++;
+    }
+}
+
+/* One car's proxy reach, which is what `bump_limit` is two of (ai_bump_derive).
+ * Kept as one expression so the two places that need it cannot disagree. */
+static float ai_reach(const ai_car *a)
+{
+    return a->bump_limit * (1.0f / AI_BUMP_LIMIT_REACH);
+}
+
+/* How much room this opponent wants between itself and `other`, centre to
+ * centre: both proxies, plus one of its own WHEELS of daylight.
+ *
+ * The margin is THE PORT'S and the wheel radius is the car's own recovered
+ * number rather than a typed-in gap. Proxies exactly touching is not a pass, it
+ * is a scrape -- the contact solve would fire on it every tick of the overtake
+ * -- and a wheel's width is the smallest real dimension the car carries. */
+static float ai_steer_clearance(const ai_car *a, float other_reach)
+{
+    return ai_reach(a) + other_reach + RB_CARS[a->car].radius;
+}
+
+/* Nothing decided, and exactly nothing -- an opponent with an empty corridor has
+   to be bit-identical to one from before this existed. */
+static void ai_steer_clear(ai_car *a)
+{
+    a->steer_want = a->steer_cmd = a->steer_hold = 0.0f;
+    a->steer_side = 0;
+    a->steer_left[0] = a->steer_left[1] = a->steer_left[2] = 0.0f;
+}
+
+/* THE DECISION. Once per tick per car, before the spring, after the pose.
+ *
+ * `px/py/pz` is the player, which ai_step is handed as a position; the other
+ * opponents are read off `ai` directly. */
+static void ai_steer_decide(ai_t *ai, int idx, float px, float py, float pz,
+                            float dt)
+{
+    ai_car *a = &ai->car[idx];
+    (void)py;
+
+    if (ai->steer_off) {
+        ai_steer_clear(a);
+        return;
+    }
+    float look[3], fwd[3], left[3], fl;
+    float best_lat = 0.0f, best_need = 0.0f, clear = 0.0f;
+    float want, tgt[3], dir[3], ang, step, horizon;
+    int blocked = 0, side, j, k;
+
+    if (!ai_path_ahead(a, AI_STEER_LOOKAHEAD, look)) {
+        ai_steer_clear(a);
+        return;
+    }
+
+    /* The recorded frame: forward is the chord to the lookahead point, left is
+       its XZ perpendicular. +X is LEFT, so for fwd = (0,0,1) this is (1,0,0). */
+    fwd[0] = look[0] - a->rec_x[0];
+    fwd[1] = 0.0f;
+    fwd[2] = look[2] - a->rec_x[2];
+    fl = (float)sqrt((double)fwd[0] * fwd[0] + (double)fwd[2] * fwd[2]);
+    if (fl < 1e-4f) {
+        ai_steer_clear(a);
+        return;
+    }
+    fwd[0] /= fl;
+    fwd[2] /= fl;
+    left[0] =  fwd[2];
+    left[1] =  0.0f;
+    left[2] = -fwd[0];
+    memcpy(a->steer_left, left, sizeof(left));
+
+    /* WHAT IS IN THE NEXT 2.7 METRES OF ROAD. Measured from the car's own
+     * RECORDED position, so the corridor is the line it is going to drive and
+     * not the one a shove has put it on -- a car knocked wide must still avoid
+     * what is on its line, and must not invent an obstacle out of the shove.
+     *
+     * ENGAGING AND RELEASING ARE DIFFERENT TESTS, and making them the same one
+     * is the whole of a weave. A car engages when something is within `c` of its
+     * line; if it then released on the same test it would release the instant it
+     * had moved far enough -- which is to say the instant the avoidance WORKED --
+     * swing back onto the line, find the obstacle there again, and re-engage,
+     * possibly on the other side. Measured before this: five changes of side and
+     * ELEVEN contact ticks passing a parked player, against one for a car that
+     * did not steer at all. So a car that has committed keeps its hazard until
+     * the thing is BEHIND it, whatever its lateral distance has become. */
+    /* THE HORIZON: 2.7 m of road at the speed this car is being played back at.
+     *
+     * NO SPEED FLOOR, and that is not a division guard, it is the rule. A car
+     * that is not moving has no line to change and nothing it is about to reach;
+     * with a floor of 1 m/s the horizon at a standing start comes out at 2.7
+     * SECONDS, which is long enough for the grid -- three cars 0.74 m apart,
+     * closing at 6 cm/s because their three recordings drift together -- to
+     * predict a collision and swerve apart before the lights go out. At racing
+     * speed it is 0.45 s, which is what "about to hit it" should mean. */
+    if (a->speed < AI_STEER_MIN_SPEED) {
+        ai_steer_clear(a);
+        return;
+    }
+    horizon = AI_STEER_LOOKAHEAD / a->speed;
+    /* AND NEVER FURTHER AHEAD THAN THE CAR COULD ACT. 2.7 m of road is 0.45 s at
+     * racing speed and the whole of a lap at walking pace, and a horizon that
+     * long turns the 6 cm/s with which two nose-to-tail recordings drift
+     * together into a predicted collision. AI_STEER_SETTLE is the offset
+     * spring's own settling time -- three time constants of `bump_w`, 0.92 s on
+     * an Overkill -- which is how long a lane change actually takes: looking
+     * further ahead than you could finish acting on is not foresight. */
+    {
+        float settle = AI_STEER_SETTLE / a->bump_w;
+        if (horizon > settle)
+            horizon = settle;
+    }
+    for (j = -1; j < ai->n; j++) {
+        const float *ov;
+        float rel[3], vel[3], ahead, lat, need, c;
+        double rr, rl, vr, vl, vv, tca, sa, sl;
+        float other_reach;
+
+        if (j == idx)
+            continue;
+        if (j < 0) {
+            other_reach = ai->player_reach > 1e-3f ? ai->player_reach
+                                                   : ai_reach(a);
+            c = ai_steer_clearance(a, other_reach);
+            rel[0] = px - a->rec_x[0];
+            rel[2] = pz - a->rec_x[2];
+            ov = ai->player_v;
+        } else {
+            /* THE OTHER OPPONENT'S ACTUAL POSE, offset and all: where it IS is
+               what has to be driven round, and it is the one place in this
+               decision that reads anything but a recording. */
+            const float *op = ai->car[j].rb.body.x;
+            other_reach = ai_reach(&ai->car[j]);
+            c = ai_steer_clearance(a, other_reach);
+            rel[0] = op[0] - a->rec_x[0];
+            rel[2] = op[2] - a->rec_x[2];
+            ov = ai->car[j].rb.body.v;
+        }
+        rel[1] = 0.0f;
+        /* Relative velocity in the recorded frame. This car's own is its
+           commanded speed straight down the path -- which is what the recording
+           is about to do, and the only prediction of it there is. */
+        vel[0] = ov[0] - fwd[0] * a->speed;
+        vel[2] = ov[2] - fwd[2] * a->speed;
+
+        ahead = rel[0] * fwd[0]  + rel[2] * fwd[2];
+        lat   = rel[0] * left[0] + rel[2] * left[2];
+        if (ahead > AI_STEER_LOOKAHEAD + c)
+            continue;                        /* further up the road than this */
+
+        if (a->steer_side != 0) {
+            /* COMMITTED: it stays the hazard until it is properly BEHIND, one
+               clearance back -- when the centres are level the two cars are
+               still alongside, and one that comes back onto the line there
+               sideswipes what it has just passed. Lateral distance is not
+               consulted at all: it is small BECAUSE the avoidance is working. */
+            if (ahead < -c)
+                continue;
+            need = c - (lat < 0.0f ? -lat : lat);
+            if (need <= 0.0f)
+                need = 1e-4f;
+            if (need > best_need) {
+                best_need = need;
+                best_lat = lat;
+                clear = c;
+                blocked = 1;
+            }
+            continue;
+        }
+
+        /* ENGAGING: not "is it near my line" but "AM I GOING TO HIT IT" -- the
+         * closest approach of the two, over the lookahead's own span of time.
+         *
+         * The difference is the whole start of a race. The field lines up on a
+         * grid 0.74 m apart and the three recordings then run nose to tail for a
+         * whole lap, because three humans drove them on three different
+         * afternoons and never met. Anything that engages on proximity has every
+         * follower swerving to its full 0.66 m budget for the entire race, and
+         * swerving at a car it was never going to reach. Two cars holding
+         * station never close, so their closest approach is where they already
+         * are, and nothing fires.
+         *
+         * AI_STEER_LOOKAHEAD is the horizon, in the units it was recovered in:
+         * 2.7 m of road at the speed this car is being played back at. */
+        rr = ahead;   rl = lat;
+        vr = vel[0] * fwd[0]  + vel[2] * fwd[2];
+        vl = vel[0] * left[0] + vel[2] * left[2];
+        vv = vr * vr + vl * vl;
+        tca = vv > 1e-9 ? -(rr * vr + rl * vl) / vv : 0.0;
+        if (tca < 0.0) tca = 0.0;
+        if (tca > horizon) tca = horizon;
+        sa = rr + vr * tca;
+        sl = rl + vl * tca;
+        if (tca <= 1e-6) {
+            /* NOT CLOSING -- the closest they get is where they already are. Two
+             * cars HOLDING STATION are not a hazard however close the station
+             * is, and that case is the whole race: three recordings driven on
+             * three different afternoons run nose to tail 0.74 m apart for a
+             * lap, which is 0.13 m of daylight between two proxies and well
+             * inside `c`. Engaging on it puts every follower at its full 0.66 m
+             * of offset from the lights to the flag. So the only thing that
+             * counts here is proxies ACTUALLY touching, with no margin. */
+            double touch = ai_reach(a) + other_reach;
+            if (rr * rr + rl * rl >= touch * touch)
+                continue;
+        } else if (sa * sa + sl * sl >= (double)c * c) {
+            continue;                    /* they never get inside each other */
+        }
+        /* And it has to be IN FRONT when they meet: a car closing from behind is
+           overtaking THIS one, and getting out of its way is its own business. */
+        if (sa < 0.0)
+            continue;
+        need = c - (float)sqrt(rl * rl);
+        if (need <= 0.0f)
+            need = (float)(c - sqrt(sl * sl));
+        if (need <= 0.0f)
+            need = 1e-4f;
+        if (need > best_need) {
+            best_need = need;
+            best_lat = (float)(sl != 0.0 ? sl : rl);
+            clear = c;
+            blocked = 1;
+        }
+    }
+
+    /* THE COMMITMENT. AI_STEER_HOLD is how long the last decision outlives the
+       last tick that still saw the obstacle at all. */
+    if (blocked) {
+        side = a->steer_side;
+        if (side == 0)
+            side = best_lat >= 0.0f ? -1 : 1;   /* go where it is not */
+        want = best_lat + (float)side * clear;
+        /* If that side cannot be reached inside the offset budget, try the
+           other one before settling for a pass that does not clear. */
+        if ((want < 0.0f ? -want : want) > a->bump_limit) {
+            float alt = best_lat - (float)side * clear;
+            if ((alt < 0.0f ? -alt : alt) <= a->bump_limit) {
+                side = -side;
+                want = alt;
+            } else {
+                want = want < 0.0f ? -a->bump_limit : a->bump_limit;
+            }
+        }
+        a->steer_side = side;
+        a->steer_hold = AI_STEER_HOLD;
+        a->steer_want = want;
+    } else if (a->steer_hold > 0.0f) {
+        a->steer_hold -= dt;
+        if (a->steer_hold <= 0.0f) {
+            a->steer_hold = 0.0f;
+            a->steer_side = 0;
+            a->steer_want = 0.0f;
+        }
+        /* else: hold `steer_want`, which is a LATERAL SCALAR and so stays
+           correct as the frame turns through a corner. Storing the world vector
+           instead would hold a line that is right only where it was decided. */
+    } else {
+        a->steer_side = 0;
+        a->steer_want = 0.0f;
+    }
+
+    /* IS THE MOVE WORTH MAKING? The recovered controller's +-0.5 degree deadband,
+     * asked of the same quantity it is a deadband on: the signed angle from the
+     * recorded heading to the target point, FUN_00410150 over FUN_004fda90's own
+     * 2.7 m lookahead. Inside it the target is straight ahead and there is
+     * nothing to steer for. */
+    for (k = 0; k < 3; k++)
+        tgt[k] = look[k] + left[k] * a->steer_want;
+    dir[0] = tgt[0] - a->rec_x[0];
+    dir[1] = 0.0f;
+    dir[2] = tgt[2] - a->rec_x[2];
+    ang = ai_signed_angle(fwd, dir);
+    if ((ang < 0.0f ? -ang : ang) < AI_STEER_DEADBAND) {
+        a->steer_want = 0.0f;
+        a->steer_side = 0;
+    }
+
+    /* WHICH WAY THE CAR POINTS, and it is a MEASUREMENT rather than a servo.
+     *
+     * FUN_004fddd0's steer is the output of a loop closed on a body it
+     * integrates; there is no body to close a loop on here, and the first
+     * attempt -- hold the heading offset AT the angle to the target, measured
+     * from the recorded forward -- was wrong in both the ways that shape can be.
+     * It never zeroed, because a car that has finished crossing and is running
+     * parallel on the new line still reads a constant angle to a target beside
+     * its recorded position; and it wound up, because the yaw spring's
+     * acceleration cap clips the damping term along with the restoring one, so a
+     * large standing error drives it bang-bang and it overshot to the full
+     * 30-degree stop while the command said 13.8 the other way.
+     *
+     * What a car's heading actually is, with no slip, is the direction it is
+     * travelling: the lateral rate the spring is producing over the forward
+     * speed the recording is being played at. It is zero when the car is on a
+     * line and zero again when it has reached a new one, it cannot wind up
+     * because nothing integrates it, and it costs an atan2.
+     *
+     * The recovered lock and rate limit still do their own work on top: 35
+     * degrees is as far over as the controller may ask, and 90 deg/s is how fast
+     * the nose may swing -- which is what stops a car snapping straight when the
+     * spring's velocity changes sign. */
+    {
+        float vlat = a->offv[0] * left[0] + a->offv[2] * left[2];
+        float v = a->speed > 1.0f ? a->speed : 1.0f;
+        ang = (float)(atan2((double)vlat, (double)v)
+                      * (180.0 / 3.14159265358979));
+    }
+    if ((ang < 0.0f ? -ang : ang) < AI_STEER_DEADBAND)
+        ang = 0.0f;
+    if (ang >  AI_STEER_LOCK) ang =  AI_STEER_LOCK;
+    if (ang < -AI_STEER_LOCK) ang = -AI_STEER_LOCK;
+    step = AI_STEER_RATE * dt;
+    if (ang > a->steer_cmd + step)      a->steer_cmd += step;
+    else if (ang < a->steer_cmd - step) a->steer_cmd -= step;
+    else                                a->steer_cmd = ang;
+}
+
 /* The return to the line: a critically damped spring on the horizontal offset
  * and on the yaw, capped at what the car's tyres could actually pull with.
  *
@@ -600,21 +1005,44 @@ static void ai_bump_clamp(ai_car *a)
  * bump that arrives while it is already moving back can ask for several times
  * that, and a car that recovers harder than it could corner is the thing that
  * would read as a rubber band rather than as driving. */
-static void ai_bump_relax(ai_car *a, float dt)
+static void ai_bump_relax(ai_car *a, float dt, const float want[3],
+                          float yaw_want)
 {
     double k, c, ax, ay, az, mag, aw, cap_w;
+    double ex, ey, ez, eyaw;
 
+    /* THE SPRING'S TARGET IS THE DECISION, and zero when there is none.
+     *
+     * `want` is what ai_steer_decide chose -- a lateral offset that clears
+     * whatever is in the next 2.7 m of road -- and `yaw_want` the heading that
+     * goes with it. NOT A SECOND MECHANISM: the frequency, the damping, the grip
+     * cap and the limits below are the bump's own, every constant unchanged, and
+     * all that moves is where the spring is pulling to. An opponent moves over
+     * no harder than `coeff_rear_tires * RB_GRAVITY` lets it, which is the whole
+     * of why a decision it makes is one it could actually execute.
+     *
+     * With nothing in the way `want` and `yaw_want` are exactly zero and every
+     * line below is the arithmetic it was before this existed -- including the
+     * early return, which is what keeps an unobstructed opponent bit-identical.
+     */
     if (a->off[0] == 0.0f && a->off[1] == 0.0f && a->off[2] == 0.0f
         && a->offv[0] == 0.0f && a->offv[1] == 0.0f && a->offv[2] == 0.0f
-        && a->off_yaw == 0.0f && a->off_yawv == 0.0f)
+        && a->off_yaw == 0.0f && a->off_yawv == 0.0f
+        && want[0] == 0.0f && want[1] == 0.0f && want[2] == 0.0f
+        && yaw_want == 0.0f)
         return;                        /* on its line: exactly the recording */
 
     k = (double)a->bump_w * a->bump_w;
     c = 2.0 * a->bump_w;
 
-    ax = -(k * a->off[0] + c * a->offv[0]);
-    ay = -(k * a->off[1] + c * a->offv[1]);
-    az = -(k * a->off[2] + c * a->offv[2]);
+    ex = (double)a->off[0] - want[0];
+    ey = (double)a->off[1] - want[1];
+    ez = (double)a->off[2] - want[2];
+    eyaw = (double)a->off_yaw - yaw_want;
+
+    ax = -(k * ex + c * a->offv[0]);
+    ay = -(k * ey + c * a->offv[1]);
+    az = -(k * ez + c * a->offv[2]);
     mag = sqrt(ax * ax + ay * ay + az * az);
     if (mag > (double)a->bump_accel && mag > 1e-9) {
         double s = (double)a->bump_accel / mag;
@@ -641,7 +1069,7 @@ static void ai_bump_relax(ai_car *a, float dt)
        over the proxy's reach -- the same tyre force, applied at the end of the
        same lever. */
     cap_w = (double)a->bump_accel / ((double)a->bump_limit * 0.5);
-    aw = -(k * a->off_yaw + c * a->off_yawv);
+    aw = -(k * eyaw + c * a->off_yawv);
     if (aw >  cap_w) aw =  cap_w;
     if (aw < -cap_w) aw = -cap_w;
     a->off_yawv = (float)((double)a->off_yawv + aw * dt);
@@ -651,15 +1079,21 @@ static void ai_bump_relax(ai_car *a, float dt)
     /* SNAP TO EXACTLY ZERO. See AI_BUMP_SNAP: a recovered opponent has to become
        the same car it was before it was touched, or the pose carries a
        micrometre of displacement for the rest of the race and ai_bump_apply
-       keeps probing the ground for it. */
-    if (mag < AI_BUMP_SNAP
+       keeps probing the ground for it.
+
+       NOT WHILE A DECISION IS STANDING. Snapping to zero against a non-zero
+       target is the spring being told to go somewhere and then teleported home,
+       once a tick, for as long as the car is holding a line round something. */
+    if (want[0] == 0.0f && want[1] == 0.0f && want[2] == 0.0f
+        && mag < AI_BUMP_SNAP
         && fabs((double)a->offv[0]) < AI_BUMP_SNAP_V
         && fabs((double)a->offv[1]) < AI_BUMP_SNAP_V
         && fabs((double)a->offv[2]) < AI_BUMP_SNAP_V) {
         a->off[0] = a->off[1] = a->off[2] = 0.0f;
         a->offv[0] = a->offv[1] = a->offv[2] = 0.0f;
     }
-    if (fabs((double)a->off_yaw) < AI_BUMP_SNAP_YAW
+    if (yaw_want == 0.0f
+        && fabs((double)a->off_yaw) < AI_BUMP_SNAP_YAW
         && fabs((double)a->off_yawv) < AI_BUMP_SNAP_YAWV)
         a->off_yaw = a->off_yawv = 0.0f;
 }
@@ -863,7 +1297,6 @@ void ai_reset(ai_t *ai)
            first query searches the whole of it. 0 is a VALID arc position (the
            start line), which is why this is negative and not zero. */
         a->spine_at = -1.0f;
-        a->spine_lap = 0;
         a->cp = 0;
         a->coeff = ai->coeff_static;
         a->speed = 0.0f;
@@ -874,10 +1307,14 @@ void ai_reset(ai_t *ai)
         a->off_yaw = a->off_yawv = 0.0f;
         a->off_gnd = a->off_gnd_at[0] = a->off_gnd_at[1] = 0.0f;
         a->bump = 0.0f;
+        /* And its decision with it: a car re-gridded still holding a side would
+           set off round an obstacle that is no longer there. */
+        ai_steer_clear(a);
         ai_pose(a);
         a->speed_rec = sample_speed(a, 0);
         rb_boost_reset(&a->rb);
     }
+    ai->player_reach = 0.0f;
     ai->player_dist = 0.0f;
     ai->player_at = -1.0f;
     ai->player_at_proj = -1.0f;
@@ -1041,6 +1478,20 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
     if (!ai || ai->n <= 0 || dt <= 0.0f)
         return;
 
+    /* THE PLAYER'S VELOCITY, for the steering decision's closing test -- see
+       ai_t.player_v. First tick is a standing start by definition. */
+    if (ai->player_seen && dt > 1e-6f) {
+        ai->player_v[0] = (px - ai->player_prev[0]) / dt;
+        ai->player_v[1] = (py - ai->player_prev[1]) / dt;
+        ai->player_v[2] = (pz - ai->player_prev[2]) / dt;
+    } else {
+        ai->player_v[0] = ai->player_v[1] = ai->player_v[2] = 0.0f;
+        ai->player_seen = 1;
+    }
+    ai->player_prev[0] = px;
+    ai->player_prev[1] = py;
+    ai->player_prev[2] = pz;
+
     if (tr && tr->spine)
         have_spine = tr->spine(tr->ctx, px, py, pz, ai->player_at, &pdist, &pcp);
     /* THE PLAYER'S PROGRESS, off the LATCHED checkpoint index rather than off a
@@ -1116,8 +1567,11 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
              * distance STORED on each racer's record rather than re-deriving them
              * from a position -- and it is why the projection's 4-to-16 jumps a
              * lap never reach the placing. */
-            a->spine_dist = (a->path_len > 1e-3f)
-                            ? a->dist * (tr->spine_len / a->path_len)
+            /* BY THE LAP, NOT BY THE POLYLINE. `path_len` is the lead-in plus
+               the lap (ai_car.lap_len), so dividing by it made every lap after
+               the first 1.8% to 3.8% short and compounding. */
+            a->spine_dist = (a->lap_len > 1e-3f)
+                            ? a->dist * (tr->spine_len / a->lap_len)
                             : adist;
             a->lead = a->spine_dist - ai->player_dist;
             gap = ai->player_cp - acp;    /* FUN_004fd5e0's iVar2 */
@@ -1159,11 +1613,28 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
         ai_throttle(a);
         rb_wheel_spin_update(&a->rb, dt);
 
-        /* THE PORT'S: work off whatever the last tick's contacts left in the
-         * offset and put the car back where that says it is. Last, so
-         * everything above -- the cursor, the lead, the recorded speed, the
-         * wheel spin -- is measured on the recording and not on the shove. */
-        ai_bump_relax(a, dt);
+        /* THE PORT'S: decide, then work off whatever the last tick's contacts
+         * left in the offset and put the car back where that says it is. Last,
+         * so everything above -- the cursor, the lead, the recorded speed, the
+         * wheel spin -- is measured on the recording and not on the shove or on
+         * the line the car has chosen. */
+        {
+            float want[3];
+            /* THE DECISION, on the pose ai_pose has just written -- so the
+               lookahead is off this tick's cursor and the obstacles are where
+               they are now. See ai.h, "the steering decision". */
+            ai_steer_decide(ai, i, px, py, pz, dt);
+            /* The lateral scalar becomes a world vector against the SAME frame
+               the decision was taken in -- ai_car.steer_left, which the decision
+               left there. Kept as a scalar plus an axis rather than as a world
+               vector so a held decision stays ACROSS the line as the line turns
+               through a corner. */
+            want[0] = a->steer_left[0] * a->steer_want;
+            want[1] = 0.0f;
+            want[2] = a->steer_left[2] * a->steer_want;
+            ai_bump_relax(a, dt, want,
+                          (float)(a->steer_cmd * (3.14159265358979 / 180.0)));
+        }
         ai_bump_apply(a);
     }
 
@@ -1201,31 +1672,57 @@ static int ai_touch_list(const float as[][4], int na,
                          const float bs[][4], int nb,
                          ai_touch *t, int max)
 {
-    int p, o, nt = 0;
+    int p, o, nt = 0, shallow = 0;
 
-    for (p = 0; p < na && nt < max; p++) {
-        for (o = 0; o < nb && nt < max; o++) {
+    /* THE LIST IS THE DEEPEST `max` PAIRS, NOT THE FIRST `max`. Two proxies are
+     * 13 spheres each -- 15 on the Hummer -- so up to 195 pairs can overlap at
+     * once, and the loop below enumerates them wheels-first. Stopping at the
+     * first `max` therefore filled the list with WHEEL pairs and dropped the
+     * body ones, and since the positional half works on the deepest entry it
+     * was depenetrating a pair that was not the worst one. Measured on
+     * country_1's field: the truncated list understated the true overlap by up
+     * to 8 mm on the ticks where more than `max` pairs were touching.
+     *
+     * `shallow` tracks the current weakest entry so a full list costs one
+     * comparison per new pair rather than a rescan. */
+    for (p = 0; p < na; p++) {
+        for (o = 0; o < nb; o++) {
             double ex = (double)as[p][0] - bs[o][0];
             double ey = (double)as[p][1] - bs[o][1];
             double ez = (double)as[p][2] - bs[o][2];
             double d2 = ex * ex + ey * ey + ez * ez;
             double sum = (double)as[p][3] + bs[o][3];
-            double len, inv;
+            double len, inv, depth;
+            int at;
 
             if (d2 >= sum * sum || d2 < 1e-12)
                 continue;
             len = sqrt(d2);
+            depth = sum - len;
+            if (nt < max) {
+                at = nt++;
+            } else if ((double)t[shallow].depth < depth) {
+                at = shallow;
+            } else {
+                continue;
+            }
             inv = 1.0 / len;
-            t[nt].normal[0] = (float)(ex * inv);
-            t[nt].normal[1] = (float)(ey * inv);
-            t[nt].normal[2] = (float)(ez * inv);
+            t[at].normal[0] = (float)(ex * inv);
+            t[at].normal[1] = (float)(ey * inv);
+            t[at].normal[2] = (float)(ez * inv);
             /* The contact point on B's surface, which is what both lever arms
                are measured from. */
-            t[nt].point[0] = (float)(bs[o][0] + t[nt].normal[0] * bs[o][3]);
-            t[nt].point[1] = (float)(bs[o][1] + t[nt].normal[1] * bs[o][3]);
-            t[nt].point[2] = (float)(bs[o][2] + t[nt].normal[2] * bs[o][3]);
-            t[nt].depth = (float)(sum - len);
-            nt++;
+            t[at].point[0] = (float)(bs[o][0] + t[at].normal[0] * bs[o][3]);
+            t[at].point[1] = (float)(bs[o][1] + t[at].normal[1] * bs[o][3]);
+            t[at].point[2] = (float)(bs[o][2] + t[at].normal[2] * bs[o][3]);
+            t[at].depth = (float)depth;
+            if (nt == max) {
+                int c;
+                shallow = 0;
+                for (c = 1; c < nt; c++)
+                    if (t[c].depth < t[shallow].depth)
+                        shallow = c;
+            }
         }
     }
     return nt;
@@ -1375,6 +1872,97 @@ static int ai_pair_resolve(ai_actor *A, ai_actor *B,
         if (t[i].depth > t[deep].depth)
             deep = i;
 
+    /* THE VELOCITY HALF RUNS FIRST, ON THE CONTACTS THAT ARE ACTUALLY THERE.
+     *
+     * It used to run last, over the SAME `t` the positional half had just spent
+     * up to AI_DEPEN_PASSES moving both bodies out of: by the time the impulses
+     * were applied their points and normals described geometry that no longer
+     * existed, and the solve drove stale contacts to +0.05 m/s of separation
+     * anyway. That is energy injected along a direction nothing is touching in,
+     * which is the "jelly" half of the reported feel.
+     *
+     * Re-gathering after the push instead of reordering does not work, and the
+     * reason is RB_PENETRATION_SLACK: the positional half leaves the pair one
+     * millimetre APART, so a re-gather finds no contact at all and the pair
+     * would exchange no impulse whatever -- two cars passing through each other
+     * with a shove that never happened. Velocities are what the moment of
+     * contact is about and positions are the cleanup, so the order is the one
+     * that keeps both honest.
+     *
+     * `impact` is the sound's, and this is now genuinely the pre-solve closing
+     * speed rather than the speed left after eight positional passes. */
+    /* THE VELOCITY HALF. Same ten passes, same 0.02 gate, same 0.05 m/s target
+     * as rb_coll_resolve; the denominator is the PAIR's, so the impulse delivers
+     * its dv across both bodies rather than all of it into one. */
+    for (pass = 0; pass < AI_CONTACT_PASSES; pass++) {
+        int any = 0;
+        for (i = 0; i < nt; i++) {
+            float va[3], vb[3], j[3], sn[3];
+            double vrel, dv, k;
+
+            /* THE DIRECTION THE CONTACT IS SOLVED ALONG, which is the contact
+             * normal for a ride-over and the normal FLATTENED for a graze --
+             * AI_TOP_COS, the same 46-degree floor cone the positional half
+             * asks the same question with.
+             *
+             * This one is a momentum LEAK and not merely a lift. An impulse is
+             * equal and opposite, so the vertical shares cancel between the two
+             * cars -- but ai_take_impulse ends in ai_bump_clamp, and a car
+             * already on AI_BUMP_MAX_SINK's one-centimetre floor has its
+             * downward share DELETED there. Ten Gauss-Seidel passes a tick,
+             * each throwing away one side of a cancelling pair, and what is left
+             * is a pair of cars with net upward momentum that neither of them
+             * was given. Measured on country_1 before this: BOTH cars of a
+             * grinding pair went from 0.06 m to 0.27 m of lift in three ticks,
+             * together, which the positional half cannot do at all -- it lifts
+             * one car, never two.
+             *
+             * Flattening costs nothing a graze should have: the pair is beside
+             * itself on the ground, the ground is what holds both cars up, and
+             * this solve cannot see it. A real ride-over keeps the full normal
+             * and its full vertical response. */
+            if (fabs((double)t[i].normal[1]) >= AI_TOP_COS) {
+                sn[0] = t[i].normal[0];
+                sn[1] = t[i].normal[1];
+                sn[2] = t[i].normal[2];
+            } else {
+                double nh = sqrt((double)t[i].normal[0] * t[i].normal[0]
+                               + (double)t[i].normal[2] * t[i].normal[2]);
+                if (nh < 1e-4)
+                    continue;
+                sn[0] = (float)((double)t[i].normal[0] / nh);
+                sn[1] = 0.0f;
+                sn[2] = (float)((double)t[i].normal[2] / nh);
+            }
+
+            ai_actor_point_vel(A, t[i].point, va);
+            ai_actor_point_vel(B, t[i].point, vb);
+            vrel = (double)(va[0] - vb[0]) * sn[0]
+                 + (double)(va[1] - vb[1]) * sn[1]
+                 + (double)(va[2] - vb[2]) * sn[2];
+            if (vrel > AI_CONTACT_VREL)
+                continue;
+            if (pass == 0 && impact && -vrel > *impact)
+                *impact = (float)-vrel;   /* the sound, before any impulse */
+            any = 1;
+            dv = AI_CONTACT_SEP - vrel;
+            if (dv < 0.0)
+                dv = 0.0;
+            k = ai_actor_denom(A, t[i].point, sn)
+              + ai_actor_denom(B, t[i].point, sn);
+            if (k < 1e-09)
+                continue;
+            j[0] = (float)(sn[0] * (dv / k));
+            j[1] = (float)(sn[1] * (dv / k));
+            j[2] = (float)(sn[2] * (dv / k));
+            ai_actor_impulse(A, t[i].point, j);
+            j[0] = -j[0]; j[1] = -j[1]; j[2] = -j[2];
+            ai_actor_impulse(B, t[i].point, j);
+        }
+        if (!any)
+            break;
+    }
+
     /* THE POSITIONAL HALF: THE DEEPEST PAIR, RE-MEASURED, SPLIT BY MASS.
      *
      * There is no carSubstepContact bisection on this path to stop the proxies
@@ -1412,30 +2000,89 @@ static int ai_pair_resolve(ai_actor *A, ai_actor *B,
     {
         float as2[RB_MAX_SPHERES][4], bs2[RB_MAX_SPHERES][4];
         ai_touch t2[AI_MAX_TOUCH];
-        const ai_touch *cur = t;
-        int n2 = nt, k, deep2 = deep;
+        const ai_touch *cur;
+        int n2, k, deep2, ga, gb;
 
+        (void)deep;
         for (k = 0; k < AI_DEPEN_PASSES; k++) {
-            float d, sep[3], mv[3], took[3];
+            float d, sep[3], mv[3], took[3], a_bot, b_bot, a_top, b_top;
             int c;
 
-            if (k > 0) {
-                int ga = rb_gather_spheres(A->car, as2);
-                int gb = rb_gather_spheres(B->car, bs2);
-                n2 = ai_touch_list(as2, ga, bs2, gb, t2, AI_MAX_TOUCH);
-                if (n2 <= 0)
-                    break;
-                cur = t2;
-                deep2 = 0;
-                for (c = 1; c < n2; c++)
-                    if (t2[c].depth > t2[deep2].depth)
-                        deep2 = c;
-            }
+            /* Re-gathered on EVERY pass, the first one included. It used to
+               reuse the caller's arrays for k == 0, which saved one gather and
+               cost the pass its sphere EXTENTS -- and the clearance test below
+               needs them on the pass that does most of the work. */
+            ga = rb_gather_spheres(A->car, as2);
+            gb = rb_gather_spheres(B->car, bs2);
+            n2 = ai_touch_list(as2, ga, bs2, gb, t2, AI_MAX_TOUCH);
+            if (n2 <= 0)
+                break;
+            cur = t2;
+            deep2 = 0;
+            for (c = 1; c < n2; c++)
+                if (t2[c].depth > t2[deep2].depth)
+                    deep2 = c;
             if (cur[deep2].depth <= 0.0f)
                 break;
             d = cur[deep2].depth + RB_PENETRATION_SLACK;
             for (c = 0; c < 3; c++)
                 sep[c] = cur[deep2].normal[c] * d;   /* A relative to B */
+
+            /* The two proxies' vertical extents, for the clearance test the
+               lift is bounded by. */
+            a_bot = b_bot = 1e30f;
+            a_top = b_top = -1e30f;
+            for (c = 0; c < ga; c++) {
+                if (as2[c][1] - as2[c][3] < a_bot) a_bot = as2[c][1] - as2[c][3];
+                if (as2[c][1] + as2[c][3] > a_top) a_top = as2[c][1] + as2[c][3];
+            }
+            for (c = 0; c < gb; c++) {
+                if (bs2[c][1] - bs2[c][3] < b_bot) b_bot = bs2[c][1] - bs2[c][3];
+                if (bs2[c][1] + bs2[c][3] > b_top) b_top = bs2[c][1] + bs2[c][3];
+            }
+
+            /* IS ONE OF THEM ACTUALLY ON TOP OF THE OTHER? Only then is any of
+             * this separation vertical.
+             *
+             * The threshold is the engine's own and not a new number: 46 degrees
+             * from up is what carDriveForce (0x4ee8fc, contact.c) uses to decide
+             * a face is something a car stands on rather than something it is
+             * up against. Same question here -- a normal inside that cone is a
+             * car riding over another car, and one outside it is two cars beside
+             * each other whose contact happens to have a little Y in it.
+             *
+             * WHY IT MATTERS, and it is the whole of the reported "opponents
+             * climb": the vertical push is one-sided. It goes entirely to the
+             * upper car and AI_BUMP_MAX_SINK caps the lower one at a centimetre,
+             * so nothing ever pushes a car back DOWN, while the return spring
+             * only pulls at bump_accel (7 m/s^2 -- 0.35 mm a tick against a push
+             * of 5 to 10 mm). Two opponents grinding along nearly-parallel
+             * recorded lines therefore RATCHET upward, a fraction of a
+             * millimetre of Y per pass, eight passes a tick, for as long as the
+             * lines overlap. country_1's field flew: two cars at off[1] = 0.596
+             * and 0.618 m at t = 8.5 s, the whole of their bump budget spent
+             * straight up, on cars 0.25 m tall.
+             *
+             * A grazing pair is separated ALONG THE GROUND instead, in the
+             * normal's own horizontal direction, and nothing is lifted. That is
+             * also what should happen physically: two cars side by side on the
+             * dirt slide apart, they do not climb. */
+            {
+                float nh = (float)sqrt((double)cur[deep2].normal[0]
+                                           * cur[deep2].normal[0]
+                                     + (double)cur[deep2].normal[2]
+                                           * cur[deep2].normal[2]);
+                if (fabs((double)cur[deep2].normal[1]) < AI_TOP_COS
+                    && nh > 1e-4f) {
+                    /* Re-aim the whole of `d` into the horizontal plane. nh is
+                       at least sqrt(1 - AI_TOP_COS^2) = 0.72 here, so the
+                       rescale is bounded by 1.39 and a pass still removes most
+                       of the depth; what is left is what the next pass is for. */
+                    sep[0] = cur[deep2].normal[0] * (d / nh);
+                    sep[1] = 0.0f;
+                    sep[2] = cur[deep2].normal[2] * (d / nh);
+                }
+            }
 
             /* HORIZONTALLY, split by mass: B takes its share and A covers
                whatever B refused, so the pair separates by the whole of it
@@ -1469,54 +2116,72 @@ static int ai_pair_resolve(ai_actor *A, ai_actor *B,
              * inside each other under the mass split and 0.031 m under this,
              * and the head-on Buggy-into-Hummer ram goes from 44 contact ticks
              * to 9 -- the pair comes apart instead of grinding along. */
-            if (sep[1] > 0.0f) {
-                mv[0] = mv[2] = 0.0f;
-                mv[1] = sep[1];
-                ai_actor_move(A, mv, took);
-            } else if (sep[1] < 0.0f) {
-                mv[0] = mv[2] = 0.0f;
-                mv[1] = -sep[1];
-                ai_actor_move(B, mv, took);
+            /* AND IT STOPS THE MOMENT THE CAR IS CLEAR. A lift is for getting
+             * one car up off another; once the lifted car's lowest sphere is
+             * above the other car's highest one there is nothing left under it
+             * to climb, and every further millimetre is a car in the air.
+             *
+             * Without this bound the lift does not converge, because the pair is
+             * in SUSTAINED contact: the return spring pulls the car back down
+             * into the other one, the next tick's eight passes lift it again,
+             * and each pass lifts by the deepest pair's full share while the
+             * thirteen-sphere proxies keep offering a different deepest pair.
+             * country_1's field reached 0.389 m of lift on cars 0.25 m tall,
+             * both of a pair at once. Bounded, the same fixture peaks at the
+             * clearance and comes back down.
+             *
+             * Cutting the vertical out altogether is NOT the fix and the harness
+             * says so: aitest's Buggy-into-Hummer ram fails three ways without
+             * it (0.084 m of overlap left standing, and the pair still inside
+             * each other when it ends) -- see ai.h on the vertical. */
+            if (sep[1] != 0.0f) {
+                ai_actor *up   = sep[1] > 0.0f ? A : B;
+                ai_actor *down = sep[1] > 0.0f ? B : A;
+                float room = sep[1] > 0.0f ? b_top - a_bot + RB_PENETRATION_SLACK
+                                           : a_top - b_bot + RB_PENETRATION_SLACK;
+                float need = sep[1] > 0.0f ? sep[1] : -sep[1];
+
+                if (need > room)
+                    need = room;
+                /* IT COMES OUT OF THE LOWER CAR'S OWN LIFT FIRST, and that is
+                 * what makes the vertical zero-sum while either car has any to
+                 * give back.
+                 *
+                 * The branch only ever moves a car UP -- whichever of the two is
+                 * on top, by however much the deepest pair is inside. Over a
+                 * sustained graze the deepest pair's normal flips between the
+                 * two cars from tick to tick, so BOTH of them collect upward
+                 * pushes and neither ever collects a downward one, and the pair
+                 * rises TOGETHER. Rising together also defeats the clearance
+                 * bound above, since a_bot and b_top climb at the same rate.
+                 * Measured on country_1's field: +1.187 m of net upward push in
+                 * twelve seconds, against an impulse half that nets to exactly
+                 * zero -- so this branch was the whole of it.
+                 *
+                 * Taking it from the lower car's own offset first means a pair
+                 * that is merely grinding trades height instead of gaining it,
+                 * and only a car standing on one that is ITSELF down on the
+                 * ground -- a real ride-over, which is what the vertical is for
+                 * -- adds any. */
+                if (need > 0.0f && down->ai && down->ai->off[1] > 0.0f) {
+                    float give = down->ai->off[1] < need ? down->ai->off[1]
+                                                         : need;
+                    mv[0] = mv[2] = 0.0f;
+                    mv[1] = -give;
+                    ai_actor_move(down, mv, took);
+                    need += took[1];              /* took[1] <= 0 */
+                    if (need < 0.0f)
+                        need = 0.0f;
+                }
+                if (need > 0.0f) {
+                    mv[0] = mv[2] = 0.0f;
+                    mv[1] = need;
+                    ai_actor_move(up, mv, took);
+                }
             }
         }
     }
 
-    /* THE VELOCITY HALF. Same ten passes, same 0.02 gate, same 0.05 m/s target
-     * as rb_coll_resolve; the denominator is the PAIR's, so the impulse delivers
-     * its dv across both bodies rather than all of it into one. */
-    for (pass = 0; pass < AI_CONTACT_PASSES; pass++) {
-        int any = 0;
-        for (i = 0; i < nt; i++) {
-            float va[3], vb[3], j[3];
-            double vrel, dv, k;
-
-            ai_actor_point_vel(A, t[i].point, va);
-            ai_actor_point_vel(B, t[i].point, vb);
-            vrel = (double)(va[0] - vb[0]) * t[i].normal[0]
-                 + (double)(va[1] - vb[1]) * t[i].normal[1]
-                 + (double)(va[2] - vb[2]) * t[i].normal[2];
-            if (vrel > AI_CONTACT_VREL)
-                continue;
-            if (pass == 0 && impact && -vrel > *impact)
-                *impact = (float)-vrel;   /* the sound, before any impulse */
-            any = 1;
-            dv = AI_CONTACT_SEP - vrel;
-            if (dv < 0.0)
-                dv = 0.0;
-            k = ai_actor_denom(A, t[i].point, t[i].normal)
-              + ai_actor_denom(B, t[i].point, t[i].normal);
-            if (k < 1e-09)
-                continue;
-            j[0] = (float)(t[i].normal[0] * (dv / k));
-            j[1] = (float)(t[i].normal[1] * (dv / k));
-            j[2] = (float)(t[i].normal[2] * (dv / k));
-            ai_actor_impulse(A, t[i].point, j);
-            j[0] = -j[0]; j[1] = -j[1]; j[2] = -j[2];
-            ai_actor_impulse(B, t[i].point, j);
-        }
-        if (!any)
-            break;
-    }
     return nt;
 }
 
@@ -1579,6 +2244,21 @@ float ai_collide_player(ai_t *ai, rb_car *player, float dt)
     np = rb_gather_spheres(player, ps);
     if (np <= 0)
         return 0.0f;
+    /* THE PLAYER'S PROXY REACH, cached for ai_steer_decide -- which is handed a
+       position rather than a car and would otherwise have to guess how much room
+       a pass round the player wants. Free here: the spheres are already
+       gathered. See ai_t.player_reach. */
+    {
+        double best = 0.0;
+        for (i = 0; i < np; i++) {
+            double dx = (double)ps[i][0] - player->body.x[0];
+            double dy = (double)ps[i][1] - player->body.x[1];
+            double dz = (double)ps[i][2] - player->body.x[2];
+            double r = sqrt(dx * dx + dy * dy + dz * dz) + ps[i][3];
+            if (r > best) best = r;
+        }
+        ai->player_reach = (float)best;
+    }
 
     for (i = 0; i < ai->n; i++) {
         ai_car *a = &ai->car[i];
@@ -1621,6 +2301,98 @@ int ai_within(const ai_t *ai, int i, float x, float y, float z, float d)
     dy = (double)ai->car[i].rb.body.x[1] - y;
     dz = (double)ai->car[i].rb.body.x[2] - z;
     return dx * dx + dy * dy + dz * dz <= (double)d * d;
+}
+
+/* Fit one car's loop. -> 1 and fills `g` (n_mk fractions, re-based on marker 0,
+ * strictly increasing) when the recording really does pass every marker.
+ *
+ * ONE PASS over the loop, carrying the running distance rather than an array of
+ * them: the longest profile is 11 081 samples and the alternative is 88 KB of
+ * scratch on a machine with none to spare. */
+static int ai_fit_one(const ai_car *a, const float (*mk)[3], int n_mk, float *g)
+{
+    double best2[AI_MAX_CP], at[AI_MAX_CP];
+    double run = 0.0;
+    int i, k, first;
+
+    if (n_mk <= 0 || n_mk > AI_MAX_CP || a->n <= 1 || !(a->lap_len > 1e-3f))
+        return 0;
+    for (k = 0; k < n_mk; k++) { best2[k] = 1e30; at[k] = 0.0; }
+
+    first = a->cycle_start > 0 ? a->cycle_start : 0;
+    for (i = first; i < a->n; i++) {
+        if (i > first) {
+            double dx = a->s[i].p[0] - a->s[i-1].p[0];
+            double dy = a->s[i].p[1] - a->s[i-1].p[1];
+            double dz = a->s[i].p[2] - a->s[i-1].p[2];
+            run += sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        for (k = 0; k < n_mk; k++) {
+            /* In XZ, for the reason every other query on this road is: urban_1
+               and urban_2 run a deck over another part of their own road, and a
+               car under one is not at the checkpoint above it -- but nor is it
+               ever within a few metres of it in the plane. */
+            double dx = a->s[i].p[0] - mk[k][0];
+            double dz = a->s[i].p[2] - mk[k][2];
+            double d2 = dx * dx + dz * dz;
+            if (d2 < best2[k]) { best2[k] = d2; at[k] = run; }
+        }
+    }
+
+    for (k = 0; k < n_mk; k++)
+        if (best2[k] > (double)AI_CP_FIT_NEAR * AI_CP_FIT_NEAR)
+            return 0;                   /* the lap does not go through it */
+
+    for (k = 0; k < n_mk; k++) {
+        double f = (at[k] - at[0]) / (double)a->lap_len;
+        while (f < 0.0) f += 1.0;
+        while (f >= 1.0) f -= 1.0;
+        g[k] = (float)f;
+    }
+    g[0] = 0.f;
+    /* STRICTLY INCREASING, which is the check that the markers were met in the
+       spine's own order and that none of them landed on the wrong side of the
+       seam. A fit that fails it is not repaired, it is dropped. */
+    for (k = 1; k < n_mk; k++)
+        if (!(g[k] > g[k-1]))
+            return 0;
+    return 1;
+}
+
+int ai_cp_fractions(const ai_t *ai, const float (*mk)[3], int n_mk,
+                    float *frac, float *lap_len_out)
+{
+    double sum[AI_MAX_CP], laps = 0.0;
+    int i, k, used = 0;
+
+    if (!ai || !mk || !frac || n_mk <= 0 || n_mk > AI_MAX_CP)
+        return 0;
+    for (k = 0; k < n_mk; k++) sum[k] = 0.0;
+
+    for (i = 0; i < ai->n; i++) {
+        float g[AI_MAX_CP];
+        if (!ai_fit_one(&ai->car[i], mk, n_mk, g))
+            continue;
+        for (k = 0; k < n_mk; k++) sum[k] += g[k];
+        laps += ai->car[i].lap_len;
+        used++;
+    }
+    if (used <= 0)
+        return 0;
+
+    for (k = 0; k < n_mk; k++) frac[k] = (float)(sum[k] / used);
+    frac[0] = 0.f;
+    /* The MEAN of separate drives can only break the ordering if two stations are
+       closer together than the drives disagree, and then the table is worthless
+       anyway -- so it is checked again rather than assumed. */
+    for (k = 1; k < n_mk; k++)
+        if (!(frac[k] > frac[k-1]))
+            return 0;
+
+    if (lap_len_out) *lap_len_out = (float)(laps / used);
+    rlog("ai: checkpoint stations fitted off %d of %d recording(s), lap %.1f m\n",
+         used, ai->n, (float)(laps / used));
+    return 1;
 }
 
 int ai_player_place(const ai_t *ai)

@@ -210,6 +210,23 @@ typedef struct {
     int   n;                 /* samples */
     int   cycle_start;       /* where the lap loop rejoins */
     float path_len;          /* the polyline's length, metres */
+
+    /* THE LOOP IS THE LAP, AND THE POLYLINE IS NOT.
+     *
+     * A recording is a LEAD-IN followed by a LOOP: the car starts on its grid
+     * slot, drives `lead_in` metres to the point the replay rejoins at, and from
+     * there round `lap_len` metres of track back to that same point -- which is
+     * why ai_advance sends the cursor back to `cycle_start` and not to 0.
+     * Measured on all 30 shipped profiles: the loop closes to within 0.08 to
+     * 0.22 m, and `path_len` from the file matches the polyline's own length to
+     * within 0.3 m, so `path_len` is `lead_in + lap_len` and NOT one lap.
+     *
+     * That distinction is a bug's worth: scaling progress by `path_len` treats
+     * the lead-in as part of every lap, so every lap after the first came out
+     * short by it -- 7.7 to 16.9 m of a 430 to 455 m lap, 1.8% to 3.8%,
+     * compounding for as long as the race runs. `lap_len` is what a lap is. */
+    float lead_in;
+    float lap_len;
     float duration;          /* the recording's own time span, seconds */
     float body_dy;           /* the lift pack_ai.py already applied */
     const ai_sample *s;
@@ -236,24 +253,11 @@ typedef struct {
     /* WITHIN the lap, and the hint the next query gets. Negative until the first
        successful query, so a fresh or reset car searches the whole spine once. */
     float spine_at;
-    /* LAPS OF THE SPINE, counted by `spine_at` WRAPPING -- not by the recording
-     * running out, which is what `lap` below counts.
-     *
-     * THE TWO ARE DIFFERENT QUESTIONS AND CONFLATING THEM PUT THE PLACE WRONG.
-     * `lap` ticks wherever a recording happens to end; measured over all 30
-     * shipped ones, 24 end at the start/finish line (arc 0, where the player's
-     * own lap ticks) and six do not -- country_4's three at 47.5 m, urban_2's
-     * three at 553.4 m, which on an 874 m spine is 320 m of every lap during
-     * which the opponents had counted a lap the player had not. That is a
-     * spurious 874 m of lead, so on urban_2 the place was simply wrong for a
-     * third of every lap.
-     *
-     * Counted at the SEAM, both sides use one definition and the comparison is
-     * exact wherever a recording starts or ends. It also fixes the grid: every
-     * car begins a few metres SHORT of the line, so every `spine_at` starts near
-     * spine_len -- and with this at 0 for everyone they are all equal there,
-     * where before whoever crossed the line first appeared to lose a whole lap. */
-    int   spine_lap;
+    /* THE SPINE LAP COUNTER IS GONE. It counted `spine_at` wrapping so that
+     * `spine_dist` could be built as `arc + lap * spine_len`, and nothing reads
+     * it any more: an opponent's progress is `dist / lap_len`, which crosses the
+     * line without needing to be told. The player still counts seams
+     * (ai_t.player_lap_seam) because its own measure IS within-lap. */
     int   cp;                /* the checkpoint it is heading for */
     int   airborne;          /* no wheel loaded, from the recorded suspension */
 
@@ -296,6 +300,29 @@ typedef struct {
     float bump_accel;        /* the return's acceleration budget, m/s^2 */
     float bump_w;            /* the return spring's natural frequency, rad/s */
     float bump;              /* |off| right now, for the log */
+
+    /* -- THE STEERING DECISION. See "the steering decision" below.
+     *
+     * `steer_want` is metres ACROSS the recorded line, positive to the left, and
+     * it is the offset the car has decided it wants rather than the one a shove
+     * gave it -- so it is the spring's target instead of zero. `steer_cmd` is the
+     * recovered controller's own steer angle, in degrees, which becomes the
+     * target for the heading deviation so the car POINTS where it is going.
+     * `steer_side` and `steer_hold` are the hysteresis: a car that has committed
+     * to a side finishes the pass on that side.
+     *
+     * All zero on a car with nothing in its way, and exactly zero, which is what
+     * keeps an unobstructed opponent bit-identical to one from before this
+     * existed -- the same property the bump offset has. */
+    float steer_want;
+    /* The unit LEFT axis of the recorded frame the decision was taken in, so
+       ai_step can turn the lateral scalar back into a world vector without
+       walking the polyline a second time and without a second copy of the frame
+       construction to disagree with this one. */
+    float steer_left[3];
+    float steer_cmd;
+    int   steer_side;        /* -1 right, 0 undecided, +1 left */
+    float steer_hold;        /* seconds left of the commitment */
 } ai_car;
 
 typedef struct {
@@ -318,10 +345,35 @@ typedef struct {
     /* and the PROJECTION's answer, kept only so the hint plumbing has somewhere
        to live and the log can see both. Not what the placing uses. */
     float  player_at_proj;
-    /* and its seam-counted lap, for the same reason ai_car.spine_lap exists: the
-       placing compares the player against the opponents, so both sides have to
-       count laps at the same point on the spine. */
+    /* and its seam-counted lap. The player's own measure is WITHIN a lap
+       (cp_lap_progress), so something has to carry the laps; an opponent's is
+       cumulative already and needs no counterpart, which is why ai_car has none
+       any more. */
     int    player_lap_seam;
+    /* THE PLAYER'S OWN PROXY REACH, metres, cached by ai_collide_player because
+     * it gathers the player's spheres anyway and ai_step is handed a position
+     * and not a car. The steering decision needs it to know how much room a
+     * pass wants; it is 0 until the first contact call, and the decision falls
+     * back to the opponent's own reach, which is the same number to within the
+     * difference between two cars. */
+    float  player_reach;
+    /* HOLD THE STEERING DECISION OFF. Zero -- decide -- on any ai_t a caller
+     * memsets, so the app never touches it and gets the decision.
+     *
+     * It exists for the fixtures that measure the REACTION: aitest part 8 drives
+     * an opponent into a parked player to check the contact solve's two-moving-
+     * bodies relative velocity and its pair denominator, and an opponent that
+     * politely goes round is an opponent that never arrives. The decision has
+     * its own fixtures; these have to keep measuring the thing they were written
+     * against. It is also what lets the ten-track survey separate a car that
+     * moved because it was HIT from one that moved because it CHOSE to. */
+    int    steer_off;
+    /* THE PLAYER'S VELOCITY, finite-differenced here because ai_step is handed a
+     * position and the steering decision needs to know whether a gap is closing.
+     * `player_prev` is last tick's position and is invalid until `player_seen`. */
+    float  player_prev[3];
+    float  player_v[3];
+    int    player_seen;
 } ai_t;
 
 /* The rate the commanded speed chases its target, m/s^2. FUN_00503880's third
@@ -421,6 +473,48 @@ int   ai_within(const ai_t *ai, int i, float x, float y, float z, float d);
 /* Race placing 1..n+1 for the player, by cumulative spine distance. Needs
    ai_step to have run at least once with a non-NULL `tr`. */
 int   ai_player_place(const ai_t *ai);
+
+/* WHERE EACH CHECKPOINT REALLY FALLS ROUND A LAP, as a fraction in [0, 1), fitted
+ * off the loaded recordings -- which are the only description of the road this
+ * port has. `mk` is the checkpoints' own markers in order, `n_mk` how many, and
+ * `frac` takes n_mk fractions with frac[0] == 0 exactly (they are re-based on
+ * checkpoint 0, the start/finish line). `lap_len_out` takes the mean road length
+ * of one lap, in metres, which is what a caller needs to put a distance measured
+ * on the ground into the same scale.
+ *
+ * WHY IT EXISTS. The placing compares the player against the opponents, and the
+ * two were not in the same metres: an opponent's progress is uniform in road
+ * distance, while the player's was laid out on the spine's cum[] arc stations --
+ * and those are not where the checkpoints are. Measured against the recordings,
+ * cum[] is 39.0 m out on average and 142 m at worst (country_4's cp_3), which is
+ * a bigger error than the whole of the interpolation fix that preceded this.
+ * `k/n` is no better at 40.1 m; there is no shortcut and the road has to be
+ * asked.
+ *
+ * THE FIT IS ON THE LOOP, not the whole polyline -- `s[cycle_start .. n-1]` is
+ * exactly one lap (ai_car.lap_len) -- and it is AVERAGED over every opponent
+ * whose fit validates, because they are three separate drives of the same road.
+ *
+ * IT VALIDATES, and -> 0 leaving `frac` alone if it cannot: every marker's
+ * closest approach must be within AI_CP_FIT_NEAR of the recorded line and the
+ * re-based fractions must come out strictly increasing. On the ten shipped tracks
+ * every one of the 30 recordings passes every one of its checkpoints within
+ * 1.3 m, so the guard is not there for them -- it is there so that a track packed
+ * without a usable recording falls back to cum[] rather than to nonsense. */
+int   ai_cp_fractions(const ai_t *ai, const float (*mk)[3], int n_mk,
+                      float *frac, float *lap_len_out);
+
+/* checkpoint.h's CP_MAX. ai.c must NOT include checkpoint.h -- that file pulls in
+   scene.h and therefore GL, which is the whole reason the spine arrives here
+   behind a callback (see ai_track) -- so this is the one place the two have to
+   agree, and main.c, which includes both, asserts that they do. */
+#define AI_MAX_CP 8
+
+/* How near a marker the recorded line has to pass before the fit above will
+   believe it went through that checkpoint. The worst of the 300 real pairs is
+   1.3 m and the widest checkpoint's drivable ground is 20 m, so 10 m is clear of
+   every real pass and well inside a miss. */
+#define AI_CP_FIT_NEAR 10.0f
 
 /* ------------------------------------------------------------- the bump offset
  *
@@ -611,6 +705,88 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
    contact resolved to the last float would otherwise chatter against the clamp;
    not more, because there is ground under the car. */
 #define AI_BUMP_MAX_SINK  0.01f
+
+/* WHEN ONE CAR COUNTS AS BEING ON TOP OF ANOTHER: the cosine of the engine's own
+ * 46-degree floor cone, the angle carDriveForce (0x4ee8fc) uses to decide a face
+ * is drivable rather than a wall. A contact normal inside it is a ride-over and
+ * the separation has a real vertical share; outside it the pair is two cars side
+ * by side and is pushed apart ALONG THE GROUND, because the vertical push has no
+ * counterpart -- AI_BUMP_MAX_SINK stops the lower car being pushed down and the
+ * return spring is two orders of magnitude weaker than the push -- so a
+ * sustained graze walks a car into the air. See ai_pair_resolve. */
+#define AI_TOP_COS  0.694658f
+
+/* ------------------------------------------------------ the steering decision
+ *
+ * WHAT THIS IS FOR. Being knocked aside and springing back is a REACTION; it is
+ * not a decision, and until now a shoved opponent had nothing else. It could not
+ * see a car stopped in its path, it drove into it, and it was pushed past --
+ * `known-issues.md` carried that as "what is missing is not the reaction, it is
+ * the decision". This is the decision.
+ *
+ * WHAT IT IS NOT. It is not FUN_004fddd0 transcribed. That controller drives a
+ * FULLY SIMULATED rigid body and the port cannot afford three of those: colprof
+ * puts one car's collision queries alone at a median 2 ms of Vita time per 1/60
+ * tick and 10% of the grid past 4 ms, against a 16.7 ms frame that also has to
+ * render -- re-measured, not quoted. So the port keeps the replay and gives it a
+ * decision, and the decision uses THE CONTROLLER'S OWN LAW AND ITS OWN NUMBERS:
+ *
+ *   the lookahead        FUN_004fda90's 2.7 m further along the path
+ *   the signed angle     FUN_00410150, transcribed at ai_signed_angle
+ *   the deadband         its +-0.5 degrees
+ *   the lock             its +-35 degrees
+ *   the rate limit       its 90 deg/s
+ *
+ * HOW IT ACTS. An opponent's pose is `recording + offset`, and the offset is all
+ * this is allowed to touch -- the replay, the cursor, the lap, the rubber band
+ * and every measurement in aitest are untouched by construction, which is the
+ * same guarantee the bump has and aitest part 9 checks bit for bit.
+ *
+ *   1. LOOK 2.7 m up the recorded path and ask what is in the corridor between
+ *      here and there -- the player and every other opponent, against the pair's
+ *      own proxy reaches plus a wheel's width of daylight.
+ *   2. If something is, pick the side with the room and set `steer_want`, the
+ *      lateral offset that clears it. Committed: `steer_side` and AI_STEER_HOLD
+ *      keep the car on that side until the pass is over, because a car that
+ *      re-decides every tick weaves.
+ *   3. The spring, unchanged in every constant, pulls the offset toward
+ *      `steer_want` instead of toward zero. The grip cap is still
+ *      `coeff_rear_tires * RB_GRAVITY`, so an opponent moves over no harder than
+ *      its own tyres could pull it -- a decision it could actually execute.
+ *   4. The steer angle out of the controller's law becomes the target for the
+ *      heading deviation, so the car POINTS into the move. Without it a car that
+ *      changes line slides sideways like a hovercraft, which is what gives the
+ *      whole thing away.
+ *
+ * `AI_STEER_LOCK` is 35 degrees and `bump_yaw_limit` is one `AngleSteer`, 30 --
+ * both apply, both recovered, and they are different quantities: the first is
+ * how hard the controller may ask, the second is how far off its recorded
+ * heading a car may end up.
+ */
+#define AI_STEER_LOOKAHEAD  2.7f   /* FUN_004fda90 */
+#define AI_STEER_DEADBAND   0.5f   /* degrees, FUN_004fddd0 */
+#define AI_STEER_LOCK      35.0f   /* degrees, FUN_004fddd0 */
+#define AI_STEER_RATE      90.0f   /* degrees/second, FUN_004fddd0 */
+
+/* How long a committed side is held after the last tick that still saw the
+ * obstacle, seconds. THE PORT'S, and it is the offset spring's own time constant
+ * (1 / bump_w, 0.28 s on an Overkill) rounded up to the nearest tenth: a car
+ * that lets go sooner than the spring can move it has not finished the pass it
+ * decided on, and one that holds much longer is driving a line nothing asked
+ * for. Below it the car weaves, which is the failure a fixture can see. */
+#define AI_STEER_HOLD       0.3f
+
+/* Below this the car is not going anywhere and decides nothing, m/s. THE PORT'S,
+ * and it is AI_SPEED_FLOOR -- the speed ai_advance refuses to walk the cursor
+ * slower than, so it is already this file's own answer to "stopped". */
+#define AI_STEER_MIN_SPEED  AI_SPEED_FLOOR
+
+/* The far end of the horizon, in time constants of the offset spring's own
+ * `bump_w`. Three of them is the standard settling time of a critically damped
+ * second order system -- 0.92 s on an Overkill -- and it is how long this car
+ * takes to complete a lane change it decides on. Derived rather than typed:
+ * change the spring and this follows it. */
+#define AI_STEER_SETTLE     3.0f
 
 /* The rubber-band coefficient, exposed so a harness can bind to it directly:
  * FuncWaitAccel<slot>(lead) * clamp(difficulty * track, 0.5, 2.0). `gap` is how

@@ -15,24 +15,33 @@
  *                 node hierarchy, their meshes, their SKIN, their animation
  *                 clips -- and the recorded paths its instances name.
  *
- * THREE THINGS THIS IS NOT.
+ * THREE THINGS THIS IS, AND ONE IT IS NOT.
  *
- *   It is not a physics object. A character does not collide with the car and
- *   the car does not collide with it, deliberately: the handling model is
- *   transcribed and every contact in it is accounted for, and adding a
- *   two-metre pedestrian to the contact solve is a handling change wearing a
- *   rendering change's clothes. What a character does notice is being RUN OVER
- *   -- a proximity test against the car, which raises a clip and a voice and
- *   moves nothing.
+ *   IT IS SOLID. Every kind the engine pairs with $CAR pushes the car out --
+ *   char_car_solid, transcribed from the two registries at 0x534d00, with the
+ *   car as the only body exactly as the world contact has it. This header used
+ *   to say the opposite at length, and reasoned from it.
  *
- *   It is not the engine's own AI. Only the WALKERS and the PATH followers
- *   replay something recorded; the Dog, the Seagull, the Crab, the Spider and
- *   the Guard run state machines that are THE PORT'S. Every threshold in them
- *   is a recovered constant out of char_data.h and every target is a marker or
- *   a volume out of the instance's own subtree, so the shapes are the data's
- *   even where the machine is not. The nine behaviour loaders that fill those
- *   constants are recovered; what the engine DOES with them is not, and the
- *   header says so at each state machine.
+ *   AND IT FIGHTS BACK. A person KICKS the car, or picks it up over its head
+ *   and THROWS it, and a Guard shoots a six-round burst at it. All of that is
+ *   recovered -- the clip tables, the decision at 0x510f40, the two impulses,
+ *   the attention machine and the burst manager -- and this header used to say
+ *   the layer noticed nothing but being RUN OVER, on a model whose clips these
+ *   notes had listed as `Pendal` (a kick) and `Brosok` (a throw) all along. See
+ *   char_data.h's "THE REACTION" and dynamic-layer.md.
+ *
+ *   Being run over is still a separate, older thing and stays: a proximity test
+ *   that raises the model's own Hurt clip and its voice and moves nothing. The
+ *   two are the split the engine keeps -- its resolver makes the car feel the
+ *   person and the person's own handler makes the person react.
+ *
+ *   IT IS PART THE ENGINE'S AI AND PART THE PORT'S, and the line moved. The
+ *   WALKERS and the PATH followers replay a recording; the REACTION and the
+ *   Guard's attention machine are transcribed; the Dog's chase, the Crab's and
+ *   the Spider's shuttle are still state machines of the port's, and every
+ *   threshold in those is a recovered constant and every target a marker or a
+ *   volume out of the instance's own subtree. The header says which is which at
+ *   each machine.
  *
  *   It is not scene.c. A character rig runs to 89 parts against
  *   CARANI_MAX_PARTS's 56, and four of the thirteen models are skinned, which
@@ -90,9 +99,14 @@ struct rb_car;
  * BEING RUN OVER. Both numbers are the port's, and the speed floor is
  * deliberately the same 0.35 m/s sfx.c uses for a prop knock -- a character
  * reacting to a car that is barely moving reads as a bug, and the two should
- * agree about what counts as a knock. CHR_HIT_RADIUS is a flat radius rather
- * than a proxy: nothing here is a collision, and a character's own collision
- * shape is not recovered (the Spider is the only model with CdtRad at all).
+ * agree about what counts as a knock.
+ *
+ * AND CHR_HIT_RADIUS IS INSIDE CHR_REACT_NEAR (0.45 against 0.80), so a car
+ * that gets close enough to be kicked can get closer still and run the person
+ * over instead -- at which point the Hurt clip wins and holds for 4.5 s plus a
+ * 3 s cooldown. That is the right way round (a car ON someone is not a car
+ * someone kicks) and it is a trap for a fixture: parking a moving car on a man
+ * to test the kick measures the run-over. See chartest part 16.
  */
 /*
  * DROPPING A CHARACTER ONTO THE GROUND, and why it takes two probes.
@@ -279,8 +293,41 @@ typedef enum {
     CHR_EV_NONE,
     CHR_EV_BARK,        /* a Dog began an attack          -> dog_attack     */
     CHR_EV_TAKEOFF,     /* a Seagull left the ground      -> seagull_vzliot */
-    CHR_EV_HURT         /* anything was run over          -> man/woman_voice */
+    CHR_EV_HURT,        /* anything was run over          -> man/woman_voice */
+    CHR_EV_SWING,       /* a person started a kick or a throw               */
+    CHR_EV_SHOOT        /* a Guard let a burst go                           */
 } chr_event_t;
+
+/*
+ * WHAT A PERSON IS DOING ABOUT THE CAR, and the whole of it is recovered --
+ * see char_data.h's "THE REACTION" for the addresses and read_react for where
+ * every threshold below comes from. The shape is the engine's:
+ *
+ *   0x510f40  decides: nothing, a KICK, or a THROW
+ *   0x511470  the kick        -- Pendal, or the Guard's own `kick`
+ *   0x5111f0  the grab        -- Brosok, up to the car leaving the ground
+ *   0x510b90  the carry and the release
+ *   0x51a950  the guard, which reaches the same kick and otherwise SHOOTS
+ *
+ * Each of these is entered by raising the model's own clip and is driven by that
+ * clip's own CURSOR, in seconds, which is what the engine tests: the sole
+ * connects 0.65 s into a 3.0 s Pendal and the car leaves the hand 2.0 s into a
+ * 4.7 s Brosok. Nothing here is a timer of the port's invention.
+ */
+typedef enum {
+    CHR_RX_NONE,
+    CHR_RX_KICK,        /* Pendal / kick -- swinging                         */
+    CHR_RX_GRAB,        /* Brosok -- reaching for it                         */
+    CHR_RX_CARRY        /* it is in the hand                                 */
+} chr_react_t;
+
+/* What char_step raised for the car this frame, consumed by char_car_react.
+   An EDGE, like chr_inst_t.event: raised for one step and cleared at the top of
+   the next, because the impulse must land exactly once per swing. */
+#define CHR_IMP_NONE   0
+#define CHR_IMP_KICK   1    /* CHR_REACT_KICK_AWAY away, CHR_REACT_KICK_UP up  */
+#define CHR_IMP_THROW  2    /* the release: FWD along the person, UP           */
+#define CHR_IMP_SHOT   3    /* CHR_BULLET_AWAY from the hit point, _UP up      */
 
 typedef struct {
     const chr_place_t *place;
@@ -307,6 +354,63 @@ typedef struct {
     unsigned int cursor;
 
     float hit_cool;
+
+    /*
+     * THE REACTION. `react` is a chr_react_t and `react_t` is the wind-up the
+     * engine keeps beside the clip cursor (people +0x180, guard +0xc, grab
+     * +0x17c) -- it gates the abort and the connect, and because the clip is
+     * raised on the same frame the decision fires, it runs in step with
+     * clip_t rather than as a second clock.
+     *
+     * `once` marks the clip as ONE-SHOT: the engine's animation table makes
+     * Brosok, Pendal and Hurt (and the guard's shoot) play through and chain
+     * back to Stand (0x50f6c0, 0x51ad50), so the cursor stops at the duration
+     * instead of wrapping and `chr_clip_done` is what the machine asks.
+     */
+    int react;                      /* chr_react_t */
+    float react_t;
+    unsigned int rnd;               /* this instance's own LCG -- see rnd01 */
+    int react_hit;                  /* the impulse for THIS swing has landed */
+    int once;                       /* the current clip plays through, once */
+
+    /* THE CARRY. `carry_q` is the car's orientation in the HAND's own frame,
+       taken once at the grab (0x5111f0 stores the same relationship as two
+       rows at +0x1b0 and +0x1bc) so the car keeps its attitude relative to the
+       hand for the whole lift. */
+    int carry;
+    float carry_q[4];
+
+    /*
+     * THE BURST, which is NOT one of the states above. The engine spawns a
+     * separate 'BRMN' object (0x51aa81) and that object fires on its own clock,
+     * so the guard goes on tracking the car and its own attention machine goes
+     * on counting while the rounds leave -- it can start the next burst 1.25 s
+     * after the last one however long the six take. `sweep` is Radius along one
+     * random unit vector and a round's aim walks from +sweep to -sweep across
+     * the six (0x52de30, 0x52ddd0).
+     */
+    int shots;                      /* rounds already fired, 0..NShoots */
+    float shot_t;
+    float sweep[3];
+
+    /* THE ATTENTION MACHINE (0x5357e0), per instance: the dwell clock and how
+       many attacks this acquisition has already spent. */
+    float w_dwell;
+    int w_count;
+    int w_have;                     /* it has a target acquired */
+    int w_seen;                     /* the last step's verdict, 0..3 */
+
+    /* Raised for ONE step. `imp_dv` is a velocity CHANGE in m/s, already in the
+       engine's own units -- 0x4f3470 multiplies by the car's mass on the way to
+       rb_apply_impulse and so does char_car_react. */
+    int imp_kind;
+    float imp_point[3];
+    float imp_dv[3];
+    /* CHR_IMP_SHOT only: one round, as a segment. char_step has no car to test
+       it against -- it fires on the clock and char_car_react resolves the hit,
+       which is the same split char_car_solid already keeps. */
+    float imp_aim[3];
+
     int event;                      /* chr_event_t, one step only */
     int seen;                       /* did it notice the car this step */
     float dist2;                    /* to the CAR, for the step cull */
@@ -469,9 +573,50 @@ int char_proxy(chr_t *c, unsigned int inst, float out[][4]);
  */
 int char_car_solid(chr_t *c, struct rb_car *car, float *impact);
 
+/*
+ * AND THEY KICK IT, THROW IT AND SHOOT AT IT. Call once per frame, right after
+ * char_step, the way char_car_solid is called: char_step decides and raises
+ * chr_inst_t.imp_kind, and this is the only thing here that touches the car.
+ *
+ *   CHR_IMP_KICK   an impulse at the car's own origin, 4.0 m/s directly away
+ *                  from the person and 7.0 m/s straight up (0x4f3470 with the
+ *                  4.0 and 7.0 pushed at 0x51160e / 0x511605)
+ *   CHR_IMP_THROW  the release: the momentum is SET to 7.0 m/s along the
+ *                  person's forward plus 4.0 up and the angular momentum is
+ *                  zeroed (0x4f3690, off 0x510e00)
+ *   CHR_IMP_SHOT   a round that landed: 6.5 m/s away from where it hit and
+ *                  3.25 up (0x508560)
+ *
+ * -> how many landed. The impulse goes through rb_apply_impulse at the car's
+ * world ORIGIN, which is what 0x4f3470 does -- both of the points it builds are
+ * the matrix translation, so with a centre of mass off that origin there is a
+ * little torque, and that is the original's too.
+ */
+int char_car_react(chr_t *c, struct rb_car *car);
+
+/*
+ * IS SOMEONE HOLDING THE CAR? -> the instance index, or -1.
+ *
+ * While a person is carrying it the car is not simulated: 0x4f3640 sets the
+ * engine's own two held flags and 0x4f3700 writes the pose straight from the
+ * hand every frame. So the caller must step char_step, ask this, and where the
+ * answer is not -1 call char_carry_car INSTEAD of the car's physics for that
+ * frame -- exactly the substitution the engine makes.
+ */
+int char_carrier(const chr_t *c);
+
+/* Put the car in that instance's hand: the LHANDeff node's own posed world
+   transform, times the attitude recorded at the grab. Zeroes both momenta, so
+   nothing integrates while it is up there. */
+void char_carry_car(chr_t *c, struct rb_car *car);
+
 /* Index of a model / clip by name, or -1. */
 int chr_model_index(const chr_t *c, const char *name);
 int chr_clip_index(const chr_model_t *m, const char *name);
+
+/* Has the current ONE-SHOT clip played through? 0 for a looping one, which
+   never finishes. */
+int chr_clip_done(const chr_t *c, unsigned int inst);
 
 /* Is (x, z) inside the volume's quad and y inside its range? A general convex
    quad test -- every shipped volume is a parallelogram and nothing here relies

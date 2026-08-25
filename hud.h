@@ -38,21 +38,42 @@
  * white, so the original never fades a message; what it animates is the SCALE,
  * about the rect's own centre (`FUN_004b12b0`).
  *
- * AND NOTHING IN THE RETAIL EXE EVER POSTS SLOT 3 OR 4. Every call to the poster
- * `FUN_004afbb0` was enumerated by scanning `.text` for `E8` rel32 -- ten of them
- * -- and between them they raise slots 0, 1, 2, 5, 6, 7, 8, 9, 10 and -1
- * (clear). The two hit messages are shipped, sized, UV'd, and dead: cut content,
- * the same shape as `SpeedAngMaxREL` and `Stone.ini`'s unread keys. So the
- * geometry is the game's and **what raises it, and which of the two, cannot be
- * recovered from the image** -- there is no code to read.
+ * THIS FILE USED TO SAY "NOTHING IN THE RETAIL EXE EVER POSTS SLOT 3 OR 4", AND
+ * THAT WAS WRONG. The enumeration behind it was right -- ten `E8` rel32 calls to
+ * the poster `FUN_004afbb0` -- and the conclusion was not: ONE of those ten call
+ * sites has its arguments set up in FOUR different branches, and `0x4b025d`
+ * posts slot 0, slot 4, slot 3 or slot 2 depending on which. Reading one branch
+ * per call site attributes one slot per call site.
+ *
+ *     0x4b022e  slot 4  GREAT !HIT!  life 1.0  animate 0  gated on phys+0x56ec
+ *     0x4b023c  slot 3  !HIT!        life 1.0  animate 0  gated on phys+0x56e8
+ *     0x4b024e  slot 2  wrong way    life 1.5  animate 1  -- see dirarrow.h
+ *
+ * So the two hit messages are NOT cut content. See ui.md, "The hit banners ARE
+ * posted, and this file said they were not", for the writers of both gates and
+ * for the recovered tier test; and traps.md, "A DOCUMENTED NEGATIVE IS STILL A
+ * CLAIM".
+ *
+ * WHAT IS STILL THE PORT'S is the TRIGGER, because the recovered one runs on an
+ * accumulator and a mean impact vector that are not transcribed. The recovered
+ * LIFE is 1.0 s against HUD_HIT_TIME's 0.85, the hit slots pass `animate 0` so
+ * the original does not scale them (the overshoot below is FUN_004b12b0's idea,
+ * which is true of the mechanism and not of these two slots) and there is no
+ * fade. Moving all three is its own pass with ui_test part 8 as the evidence;
+ * ui.md says why it has not been taken.
  *
  * WHAT IS THE PORT'S, therefore
  * -----------------------------
  *   - the trigger: a prop-hit edge, above the same speed floor sfx.c uses
  *   - which of the two halves (HUD_GREAT_SPEED / HUD_GREAT_COUNT below)
- *   - the timing, and a fade rather than the original's scale animation, because
- *     the message QUEUE -- channels, priorities, per-channel countdowns -- is not
- *     transcribed and there is nothing here for a priority to arbitrate
+ *   - the timing, and a fade rather than the original's scale animation. The
+ *     PRIORITY TABLE is transcribed now -- msg.c owns it, and these two slots are
+ *     arbitrated through msg_arbitrate like everything else, so "there is nothing
+ *     here for a priority to arbitrate" is no longer the reason. The reason is
+ *     that the recovered post is life 1.0 with `animate 0' and no fade, against
+ *     this file's 0.85 with an overshoot: moving all three is a visible change to
+ *     something nobody has complained about, and it wants its own pass with
+ *     ui_test part 8 as the evidence. See ui.md and msg.h
  *   - the vertical band: the top-half anchor rather than the whole-screen one,
  *     which is a choice between two of the drawer's own three. See HUD_MSG_ANCHOR
  *
@@ -172,6 +193,11 @@ int hud_active(const hud_t *h);
 
 /* Is the pop currently the GREAT !HIT! half of the atlas? */
 int hud_is_great(const hud_t *h);
+
+/* WHICH MESSAGE SLOT the pop is, in the engine's own numbering, or -1 for none.
+   This file still draws its own geometry -- see msg.h for why -- but the
+   arbitration is the layer's, and a slot number is what it arbitrates over. */
+int hud_slot(const hud_t *h);
 
 void hud_draw(const hud_t *h, int screen_w, int screen_h);
 

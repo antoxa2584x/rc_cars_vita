@@ -133,7 +133,10 @@ typedef struct {
        because the mark texture is 64 x 256 with its tread down the long axis --
        see the note in trace_draw. */
     float u;
-    float half_w;           /* half the mark's width, in metres */
+    /* Half the mark's width in metres, as it was when this sample was laid:
+       TRACE_WIDTH_UNIT * the tyre table. Per sample and not per trace, because
+       a strip outlives the upgrade that made it. */
+    float half_w;
     float life;             /* record +0x00, seconds remaining */
     /* record +0x04, FUN_0052f990's param_5: how hard this sample marks the
        ground, 0..1. The fade multiplies it; see TRACE_STRENGTH. */
@@ -164,10 +167,6 @@ typedef struct {
 typedef struct {
     trace_ring w[RB_MAX_WHEELS];
     GLuint tex[TRACE_TEX_N];
-    /* Half the width of the tyre that makes this wheel's mark, measured off the
-       packed mesh at trace_init. 0 when the scene carries no rig to measure, and
-       then the mark falls back to TRACE_WIDTH_FRAC of the physics radius. */
-    float half_w[RB_MAX_WHEELS];
     int n_tex;
     int enabled;
     int n_quads;            /* drawn last frame, for telemetry */
@@ -175,14 +174,6 @@ typedef struct {
 
 /* `src` is the scene the t_halfdry_tire2_* textures were packed into. */
 void trace_init(trace_t *tr, const scene_t *src);
-
-/* Measure each wheel's tyre off the packed mesh, so the mark is as wide as the
- * tyre that makes it. trace_init calls this itself, but it is separate because
- * the rb-wheel-index -> mesh-node mapping is carani_bind's and main.c binds the
- * rig in respawn(), AFTER load_car has built the trace -- so respawn calls it
- * again once the mapping exists. Safe in either order and safe to repeat: an
- * unbound rig leaves every width at 0 and the mark falls back to the radius. */
-void trace_fit_tyres(trace_t *tr, const scene_t *src);
 
 /* Sample every wheel in contact and age everything. Call once per frame. */
 /* `col` may be NULL, and on a pre-COL4 grid it answers 0 anyway: both cases fall

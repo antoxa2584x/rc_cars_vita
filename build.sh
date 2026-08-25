@@ -531,6 +531,24 @@ fi
 # metrics; gen_hud_data.py reads all four.
 HUDTEX=map_arrow,map_cp,place1,place2,place3,place4,place5,place6,lap
 HUDTEX=$HUDTEX,cockpit_sp1,cockpit_sp2,Smash20,Smash26
+# AND THE DIRECTION ARROW, which is the last piece of the HUD and the last two
+# textures it needs. `coc_str_2' is the chevron the engine's own `DirectArrow' is
+# drawn from -- a 128x128 grey V on alpha, mapped onto the two six-vertex meshes
+# `extru9' and `extru9_3' in RCCarsDB/cockpit.sb -- and `msg_wrong_way' is
+# message SLOT 2 of the same eleven-slot layer msg_hits and msg_321_s_f come out
+# of, 512x128 of `WrongWay' word art drawn over the whole texture rather than out
+# of an atlas. dirarrow.c, and hud_data.h's arrow block. Measured: props.vsc goes
+# from 4.8 to 5.2 MB, once, for the whole session.
+HUDTEX=$HUDTEX,coc_str_2,msg_wrong_way
+# AND THE REST OF THE MESSAGE LAYER. RCCars.exe loads SIX message textures at
+# 0x4af195 and the order it loads them in IS the texture index its eleven-slot
+# table uses, so the port carries all six and lets the table pick: msg_pause
+# (slot 1, priority 9 -- the highest in the table) and msg_bestlap (slot 10) are
+# the two whose art, geometry and priority were all shipped and which nothing had
+# ever raised. msg_low_signal (slot 0) is packed for completeness -- it is a
+# network-link warning and this port has no network -- so that MSG_TEX_NAME's
+# index and the packed set cannot drift apart. msg.c.
+HUDTEX=$HUDTEX,msg_pause,msg_bestlap,msg_low_signal
 
 if wanted props; then
     step "Packing props"

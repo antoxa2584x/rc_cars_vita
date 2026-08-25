@@ -72,6 +72,25 @@ typedef struct { float acc; } rbcar_clock;
 int rbcar_step_frame(rb_car *c, rbcar_clock *k, float throttle, float brake,
                      float steer, int boost, float frame_dt);
 
+/* The same, with a hook run AFTER every tick this frame spends.
+ *
+ * EVERYTHING THAT COLLIDES WITH THE CAR HAS TO ADVANCE INSIDE THIS LOOP, not
+ * after it. A frame can be worth several ticks, and running the whole frame of
+ * car physics first and only then stepping the props and the opponents means
+ * they are all tested against the pose the car ENDED on -- so the car's path
+ * through the frame is never sampled and a small object in it is simply missed.
+ * Measured on a Cola can, whose two proxy spheres are 4.4 cm and whose contact
+ * window against a wheel is about 20 cm: at the car's own 6.9 m/s the frame's
+ * travel is 11 cm at 60 fps, 23 cm at 30 and 35 cm at 20, and the can was
+ * driven straight THROUGH -- zero contacts at 20 fps on every approach line
+ * tried, which is the reported "objects go through the player car". One tick is
+ * 11 cm whatever the frame rate, and that fits.
+ *
+ * `per_tick` may be NULL, which is exactly rbcar_step_frame. */
+int rbcar_step_frame_cb(rb_car *c, rbcar_clock *k, float throttle, float brake,
+                        float steer, int boost, float frame_dt,
+                        void (*per_tick)(void *ctx), void *ctx);
+
 /* Drop any banked time. Call after anything that stalls the frame for reasons
    the world should not experience -- a track or car load, a respawn. */
 void rbcar_clock_reset(rbcar_clock *k);

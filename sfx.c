@@ -94,6 +94,33 @@ static const char *const UI_SND[5] = {
    the rolling rate. Normalised by this to a 0..1 blend. */
 #define WS_FULL_SLIP    25.0f   /* rad/s of extra spin for a full wheelspin layer */
 
+/* THE MOTOR IS A LATCH, and unlike everything above it this part IS the
+ * engine's. `0x0050acf0` keeps a per-car "the motor is sounding at all" flag at
+ * `phys+0xe7c4`, and `0x0050a2a0` -- the car_motor callback -- returns without
+ * touching a voice while it is clear:
+ *
+ *     prev == 0 && now == 0   ->  return, nothing plays
+ *     prev != 0 && now == 0   ->  play the stop transition, then nothing
+ *
+ * The flag is raised the moment the motor state is neither 0 (stationary, no
+ * input) nor 4 (coasting), and cleared again after the state has been 0 for a
+ * continuous 4 seconds (`ds:0x5543f0`); the threshold under which a car counts
+ * as stationary is 1 m/s (`ds:0x554390`), and the two inputs the state machine
+ * reads are `phys+0x576c` and `phys+0x5774` bit 0 -- accelerate and brake,
+ * which are `rb_input.accel` and `.brake` here.
+ *
+ * `0x00509ff0` zeroes the whole 0x25-dword block whenever the car is not
+ * audible, so a car that has just been created starts with the flag CLEAR. That
+ * is why there is no engine noise over the 3-2-1: the car is on the grid, the
+ * controls are locked out, the state never leaves 0, and the motor has not
+ * started. It starts on GO, with the first throttle.
+ *
+ * `motor_off.wav` (1.66 s) is the stop transition, and there is deliberately no
+ * `motor_on` to match -- the engine simply begins. It has shipped in every bank
+ * this port has ever built and nothing has ever played it. */
+#define ENG_ON_SPEED    1.0f    /* ds:0x554390 -- below this it counts as stopped */
+#define ENG_OFF_TIME    4.0f    /* ds:0x5543f0 -- of that before the motor cuts */
+
 /* A landing is only a landing if it lands hard enough to hear. */
 #define LAND_MIN_SPEED  0.8f    /* m/s of downward velocity */
 #define LAND_FULL_SPEED 5.0f
@@ -152,12 +179,15 @@ static struct {
     int hit_snd[SURF_COUNT];
     int ui_snd[5];
     int snd_landing, snd_splash, snd_cp, snd_wrong, snd_prestart, snd_reset;
+    int snd_beside;
     int snd_start;              /* cp_start -- the four countdown beeps */
     int snd_brake, snd_cdt_obj;
     /* The opponents: one positional loop each off the single motorAI wav that
        ships. See sfx.h. */
     int snd_ai_motor;
     int snd_cdt_car;
+    int snd_bullet, snd_cdt_bullet;
+    float bullet_cool;
     float car_cool;
     loop_t l_ai[SFX_AI_MAX];
     float ai_pos[SFX_AI_MAX][3];
@@ -168,6 +198,11 @@ static struct {
     float voice_cool[SFX_VOICE_COUNT];
     float prop_cool[PROP_N_MODELS];
     float cdt_cool;
+
+    /* The motor latch, phys+0xe7c4 / +0xe7c8 / +0xe7cc. See ENG_OFF_TIME. */
+    int   eng_on;
+    int   eng_was_on;
+    float eng_off_t;
 
     /* edge detection */
     int   was_airborne;
@@ -272,6 +307,12 @@ int sfx_init(void)
     S.snd_splash   = find_load("water_splash");
     S.snd_cp       = find_load("cp");
     S.snd_wrong    = find_load("cp_wrongway");
+    /* `cp_beside\' -- shipped, named by snd.dat, packed by pack_snd.py and until
+       now never loaded, because nothing knew what raised it. The engine fires it
+       once per checkpoint when the car has been within 4 m of the marker it is
+       heading for and has got back outside 5 m (FUN_004eb550, message-system id
+       0x25e). See dirarrow.h. */
+    S.snd_beside   = find_load("cp_beside");
     S.snd_prestart = find_load("prestart");
     /* THE WHOLE 3-2-1-GO IN ONE FILE. cp_start.wav is 4.44 s holding four beeps
        whose onsets are at 0.0005, 1.0005, 2.0005 and 3.0005 s -- 1.0000 s apart
@@ -287,6 +328,14 @@ int sfx_init(void)
        sample against the motor family's three. */
     S.snd_ai_motor = find_load("motorAI_accel1");
     S.snd_cdt_car  = find_load("car_cdt_car");
+    /* THE GUARDS SHOOT, AND BOTH SOUNDS SHIP. `snd.dat` names `bullet` and
+       `car_cdt_bullet` and both wavs are in Sound/; `chn.dat` declares a
+       `bullet` channel and a `burst` one beside `radar`. This project's notes
+       said the guard was a man who stands and turns, and the whole burst -- the
+       clips, the constants, the particle systems and these two cues -- was in
+       the shipped data. See char.c's step_guard. */
+    S.snd_bullet     = find_load("bullet");
+    S.snd_cdt_bullet = find_load("car_cdt_bullet");
     for (i = 0; i < SFX_AI_MAX; i++) {
         S.l_ai[i].snd = S.snd_ai_motor;
         S.l_ai[i].v = MIX_NOVOICE;
@@ -343,6 +392,10 @@ void sfx_set_car(int car_index)
     loop_stop(&S.l_ws);
     S.l_main.snd = S.l_idle.snd = S.l_ws.snd = S.l_trans.snd = -1;
     S.trans_slot = -1;
+    /* A different car is a different motor: the latch goes with the family. */
+    S.eng_on = 0;
+    S.eng_was_on = 0;
+    S.eng_off_t = 0.f;
     audio_unlock();
 
     /* Refcounts and the memory-card read, both UNLOCKED -- this is the several
@@ -431,6 +484,26 @@ void sfx_pause(int paused)
     }
 }
 
+/* The car has just been put on the grid. 0x00509ff0 zeroes the whole sound
+   block whenever a car is not audible, so a car that has just been created
+   starts with the motor flag clear -- this is that, at the one place the port
+   has a race start. It clears the edge tracker too: a grid reset is not an
+   engine being switched off, so it must not play the stop transition. */
+void sfx_engine_off(void)
+{
+    S.eng_on = 0;
+    S.eng_was_on = 0;
+    S.eng_off_t = 0.f;
+    if (!S.ok) return;
+    audio_lock();
+    loop_stop(&S.l_main);
+    loop_stop(&S.l_idle);
+    loop_stop(&S.l_trans);
+    loop_stop(&S.l_ws);
+    S.trans_slot = -1;
+    audio_unlock();
+}
+
 /* ---- the per-frame model ------------------------------------------------- */
 
 /* The car's top speed in m/s, from its own tuning: speedBaseMax is km/h (see
@@ -499,47 +572,89 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
     if (in_water) mat = SURF_WATER;
     S.cur_surface = mat;
 
-    audio_lock();
-
-    /* --- layer 1: the sustained engine, idle crossfaded into running ------ */
-    /* A car at rest with no throttle is pure idle; either revs or road speed
-       brings the running loop up. They overlap deliberately -- crossfading to
-       silence in the middle leaves an audible hole at walking pace. */
-    g_eng = clampf(load > ratio ? load : ratio, 0.f, 1.f);
-    g_idle = 1.f - clampf(g_eng * 1.3f, 0.f, 1.f);
-    pitch = ENG_PITCH_LO + (ENG_PITCH_HI - ENG_PITCH_LO) * clampf(ratio, 0.f, 1.f);
-    /* Off the ground the wheels are free, so the note runs up with throttle
-       rather than with road speed. This is why car_flying exists in the set. */
-    if (airborne) pitch += 0.25f * load;
-
-    loop_drive(&S.l_main, ENG_GAIN * g_eng, pitch, PRIO_ENGINE);
-    loop_drive(&S.l_idle, IDLE_GAIN * g_idle,
-               IDLE_PITCH_LO + (IDLE_PITCH_HI - IDLE_PITCH_LO) * load,
-               PRIO_ENGINE);
-
-    /* --- layer 2: the transient -- accel, decel or reverse ---------------- */
-    if (c->gear < 0 && fwd_speed < -0.2f) {
-        set_trans(M_REVERSE);
-        loop_drive(&S.l_trans, TRANS_GAIN * clampf(-fwd_speed / 2.f, 0.f, 1.f),
-                   0.9f + 0.4f * ratio, PRIO_ENGINE);
-    } else if (load > 0.05f) {
-        set_trans(M_ACCEL);
-        /* loudest while actually pulling: full throttle well below top speed */
-        loop_drive(&S.l_trans, TRANS_GAIN * load * (1.f - 0.6f * ratio),
-                   0.85f + 0.55f * ratio, PRIO_ENGINE);
-    } else if (ratio > 0.08f) {
-        set_trans(M_DECEL);
-        loop_drive(&S.l_trans, TRANS_GAIN * clampf(ratio, 0.f, 1.f) * 0.8f,
-                   0.85f + 0.5f * ratio, PRIO_ENGINE);
+    /* --- the motor latch, before any of the three layers ------------------
+     *
+     * This is the engine's own, not a port model: see ENG_OFF_TIME. The motor
+     * state is 0 while the car is under ENG_ON_SPEED with neither accelerate nor
+     * brake held; the flag rises the instant it leaves that, and falls again
+     * after ENG_OFF_TIME continuous seconds back in it. Coasting fast with
+     * nothing pressed is the state machine's 4, which neither raises nor lowers
+     * it, so the timer is simply held.
+     *
+     * The countdown needs no special case at all and does not get one. The car
+     * is on the grid, main.c has zeroed the controls and is spending no ticks,
+     * so speed is 0 and both inputs are clear -- state 0 from a flag that
+     * respawn() cleared. The engine starts on GO with the first throttle. */
+    if (c->in.accel || c->in.brake) {
+        S.eng_off_t = 0.f;
+        S.eng_on = 1;
+    } else if (speed < ENG_ON_SPEED) {
+        S.eng_off_t += dt;
+        if (S.eng_off_t >= ENG_OFF_TIME)
+            S.eng_on = 0;
     } else {
-        set_trans(-1);
-        loop_stop(&S.l_trans);
+        S.eng_off_t = 0.f;
     }
 
-    /* --- layer 3: wheelspin ---------------------------------------------- */
-    g_ws = clampf(slip / WS_FULL_SLIP, 0.f, 1.f);
-    if (airborne) g_ws = 0.f;               /* nothing to spin against */
-    loop_drive(&S.l_ws, WS_GAIN * g_ws, 0.9f + 0.5f * ratio, PRIO_ENGINE);
+    audio_lock();
+
+    /* The stop transition, on the falling edge and nowhere else. 0x0050a2a0
+       plays it exactly here, off the 0xe7c8 / 0xe7c4 pair this mirrors. */
+    if (S.eng_was_on && !S.eng_on)
+        one_shot(S.motor[M_OFF], ENG_GAIN, 1.f);
+    S.eng_was_on = S.eng_on;
+
+    /* Not "gain 0" -- no voice at all, which is what the callback's early return
+       means. The surface loop, the ambient bed and the one-shots below are NOT
+       part of the motor and keep running either way: a car rolling with the
+       engine off still makes tyre noise. */
+    if (!S.eng_on) {
+        loop_stop(&S.l_main);
+        loop_stop(&S.l_idle);
+        loop_stop(&S.l_trans);
+        loop_stop(&S.l_ws);
+        S.trans_slot = -1;
+    } else {
+        /* --- layer 1: the sustained engine, idle crossfaded into running ------ */
+        /* A car at rest with no throttle is pure idle; either revs or road speed
+           brings the running loop up. They overlap deliberately -- crossfading to
+           silence in the middle leaves an audible hole at walking pace. */
+        g_eng = clampf(load > ratio ? load : ratio, 0.f, 1.f);
+        g_idle = 1.f - clampf(g_eng * 1.3f, 0.f, 1.f);
+        pitch = ENG_PITCH_LO + (ENG_PITCH_HI - ENG_PITCH_LO) * clampf(ratio, 0.f, 1.f);
+        /* Off the ground the wheels are free, so the note runs up with throttle
+           rather than with road speed. This is why car_flying exists in the set. */
+        if (airborne) pitch += 0.25f * load;
+
+        loop_drive(&S.l_main, ENG_GAIN * g_eng, pitch, PRIO_ENGINE);
+        loop_drive(&S.l_idle, IDLE_GAIN * g_idle,
+                   IDLE_PITCH_LO + (IDLE_PITCH_HI - IDLE_PITCH_LO) * load,
+                   PRIO_ENGINE);
+
+        /* --- layer 2: the transient -- accel, decel or reverse ---------------- */
+        if (c->gear < 0 && fwd_speed < -0.2f) {
+            set_trans(M_REVERSE);
+            loop_drive(&S.l_trans, TRANS_GAIN * clampf(-fwd_speed / 2.f, 0.f, 1.f),
+                       0.9f + 0.4f * ratio, PRIO_ENGINE);
+        } else if (load > 0.05f) {
+            set_trans(M_ACCEL);
+            /* loudest while actually pulling: full throttle well below top speed */
+            loop_drive(&S.l_trans, TRANS_GAIN * load * (1.f - 0.6f * ratio),
+                       0.85f + 0.55f * ratio, PRIO_ENGINE);
+        } else if (ratio > 0.08f) {
+            set_trans(M_DECEL);
+            loop_drive(&S.l_trans, TRANS_GAIN * clampf(ratio, 0.f, 1.f) * 0.8f,
+                       0.85f + 0.5f * ratio, PRIO_ENGINE);
+        } else {
+            set_trans(-1);
+            loop_stop(&S.l_trans);
+        }
+
+        /* --- layer 3: wheelspin ---------------------------------------------- */
+        g_ws = clampf(slip / WS_FULL_SLIP, 0.f, 1.f);
+        if (airborne) g_ws = 0.f;               /* nothing to spin against */
+        loop_drive(&S.l_ws, WS_GAIN * g_ws, 0.9f + 0.5f * ratio, PRIO_ENGINE);
+    }
 
     /* --- the surface loop ------------------------------------------------- */
     if (airborne) {
@@ -564,6 +679,7 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
     if (S.brake_cool > 0.f) S.brake_cool -= dt;
     if (S.cdt_cool > 0.f) S.cdt_cool -= dt;
     if (S.car_cool > 0.f) S.car_cool -= dt;
+    if (S.bullet_cool > 0.f) S.bullet_cool -= dt;
     for (i = 0; i < PROP_N_MODELS; i++)
         if (S.prop_cool[i] > 0.f) S.prop_cool[i] -= dt;
     for (i = 0; i < SFX_VOICE_COUNT; i++)
@@ -618,6 +734,7 @@ void sfx_ui(sfx_ui_t which)
 
 SFX_CUE(sfx_checkpoint, snd_cp, 0.9f)
 SFX_CUE(sfx_wrongway, snd_wrong, 0.9f)
+SFX_CUE(sfx_cp_beside, snd_beside, 0.8f)
 SFX_CUE(sfx_prestart, snd_prestart, 1.0f)
 SFX_CUE(sfx_countdown, snd_start, 1.0f)
 SFX_CUE(sfx_respawn, snd_reset, 0.9f)
@@ -763,6 +880,47 @@ void sfx_car_hit(float speed)
     S.car_cool = PROP_CDT_COOL;
     audio_lock();
     one_shot(S.snd_cdt_car, g, 0.96f + 0.08f * g);
+    audio_unlock();
+}
+
+/*
+ * A ROUND FROM A GUARD'S BURST, and the hit it lands.
+ *
+ * `bullet` is positional at the muzzle; `car_cdt_bullet` is not, because it is
+ * the player's own car being hit and the engine keeps every car_cdt_* cue on
+ * car_CDT&Boost with the rest of the car's own -- the same split sfx_prop_hit
+ * already makes between the prop's knock and the car's.
+ *
+ * THE RADII ARE THE PORT'S. The burst manager's own MOD_SNDCHANNEL is inside
+ * the 'BRMN' object the engine spawns by 4CC, which is not in any of the three
+ * character databases pack_chars.py reads, and chn.dat carries a name and a
+ * volume and no routing at all. So these are the props' declared 30/8 knock
+ * pair -- the nearest thing in the shipped data to a sharp report -- and they
+ * are marked rather than presented as recovered.
+ */
+#define BULLET_RMIN 30.0f
+#define BULLET_RMAX 8.0f
+#define BULLET_COOL 0.05f       /* under one TimeShoot, so all six are heard */
+
+void sfx_bullet(const float pos[3])
+{
+    if (!S.ok || S.paused || !pos || S.snd_bullet < 0)
+        return;
+    if (S.bullet_cool > 0.f)
+        return;
+    S.bullet_cool = BULLET_COOL;
+    audio_lock();
+    mix_play_3d(audio_mix(), S.snd_bullet, pos[0], pos[1], pos[2],
+                BULLET_RMIN, BULLET_RMAX, 1.f, 1.f, 0, PRIO_ONESHOT);
+    audio_unlock();
+}
+
+void sfx_bullet_hit(void)
+{
+    if (!S.ok || S.paused || S.snd_cdt_bullet < 0)
+        return;
+    audio_lock();
+    one_shot(S.snd_cdt_bullet, 1.f, 1.f);
     audio_unlock();
 }
 

@@ -65,6 +65,135 @@
 #define CHR_ROADCAR_TOWERSHOOTT        1.0f           /* raw 10 ini, raw * 0.1 -> 0x14ee8b4 */
 
 /*
+ * BURST_MNG -- the gunfire. burst_mng.ini + burst_mng.crs, read through the
+ * FLOAT getter at 0x532410 (value = raw / div, and it does NOT clamp), so
+ * `Radius` ships at 200 against its own .ini range of 0..100 and means 2.0 m.
+ *
+ * A guard whose watcher says ATTACK spawns a 'BRMN' object at 0x51aa81, one
+ * metre and a half above its own pivot, and that object fires NShoots rounds
+ * TimeShoot apart. Each round is a ray from the muzzle to the target car's
+ * position led by `Offset` x its speed IN KM/H x 0.5, plus a sweep that walks
+ * from +Radius to -Radius along one random unit vector across the burst -- so a
+ * burst sprays and only the middle of it is on the car.
+ */
+#define CHR_BURST_NSHOOTS        6.0f           /* raw 6 crs, / 1 at 0x52df3f -> 0x165be44 */
+#define CHR_BURST_TIMESHOOT      0.100000001f   /* raw 10 crs, / 100 at 0x52df5b -> 0x165be48 */
+#define CHR_BURST_OFFSET         0.5f           /* raw 50 crs, / 100 at 0x52df7d -> 0x165be4c */
+#define CHR_BURST_RADIUS         2.0f           /* raw 200 crs, / 100 at 0x52df9a -> 0x165be50 */
+#define CHR_BURST_COLLISIONLEN   1.5f           /* raw 150 crs, / 100 at 0x52dfba -> 0x165be58 */
+
+/* The whole burst lasts (NShoots - 1) * TimeShoot, derived at 0x52dff0. */
+#define CHR_BURST_LEN            0.5f
+
+/* AND `CollisionLen` IS A DEAD KEY. 0x52dfd4 stores it at 0x165be58 and nothing
+ * in the image reads that dword -- searched by scanning every dword in .text
+ * inside 0x165be3c..0x165be60, which finds all six of its neighbours' readers.
+ * The ray's own length is 1.5x the distance to the aim point or 10 m, whichever
+ * is longer, and both of those are immediates in 0x52dc50. Same shape as the
+ * guard's four .ini keys below: shipped, converted, and never consumed.
+ */
+
+/*
+ * THE ATTENTION MACHINE -- 0x535720 builds it, 0x5357e0 steps it, and four
+ * creatures share it. It holds a target, two volumes and a dwell clock:
+ *
+ *   nothing is in the ACQUIRE volume            -> 0, the creature is idle
+ *   the target has left the HOLD volume         -> 1, dropped
+ *   the dwell has not run out yet               -> 2, tracking (turn to face)
+ *   it has                                      -> 3, ATTACK
+ *
+ * Acquire takes the NEAREST '$CAR' in the acquire volume with the distance of
+ * the last car it attacked DOUBLED, so it works round a field rather than
+ * fixating. `first` is the dwell before the first attack and `again` the dwell
+ * between later ones; after `count` attacks it drops the target and re-acquires.
+ * Every one of those is an immediate at the creation site, quoted per row.
+ */
+typedef struct {
+    float first, again;
+    int   count;
+} chr_watch_t;
+
+#define CHR_WATCH_GUARD      { 0.150000006f,  1.25f,         2 } /* 0x51a670 -- Guard_Man: visibilityVolume + guardVolume */
+#define CHR_WATCH_TOWER      { 0.330000013f,  1.25f,         3 } /* 0x517f10 -- the Btr's tower, roadcar.ini's Tower* keys */
+#define CHR_WATCH_DOG        { 2.0f,          0.0f,          1 } /* 0x518b80 -- the Dog: attackVolume */
+#define CHR_WATCH_SEAGULL    { 1.0f,          0.0f,          1 } /* 0x513b40 -- the Seagull, whose ground machine does not use it */
+
+/*
+ * THE REACTION -- a person KICKS a car, or picks it up and THROWS it, and a
+ * guard shoots at it. All of it was in the shipped data while these notes said
+ * the layer only noticed being run over: people.sb gives the Man, the Woman and
+ * the RepairMan a `Pendal` (Russian for a kick) and a `Brosok` (a throw), the
+ * Guard a `kick` and a `shoot`, and the exe's own clip tables put them in
+ * animation-state order --
+ *
+ *   people  0x573c68  [ Stand, Walk, Brosok, Pendal, Hurt ]
+ *   guard   0x574bec  [ kick, shoot, stand ]
+ *   seagull 0x573e84  [ start_flight, flight_idle, look_around, walk, flight ]
+ *
+ * -- selected from a flag word by 0x50f780 (0x100 throw, 0x20 kick, 0x10 hurt,
+ * 0x3 walk, else stand), 0x51ae10 (0x10 kick, 0x20 shoot, else stand) and
+ * 0x5137c0 (1 look_around, 2 walk, 4 flight, else start_flight). The decision
+ * itself is 0x510f40, the kick 0x511470, the grab 0x5111f0 and the carry and
+ * release 0x510b90.
+ *
+ * None of it is sliderable, so every threshold below is emitted as the float at
+ * the address the instruction reads, with the instruction beside it -- a wrong
+ * site emits a wrong number rather than agreeing with a comment.
+ */
+#define CHR_REACT_DY           0.600000024f   /* 0x554688 read at 0x510f89
+                           the car has to be within this much of the person's own height */
+#define CHR_REACT_NEAR         0.800000012f   /* 0x5544a0 read at 0x511098
+                           inside this it always reacts, whichever way it is facing */
+#define CHR_REACT_THROW_P      0.200000003f   /* 0x5544f0 read at 0x5110da
+                           rand01 at or under this tries the THROW; above it, the kick */
+#define CHR_REACT_CONE         25.0f          /* 0x5547bc read at 0x511163
+                           degrees off the person's forward, for the running kick */
+#define CHR_REACT_FAR          4.0f           /* 0x5543f0 read at 0x511174
+                           and how far away that one reaches */
+#define CHR_REACT_CAR_SPEED    4.16666698f    /* 0x554b08 read at 0x5111b0
+                           and how fast the car has to be coming -- 15.0 km/h exactly */
+#define CHR_REACT_TURN_RATE    360.0f         /* imm at 0x5114cd
+                           degrees a second onto the car, pushed as an immediate */
+#define CHR_REACT_WINDUP       0.5f           /* 0x554384 read at 0x5114f9
+                           seconds facing the car before the swing starts */
+#define CHR_REACT_KICK_LOST    1.10000002f    /* 0x554518 read at 0x511555
+                           the car got away: abandon the kick past this */
+#define CHR_REACT_KICK_T0      0.649999976f   /* 0x554aac read at 0x5115c4
+                           seconds into the 3.0 s Pendal clip when the sole connects */
+#define CHR_REACT_GRAB_LOST    1.39999998f    /* 0x554b0c read at 0x511290
+                           the same for the throw, which reaches further */
+#define CHR_REACT_GRAB_T0      0.600000024f   /* 0x554688 read at 0x5112eb
+                           seconds into the 4.7 s Brosok clip when the car leaves the ground */
+#define CHR_REACT_LET_GO_T     2.0f           /* 0x5543c8 read at 0x510dd7
+                           and when it leaves the hand */
+#define CHR_REACT_LIFT_UP      2.20000005f    /* 0x554b04 read at 0x510ec3
+                           how far above the person the clearance sphere sits */
+#define CHR_REACT_KICK_AWAY    4.0f           /* imm at 0x51160e
+                           m/s away from the person, horizontally */
+#define CHR_REACT_KICK_UP      7.0f           /* imm at 0x511605
+                           and m/s straight up -- the kick pops the car */
+#define CHR_REACT_THROW_FWD    7.0f           /* 0x5547e4 read at 0x510dfe
+                           m/s along the person's forward, past the car's own 6.91 top speed */
+#define CHR_REACT_THROW_UP     4.0f           /* 0x5543f0 read at 0x510e0a
+                           and m/s up -- the throw is the flatter of the two */
+#define CHR_BULLET_AWAY        6.5f           /* imm at 0x5085c8
+                           a round that lands: m/s away from where it hit */
+#define CHR_BULLET_UP          3.25f          /* imm at 0x5085c3
+                           and m/s up */
+#define CHR_BULLET_LEAD        0.5f           /* 0x554384 read at 0x52dc8e
+                           Offset is scaled by this and the target's speed IN KM/H, to lead it */
+#define CHR_BULLET_REACH       1.5f           /* 0x554824 read at 0x52dd0e
+                           the ray runs this many times the distance to the aim point */
+#define CHR_BULLET_MIN         10.0f          /* 0x554490 read at 0x52dd14
+                           or this far, whichever is longer */
+#define CHR_GULL_STARTLE       4.0f           /* imm at 0x512d0e
+                           a car, a person or a dog inside this and the gull goes up */
+#define CHR_GULL_ARRIVE        0.25f          /* imm at 0x512ce2
+                           and how near its wander target counts as arrived */
+#define CHR_GUARD_MUZZLE       1.5f           /* 0x554824 read at 0x51aa6c
+                           the burst is spawned this far above the guard's own pivot */
+
+/*
  * THE COLLISION PROXY -- one per model, and the characters ARE solid.
  *
  * The retail engine registers a sphere-set provider per object 4CC and a

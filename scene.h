@@ -241,9 +241,19 @@ typedef struct {
     GLuint gl_vbo_buv;              /* buv on the GPU, 0 = client pointer */
     unsigned int env;               /* ENV_*, 0 on a scene older than VSC7 */
     unsigned int model;             /* VSC8: which prop model, 0 otherwise */
-    /* Model-space vertex normals, 3 floats each, NULL unless env != 0. The
-       glance pass turns these into sphere-map UVs; nothing else reads them. */
+    /* Model-space vertex normals, 3 floats each. In the file only on an
+       env != 0 batch (VSC7 writes them for the glance); scene_set_build_normals
+       fills in the rest at load, because the car's LIGHT needs one on every
+       batch it draws and the glance only ever needed them on the shell. The
+       glance pass turns them into sphere-map UVs, draw_pass hands them to GL as
+       a normal array. */
     float *nrm;
+    unsigned int nrm_built;         /* built at load rather than read */
+    /* The car's own light, one RGBA per vertex, rebuilt every frame by
+       scene_shade out of `nrm' and uploaded to gl_vbo_lit. NULL until the first
+       shade -- see carlight.h for why the CPU does this and not GL. */
+    unsigned char *lit;
+    GLuint gl_vbo_lit;
     vtx_t *verts;
     unsigned short *idx;
     GLuint gl_tex;
@@ -368,8 +378,7 @@ typedef struct {
  * Cost: one extra copy of the vertex and index data, ~3.3 MB on beach_1, held on
  * the GPU alongside the main-memory copy. The main-memory copy has to stay --
  * culling boxes are built from it at load, water keeps `rest` from it, envmap
- * reads it per frame, and trace_fit_tyres and carani measure the packed meshes
- * through it.
+ * reads it per frame, and carani measures the packed meshes through it.
  */
 
 /*
@@ -430,6 +439,43 @@ int  scene_tex_quality(void);
  */
 void scene_set_tex_swap_rb(int on);
 int  scene_tex_swap_rb(void);
+
+/*
+ * The NEXT scene_load builds a vertex normal for every batch that arrives
+ * without one, and puts them on the GPU beside the vertices.
+ *
+ * On for the three cars and off for everything else. The car's light needs a
+ * normal on every batch it draws (carlight.h); the .vsc carries one only where
+ * the glance needed it, which is the shell and the glass and not the wheels. A
+ * track would be 47,000 triangles of normals that nothing reads, and props and
+ * characters are not lit either.
+ *
+ * Left in the app rather than in pack_vsc.py on purpose: it costs a few
+ * milliseconds at load and no change to the shipped .vsc files, so an installed
+ * copy of the assets does not have to be rebuilt to get the lighting.
+ */
+void scene_set_build_normals(int on);
+
+/*
+ * Bind the per-vertex light as a COLOUR array while drawing. The car's own
+ * passes only: leaving it on for the world would bind an array no track batch
+ * has, and every other module in the port draws with its own colours.
+ */
+void scene_set_lighting(int on);
+
+/*
+ * Shade every batch that has normals: one grey per vertex out of
+ * carlight_shade, uploaded to that batch's own colour buffer. Called once per
+ * car per frame, before the two draw passes.
+ *
+ * `L_model' is the direction toward the light in the SCENE's model space -- the
+ * caller rotates the world direction by the car's own matrix, because the caller
+ * is what has it. A RIGGED part is rotated again here, by its own draw matrix,
+ * which is the one thing this has to know that the caller does not: a wheel is
+ * drawn under `rig.draw[part]' and its normals are in its own space.
+ */
+void scene_shade(scene_t *s, const float L_model[3],
+                 float ambient, float direct);
 
 int scene_load(const char *path, scene_t *s);
 

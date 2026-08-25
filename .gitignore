@@ -21,6 +21,7 @@ allstarts
 antheight
 atstart
 audio_test
+carlight_test
 carparts_test
 ceiling
 chartest
@@ -34,6 +35,7 @@ inv
 menu_test
 meshalign
 placechk
+progchk
 proptest
 rb_test
 rockroll
