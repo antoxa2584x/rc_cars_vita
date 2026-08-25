@@ -368,12 +368,25 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
 
     python3 $RE/vsc_check.py assets/*.vsc      # exit 0 = clean
 
-`pack_col.py` writes **COL3**: the grid, plus one material byte per triangle and
-a per-track default (what the surface sounds key on), plus the **water surface
-height per cell**. Older grids still load -- COL1 reports the default material
-everywhere, and COL1 or COL2 report no water anywhere -- so an un-repacked track
-runs; it just always sounds like one surface and its rivers do not slow the car.
-Repack all ten after touching `SURF_RE` or anything about water.
+`pack_col.py` writes **COL5**: the grid, plus one material byte per triangle and
+a per-track default (what the surface sounds key on), the **water surface height
+per cell** (COL3), the ENGINE's own surface class per triangle (COL4, what the
+tyre marks key their strength on) and how bright the level's own LIGHTMAP is on
+each triangle (COL5, what darkens the car under a bridge). Older grids still
+load -- COL1 reports the default material everywhere, COL1 or COL2 report no
+water anywhere, a pre-COL4 grid reports surface class 0 and a pre-COL5 grid has
+no opinion about the lightmap -- so an un-repacked track runs; it just always
+sounds like one surface, its rivers do not slow the car, its marks are one flat
+strength and its car never goes dark. Repack all ten after touching `SURF_RE`,
+anything about water, `eng_surface_class` or the lightmap bake.
+
+**Every version so far APPENDS a trailing array and leaves the prefix -- header,
+tris, cell_start, tri_idx -- byte-identical, and readers should depend on that
+rather than on a list of magics.** `pack_ai.py` has its own small `.col` reader
+for ground heights and whitelisted COL1-COL4; COL5 then broke `./build.sh` in a
+module with no interest in lightmaps. It now takes any `COL`*n* and validates the
+parse instead. **Three things read this format -- `col.c`, `pack_col.py` and
+`pack_ai.py` -- so a version bump means grepping for all three.**
 
 Six of the ten tracks have water (the four beaches, country_1, country_3);
 country_2, country_4, urban_1 and urban_2 have none. The water is deliberately
