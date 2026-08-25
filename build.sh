@@ -277,6 +277,10 @@ export VITASDK
 export PATH="$VITASDK/bin:$PATH"          # its own statement: see BUILD.md, the
                                           # one-liner expands VITASDK before it
                                           # is assigned and PATH becomes "/bin:"
+export RCCARS_EXE="$GAME/RCCars.exe"
+export RCCARS_DB="$DB"
+export RCCARS_SETTINGS="$EXTRACTED/Settings"
+export RCCARS_PROFILES="$EXTRACTED/Profiles"
 
 if wanted build; then
     command -v arm-vita-eabi-gcc >/dev/null \
@@ -420,7 +424,8 @@ if wanted tracks; then
                    "$RE/gen_vis_data.py"; then
             skip "$t.col"
         else
-            run python3 "$RE/pack_col.py" "$src" "$ASSETS/$t.col"
+            run python3 "$RE/pack_col.py" "$src" "$ASSETS/$t.col" \
+                --settings "$EXTRACTED/Settings"
         fi
     done
 fi
@@ -649,7 +654,9 @@ if wanted tables; then
         run python3 "$RE/gen_hud_data.py" "$VITA/hud_data.h" \
             --exe "$GAME/RCCars.exe" --settings "$EXTRACTED/Settings" \
             --lang "$GAME/Language/English" \
-            --textures "$EXTRACTED/Textures.1"
+            --textures "$EXTRACTED/Textures.1" \
+            --cockpit "$DB/cockpit.sb" \
+            --champ "$EXTRACTED/Scripts/championship.ini"
     fi
 
     if [ -f "$VITA/font.h" ] && [ "$FORCE" = 0 ]; then
@@ -727,7 +734,8 @@ if wanted ai; then
     else
         run python3 "$RE/pack_ai.py" --profiles "$EXTRACTED/CarProfiles" \
             --data "$VITA/ai_data.h" --tracks "$VITA/tracks.h" \
-            --col "$ASSETS" --out "$ASSETS"
+            --col "$ASSETS" --out "$ASSETS" \
+            --rb-data "$VITA/rb_data.h"
     fi
 fi
 
