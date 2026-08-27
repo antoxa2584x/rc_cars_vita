@@ -69,6 +69,9 @@
 #include "carlight.h"
 #include "dirarrow.h"
 #include "msg.h"
+#include "mainmenu.h"
+#include "touch.h"
+#include "results.h"
 #include "menu.h"
 #include "settings.h"
 #include "ai.h"
@@ -109,6 +112,42 @@ static scene_t track, car;
 /* props.vsc holds all 13 knockable props and is shared by every track, so it
    loads ONCE at init and is never released with the track. See prop.h. */
 static scene_t props_scene;
+
+/* THE FRONT END. `menu_scene` is a texture-only .vsc built off Interface.sb --
+   the game's own manifest of what the interface is made of -- and the app boots
+   into `mm` rather than into a race. `in_main_menu` is the app's only mode bit:
+   with it up the world is not simulated and not drawn, because the menu's
+   Desktop covers every pixel and 40,000 triangles under an opaque background is
+   40,000 triangles of nothing. See mainmenu.h. */
+static scene_t     menu_scene;
+static mainmenu_t  mm;
+static touch_state g_touch;
+static int         in_main_menu = 1;
+
+/* THE RACE SETUP the quick-race page chose. `race_laps` is enumNLaps -- the lap
+   LIMIT, which this port had no source for until the exe's own dlgRACESUM turned
+   out to carry the row (ui.md); `ai_skill` is enumSkill, and load_ai hands it to
+   ai_init. `race_over` latches when the limit is reached so the FINISH banner is
+   posted once and the clocks stop where they are. */
+static int race_laps = MM_LAPS_DEF;
+static int ai_skill = 1;
+static int race_over;
+
+/* THE RESULTS, and the bookkeeping the finish screen needs. None of it exists
+ * anywhere else: the port tracks the PLAYER's clock in race_ui and knows every
+ * opponent's progress in spine metres, and neither of those is a lap time.
+ *
+ * Watched off each racer's own lap counter, which is the cheapest thing that is
+ * also right -- `ai_car.spine_lap' for an opponent and cps.lap for the player,
+ * both of which already tick at the seam (ai.h). One float per racer per lap and
+ * a comparison; nothing is allocated and nothing is sampled per tick. */
+static results_t results;
+static int   results_up;
+static float race_t;                       /* the race clock, from GO */
+static float lap_t0[AI_MAX_OPPONENTS + 1]; /* when this racer's lap began */
+static float lap_best[AI_MAX_OPPONENTS + 1];
+static float fin_t[AI_MAX_OPPONENTS + 1];  /* 0 until it crossed for the last time */
+static int   lap_seen[AI_MAX_OPPONENTS + 1];
 static props_t props;
 /*
  * The track's people, animals and road cars. Per track, unlike props.vsc: a
@@ -480,7 +519,12 @@ static void place_car(float x, float z, float ref_y, float yaw)
         carani_bind(&car.rig, &rc);
 
     /* The engine's own reset cue. Also the one place the loops are guaranteed
-       to be re-evaluated against a car that has just teleported. */
+       to be re-evaluated against a car that has just teleported.
+     *
+       NOT GATED HERE. place_car runs at boot, under the front end, and this used
+       to fire the spawn cue over the main menu -- but the gate belongs in sfx.c,
+       which refuses every race one-shot while sfx_race_active is 0. See sfx.h
+       for why that is one question there rather than an `if' at each site. */
     sfx_respawn();
 }
 
@@ -516,8 +560,34 @@ static void respawn(void)
        the car and the field on the line. See countdown.h. Started here rather
        than by the caller so every entry into a race gets one: a track change, a
        car change, a texture-quality reload and the menu's Restart row. */
+    /* ...BUT NOT WHILE THE FRONT END IS UP. The app loads a track at boot so the
+     * Race button has one to start, and respawn() is what puts the car on the
+     * grid -- but a countdown started there runs its 3, 2, 1 SOUND over the main
+     * menu, and by the time the player presses Race the light has been sitting
+     * on GO for as long as they took to choose. The same goes for a track change
+     * made from Options, which is still the menu.
+     *
+     * THE SOUND is refused by sfx.c while sfx_race_active is 0 (sfx.h), and THE
+     * LIGHT holds where countdown_start leaves it because dt is 0 under the
+     * menu -- so a race started from the front end gets a fresh 3, 2, 1 either
+     * way. Everything else respawn() does -- the grid, the checkpoint cursor,
+     * the field, the characters, the clocks -- happens whenever it is called, so
+     * what the menu sits in front of is a race ready to go. */
     countdown_start(&countdown);
     sfx_countdown();
+    /* The results' own state. Cleared HERE rather than at the flag, because a
+       restart is the only thing that makes the last race's times wrong. */
+    {
+        int i;
+        race_t = 0.f;
+        results_up = 0;
+        for (i = 0; i <= AI_MAX_OPPONENTS; i++) {
+            lap_t0[i] = 0.f;
+            lap_best[i] = 0.f;
+            fin_t[i] = 0.f;
+            lap_seen[i] = 0;
+        }
+    }
     /* ...and the motor is SILENT over it. The engine keeps a per-car "the motor
        is sounding" flag and clears it whenever the car is not audible, so a car
        just placed on the grid has no engine noise until it is driven; the
@@ -578,6 +648,162 @@ static void respawn_checkpoint(void)
          (int)(p[2] * 100.f), (int)yaw, cps.lap);
 }
 
+/* THE MAIN MENU'S CAR VIEWPORT -- `animCar', the one control on the quick-race
+ * page mainmenu.c cannot draw itself (mainmenu.h). The rectangle is in screen
+ * pixels and ui.c's ortho pass has already been left, so this is an ordinary 3D
+ * draw into a scissored viewport.
+ *
+ * IN MODEL SPACE, not world space. The in-race draw multiplies by
+ * rbcar_matrix(&rc) and shifts by CenterMassOY to get from the rigid body's
+ * origin to the mesh's; here the car is simply AT the origin facing +Z -- the
+ * mesh's own nose direction -- and the camera turns around it. Nothing about the
+ * car's actual pose on the grid reaches this, which is the point: the preview is
+ * of the model, not of a parked car.
+ *
+ * WHERE the camera stands and WHAT it looks at are two questions with two
+ * answers, and treating them as one is what put the cars off centre. Both are
+ * scene_frame_turntable's, cached by menu_car_frame below.
+ *
+ * THE SCISSOR IS NOT OPTIONAL. A viewport clips geometry but not the clear or a
+ * blend, and the car's own alpha-keyed passes would otherwise bleed across the
+ * frame; scissoring the pair to the same rectangle is what keeps the preview
+ * inside its box.
+ */
+#define MENU_CAR_FOV   34.f     /* the lens */
+#define MENU_CAR_PITCH 14.f     /* degrees above the car, as the game's shot has */
+#define MENU_CAR_SPIN  22.f     /* degrees a second */
+/* How much of the frustum the car's own bounding box fills, inverted: 1.0 puts
+ * the widest point of the turn exactly on the viewport's edge.
+ *
+ * IT IS THE KNOB, and it now has less to hide. The box takes in the ANTENNA --
+ * 0.67 m up on the Overkill -- so the car's ink is smaller than its bounds and
+ * 1.0 leaves a real margin, and the margin is what the re-aim below spends.
+ * What matters is that the box is per-car and consistent (0.79 / 0.73 / 1.09 on
+ * the three, which is their true order), so changing car reframes instead of
+ * clipping -- which is what the fixed 0.78 m distance this replaced could not
+ * do. rccars_re/menuframe.c is what says the margin is still there. */
+#define MENU_CAR_MARGIN 1.0f
+
+/* THE FRAME, SOLVED ONCE PER CAR. scene_frame_turntable projects every drawn
+ * vertex at twelve spin angles, six times over, which is a few hundred thousand
+ * transforms -- fine at a car change and not fine at 60 Hz. So it is cached on
+ * the two things it depends on: which car is loaded, and the shape of the
+ * viewport (the window can be resized on the host build, and the Vita's is
+ * fixed).
+ *
+ * WHAT IS LEFT OUT OF THE AIM is the ANTENNA, and that is the whole fix behind
+ * this. A car's bounding box is not its picture: the Overkill's is
+ * y[-0.090 0.674] while its body ends at 0.293, the top 56% being 0.38 m of
+ * one-pixel whip. Aiming at that box's centre pointed the camera 0.19 m over the
+ * roof, and -- measured by projecting the drawn vertices, not by reading the box
+ * back -- put the body's centre at y 198 / 166 / 174 of a 276 px viewport that
+ * wants 138. Reported as the car models being off centre. It now lands on
+ * 138.1 / 138.4 / 138.0.
+ *
+ * The whip stays in the DISTANCE, so the car does not shrink and does not run
+ * off the sides; what it loses is its top, which now leaves the frame by 83 px
+ * on the Overkill, 4 on the Hummer and none on the Buggy. That trade was chosen
+ * over the alternative -- keeping the aerial in frame costs a third of the
+ * Overkill's size, since its whip is nearly as tall as the truck.
+ *
+ * rccars_re/menuframe.c holds every number in this comment.
+ *
+ * antenna.part rather than a name lookup here: antenna.c is the one file that
+ * knows how to find the whip, and it answers -1 for a scene packed without one,
+ * which frames exactly as before. */
+static const scene_frame_t *menu_car_frame(float aspect)
+{
+    static scene_frame_t fr;
+    static int   for_car = -2;
+    static float for_aspect = 0.f;
+
+    if (for_car != cur_car || aspect != for_aspect) {
+        scene_frame_turntable(&car, antenna.part, MENU_CAR_FOV,
+                              MENU_CAR_PITCH, aspect, MENU_CAR_MARGIN, &fr);
+        for_car = cur_car;
+        for_aspect = aspect;
+        rlog("[rccars] menu car frame: %s  aim (%d,%d,%d) mm  %d cm back\n",
+             rbcar_name(cur_car), (int)(fr.aim[0] * 1000.f),
+             (int)(fr.aim[1] * 1000.f), (int)(fr.aim[2] * 1000.f),
+             (int)(fr.dist * 100.f));
+    }
+    return &fr;
+}
+
+static void menu_car_draw(void *ctx, float x, float y, float w, float h)
+{
+    const int vx = (int)(x + 0.5f), vw = (int)(w + 0.5f);
+    const int vh = (int)(h + 0.5f);
+    /* GL's viewport has its origin bottom left and ui.c's rectangles are top
+       left, so the y flips about the screen's own height. */
+    const int vy = SCR_H - (int)(y + 0.5f) - vh;
+
+    (void)ctx;
+    if (!car.n_batches || vw <= 0 || vh <= 0)
+        return;
+
+    glViewport(vx, vy, vw, vh);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(vx, vy, vw, vh);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    perspective(MENU_CAR_FOV, (float)vw / (float)vh, 0.02f, 20.f);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    /* FRAMED OFF THIS CAR, not off a distance tuned by eye -- which is the
+     * difference between the 42 cm Overkill and the 53 cm Buggy, and is why a
+     * fixed distance clipped one of them at every edge. The rule, and why the
+     * distance and the aim point come from different boxes, is in scene.h at
+     * scene_frame_turntable. */
+    {
+        const scene_frame_t *fr = menu_car_frame((float)vw / (float)vh);
+        glTranslatef(0.f, 0.f, -fr->dist);
+        glRotatef(MENU_CAR_PITCH, 1.f, 0.f, 0.f);
+        glRotatef(mm.t * MENU_CAR_SPIN, 0.f, 1.f, 0.f);
+        glTranslatef(-fr->aim[0], -fr->aim[1], -fr->aim[2]);
+    }
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LEQUAL);
+    glClear(GL_DEPTH_BUFFER_BIT);      /* scissored to the box, by the line above */
+    glEnable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glColor4f(1.f, 1.f, 1.f, 1.f);
+
+    /* A rig's model-space box means nothing against the world frustum, and there
+       is no world frustum here at all. */
+    scene_cull_off();
+    /* LIT BY A FIXED STUDIO LIGHT, not by the track's. carlight's own terms chase
+       the lightmap under the wheels (carlight.h), which in a menu is wherever the
+       car happens to be parked -- a car previewed under a bridge would come up
+       black. Model space, because scene_shade works there. */
+    {
+        static const float Lm[3] = { 0.42f, 0.80f, 0.43f };
+        scene_shade(&car, Lm, 0.55f, 0.55f);
+        scene_set_lighting(1);
+    }
+    scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+    /* The exhaust, opaque with the reference dropped -- the same pass and the
+       same reason as the in-race draw. */
+    glAlphaFunc(GL_GREATER, 0.f);
+    scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    scene_set_lighting(0);
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, SCR_W, SCR_H);
+}
+
 /* ai_track.spine, bound to checkpoint.c's own spine. The original asks the same
    question of the player and of every opponent (FUN_004ea120), so this is the one
    function both sides are measured with. */
@@ -629,7 +855,7 @@ static void load_ai(int idx)
     ai_tr.spine_len = cps.spine_len;
 
     if (!ai_init(&ai, idx, "app0:assets", col_rb_world(&col),
-                 1 /* normal */, 0 /* single race */))
+                 ai_skill, 0 /* single race */))
         return;
 
     /* THE PLAYER'S SIDE OF THE PLACING, PUT IN THE OPPONENTS' METRES -- and this
@@ -655,6 +881,32 @@ static void load_ai(int idx)
             || !cp_set_stations(&cps, frac, n, lap_len))
             rlog("[rccars] checkpoint stations: no usable fit, keeping the "
                  "spine's arc lengths\n");
+        /* AND THE ROAD ITSELF, out of the same recordings and for the harder
+         * half of the same question. The stations say WHERE round a lap each
+         * checkpoint falls; the line says where round it the CAR is -- which the
+         * player's side had no way to ask, and answered with an odometer
+         * instead. An odometer only grows, so a wide line or a spin read as
+         * progress and the place came out one or two better than the truth
+         * whenever an opponent was near enough to compare against. See
+         * checkpoints_t.line_pt.
+         *
+         * Installed here, beside the stations, because this is the one place the
+         * two subsystems meet -- ai.c owns the recordings, checkpoint.c owns the
+         * markers, neither may include the other. The copy is checkpoint.c's, so
+         * the line is freed again the moment it has been handed over. */
+        {
+            ai_line line;
+            if (ai_fit_line(&ai, (const float (*)[3])mk, n, &line)) {
+                if (!cp_set_line(&cps, (const float (*)[2])line.pt, line.cum,
+                                 line.n, line.len, line.at, line.n_cp))
+                    rlog("[rccars] the road: fitted but not usable, the "
+                         "odometer stands\n");
+                ai_line_free(&line);
+            } else {
+                rlog("[rccars] the road: no recording fits, the odometer "
+                     "stands\n");
+            }
+        }
     }
 
     /* One scene per model the roster actually asks for, and no more: a car .vsc
@@ -737,6 +989,9 @@ static int load_track(int idx)
        vertical offset are now per track and reading them off the wrong row is
        exactly the bug this replaced. */
     water_init(&water, &track, &col, idx);
+    /* BEFORE cp_init, which memsets: the fitted road is the one thing in
+       there that is allocated. */
+    cp_free(&cps);
     cp_init(&cps, &track, &col);
     /* The sun: the SUN_AF marker out of this track's own .sb, plus the five
        flare textures --markers packed beside it. urban_1 and urban_2 carry no
@@ -1025,6 +1280,11 @@ int main(void)
     if (audio_init("app0:assets/sound.sbk", "app0:assets/music") != 0)
         rlog("[rccars] audio: no sound.sbk -- running silent\n");
     sfx_init();
+    /* AND THE FRONT END IS UP FROM HERE, so nothing that belongs to a race is
+       audible until one is started. Set BEFORE the first load and the first
+       respawn, both of which run before the frame loop and both of which raise
+       race cues -- the frame loop's own call keeps it in step after that. */
+    sfx_race_active(!in_main_menu);
 
     /* The three visual subsystems come up inside load_track/load_car. All are
        no-ops if the track was packed before --markers existed (no surface flags,
@@ -1034,6 +1294,90 @@ int main(void)
        the props simply do not appear. */
     if (!scene_load("app0:assets/props.vsc", &props_scene))
         rlog("[rccars] no props.vsc -- the track's props will not appear\n");
+
+    /* THE FRONT END'S ART, out of its own texture-only scene. Interface.sb is the
+     * game's manifest -- "Dialog Textures", "Shot textures", "Track preview" --
+     * and pack_vsc.py builds menu.vsc off exactly that list, plus one portrait
+     * out of FacesSys (a TARGA, which is why the packer grew --imgdir).
+     *
+     * A menu.vsc that is missing is NOT fatal and does not even hide the menu:
+     * every handle stays 0, every draw in mainmenu.c checks, and what comes up
+     * is the same layout in flat colour with the compiled-in font -- the rule
+     * hud.c, countdown.c and race_ui.c all follow. It is the front end; it must
+     * come up.
+     */
+    {
+        mainmenu_tex mt;
+        int i;
+        memset(&mt, 0, sizeof mt);
+        if (!scene_load("app0:assets/menu.vsc", &menu_scene))
+            rlog("[rccars] no menu.vsc -- the main menu falls back to flat "
+                 "colour and the compiled-in font\n");
+        mt.desktop  = scene_tex(&menu_scene, "Desktop");
+        mt.podl_lt  = scene_tex(&menu_scene, "Podl_LeftTop");
+        mt.podl_rt  = scene_tex(&menu_scene, "Podl_RightTop");
+        mt.podl_lb  = scene_tex(&menu_scene, "Podl_LeftBottom");
+        mt.podl_rb  = scene_tex(&menu_scene, "Podl_RightBottom");
+        mt.header   = scene_tex(&menu_scene, "HeaderSkin");
+        mt.buttons  = scene_tex(&menu_scene, "ButtonsTextures");
+        mt.race     = scene_tex(&menu_scene, "Button_race");
+        mt.back     = scene_tex(&menu_scene, "Button_back");
+        mt.logo     = scene_tex(&menu_scene, "logoRC_Main");
+        mt.face     = scene_tex(&menu_scene, "Face1");
+        mt.arrows   = scene_tex(&menu_scene, "enumarrows");
+        /* THE FINISH SCREEN's own handles, out of the same scene. The portraits
+           are matched to the drivers by NAME through ai_data.h's roster, which
+           is where the .tga each one is pictured with is written down. */
+        {
+            results_tex rt;
+            memset(&rt, 0, sizeof rt);
+            rt.back = scene_tex(&menu_scene, "Button_back");
+            rt.buttons = scene_tex(&menu_scene, "ButtonsTextures");
+            rt.panel = scene_tex(&menu_scene, "messagebox_empty");
+            rt.font_big = mt.font_big;
+            rt.font_small = mt.font_small;
+            results_init(&results, &rt);
+        }
+        for (i = 0; i < 9; i++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "ButtonPodl_right_%d", i + 1);
+            mt.wedge[i] = scene_tex(&menu_scene, nm);
+        }
+        /* `shot_beach1_0`, not `shot_beach_1_0`: the shot names drop the track
+           name's underscore, which is the artists' own spelling and the reason
+           this is built from TRACKS[].base rather than typed out again. */
+        for (i = 0; i < N_TRACKS; i++) {
+            char nm[40], base[24];
+            const char *b = TRACKS[i].base;
+            int j = 0, k = 0;
+            for (; b[j] && k < (int)sizeof base - 1; j++)
+                if (b[j] != '_') base[k++] = b[j];
+            base[k] = 0;
+            snprintf(nm, sizeof nm, "shot_%s_0", base);
+            mt.shot[i] = scene_tex(&menu_scene, nm);
+        }
+        /* The engine's own letters, which the HUD already loads from the track's
+           scene -- but the menu is up before any track has to be, so they come
+           from here as well. */
+        mt.font_big   = scene_tex(&menu_scene, "Smash26");
+        mt.font_small = scene_tex(&menu_scene, "Smash20");
+        if (!mt.font_big)   mt.font_big   = scene_tex(&props_scene, "Smash26");
+        if (!mt.font_small) mt.font_small = scene_tex(&props_scene, "Smash20");
+        mainmenu_init(&mm, &mt);
+        mainmenu_set_car_draw(&mm, menu_car_draw, NULL);
+        mm.track = menu.track;
+        mm.car = menu.car;
+        rlog("[rccars] main menu: desktop %d frame %d/%d/%d/%d buttons %d "
+             "wedges %d race %d logo %d face %d shots %d font %d/%d\n",
+             !!mt.desktop, !!mt.podl_lt, !!mt.podl_rt, !!mt.podl_lb,
+             !!mt.podl_rb, !!mt.buttons,
+             (mt.wedge[0] && mt.wedge[8]) ? 9 : 0, !!mt.race, !!mt.logo,
+             !!mt.face,
+             (int)(!!mt.shot[0] + !!mt.shot[1] + !!mt.shot[2] + !!mt.shot[3]
+                   + !!mt.shot[4] + !!mt.shot[5] + !!mt.shot[6] + !!mt.shot[7]
+                   + !!mt.shot[8] + !!mt.shot[9]),
+             !!mt.font_big, !!mt.font_small);
+    }
 
     /* The start light is bound HERE, before the first respawn(), because
        respawn() is what starts a countdown -- binding it afterwards would memset
@@ -1231,8 +1575,127 @@ unsigned int acc_ticks = 0;
                 settings_save_if_changed(&menu);
             menu_was_open = menu.open;
         }
-        if (menu.req_quit)
-            break;
+        /* THE START MENU'S LAST ROW IS NOW "Main menu", NOT "Quit". A race is
+           something you leave, and where you leave it to is the front end -- so
+           the app can only be quit from the main menu's own Quit button, which
+           is where the original puts it too. Opened FROM the main menu (its
+           Options button) the row just closes itself, since that is already
+           where it would go. */
+        if (menu.req_quit) {
+            menu.req_quit = 0;
+            menu.open = 0;
+            if (!in_main_menu) {
+                in_main_menu = 1;
+                mm.track = cur_track;
+                mm.car = cur_car;
+                sfx_ui(SFX_UI_BACK);
+            }
+        }
+
+        /* THE FRONT END. The panel is read every frame whatever is up, because
+           touch.h's edges are differences and a frame that skipped the read
+           would turn the next press into a phantom drag; the menu only ACTS on
+           it when the settings overlay is not covering it. */
+        touch_step(&g_touch, SCR_W, SCR_H);
+        /* THE FINISH SCREEN owns the input while it is up -- it is a modal over
+           a race that is over, and the START menu underneath it would be
+           choosing settings for a race nobody is driving. */
+        if (results_up && !in_main_menu && !menu.open) {
+            results_step(&results, pad.buttons, &g_touch, SCR_W, SCR_H,
+                         frame_dt);
+            if (results.cue == 1) sfx_ui(SFX_UI_FOCUS);
+            if (results.cue == 2) sfx_ui(SFX_UI_ENTER);
+            if (results.action == RES_ACT_AGAIN) {
+                results_up = 0;
+                respawn();
+            } else if (results.action == RES_ACT_QUIT) {
+                results_up = 0;
+                in_main_menu = 1;
+                mm.track = cur_track;
+                mm.car = cur_car;
+                sfx_ui(SFX_UI_BACK);
+            }
+        }
+        /* THE TWO MENUS AGREE ABOUT THE TRACK. Options opens the START menu over
+           the front end and that menu has a Track row of its own, so the frame
+           it closes on is where the carousel has to catch up -- otherwise the
+           picture says one track and the Race button starts another. The
+           carousel is the authority the rest of the time, which is the other
+           half of this, in MM_ACT_RACE below. */
+        {
+            static int settings_was_open;
+            if (in_main_menu && settings_was_open && !menu.open) {
+                mm.track = menu.track;
+                mm.car = menu.car;
+            }
+            settings_was_open = menu.open;
+        }
+        if (in_main_menu && !menu.open) {
+            mainmenu_step(&mm, pad.buttons, &g_touch, SCR_W, SCR_H, frame_dt);
+            /* THE CAR PICKER LOADS THE CAR. animCar draws the scene that is
+               loaded, so without this the quick-race page changed the name and
+               the numbers and went on turning the previous model -- reported as
+               "car model not change if choose other car".
+             *
+               Straight away rather than at the flag: the picture IS the control's
+               feedback, and it is the same call the START menu's own Car row
+               makes. It costs a scene load, which is what changing a car costs
+               anywhere in this app. */
+            if (mm.car != cur_car && mm.car >= 0 && mm.car < MENU_N_CARS) {
+                menu.car = mm.car;
+                load_car(mm.car);
+            }
+            switch (mm.cue) {
+            case MM_CUE_FOCUS: sfx_ui(SFX_UI_FOCUS); break;
+            case MM_CUE_ARROW: sfx_ui(SFX_UI_PRESS); break;
+            case MM_CUE_PRESS: sfx_ui(SFX_UI_ENTER); break;
+            case MM_CUE_DENY:  sfx_ui(SFX_UI_BACK);  break;
+            default: break;
+            }
+            switch (mm.action) {
+            case MM_ACT_RACE:
+                /* THE QUICK-RACE PAGE IS THE RACE SETUP, so what it chose is
+                   applied here and nowhere else: the skill decides how much of
+                   the field turns up (ai_set_skill_field) and therefore has to
+                   be set BEFORE load_track builds the roster, and the lap limit
+                   goes to the HUD and to the finish test below.
+                 *
+                   The car goes through menu.car so the START menu's own row and
+                   the settings file stay the authority on what is loaded --
+                   there is one car picker in the app, on two screens. */
+                race_laps = mm.laps;
+                ai_set_skill_field(1);
+                ai_skill = mm.skill;
+                if (mm.car != cur_car) {
+                    menu.car = mm.car;
+                    load_car(mm.car);
+                }
+                /* The carousel is the authority on the track from here, so the
+                   settings row follows it rather than the other way round --
+                   otherwise the START menu would open on the old one and the
+                   next save would write it back. RELOADED even when it has not
+                   changed, because the skill decides the roster and the roster
+                   is built by load_track. */
+                menu.track = mm.track;
+                load_track(mm.track);
+                race_over = 0;
+                in_main_menu = 0;
+                /* AFTER the mode bit, because respawn() is what starts the
+                   countdown and the countdown must not tick under the menu. */
+                respawn();
+                break;
+            case MM_ACT_OPTIONS:
+                menu.open = 1;
+                break;
+            case MM_ACT_QUIT:
+                menu.req_quit = 1;
+                break;
+            default:
+                break;
+            }
+            if (menu.req_quit)
+                break;
+        }
         if (menu.req_track >= 0) {
             load_track(menu.req_track);
             menu.req_track = -1;
@@ -1301,7 +1764,7 @@ unsigned int acc_ticks = 0;
         /* Freeze the world while the menu is up. dt = 0 rather than skipping the
            step, so the water clock and the camera hold their phase instead of
            jumping when it closes. */
-        if (menu.open)
+        if (menu.open || in_main_menu)
             dt = 0.f;
 
         if ((pad.buttons & SCE_CTRL_SELECT) && !(prev_buttons & SCE_CTRL_SELECT))
@@ -1374,6 +1837,133 @@ unsigned int acc_ticks = 0;
                the life is msg.h's and said to be. */
             msg_post(&msgs, MSG_BEST_LAP, MSG_BEST_LIFE, 0.f, 1);
             rlog("[rccars] best lap %.2f s\n", (double)race_ui.best_lap);
+        }
+        /* THE LAP LIMIT, and the FINISH banner the message layer has carried
+         * unraised since it was recovered -- slot 8, out of msg_321_s_f's own
+         * atlas, priority 5 (msg.h).
+         *
+         * `cps.lap` counts laps COMPLETED and the opening crossing of the line
+         * completes none (checkpoints_t.started), so reaching the limit IS the
+         * finish. LATCHED, because the player can keep driving over the line
+         * afterwards and a banner re-posted every lap is not a finish.
+         *
+         * The clocks stop where they are; nothing else does. This port has no
+         * results screen -- dlgFINISH is in the exe and is not built
+         * (known-issues.md) -- so the race ends by saying so and leaving the car
+         * where the player can drive it back to the START menu. */
+        /* THE RACE CLOCK AND EVERY RACER'S LAPS, for the finish screen. One
+         * float per racer per lap: a lap is the moment `spine_dist' crosses an
+         * integer multiple of the spine's length, which is exactly what one lap
+         * of the placing IS (ai.h), so nothing new has to be measured and the
+         * opponents' laps are counted on the same ruler as the player's.
+         *
+         * Not stepped once the race is over, and not while the countdown holds:
+         * the three seconds on the line are not on anyone's clock. */
+        if (!race_over && !countdown_holding(&countdown))
+            race_t += dt;
+        if (!race_over && cps.spine_len > 0.f) {
+            const float lap_len = cps.spine_len;
+            int k;
+            for (k = 0; k <= ai.n && k < AI_MAX_OPPONENTS + 1; k++) {
+                const float d = (k == 0) ? ai.player_dist
+                                         : ai.car[k - 1].spine_dist;
+                const int laps = (int)(d / lap_len);
+                if (laps > lap_seen[k]) {
+                    const float t = race_t - lap_t0[k];
+                    /* The FIRST crossing of the line is the end of the run up
+                       from the grid, not a lap -- the same edge
+                       checkpoints_t.started exists for. */
+                    if (lap_seen[k] > 0 && t > 0.f
+                        && (lap_best[k] <= 0.f || t < lap_best[k]))
+                        lap_best[k] = t;
+                    lap_t0[k] = race_t;
+                    lap_seen[k] = laps;
+                    if (laps >= race_laps && fin_t[k] <= 0.f)
+                        fin_t[k] = race_t;
+                }
+            }
+        }
+
+        if (!race_over && race_laps > 0 && cps.lap >= race_laps) {
+            int k;
+            race_over = 1;
+            race_ui_stop(&race_ui);
+            msg_post(&msgs, MSG_FINISH, MSG_BEST_LIFE, 0.f, 1);
+            rlog("[rccars] FINISH -- %d lap(s), %.2f s, best %.2f s\n",
+                 race_laps, (double)race_t, (double)race_ui.best_lap);
+
+            /* THE TABLE, filled once. Everything in it is a number this frame
+               already has: the clocks above, the progress the placing runs on,
+               and the roster's own names and faces. */
+            {
+                const float road = (cps.road_len > 1e-3f && cps.spine_len > 0.f)
+                                   ? cps.road_len / cps.spine_len : 1.f;
+                float lead = ai.player_dist;
+                results_up = 1;
+                results.n = 0;
+                for (k = 0; k <= ai.n && results.n < RES_MAX_ROWS; k++) {
+                    const float d = (k == 0) ? ai.player_dist
+                                             : ai.car[k - 1].spine_dist;
+                    if (d > lead) lead = d;
+                }
+                for (k = 0; k <= ai.n && results.n < RES_MAX_ROWS; k++) {
+                    results_row *w = &results.row[results.n++];
+                    const float d = (k == 0) ? ai.player_dist
+                                             : ai.car[k - 1].spine_dist;
+                    const float t = (fin_t[k] > 0.f) ? fin_t[k] : race_t;
+                    memset(w, 0, sizeof *w);
+                    w->is_player = (k == 0);
+                    if (k == 0) {
+                        snprintf(w->name, sizeof w->name, "Player");
+                        w->best_lap = race_ui.best_lap;
+                    } else {
+                        /* THE PROFILE'S OWN NAME, not a lookup through the
+                           roster: ai_car.name is the driver as the .aip
+                           declares it, which is the same string ailayouts.ini
+                           has and one indirection fewer to get wrong. */
+                        snprintf(w->name, sizeof w->name, "%s",
+                                 ai.car[k - 1].name);
+                        w->best_lap = lap_best[k];
+                    }
+                    w->finished = fin_t[k] > 0.f;
+                    w->time = fin_t[k];
+                    w->behind_m = (lead - d) * road;
+                    /* Road metres actually driven over the time it took. */
+                    w->av_speed = (t > 0.1f) ? (d * road) / t * 3.6f : 0.f;
+                }
+                results_finish(&results);
+                /* THE PORTRAITS, matched by NAME after the sort -- the rows move
+                   and the faces have to move with them. ai_data.h says which
+                   .tga each driver is pictured with (ailayouts.ini's
+                   AIPlayer<n>Face); the player keeps Face1, which is the one
+                   the card on the main menu uses. */
+                for (k = 0; k < results.n; k++) {
+                    int j;
+                    results.tex.face[k] = 0;
+                    if (results.row[k].is_player) {
+                        results.tex.face[k] = scene_tex(&menu_scene, "Face1");
+                        continue;
+                    }
+                    for (j = 0; j < AI_N_PLAYERS; j++) {
+                        char nm[32];
+                        const char *dot;
+                        if (strcmp(AI_PLAYERS[j].name, results.row[k].name))
+                            continue;
+                        snprintf(nm, sizeof nm, "%s", AI_PLAYERS[j].face);
+                        dot = strrchr(nm, '.');
+                        if (dot) *(char *)dot = 0;
+                        results.tex.face[k] = scene_tex(&menu_scene, nm);
+                        break;
+                    }
+                }
+                for (k = 0; k < results.n; k++)
+                    rlog("[rccars]   %d %-12s %s %.2f s  best %.2f  %.2f km/h\n",
+                         results.row[k].place, results.row[k].name,
+                         results.row[k].finished ? "" : "(dnf)",
+                         (double)results.row[k].time,
+                         (double)results.row[k].best_lap,
+                         (double)results.row[k].av_speed);
+            }
         }
         race_ui_step(&race_ui, dt);
 
@@ -1509,6 +2099,24 @@ unsigned int acc_ticks = 0;
         if (countdown_holding(&countdown) && !free_cam) {
             thr = 0.f;
             brk = 0.f;
+            lx = 0.f;
+        }
+        /* AND THE RACE IS OVER, so the car is not the player's any more: full
+         * brake, no throttle, no steering, until it is standing still.
+         *
+         * BRAKE, NOT A FREEZE. The countdown above holds the car by spending no
+         * physics ticks at all, which is right on the grid -- the car is
+         * stationary and nothing has to settle. At the flag it is doing 20 km/h
+         * and stopping the world under it would leave it hanging mid-corner with
+         * the suspension loaded. Braking is what the car does, through the model
+         * that already exists, so it settles on its springs and the dust and the
+         * tyre marks finish the way they would have.
+         *
+         * The free camera still flies: it is not part of the race, which is the
+         * same rule the countdown follows. */
+        if (race_over && !free_cam) {
+            thr = 0.f;
+            brk = 1.f;
             lx = 0.f;
         }
 
@@ -1987,9 +2595,20 @@ unsigned int acc_ticks = 0;
 
             /* The menu freezes the world (dt = 0) but not the sound thread, so
                the loops are stopped explicitly rather than left droning on a
-               car that is no longer moving. */
+               car that is no longer moving.
+             *
+               AND THE FRONT END COUNTS AS A MENU, which it did not at first: the
+               app loads a track at boot, so with only `menu.open' here the
+               engine and the track's ambient bed came up UNDER the main menu and
+               played the whole time the player was choosing. sfx_pause stops the
+               loops and quiets the bed and leaves the music alone; the group
+               below then puts the MENU music on, which is what the original
+               plays on this screen -- there are eleven of them in the bank
+               against the race's seven. */
+            sfx_race_active(!in_main_menu);
             sfx_pause(menu.open);
-            audio_music_group(menu.open ? AUDIO_MUSIC_MENU : AUDIO_MUSIC_RACE);
+            audio_music_group((menu.open || in_main_menu) ? AUDIO_MUSIC_MENU
+                                                          : AUDIO_MUSIC_RACE);
 
             /* The menu raises what the last input DID; turning that into one of
                the game's own interface sounds is this side's job, so menu.c
@@ -2167,6 +2786,21 @@ unsigned int acc_ticks = 0;
            the report under the fps line for what this is for. */
         sceRtcGetCurrentTick(&t_draw0);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        /* THE FRONT END DRAWS INSTEAD OF THE WORLD, not over it: its Desktop
+           covers every pixel, so a track drawn underneath is 40,000 triangles
+           nobody sees -- and the menu wants the frame budget more than the
+           frozen world does. The settings overlay still goes on top, which is
+           what makes Options open over the menu the way it opens over a race. */
+        if (in_main_menu) {
+            ui_begin(SCR_W, SCR_H);
+            mainmenu_draw(&mm, SCR_W, SCR_H);
+            ui_end();
+            if (menu.open)
+                menu_draw(&menu, SCR_W, SCR_H);
+            goto frame_end;
+        }
+
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         perspective(65.f, (float)SCR_W / (float)SCR_H, 0.1f, 4000.f);
@@ -2485,12 +3119,14 @@ unsigned int acc_ticks = 0;
                     * 0.017453292519943295f;
                 st.n_others++;
             }
-            /* cp[i].p[0] is the checkpoint marker itself -- the cp_N node -- and
-               the cp_N_M refining points are not on the road (checkpoint.h says
-               so), so only the marker goes on the map. */
+            /* THE PAINT, which is where the animated arrow stands and therefore
+               what the player is looking for on the road: cp_t.paint, not the
+               cp_N node, which is a mean 0.27 m and worst 0.79 m away from it.
+               The cp_N_M refining points are not on the road at all
+               (checkpoint.h says so), so they never go on the map. */
             for (i = 0; i < cps.n && i < RUI_MAX_CP; i++) {
-                st.cp_x[st.n_cp] = cps.cp[i].p[0][0];
-                st.cp_z[st.n_cp] = cps.cp[i].p[0][2];
+                st.cp_x[st.n_cp] = cps.cp[i].paint[0];
+                st.cp_z[st.n_cp] = cps.cp[i].paint[2];
                 st.n_cp++;
             }
             st.cp_next = cps.next;
@@ -2512,13 +3148,19 @@ unsigned int acc_ticks = 0;
 
             /* cps.lap counts laps COMPLETED -- 0 on the grid, and NOT 1: the
                opening crossing of the line completes none -- so the lap being
-               driven is one more. n_laps stays 0: the lap limit is a race-setup value and this
-               port has no race setup -- nothing in the shipped data carries a
-               per-track count (championship.ini has cash and placings and no
-               laps), so the HUD shows `3' rather than inventing `3/6'. See
-               known-issues.md. */
+               driven is one more.
+             *
+               AND THE PORT HAS A RACE SETUP NOW, so `n_laps' is a real number
+               and the HUD reads `2/3'. It used to be 0 -- the bare `3' -- on the
+               grounds that nothing in the shipped data carries a per-track lap
+               count. Nothing does; what carries it is the exe's own quick-race
+               dialog, `enumNLaps' on dlgRACESUM (ui.md), which says the count is
+               a race-setup value and gives the port somewhere to ask for it.
+               Clamped at the limit so the last lap reads `3/3' and not `4/3'. */
             st.lap = cps.lap + 1;
-            st.n_laps = 0;
+            if (race_laps > 0 && st.lap > race_laps)
+                st.lap = race_laps;
+            st.n_laps = race_laps;
 
             st.speed = rbcar_speed(&rc);
             /* Full scale is the car's own BOOST top speed, not its base one: a
@@ -2576,10 +3218,20 @@ unsigned int acc_ticks = 0;
             }
         }
 
+        /* THE FINISH SCREEN, over the world and under the settings menu -- the
+           order the original's own screenshot has: the race is still on screen
+           behind it, dimmed, because it is what the table is about. */
+        if (results_up) {
+            ui_begin(SCR_W, SCR_H);
+            results_draw(&results, SCR_W, SCR_H);
+            ui_end();
+        }
+
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)
             menu_draw(&menu, SCR_W, SCR_H);
 
+frame_end:
         sceRtcGetCurrentTick(&t_swap0);
         vglSwapBuffers(GL_FALSE);
         sceRtcGetCurrentTick(&t_swap1);

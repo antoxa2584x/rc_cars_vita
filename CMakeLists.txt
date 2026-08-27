@@ -36,7 +36,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -ffast-math -mtune=cortex-a9 -mfpu
 # allstarts) in the two hottest modules in the port.
 set(PHYSICS_C_FLAGS "-Wall -O3 -fno-fast-math -ffp-contract=off -mtune=cortex-a9")
 
-add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c dirarrow.c msg.c menu.c settings.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
+add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c sfont.c dirarrow.c msg.c menu.c mainmenu.c results.c touch.c settings.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
   prop.c char.c ai.c mix.c audio.c sfx.c rlog.c)
 
 separate_arguments(PHYSICS_FLAGS_LIST UNIX_COMMAND "${PHYSICS_C_FLAGS}")

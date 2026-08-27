@@ -629,6 +629,186 @@ static int cull_on;
    one: it changes per PASS, not per batch. */
 static int light_on;
 
+#define SCENE_DEG 0.017453292f
+
+/* The spin angles the turntable solve samples. Twelve is 30 degrees apart, and
+   the quantity being balanced -- the highest and lowest ink over a whole turn --
+   moves slowly with the angle, so this is not a place that wants more. */
+#define FRAME_SPINS 12
+/* Fixed-point rather than a bisection: each pass moves the aim by exactly the
+   error it just measured, converted back to metres through the frustum, and the
+   projection is near enough linear over the residual that six passes leave under
+   a tenth of a pixel. */
+#define FRAME_PASSES 6
+
+/* the vertical extent of everything that DRAWS, in units of the frustum's own
+   half-height at the aim's depth: -1 is the bottom edge of the picture, +1 the
+   top. Everything the caller's transform does, except the final divide by the
+   viewport size, which cancels. */
+static void frame_span(const scene_t *s, int skip_part, const float aim[3],
+                       float d, float t, float sp, float cp,
+                       float *lo, float *hi)
+{
+    unsigned int i;
+    int k, a;
+    *lo =  1e30f;
+    *hi = -1e30f;
+    for (a = 0; a < FRAME_SPINS; a++) {
+        const float ang = 6.2831853f * (float)a / (float)FRAME_SPINS;
+        const float ss = sinf(ang), cs = cosf(ang);
+        for (i = 0; i < s->n_batches; i++) {
+            const batch_t *b = &s->batches[i];
+            if (!b->nidx || !b->verts)
+                continue;
+            if (skip_part >= 0 && b->part == (unsigned int)skip_part)
+                continue;
+            for (k = 0; k < (int)b->nverts; k++) {
+                float p[3], q[3], y, z1, y2, vz, e;
+                p[0] = b->verts[k].x;
+                p[1] = b->verts[k].y;
+                p[2] = b->verts[k].z;
+                /* a rigged batch's vertices are in its part's space -- the same
+                   correction scene_bounds makes, and for the same reason */
+                if (s->has_rig && b->part < (unsigned int)s->rig.n) {
+                    const float *m = s->rig.part[b->part].rest;
+                    int j;
+                    for (j = 0; j < 3; j++)
+                        q[j] = m[j] * p[0] + m[4 + j] * p[1] + m[8 + j] * p[2]
+                               + m[12 + j];
+                } else {
+                    q[0] = p[0]; q[1] = p[1]; q[2] = p[2];
+                }
+                y  = q[1] - aim[1];
+                z1 = -ss * (q[0] - aim[0]) + cs * (q[2] - aim[2]);
+                y2 =  cp * y - sp * z1;
+                vz =  sp * y + cp * z1 - d;
+                if (vz > -0.001f)
+                    continue;                  /* behind the eye */
+                e = (y2 / t) / -vz;
+                if (e < *lo) *lo = e;
+                if (e > *hi) *hi = e;
+            }
+        }
+    }
+}
+
+int scene_frame_turntable(const scene_t *s, int aim_skip_part,
+                          float fov_deg, float pitch_deg, float aspect,
+                          float margin, scene_frame_t *out)
+{
+    float mn[3], mx[3], an[3], ax[3];
+    float hx, hy, need, t, sp, cp;
+    int k, pass;
+
+    if (!s || !out)
+        return 0;
+    out->aim[0] = out->aim[1] = out->aim[2] = 0.f;
+    out->dist = 1.f;
+
+    if (!scene_bounds(s, -1, mn, mx)) {
+        mn[0] = mn[1] = mn[2] = -0.2f;
+        mx[0] = mx[1] = mx[2] =  0.2f;
+    }
+    /* THE DIAGONAL, not the width: the model turns, and at 45 degrees it is the
+       diagonal of its footprint that has to fit across the picture. */
+    hx = 0.5f * sqrtf((mx[0] - mn[0]) * (mx[0] - mn[0])
+                      + (mx[2] - mn[2]) * (mx[2] - mn[2]));
+    hy = 0.5f * (mx[1] - mn[1]);
+    need = (aspect > 0.f) ? hx / aspect : hx;
+    if (hy > need)
+        need = hy;
+    t = tanf(fov_deg * 0.5f * SCENE_DEG);
+    out->dist = margin * need / t;
+
+    if (!scene_bounds(s, aim_skip_part, an, ax))
+        for (k = 0; k < 3; k++) { an[k] = mn[k]; ax[k] = mx[k]; }
+    for (k = 0; k < 3; k++)
+        out->aim[k] = 0.5f * (an[k] + ax[k]);
+
+    /* and now MEASURE it. The box centre is the starting guess; each pass reads
+       the real picture back and slides the aim by half the imbalance, in metres
+       at the aim's own depth (the frustum is 2*dist*t tall there). */
+    sp = sinf(pitch_deg * SCENE_DEG);
+    cp = cosf(pitch_deg * SCENE_DEG);
+    for (pass = 0; pass < FRAME_PASSES; pass++) {
+        float lo, hi;
+        frame_span(s, aim_skip_part, out->aim, out->dist, t, sp, cp, &lo, &hi);
+        if (lo > hi)
+            break;                       /* nothing drew -- keep the box centre */
+        out->aim[1] += 0.5f * (lo + hi) * out->dist * t;
+    }
+    return 1;
+}
+
+int scene_bounds(const scene_t *s, int skip_part, float mn[3], float mx[3])
+{
+    unsigned int i;
+    int k, any = 0;
+    float lo[3], hi[3];
+
+    if (!s || !mn || !mx)
+        return 0;
+    lo[0] = lo[1] = lo[2] =  1e30f;
+    hi[0] = hi[1] = hi[2] = -1e30f;
+    for (i = 0; i < s->n_batches; i++) {
+        const batch_t *b = &s->batches[i];
+        int c;
+        if (b->bmin[0] > b->bmax[0])
+            continue;                  /* empty -- see the header */
+        if (!b->nidx)
+            continue;                  /* hidden by carparts.c -- ditto */
+        if (skip_part >= 0 && b->part == (unsigned int)skip_part)
+            continue;
+        /* A RIGGED BATCH'S BOX IS IN ITS PART'S SPACE, not the model's, and
+         * scene_draw is what puts each part's rest matrix under it. Folding the
+         * raw boxes together gave the three cars a 4.4 m bounding box for a
+         * 0.42 m car -- ten times over, because the wheel and suspension meshes
+         * are authored about their own nodes and placed by the rig.
+         *
+         * So each box's EIGHT CORNERS go through the part's rest matrix and the
+         * result is bounded. Corners rather than the two extremes, because a
+         * rotation maps a box to a box only when it is axis-aligned. */
+        for (c = 0; c < 8; c++) {
+            float p[3], q[3];
+            /* THE PAD COMES BACK OFF. Every batch's box carries SCENE_CULL_PAD
+             * of slack -- two metres, added at load so the water's swell cannot
+             * cull itself -- and on a 7 cm wheel that IS the box: reading them
+             * raw gave a 0.42 m car a 4.4 m bounding box, ten times over, on all
+             * three cars. They are CULLING boxes and nothing had ever asked one
+             * for a size.
+             *
+             * Exact rather than approximate: the pad is a constant added to
+             * every axis of every non-empty batch, in this file, so taking it
+             * off recovers the geometry's own extent. */
+            p[0] = (c & 1) ? b->bmax[0] - SCENE_CULL_PAD
+                           : b->bmin[0] + SCENE_CULL_PAD;
+            p[1] = (c & 2) ? b->bmax[1] - SCENE_CULL_PAD
+                           : b->bmin[1] + SCENE_CULL_PAD;
+            p[2] = (c & 4) ? b->bmax[2] - SCENE_CULL_PAD
+                           : b->bmin[2] + SCENE_CULL_PAD;
+            if (s->has_rig && b->part < (unsigned int)s->rig.n) {
+                const float *m = s->rig.part[b->part].rest;
+                /* the same column-major, column-vector convention scene_draw
+                   hands to glMultMatrixf */
+                for (k = 0; k < 3; k++)
+                    q[k] = m[k] * p[0] + m[4 + k] * p[1] + m[8 + k] * p[2]
+                           + m[12 + k];
+            } else {
+                q[0] = p[0]; q[1] = p[1]; q[2] = p[2];
+            }
+            for (k = 0; k < 3; k++) {
+                if (q[k] < lo[k]) lo[k] = q[k];
+                if (q[k] > hi[k]) hi[k] = q[k];
+            }
+        }
+        any = 1;
+    }
+    if (!any)
+        return 0;
+    for (k = 0; k < 3; k++) { mn[k] = lo[k]; mx[k] = hi[k]; }
+    return 1;
+}
+
 void scene_set_lighting(int on) { light_on = on ? 1 : 0; }
 
 void scene_shade(scene_t *s, const float L_model[3],

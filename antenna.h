@@ -50,6 +50,13 @@ typedef struct {
 
     /* the batch this bends, and the mesh's own extent along its axis */
     batch_t *batch;
+    /* WHICH RIG PART it is, or -1 when the scene was packed without one. Kept
+       because the main menu's car viewport has to frame the car WITHOUT the
+       whip -- 0.38 m of wire over a 0.42 m truck, which owns the top half of
+       the car's bounding box (scene_bounds, menu_car_draw). This file is the
+       one place that knows how to find the part, so it is the one place that
+       should say which it is. */
+    int part;
     float base_y, tip_y;    /* model-space y of the mesh's bottom and top */
     float base[3];          /* model-space anchor (x, base_y, z) */
     int   ready;

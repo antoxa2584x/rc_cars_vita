@@ -16,7 +16,10 @@
  *
  * THIS FILE USED TO SAY "the game ships no reusable glyph atlas -- Faces/ and
  * FacesSys/ are avatar portraits and Interface.sb has only dialog skins", AND
- * THAT WAS WRONG. The engine has two fonts and they are in `Language/English/`:
+ * BOTH HALVES OF THAT WERE WRONG. FacesSys' nine TARGAs are the player
+ * portraits the MAIN MENU draws (mainmenu.h), and Interface.sb is not skins at
+ * all -- it is the engine's own MANIFEST of the whole interface, in named
+ * folders, and menu.vsc is packed off it. The engine has two fonts and they are in `Language/English/`:
  * `Smash20.csi` and `Smash26.csi`, 90 glyphs each on a 10 x 9 atlas, with the
  * character order in a matching `.dat` and the metrics in
  * `Settings/smash20.ini` / `smash26.ini`. The claim was made over

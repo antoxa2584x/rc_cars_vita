@@ -68,9 +68,29 @@ void sfx_set_track(int track_index, const col_t *col);
    layers, the surface loop, landings, splashes and the ambient bed. */
 void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt);
 
-/* Everything stops and the ambient bed goes quiet; used while the menu is up.
-   The music keeps playing -- that is the menu's business, not this one's. */
+/* Everything stops and the ambient bed goes quiet; used while the START menu is
+   up over a race. The music keeps playing -- that is the menu's business, not
+   this one's. One-shots already sounding are left to ring out: a cue that was
+   playing when the menu opened is part of what just happened. */
 void sfx_pause(int paused);
+
+/* IS THERE A RACE AT ALL? 0 while the front end is up (mainmenu.h), 1 once one
+ * has been started. Distinct from sfx_pause, which freezes a race that IS
+ * running; this says there is none, so nothing belonging to one may be heard —
+ * the loops stop AND the six race one-shots are refused outright.
+ *
+ * IT EXISTS BECAUSE main.c KEPT BEING ONE `if' SHORT. The app loads a track at
+ * boot so the front end's Race button has one ready, which means place_car,
+ * respawn and the whole audio update all run under the menu -- and each one was
+ * found and gated separately, one bug report at a time: the 3-2-1, then the
+ * spawn cue, then the engine and the ambient bed. A caller that has to remember
+ * every site is a caller that will miss the next one, so the question is asked
+ * ONCE, here, and audio_test holds it. sfx_ui is deliberately outside it: the
+ * menu needs its own clicks.
+ *
+ * Set it BEFORE the first respawn, not in the frame loop only -- boot places the
+ * car before the loop starts. */
+void sfx_race_active(int active);
 
 /* THE MOTOR IS A LATCH, and it is the engine's, not a port model: the car makes
    no engine noise at all until it is driven, and cuts out again after four

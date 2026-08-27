@@ -4,6 +4,7 @@
  */
 
 #include "race_ui.h"
+#include "sfont.h"
 #include "ui.h"
 
 #include <math.h>
@@ -50,119 +51,6 @@ static float axC(const frame *f, float x)
     return f->w * 0.5f + (x - HUD_REF_W * 0.5f) * f->s;
 }
 static float ay(const frame *f, float y) { return y * f->s; }
-
-/* ------------------------------------------------------- the engine's own font
- *
- * A glyph is one cell of a 10 x 9 atlas, and the quad is the cell's INK rather
- * than the whole cell: the art is set with a wide, ragged margin either side
- * (0.08 to 0.43 of a cell on the left alone), so a monospaced advance spreads
- * `1/6` and a clock out into nonsense. SF_INK_* carries the measured bounds and
- * the advance is the ink plus letSpace.
- *
- * `scale` is a multiplier on letSizeX/letSizeY, so 1.0 draws the atlas at the
- * pixel size its own .ini names.
- */
-typedef struct {
-    unsigned int tex;
-    const float (*ink)[2];
-    float size_x, size_y, space, space_len;
-} sfont;
-
-static sfont sf_big(const race_ui_t *r)
-{
-    sfont f;
-    f.tex = r->tex.font_big;
-    f.ink = SF_INK_BIG;
-    f.size_x = SF_BIG_SIZE_X;
-    f.size_y = SF_BIG_SIZE_Y;
-    f.space = SF_BIG_SPACE;
-    f.space_len = SF_BIG_SPACE_LEN;
-    return f;
-}
-
-static sfont sf_small(const race_ui_t *r)
-{
-    sfont f;
-    f.tex = r->tex.font_small;
-    f.ink = SF_INK_SMALL;
-    f.size_x = SF_SMALL_SIZE_X;
-    f.size_y = SF_SMALL_SIZE_Y;
-    f.space = SF_SMALL_SPACE;
-    f.space_len = SF_SMALL_SPACE_LEN;
-    return f;
-}
-
-static int sf_glyph(int c)
-{
-    return SF_INDEX[(unsigned char)c];
-}
-
-static float sf_w(const sfont *f, float scale, const char *s)
-{
-    float w = 0.f;
-    for (; *s; s++) {
-        int g = sf_glyph(*s);
-        if (g < 0)
-            w += f->space_len * scale;
-        else
-            w += (f->ink[g][1] - f->ink[g][0]) * f->size_x * scale
-                 + f->space * scale;
-    }
-    return w;
-}
-
-static float sf_h(const sfont *f, float scale)
-{
-    return f->size_y * scale;
-}
-
-/* One string, top-left at (x, y). Nothing is drawn when the atlas is missing --
-   the caller falls back to ui_text. */
-static void sf_text(const sfont *f, float x, float y, float scale,
-                    float r, float g, float b, float a, const char *s)
-{
-    /* Half a texel in on V. The nine rows are adjacent in the atlas, so
-       GL_LINEAR would otherwise bleed the row above and below into a glyph's
-       top and bottom. U needs no such inset: the ink bounds are already inside
-       the cell on both sides for all 90 glyphs. */
-    const float vh = 0.5f / (float)SF_ATLAS;
-    const float hh = sf_h(f, scale);
-
-    if (!f->tex)
-        return;
-    for (; *s; s++) {
-        int gi = sf_glyph(*s);
-        if (gi < 0) {
-            x += f->space_len * scale;
-            continue;
-        }
-        {
-            const int col = gi % SF_COLS, row = gi / SF_COLS;
-            const float l = f->ink[gi][0], rr = f->ink[gi][1];
-            const float w = (rr - l) * f->size_x * scale;
-            ui_image(x, y, w, hh, f->tex,
-                     ((float)col + l) / (float)SF_COLS,
-                     (float)row / (float)SF_ROWS + vh,
-                     ((float)col + rr) / (float)SF_COLS,
-                     (float)(row + 1) / (float)SF_ROWS - vh,
-                     r, g, b, a);
-            x += w + f->space * scale;
-        }
-    }
-}
-
-/* The same string twice: a dark copy offset by a fraction of its own height,
-   then the bright one. The tracks are sand, asphalt and pale stone, and the
-   game's own font is light grey -- unshadowed it disappears on half of them.
-   The offset scales with the text so it does not become a smear at one size and
-   invisible at another. */
-static void sf_text_shadowed(const sfont *f, float x, float y, float scale,
-                             float r, float g, float b, float a, const char *s)
-{
-    const float d = sf_h(f, scale) * 0.07f;
-    sf_text(f, x + d, y + d, scale, 0.f, 0.f, 0.f, a * 0.65f, s);
-    sf_text(f, x, y, scale, r, g, b, a, s);
-}
 
 /* ----------------------------------------------------------------- the clocks */
 
@@ -534,7 +422,7 @@ static void draw_dial(const race_ui_t *r, const frame *f, int mirror,
     const float a0 = HUD_IND_ANG_MIN * DEG2RAD;
     const float a1 = HUD_IND_ANG_MAX * DEG2RAD;
     const float sw = mirror ? -1.f : 1.f;
-    sfont fs = sf_small(r);
+    sfont fs = sf_small(r->tex.font_small);
 
     frac = clampf(frac, 0.f, 1.f);
 
@@ -595,8 +483,8 @@ void race_ui_draw(const race_ui_t *r, const race_ui_state *s,
 
     if (!r || !s)
         return;
-    big = sf_big(r);
-    small_ = sf_small(r);
+    big = sf_big(r->tex.font_big);
+    small_ = sf_small(r->tex.font_small);
 
     ui_begin(screen_w, screen_h);
 

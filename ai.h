@@ -295,11 +295,27 @@ typedef struct {
     /* Per-car, derived at load from the car's own data -- see ai_bump_derive.
      * Kept on the car rather than recomputed because the proxy reach costs a
      * sphere gather. */
+    float bump_reach;        /* the proxy's own reach, metres -- the car's size */
+    float bump_ref;          /* the spring's reference displacement (bump_w) */
     float bump_limit;        /* metres the offset may reach */
     float bump_yaw_limit;    /* radians it may turn */
     float bump_accel;        /* the return's acceleration budget, m/s^2 */
     float bump_w;            /* the return spring's natural frequency, rad/s */
     float bump;              /* |off| right now, for the log */
+    /* HOW MANY TIMES THIS CAR HAS BEEN PUT BACK ON ITS LINE because a shove left
+       it somewhere the player would have died -- see ai.h, "dying". For the log
+       and for the harness; nothing in the model reads it. */
+    unsigned int respawns;
+    /* How long the car has been under the ground without a break, seconds. The
+       burial test is the one death that has to PERSIST -- see ai_bump_death. */
+    float buried_for;
+    /* THE WALL STOP. How far the offset may go along its own current direction
+     * before the displaced car would be inside the level, and the horizontal
+     * offset that answer was measured at. A negative wall means "not measured"
+     * -- see ai_bump_wall. Kept on the car because the query behind it is a
+     * world segment test and is amortised the same way the ground probe is. */
+    float bump_wall;
+    float bump_wall_at[2];
 
     /* -- THE STEERING DECISION. See "the steering decision" below.
      *
@@ -438,6 +454,27 @@ typedef struct {
  * -> the number of opponents loaded, or 0. Safe to call on a live ai_t; it frees
  * first. A missing or short .aip is not an error, it is a race with no
  * opponents, and it says so in the log. */
+/* THE SKILL ROW'S ONE REAL EFFECT, and it is the engine's own rule enabled in a
+ * mode the original leaves it off in.
+ *
+ * Every opponent carries AI<n>Races, a mask of the race types it appears in
+ * (ai_data.h), and the roster loop only consults it in a CHAMPIONSHIP: outside
+ * one the original starts the whole field whatever the difficulty is, which is
+ * why a single race has always had five. The masks are graded and shipped --
+ * beach_1's five read 4, 7, 6, 7, 7, so EASY fields three, NORMAL four and HARD
+ * five -- and nothing outside the championship ever reads them.
+ *
+ * The quick-race dialog the exe carries (dlgRACESUM, ui.md) has an `enumSkill'
+ * on it, so the row is the game's; what the row DOES here is the port's, and
+ * this is it: turn the engine's own mask on for a single race. The alternative
+ * was a row that changes nothing, which is the thing the five grey buttons on
+ * the main menu already say honestly.
+ *
+ * SET BEFORE ai_init, which is when the roster is built -- the same shape
+ * scene_set_tex_quality has, and for the same reason. Default 0, so every
+ * harness and every existing caller keeps the field it measured. */
+void ai_set_skill_field(int on);
+
 int  ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
              int difficulty, int championship);
 
@@ -515,6 +552,56 @@ int   ai_cp_fractions(const ai_t *ai, const float (*mk)[3], int n_mk,
    1.3 m and the widest checkpoint's drivable ground is 20 m, so 10 m is clear of
    every real pass and well inside a miss. */
 #define AI_CP_FIT_NEAR 10.0f
+
+/* --------------------------------------------------------------- THE ROAD
+ *
+ * ONE OPPONENT'S RECORDED LOOP, HANDED OVER AS THE ROAD. The fit above already
+ * proves a recording passes every marker; this returns the polyline it proved it
+ * on, so that something other than the checkpoint spine can be asked where a car
+ * is round the lap.
+ *
+ * WHY THIS EXISTS. The player's progress was measured by an ODOMETER -- road
+ * metres driven since the last checkpoint, against that stretch's fitted length
+ * -- and an odometer can only grow. A wide line, a correction, a slide, a spin
+ * or a shove all add to it and none of them is progress, so the player's own
+ * measure ran AHEAD of where the player was, always in the player's favour,
+ * while every opponent's stayed exact (its recording's own arc length). Measured
+ * on the ten shipped tracks with the player driving car 0's recording under a
+ * lateral wobble that lengthens the path 20%: the SAME CAR read +13.3 m further
+ * on the player's ruler than on the opponents', worst +78 m -- enough to put the
+ * player ahead of a car it was behind whenever that car was near, which is
+ * exactly what "the place says 1st while two cars are in front" is.
+ *
+ * A PROJECTION ONTO THE ROAD CANNOT INFLATE: a wide line is perpendicular to it
+ * and contributes nothing. The spine cannot serve -- it is 1.4 to 2.1x longer
+ * than the lap it describes and wanders up to 84 m off it (checkpoint.h) -- but
+ * a recorded lap IS the road, by construction, and this game ships thirty of
+ * them. Its samples are 0.06 to 0.25 m apart, which is what makes a WINDOWED
+ * projection possible at all: the same window on the spine, whose samples are 23
+ * to 40 m apart, saw one segment and froze (ui.md records that attempt).
+ *
+ * `pt` is XZ only, for the same reason every other query on this road is
+ * (checkpoint.c: a car under a deck is not at the checkpoint above it). `cum` is
+ * arc from the loop's first sample; the loop CLOSES from the last sample back to
+ * the first, which is 0.3 m or less on all thirty. `at[k]` is the arc at which
+ * the loop passes checkpoint k -- the same closest approach ai_cp_fractions
+ * averages, kept unaveraged here because the window has to be laid out on THIS
+ * car's line and not on the mean of three. */
+typedef struct {
+    float (*pt)[2];         /* the loop's samples, XZ */
+    float  *cum;            /* arc from pt[0], metres */
+    int     n;
+    float   len;            /* the loop closed -- one lap of road */
+    float   at[AI_MAX_CP];
+    int     n_cp;
+    int     from;           /* which opponent's recording it is */
+} ai_line;
+
+/* -> 1 and fills `L` off the FIRST recording whose fit validates, which is the
+   same test ai_cp_fractions applies. 0 leaves the caller with no road, which is
+   what a track with no usable recording gets; the odometer is still there. */
+int  ai_fit_line(const ai_t *ai, const float (*mk)[3], int n_mk, ai_line *L);
+void ai_line_free(ai_line *L);
 
 /* ------------------------------------------------------------- the bump offset
  *
@@ -640,14 +727,83 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  * four per car out of these.
  */
 
-/* HOW FAR a bump may carry an opponent, in multiples of its own collision
- * proxy's reach (the furthest any of its 13 or 15 spheres gets from the centre
- * of mass, plus that sphere's radius -- measured at load, so a Hummer gets more
- * room than a Buggy because it IS bigger). Two reaches is the distance at which
- * the car that hit it is completely clear of it, which is as far as a bump has
- * anything to say; past that something is dragging an opponent off the track
- * rather than knocking it aside. 0.55 m on the Overkill. */
-#define AI_BUMP_LIMIT_REACH 2.0f
+/* THE SPRING'S REFERENCE DISPLACEMENT, in multiples of the car's own collision
+ * proxy reach (the furthest any of its 13 or 15 spheres gets from the centre of
+ * mass, plus that sphere's radius -- measured at load, so a Hummer gets a bigger
+ * number than a Buggy because it IS bigger). Two reaches is the distance at
+ * which the car that hit it is completely clear of it. 0.63 m on the Overkill.
+ *
+ * THIS USED TO BE THE DISPLACEMENT LIMIT AS WELL, and that was the bug behind
+ * "player can bump cars a bit, but cant bump it out of track... they seem too
+ * heavy or just screwed to their way". One number was doing two jobs:
+ *
+ *   - it set the spring, w = sqrt(accel / ref), which is right. It is a
+ *     RECOVERY scale: how far a car has to be off its line before the return
+ *     wants the whole of its grip. That is a property of the car's size.
+ *   - and it capped how far a shove could ever carry the car, which is not the
+ *     same quantity at all -- and at 0.63 m it saturated at ordinary racing
+ *     speed. Measured on a lone beach_1 opponent hit sideways: 1 m/s moved it
+ *     0.099 m, 2 m/s 0.275, and 4, 6, 8 and 12 m/s ALL moved it 0.630 -- the
+ *     clamp, to the millimetre, with the yaw pinned at exactly 30 degrees from
+ *     1 m/s upward. Hitting harder did nothing, which is exactly what a car
+ *     bolted to its line feels like.
+ *
+ * So this one keeps the spring, and bump_limit below is anchored on its own
+ * quantity. The split leaves small knocks bit-for-bit as they were. */
+#define AI_BUMP_REF_REACH 2.0f
+
+/* HOW FAR a bump may carry an opponent, and it is now the car's own GRIP that
+ * says so rather than its size.
+ *
+ * A car knocked sideways at v slides until its tyres stop it, and the
+ * deceleration they can manage is already in this model: bump_accel, the
+ * recovered coeff_rear_tires * g that caps the return. So the distance is
+ * v^2 / (2 * accel), and the furthest a shove can ever legitimately carry a car
+ * is that distance from the fastest hit the game can deliver -- which is the
+ * car's own recovered top speed, `speed_boost_max` (35 km/h = 9.72 m/s, engine
+ * word 3). 6.75 m on the Overkill.
+ *
+ * IT IS A SAFETY BOUND, NOT THE THING THAT STOPS THE CAR. What stops it in
+ * ordinary play is the acceleration cap in the relax -- displacement comes out
+ * proportional to v^2 across the whole useful range, 0.11 m for a 1 m/s tap and
+ * 4.6 m for an 8 m/s ram -- and, before either, the WALL: a shove now stops at
+ * geometry (ai_bump_wall). Without that stop this budget would be unusable, and
+ * that is measured rather than assumed: sampling every opponent's own lap on all
+ * ten tracks, a straight sideways displacement crosses level geometry 1.3% of
+ * the time at the old 0.63 m and 64% of the time at 5 m.
+ *
+ * There is no constant here: the whole of it is the car's own data, and
+ * ai_bump_derive is where the two numbers meet. */
+
+/* THE WALL STOP -- what a shove actually runs out of, and the reason the budget
+ * above can be metres instead of centimetres.
+ *
+ * Nothing else in the bump model looks sideways at the level. The offset is a
+ * displacement from a recorded pose and the only world query under it is a
+ * GROUND probe, so a car shoved far enough went through whatever was beside the
+ * track. That did not matter while the budget was 0.63 m (1.3% of directions
+ * blocked); it decides the feature at 5 m (64%).
+ *
+ * The test is the world's own segment query -- rb_world.segment, the engine's
+ * 0x004557e0 -- from the recorded position to the displaced one, run at
+ * AI_WALL_CLEAR above the ground AT EACH END so that a slope the terrain follow
+ * would climb does not read as a wall. Blocked, the reach is bisected
+ * AI_WALL_BISECT times and the offset is held at the last clear point, with the
+ * outward velocity killed exactly as the budget does it.
+ *
+ * The clearance is the car's own half height (extent[1]), because that is what
+ * decides whether the BODY passes: a lip under it is something the car rolls
+ * over and the ground follow already handles, and anything taller across the
+ * path is a wall. Four bisections put the stop within 1/16 of the reach, which
+ * on a metre of shove is 6 cm -- under the proxy radius, so a car cannot end up
+ * visibly inside anything. */
+#define AI_WALL_CLEAR_EXTENT 1.0f
+#define AI_WALL_BISECT 4
+/* The wall answer is reused until the car has moved this far, the same
+   amortisation and the same reason as AI_BUMP_PROBE_STEP -- the contact solve
+   re-poses a car after every one of its eight depenetration passes, and a
+   segment query per pass per touching pair is not affordable. */
+#define AI_WALL_STEP 0.02f
 
 /* HOW HARD it pulls itself back: the return acceleration is capped at the car's
  * own grip times gravity -- coeff_rear_tires * RB_GRAVITY, 7.0 m/s^2 on the
@@ -662,6 +818,24 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  *
  * -- 3.6 rad/s on the Overkill, a 0.28 s time constant and about a second to
  * settle, which is what a driver correcting a knock looks like. */
+
+/* NOTHING GOES FASTER THAN A CAR CAN GO, and until now nothing added the two
+ * velocities up.
+ *
+ * An opponent's velocity is its RECORDING's plus its OFFSET's, and only the
+ * first of the two was ever bounded. A car held back by a player wedged into it
+ * fills its offset along the road at the speed its recording is running away at,
+ * about 7 m/s, and metres of budget take about a second to fill; when the pair
+ * comes apart the spring returns the lot at the grip limit. Measured on urban_2:
+ * 6.56 m of along-track offset coming back at 9.81 m/s while the recording under
+ * it was doing 7 -- sixteen metres a second, on a car whose own recovered top
+ * speed is 9.72. Reported as "player car stuck in opponent car and oponent car
+ * accselerate insanly to its line".
+ *
+ * So the SUM is capped at `speed_boost_max`, in the relax, on the velocity. What
+ * comes out is a car driving back to its line at the fastest a car in this game
+ * drives, which is what a real one held up by a shunt does -- about two seconds
+ * for the whole budget instead of half of one. See ai_bump_relax. */
 
 /* HOW FAR OFF its heading a bump may turn it, as a fraction of the car's own
  * steering lock (AngleSteer, 30 degrees on all three). One lock is the angle it
@@ -715,6 +889,60 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  * return spring is two orders of magnitude weaker than the push -- so a
  * sustained graze walks a car into the air. See ai_pair_resolve. */
 #define AI_TOP_COS  0.694658f
+
+/* ------------------------------------------------------------------ DYING
+ *
+ * AN OPPONENT DIES THE WAY THE PLAYER DIES, and goes back to the same place the
+ * player goes back to.
+ *
+ * The player has two deaths (main.c): DROWNED -- its centre of mass a whole
+ * DROWN_DEPTH under a water surface -- and FELL OUT OF THE WORLD, measured
+ * against the ground it was last placed on rather than a constant, because the
+ * ten tracks sit at very different heights. Either one puts it back on the last
+ * checkpoint it crossed, keeping its lap: a death is not a race restart.
+ *
+ * An opponent had neither, and the shove that can now carry it metres is exactly
+ * what puts it in the sea off the end of beach_1's sand. So it gets the same two
+ * tests, with the same two numbers, against the one place it can be put back to:
+ * ITS OWN RECORDED LINE. That is the opponent's last checkpoint and more -- the
+ * recording is a real lap driven on this physics, so the line is drivable by
+ * construction, and the cursor, the lap and the rubber band are all still where
+ * the car left them. Putting it back is exactly clearing the offset.
+ *
+ * ONLY WHEN THE SHOVE DID IT. The test is on the car's actual pose, and an
+ * opponent with no offset IS its recording -- so if the recording itself fords a
+ * stream, clearing an offset of zero would change nothing and the car would be
+ * declared dead every tick for the rest of the race. A car on its line cannot
+ * die; there is nowhere better to send it.
+ *
+ * The numbers are the player's, quoted rather than shared, because ai.c cannot
+ * see main.c: DROWN_DEPTH is 0.5 m -- the tallest body box is 0.14 m, so half a
+ * metre under is unambiguously submerged, while the deepest water a car can
+ * actually ford on any of the ten tracks is the stream at 2 to 13 cm -- and the
+ * fall is 30 m, here below the car's own RECORDED height rather than below a
+ * spawn height, which is the same idea measured off something that follows the
+ * track. */
+#define AI_DROWN_DEPTH 0.5f
+#define AI_FELL_BELOW  30.0f
+/* An offset this small is not a shove that put the car anywhere: below it the
+   car is on its line and there is nothing to put it back to. A wheel radius. */
+#define AI_DEATH_MIN_OFF 0.072f
+
+/* HOW LONG A CAR HAS TO BE BURIED BEFORE IT COUNTS AS STUCK, in time constants
+ * of its own return spring (1 / bump_w, 0.30 s on an Overkill).
+ *
+ * Drowning and falling are unambiguous the instant they happen, which is why the
+ * player dies on the spot for both. Being under the ground is not: a car sliding
+ * along a bank clips into it and out again constantly, and killing it for that
+ * is the teleport the whole of this work has been removing -- tested on the
+ * instant, 130 of 640 hard shoves ended in a respawn, one in five.
+ *
+ * So the burial test gives the machinery that already exists its full chance
+ * first. Three time constants is the settling time of a critically damped
+ * return, which is the same number AI_STEER_SETTLE is three of and the same
+ * reasoning: after it, the spring has finished and whatever is still true is
+ * going to stay true. */
+#define AI_BURIED_SETTLE 3.0f
 
 /* ------------------------------------------------------ the steering decision
  *

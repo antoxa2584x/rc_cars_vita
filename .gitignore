@@ -32,7 +32,9 @@ curb
 flipped
 hudshot
 inv
+mainmenu_test
 menu_test
+menuframe
 meshalign
 placechk
 progchk
@@ -44,6 +46,7 @@ ui_test
 vis_test
 wading
 wetcheck
+wideline
 
 # Logs from the Vita and from the build
 *.log

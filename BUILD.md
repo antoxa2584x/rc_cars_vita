@@ -12,6 +12,9 @@ there is nothing to translate.
     rccars_re/        the RE tools, a submodule -- every packer, generator and
                       host test harness below lives in here
     assets/*.vsc      packed scenes (produced by rccars_re/pack_vsc.py)
+assets/menu.vsc   the MAIN MENU's art -- textures only, no geometry
+dlg_data.h        the engine's own DIALOG LAYOUTS, out of Settings/dlg*.ini
+                  (rccars_re/gen_dlg_data.py)
     assets/props.vsc  the 13 knockable props + the !HIT! banner, VSC8
                       (rccars_re/pack_props.py)
     sce_sys/          bubble icon + LiveArea art (rccars_re/gen_sce_sys.py)
@@ -312,12 +315,54 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
     DB="/mnt/c/Games/RC Cars/RCCarsDB"
     RE=rccars_re
 
-    # every track: geometry, then the collision grid
+    # every track: geometry, then the collision grid.
+    #
+    # RUN build.sh INSTEAD OF THIS unless you have a reason not to. The lines
+    # below are here to be read, and they are the ones build.sh runs -- but three
+    # of the flags are not optional and every one of them fails SILENTLY:
+    #
+    #   --extra-tex trackmap_<n>  the minimap's painted art, referenced by no
+    #                             mesh and bound by name at runtime. Without it
+    #                             the scene packs, loads and drives, and the
+    #                             minimap is simply blank. `n` is the ENGINE's
+    #                             level number, not the port's -- it comes from
+    #                             `gen_hud_data.py --print-maps`, and vis_test
+    #                             part 12 is what catches a wrong one
+    #   --csidir                  the unpacked textures
+    #   --embdir                  the per-track EMBEDDED lightmap atlases, whose
+    #                             names (lightmap___rds_00..) are the SAME on
+    #                             every track. Point this at the wrong directory
+    #                             and a track is lit with another track's
+    #                             lightmaps, or with none
     for t in beach_1 beach_2 beach_3 beach_4 \
              country_1 country_2 country_3 country_4 urban_1 urban_2; do
-        python3 $RE/pack_vsc.py "$DB/$t.sb" assets/$t.vsc --markers
-        python3 $RE/pack_col.py "$DB/$t.sb" assets/$t.col
+        n=$(python3 $RE/gen_hud_data.py --print-maps | awk -v t=$t '$1==t{print $2}')
+        python3 $RE/pack_vsc.py "$DB/$t.sb" assets/$t.vsc --markers \
+            --extra-tex "trackmap_$n" \
+            --csidir .cache/extracted --embdir .cache/lightmaps/embedded
+        python3 $RE/pack_col.py "$DB/$t.sb" assets/$t.col \
+            --settings .cache/extracted/Settings
     done
+
+    # THE FRONT END's art, out of Interface.sb -- which carries NO GEOMETRY: it is
+    # the engine's own manifest of what the interface is made of, in named
+    # folders ("Dialog Textures", "Shot textures", "Track preview", "Control
+    # sounds"). Packing it gives a scene of 0 batches and 30 textures, which is
+    # exactly what mainmenu.c wants. --imgdir is for the player portrait: the
+    # FacesSys images are TARGA, not .csi, so the .csi index cannot see them.
+    #
+    # Smash20/Smash26 are deliberately NOT on this list. They live in
+    # game_data/Language/, outside the pack, and ride in props.vsc instead;
+    # main.c falls back to that scene for both.
+    IF=Desktop,Podl_LeftTop,Podl_RightTop,Podl_LeftBottom,Podl_RightBottom
+    IF=$IF,HeaderSkin,ButtonsTextures,Button_race,Button_back,logoRC_Main
+    IF=$IF,Face1,enumarrows
+    for i in 1 2 3 4 5 6 7 8 9; do IF=$IF,ButtonPodl_right_$i; done
+    for t in beach1 beach2 beach3 beach4 country1 country2 country3 country4 \
+             urban1 urban2; do IF=$IF,shot_${t}_0; done
+    python3 $RE/pack_vsc.py "$DB/Interface.sb" assets/menu.vsc \
+        --extra-tex "$IF" --csidir .cache/extracted \
+        --embdir .cache/lightmaps/embedded --imgdir .cache/extracted/FacesSys
 
     # the three cars. --shadow-tex bakes the top-down silhouette the projected
     # shadow uses and fits its radius to the car; --envmap classifies the body's
@@ -411,9 +456,10 @@ Host harnesses, none of which needs the Vita toolchain. **`rm` the binary first*
 -- two of these lines had gone stale and did not link at all, and a failed link
 leaves the previous binary sitting there to answer for it:
 
-    rm -f rb_test vis_test carparts_test menu_test settings_test ui_test meshalign \
+    rm -f rb_test vis_test carparts_test menuframe menu_test settings_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
-          colprof flipped antheight aitest chrfloat curb hudshot
+          colprof flipped antheight aitest chrfloat curb hudshot wideline \
+          mainmenu_test menushot results_test finishshot
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -433,6 +479,18 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -Itestgl -O2 rccars_re/carparts_test.c carparts.c scene.c \
         carani.c rb.c contact.c collide.c rlog.c carlight.c \
         -o carparts_test -lm                           # upgrade parts
+    gcc -I. -Itestgl -O2 rccars_re/menuframe.c scene.c carparts.c \
+        antenna.c carani.c rb.c contact.c collide.c rlog.c carlight.c \
+        -o menuframe -lm             # the MAIN MENU's car viewport framing
+                            # antenna.c is on this line because the framing has
+                            # to leave the WHIP out of what it aims at, and
+                            # antenna.c is the file that knows which rig part
+                            # that is. carparts.c because the menu draws one
+                            # exhaust, not four, and a box round three that never
+                            # draw is not the picture's box.
+                            # `./menuframe old' prints the two rules this
+                            # replaced beside the current one -- the check has to
+                            # be shown to fail.
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/proptest.c prop.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c rlog.c -lm -o proptest                # the knockable props
@@ -491,8 +549,8 @@ leaves the previous binary sitting there to answer for it:
                             # recovered angle, over the recovered sweep.
                             # 414 checks; 38 of 38 mutants die on part 17 and
                             # 27 of 27 on part 18.
-    gcc -I. -Itestgl -O2 rccars_re/hudshot.c ui.c race_ui.c dirarrow.c \
-        msg.c -lm -o hudshot
+    gcc -I. -Itestgl -O2 rccars_re/hudshot.c rccars_re/glrec.c ui.c \
+        race_ui.c sfont.c dirarrow.c msg.c -lm -o hudshot
                             # NOT a test: it PRINTS the HUD's triangles, and
                             # rccars_re/hudshot.py composites them over the game's
                             # real .csi art into a 960x544 PNG. ui_test asserts
@@ -546,6 +604,73 @@ leaves the previous binary sitting there to answer for it:
                             # exactly, scores BOTH sides of the placing against
                             # the road, and runs the RULE IT REPLACED beside it on
                             # the same frames as its own control. Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/wideline.c scene.c checkpoint.c col.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c carlight.c \
+        rccars_re/glstub_host.c -lm -o wideline
+                            # and the question all three above are blind to: the
+                            # player is NOT on the recorded line. They all drive
+                            # the player along a recording, which is the one lap
+                            # on which an ODOMETER and the road are the same
+                            # number -- so none of them could see the player's
+                            # progress running ahead of the player by 10 to 23 m
+                            # the moment the line got wide. Drives a lap three
+                            # metres wide of the racing line and asks the
+                            # placing's two rulers about the SAME CAR, with the
+                            # odometer (still the fallback) run on the same
+                            # frames as its control. Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c touch.c \
+        ui.c sfont.c -lm -o mainmenu_test
+                            # THE MAIN MENU's input and its HIT BOXES -- the half
+                            # a picture cannot answer. The focus ring skipping the
+                            # five unbuilt rows, a drag off a button cancelling it,
+                            # a tap on a photograph walking the carousel, and the
+                            # touch panel's own units (it reports 1920x1088 over a
+                            # 960x544 screen and holds nothing on the release
+                            # frame). The layout is checked as PROPERTIES -- the
+                            # 45 px pitch with one 65 px gap, no two rows on one
+                            # line, every row reaching the right edge -- not
+                            # against a copy of its own table, and the QUICK
+                            # RACE page's four enums walked a full lap each.
+                            # Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/menushot.c rccars_re/glrec.c \
+        mainmenu.c touch.c ui.c sfont.c -lm -o menushot
+                            # and hudshot's twin for the menu: it PRINTS the
+                            # front end's triangles and rccars_re/hudshot.py
+                            # composites them over the real .csi and .tga art.
+                            # "Does it look like the game's own menu" is the only
+                            # question that matters about a reproduction of a
+                            # screenshot, and no assertion answers it. It drives
+                            # the input too, so the picture can be of a state
+                            # rather than of the idle screen:
+                            #
+                            #   ./menushot 800 600 | python3 rccars_re/hudshot.py \
+                            #       menu.png            # beside the original
+                            #   ./menushot 960 544 rrdd | ...   # two right, two down
+                            #   ./menushot 960 544 t900,180 | ...  # a touch
+                            #
+                            # 800x600 is the size to compare at: it is the frame
+                            # every constant in mainmenu.c was measured in.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/results_test.c results.c touch.c \
+        ui.c sfont.c -lm -o results_test
+                            # THE FINISH SCREEN's ordering and its hit boxes.
+                            # A finisher always beats one that did not, whatever
+                            # the clocks say; finishers sort by time and the rest
+                            # by how far behind they were; the gap is against the
+                            # WINNER and only where both crossed. It also holds
+                            # dlgFINISH.ini's own numbers to what the code
+                            # assumes of them -- that column 0 is SQUARE (47.8 x
+                            # 47.2), which is what says it is the portrait's and
+                            # not Player's, and that six rows fit between the two
+                            # rules. Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/finishshot.c rccars_re/glrec.c \
+        results.c touch.c ui.c sfont.c -lm -o finishshot
+                            # and its picture, menushot's sibling:
+                            #   ./finishshot 960 544 | python3 rccars_re/hudshot.py f.png
+                            # The fixture is four racers with one still out on
+                            # track when the flag fell, which is the row worth a
+                            # picture -- `---' for a time it never set and a
+                            # distance for its gap. It is what caught the column
+                            # indexing being one out.
     gcc -I. -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \

@@ -120,13 +120,19 @@
  * CP_SIZE_SCALE: FUN_0052abc0 builds the quad as centre +/- Size on both axes,
  * so Size 1.46 is a HALF-extent and the sprite is 2.92 m tall. That is seven
  * car lengths on a 0.42 m car and it towered. Halving it gives a 1.46 m marker.
- * The original's anchor is the mean of the checkpoint GATE OBJECT's vertices --
- * an object these tracks do not carry, since they store checkpoints as markers
- * only -- so the reference this was tuned against does not exist here.
  *
- * CP_GROUND: anchor the quad's BOTTOM on the terrain under the marker instead
- * of centring it at marker + Shift. The markers themselves float 0.18 to 0.49 m
- * above the ground, and Shift then lifted the whole sprite again.
+ * THIS USED TO SAY the original's anchor was "the mean of the checkpoint GATE
+ * OBJECT's vertices -- an object these tracks do not carry", and that was wrong:
+ * every track carries one for every checkpoint, it is the ACP ground marking,
+ * and the port now anchors on it (cp_t.paint). So the reference this was tuned
+ * against DOES exist, and the size is left bent on its own merits -- how it
+ * looks -- rather than on a claim that there was nothing to compare with.
+ *
+ * CP_GROUND: anchor the quad's BOTTOM on the ground under it rather than
+ * centring it at anchor + Shift. `cp_N` floats 0.18 to 0.49 m above the terrain
+ * and Shift then lifted the whole sprite again. With the paint as the anchor the
+ * height comes from the paint's own mean, which is the terrain plus the
+ * centimetre the decal is draped by, so the probe is only the fallback now.
  *
  * The recovered constants are untouched in vis_data.h; this is where they get
  * bent. */
@@ -261,12 +267,33 @@
 #define CP_MAX_POINTS 33          /* cp_N plus up to 32 edges, per the loader */
 
 typedef struct {
-    /* p[0] is cp_N itself -- the checkpoint, and where the arrow goes. p[1..]
-       are its cp_N_M refining points, which bend the spine on the way to the
-       next checkpoint and are only used for progression and distance. */
+    /* p[0] is cp_N itself -- the checkpoint, and what the progression, the spine
+       and the respawn are all built on. p[1..] are its cp_N_M refining points,
+       which bend the spine on the way to the next checkpoint and are only used
+       for progression and distance.
+     *
+       IT IS NOT WHERE THE ARROW GOES, which this comment used to say and the
+       code used to do. See `paint`. */
     float p[CP_MAX_POINTS][3];
     int n;
-    float ground;                 /* terrain height under p[0], for the marker */
+    float ground;                 /* terrain height under p[0], for the respawn */
+
+    /* WHERE THE PAINT IS -- the mean of the ACP mesh's vertices, shipped as the
+     * `acp_N` marker by pack_vsc.py, and where the animated arrow and the
+     * minimap dot both belong.
+     *
+     * THE ENGINE'S OWN ANCHOR, and it is not `p[0]`. FUN_0052b2c0 registers each
+     * ACP-tagged mesh under the index in its own name and FUN_0052abc0 draws the
+     * billboard at the mean of THAT OBJECT'S vertices (0x52ac66: count at +0xfc,
+     * float3 array at +0x100). `cp_N` is a bare MARK node on the racing line and
+     * sits a mean 0.27 m from it, worst 0.79 m on paint 3.1 m across -- which is
+     * an arrow visibly off its own graffiti, and a minimap dot off with it.
+     *
+     * `has_paint` is 0 for a scene packed before pack_vsc.py grew `acp_N`, and
+     * then this is p[0] and `paint_y` is `ground`: the old answer, so an old
+     * asset still draws. */
+    float paint[3];
+    int   has_paint;
 } cp_t;
 
 typedef struct {
@@ -355,6 +382,34 @@ typedef struct {
     float prog_odo;
     float prog_x, prog_z;
     int   prog_ok;
+
+    /* THE ROAD, when a recording could be fitted to it -- ai.h's ai_line, copied
+     * in by cp_set_line and owned here, so nothing about it outlives cp_free.
+     *
+     * THE ODOMETER ABOVE IS THE FALLBACK NOW. It measures PATH LENGTH, and path
+     * length is not progress: a wide line, a correction, a slide, a spin or a
+     * shove all lengthen it and none of them moves the car up the road, so the
+     * player's own measure ran ahead of the player -- +13.3 m on average and
+     * +78 m at worst over a path 20% longer than the racing line, always in the
+     * player's favour, while every opponent's stayed exact. That is what put the
+     * place one or two better than the truth whenever a car was near enough for
+     * the difference to matter. A PROJECTION cannot inflate: a wide line is
+     * perpendicular to the road and contributes nothing to it.
+     *
+     * `line_prev` is the arc the last frame answered with -- the window's anchor,
+     * -1 for "the stretch's own start", which is what a reset leaves. The window
+     * is CP_LINE_BACK behind it and CP_LINE_FWD ahead, intersected with the
+     * LATCHED STRETCH, so it is re-derived from the latch every frame and cannot
+     * pin itself the way an anchor carried forward alone does (ui.md records that
+     * attempt on the spine). It cannot freeze either, which the same attempt on
+     * the spine did: these samples are 0.06 to 0.25 m apart, not 23 to 40. */
+    float (*line_pt)[2];
+    float  *line_cum;
+    int     line_n;
+    float   line_len;
+    float   line_at[CP_MAX];
+    float   line_prev;
+    int     line_ok;
 
     int next;                     /* the checkpoint being headed for */
     int lap;
@@ -595,6 +650,41 @@ float cp_lap_origin(const checkpoints_t *c);
  * CALL IT AFTER THE OPPONENTS ARE LOADED AND BEFORE cp_restart, which reads
  * `road_len` to place the grid. main.c's load_track does both in that order. */
 int cp_set_stations(checkpoints_t *c, const float *frac, int n, float lap_len);
+
+/* HOW FAR BEHIND AND AHEAD OF THE LAST ANSWER the projection may look, metres.
+ *
+ * FORWARD bounds the one thing a stretch-restricted projection still gets wrong:
+ * a stretch that FOLDS onto itself, where a car really is a metre or two from a
+ * piece of road it will not reach for another fifty. beach_1's cp_0 stretch is a
+ * 71 m hairpin that comes back to within 1.07 m of its own start; country_1 has
+ * a tighter one, and a car three metres wide of the line in it lands on the
+ * returning branch -- which is the whole of what this window is here to stop.
+ *
+ * 20, MEASURED. `wideline' drives a lap three metres wide of the racing line and
+ * scores the placing's two rulers against each other: at 40 m of window
+ * country_1's fold gets through (+3.7 m of mean disagreement where every other
+ * track has under 0.5), and at 12 m the same track's PLACE comes out worse than
+ * the odometer's, which is the floor this replaced. 20 passes both, and it is
+ * still 40 frames of headroom at the fastest any car on these tracks goes.
+ *
+ * BACKWARD is small and non-zero so that a car nudged back a metre is still
+ * found, without opening the fold up again. */
+#define CP_LINE_BACK 8.0f
+#define CP_LINE_FWD 20.0f
+
+/* INSTALL THE ROAD -- ai.h's ai_line, copied. -> 1 when it is usable. `at` is
+ * n_cp arcs, one per checkpoint, in the same order as `station`. Everything is
+ * copied, so the caller may free its own the moment this returns.
+ *
+ * A NULL `pt`, or a length that does not check out, drops any road already
+ * installed and puts the odometer back -- which is what a track with no usable
+ * recording gets. See checkpoints_t.line_pt for what this is for. */
+int cp_set_line(checkpoints_t *c, const float (*pt)[2], const float *cum,
+                int n, float len, const float *at, int n_cp);
+
+/* The road is the only thing in here that is allocated. cp_init memsets, so this
+   has to be called BEFORE re-initialising a checkpoints_t that has been used. */
+void cp_free(checkpoints_t *c);
 
 /* Metres along the closed spine at (x, z). The nearest sample over the WHOLE
    spine -- see cp_spine_dist_near for why that flickers, and prefer it wherever

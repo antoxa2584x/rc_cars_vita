@@ -461,6 +461,76 @@ void scene_set_build_normals(int on);
  * passes only: leaving it on for the world would bind an array no track batch
  * has, and every other module in the port draws with its own colours.
  */
+/* THE WHOLE SCENE'S MODEL-SPACE BOX, out of the per-batch AABBs scene_load
+ * computes. -> 0 and leaves `mn`/`mx` untouched for a scene with no geometry at
+ * all.
+ *
+ * IT IS NOT A SUM OF THOSE BOXES, and the two things it does instead are the
+ * whole reason this is a function rather than four lines at the call site:
+ *
+ *   - EMPTY BATCHES ARE SKIPPED. An empty one carries an INVERTED box (see
+ *     batch_t.bmin), which is this file's way of saying "nothing to draw", and
+ *     folding one in blows the answer out to +/-1e30. So is a HIDDEN one: a
+ *     batch whose index count carparts.c has zeroed is not on screen, and a box
+ *     drawn round three exhausts that never draw is not the picture's box.
+ *   - SCENE_CULL_PAD COMES BACK OFF, and a RIGGED batch's box goes through its
+ *     part's rest matrix. The boxes are CULLING boxes: two metres of slack on
+ *     every axis, and for a car they are in each PART's own space. Read raw they
+ *     gave the 0.42 m Overkill a 4.4 m box -- ten times over -- because nothing
+ *     had ever asked a culling box for a size.
+ *
+ * `skip_part` drops every batch belonging to one rig part, or -1 for none. The
+ * main menu's car viewport asks TWICE with it: once for the whole car, which is
+ * how far away to stand, and once without the ANTENNA, which is where to AIM.
+ * The whip is 0.38 m of wire over a 0.42 m Overkill and it owns the top half of
+ * the car's box, so aiming at that box's centre put the truck 60 px low in a
+ * 276 px viewport -- reported as the car being off centre. See menu_car_draw.
+ *
+ * The main menu's car viewport frames off this: the 42 cm Overkill and the 53 cm
+ * Buggy want different distances and a number tuned for one clips the other
+ * (ui.md). */
+int scene_bounds(const scene_t *s, int skip_part, float mn[3], float mx[3]);
+
+/*
+ * TURNTABLE FRAMING -- where to stand and where to aim so a model turning about
+ * its own Y fills a picture and stays inside it. The main menu's car viewport is
+ * the one caller; it is here rather than in main.c so that the harness can test
+ * the framing itself and not a copy of it (rccars_re/menuframe.c).
+ *
+ * TWO QUESTIONS WITH TWO ANSWERS, which is the whole point of the function.
+ *
+ *   `dist` comes from the WHOLE drawn model, and its horizontal half-extent is
+ *   the box's DIAGONAL rather than its width, because at 45 degrees through the
+ *   turn that is what the model presents. Anything left out here is something
+ *   allowed to leave the frame.
+ *
+ *   `aim` comes from the model MINUS `aim_skip_part` -- one rig part, or -1 for
+ *   none -- and it is MEASURED, not taken off the box. A box centre and the
+ *   centre of the picture are not the same point: the camera is pitched down, so
+ *   the near end of a long model foreshortens more than the far end and its ink
+ *   hangs below the box's middle by 12 to 15 px of a 276 px viewport on these
+ *   cars. So the height is solved by projecting every drawn vertex through the
+ *   very transform the caller will build, at a ring of spin angles, and sliding
+ *   the aim until the extremes balance. Only the HEIGHT: `aim` is also the axis
+ *   the model spins about, so moving it sideways to flatter one angle unbalances
+ *   every other, and over a full turn the sideways ink is symmetric anyway.
+ *
+ * The caller's transform must be, outermost first: back off `dist`, pitch,
+ * spin, then translate by -aim. See menu_car_draw.
+ *
+ * `margin` scales the distance -- 1.0 puts the widest point of the turn on the
+ * frame's edge. Returns 0, and fills in a 0.4 m cube's worth of nothing, for a
+ * scene with no geometry.
+ */
+typedef struct {
+    float aim[3];       /* model-space point to look at, and to spin about */
+    float dist;         /* how far back along the view axis, metres */
+} scene_frame_t;
+
+int scene_frame_turntable(const scene_t *s, int aim_skip_part,
+                          float fov_deg, float pitch_deg, float aspect,
+                          float margin, scene_frame_t *out);
+
 void scene_set_lighting(int on);
 
 /*
