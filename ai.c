@@ -92,6 +92,15 @@ void ai_free(ai_t *ai)
     memset(ai, 0, sizeof(*ai));
 }
 
+/* See ai.h. A file static rather than an ai_t field because it has to be known
+   while the roster is being BUILT, which is before there is an ai_t to ask. */
+static int g_skill_field;
+
+void ai_set_skill_field(int on)
+{
+    g_skill_field = on ? 1 : 0;
+}
+
 int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
             int difficulty, int championship)
 {
@@ -196,7 +205,7 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
         memcpy(u32, r + 64, sizeof(u32));
         memcpy(f32, r + 76, sizeof(f32));
 
-        if (ai->championship && !(u16[2] & mask))
+        if ((ai->championship || g_skill_field) && !(u16[2] & mask))
             continue;
         /* The field is AI_MAX_FIELD, not the layout's five -- see ai.h. Capped
            here rather than at the array bound so the entries that do start keep
@@ -466,11 +475,103 @@ static void ai_bump_derive(ai_car *a)
     if (reach < 1e-3)
         reach = (double)d->radius;
 
-    a->bump_limit     = (float)(AI_BUMP_LIMIT_REACH * reach);
+    a->bump_reach     = (float)reach;
+    a->bump_ref       = (float)(AI_BUMP_REF_REACH * reach);
     a->bump_accel     = d->tune.coeff_rear_tires * RB_GRAVITY;
-    a->bump_w         = (float)sqrt((double)a->bump_accel / a->bump_limit);
+    /* THE SPRING is set by the car's SIZE and the LIMIT by its GRIP, and they
+     * are different questions -- see ai.h. `ref` is the displacement at which
+     * the return wants the whole of the car's grip; `limit` is how far that
+     * grip could ever let it slide, from the car's own recovered top speed.
+     * speed_boost_max is km/h (rb.h), hence the /3.6. */
+    {
+        double vtop = (double)d->tune.speed_boost_max / 3.6;
+        a->bump_limit = (float)(vtop * vtop / (2.0 * a->bump_accel));
+    }
+    a->bump_w         = (float)sqrt((double)a->bump_accel / a->bump_ref);
     a->bump_yaw_limit = (float)(AI_BUMP_YAW_LOCKS * d->steer_max_deg
                                 * (3.14159265358979 / 180.0));
+    a->bump_wall      = -1.0f;         /* not measured */
+}
+
+/* HOW FAR THE LEVEL LETS THIS SHOVE GO, along the offset's own horizontal
+ * direction. See ai.h, "the wall stop". -> a horizontal distance, or a negative
+ * number when the world cannot be asked, which every caller reads as "no limit".
+ *
+ * Amortised on AI_WALL_STEP for the reason AI_BUMP_PROBE_STEP gives: this runs
+ * from ai_bump_clamp, which the contact solve calls after every push.
+ */
+static float ai_bump_wall(ai_car *a)
+{
+    const rb_world *w = a->rb.world;
+    float clear, y0, y1, n[3], ceil_y, ux, uz;
+    float A[3], B[3], lo, hi;
+    double d;
+    int i;
+
+    if (!w || !w->segment || !w->ground)
+        return -1.0f;
+    d = sqrt((double)a->off[0] * a->off[0] + (double)a->off[2] * a->off[2]);
+    if (d < 1e-4)
+        return -1.0f;                  /* straight up or nowhere: no wall to hit */
+    /* AND NOT FOR AN ORDINARY KNOCK. Inside the spring's own reference
+     * displacement the car is where the whole model used to allow it to be, and
+     * the ten-track survey behind ai.h's note found something in the way there
+     * 1.3% of the time -- against 31% at 2.5 m and 64% at 5. Paying six ground
+     * probes and five segment queries for that is the wrong trade, and this is
+     * where the cost of the feature is kept off every tap. */
+    if (d <= (double)a->bump_ref)
+        return -1.0f;
+    /* THE CACHE IS KEYED ON WHERE THE CAR IS, not just on how far off it is.
+     * The offset is measured from a recorded pose that is MOVING -- 12 cm a tick
+     * at racing speed -- so the same offset vector points at different geometry
+     * every tick, and a key on `off` alone goes on answering with a wall the car
+     * has already driven past. What the amortisation is really for is the
+     * eight depenetration passes inside ONE tick, and those move `off` by
+     * millimetres and `rec_x` not at all. */
+    if (a->bump_wall >= 0.0f
+        && fabs((double)a->off[0] + a->rec_x[0] - a->bump_wall_at[0])
+         + fabs((double)a->off[2] + a->rec_x[2] - a->bump_wall_at[1])
+           < AI_WALL_STEP)
+        return a->bump_wall;           /* near enough; reuse it */
+    a->bump_wall_at[0] = a->off[0] + a->rec_x[0];
+    a->bump_wall_at[1] = a->off[2] + a->rec_x[2];
+
+    ux = (float)(a->off[0] / d);
+    uz = (float)(a->off[2] / d);
+    clear = AI_WALL_CLEAR_EXTENT * 0.5f * RB_CARS[a->car].extent[1];
+    ceil_y = a->rec_x[1] + AI_BUMP_CEIL;
+    if (!w->ground(w->ctx, a->rec_x[0], a->rec_x[2], ceil_y, &y0, n)) {
+        a->bump_wall = -1.0f;
+        return -1.0f;
+    }
+    A[0] = a->rec_x[0]; A[1] = y0 + clear; A[2] = a->rec_x[2];
+
+    /* the far end first: clear all the way and there is nothing to bisect */
+    lo = 0.0f;
+    hi = (float)d;
+    B[0] = a->rec_x[0] + ux * hi;
+    B[2] = a->rec_x[2] + uz * hi;
+    if (!w->ground(w->ctx, B[0], B[2], ceil_y, &y1, n))
+        y1 = y0;
+    B[1] = y1 + clear;
+    if (!w->segment(w->ctx, A, B)) {
+        a->bump_wall = -1.0f;          /* nothing in the way at this reach */
+        return -1.0f;
+    }
+    /* BISECT ON THE REACH, not on the segment: each probe is its own ground
+       query at its own point, so the test walks the terrain instead of cutting
+       across it -- which is the whole reason a slope does not read as a wall. */
+    for (i = 0; i < AI_WALL_BISECT; i++) {
+        float mid = 0.5f * (lo + hi);
+        B[0] = a->rec_x[0] + ux * mid;
+        B[2] = a->rec_x[2] + uz * mid;
+        if (!w->ground(w->ctx, B[0], B[2], ceil_y, &y1, n))
+            y1 = y0;
+        B[1] = y1 + clear;
+        if (w->segment(w->ctx, A, B)) hi = mid; else lo = mid;
+    }
+    a->bump_wall = lo;
+    return lo;
 }
 
 /* THE TERRAIN FOLLOW, which is a SEPARATE term from the offset and not part of
@@ -495,15 +596,28 @@ static float ai_bump_ground_dy(ai_car *a)
     if (!w || !w->ground)
         return 0.0f;
     if (fabs((double)a->off[0]) + fabs((double)a->off[2]) < 1e-4) {
-        /* straight up or nowhere: same column, same ground */
-        a->off_gnd_at[0] = a->off_gnd_at[1] = 0.0f;
+        /* straight up or nowhere: same column, same ground. The key is
+           poisoned rather than zeroed -- zero is a position like any other now
+           that rec_x is in it. */
+        a->off_gnd_at[0] = a->off_gnd_at[1] = 1e30f;
         return 0.0f;
     }
-    if (fabs((double)a->off[0] - a->off_gnd_at[0])
-        + fabs((double)a->off[2] - a->off_gnd_at[1]) < AI_BUMP_PROBE_STEP)
+    /* KEYED ON WHERE THE CAR IS, not on how far off its line it is. The offset
+     * is measured from a recorded pose travelling 12 cm a tick, so an unchanged
+     * `off` is a DIFFERENT piece of ground every tick and a key on `off` alone
+     * answers with the height difference from somewhere the car has left. That
+     * cost nothing while the offset was capped at 0.63 m and the difference was
+     * millimetres; at the metres a shove now reaches, the ground it describes
+     * can be a different piece of hillside. What the amortisation is for is the
+     * eight depenetration passes
+     * inside ONE tick, and those move `off` by millimetres and `rec_x` not at
+     * all -- so both terms belong in the key and the saving is kept. */
+    if (fabs((double)a->off[0] + a->rec_x[0] - a->off_gnd_at[0])
+        + fabs((double)a->off[2] + a->rec_x[2] - a->off_gnd_at[1])
+          < AI_BUMP_PROBE_STEP)
         return a->off_gnd;                      /* near enough; reuse it */
-    a->off_gnd_at[0] = a->off[0];
-    a->off_gnd_at[1] = a->off[2];
+    a->off_gnd_at[0] = a->off[0] + a->rec_x[0];
+    a->off_gnd_at[1] = a->off[2] + a->rec_x[2];
     ceil_y = a->rec_x[1] + AI_BUMP_CEIL;
     if (!w->ground(w->ctx, a->rec_x[0], a->rec_x[2], ceil_y, &y0, n))
         return 0.0f;
@@ -511,9 +625,89 @@ static float ai_bump_ground_dy(ai_car *a)
                    ceil_y, &y1, n))
         return 0.0f;
     dy = y1 - y0;
-    if (dy >  AI_BUMP_MAX_LIFT) dy =  AI_BUMP_MAX_LIFT;
-    if (dy < -AI_BUMP_MAX_LIFT) dy = -AI_BUMP_MAX_LIFT;
+    /* HOW FAR THE FOLLOW MAY CLIMB, and it is now the DISTANCE that says so.
+     *
+     * A flat AI_BUMP_MAX_LIFT was right while a shove could carry a car 0.63 m,
+     * where 0.35 m of height change is a probe that has landed on something it
+     * should not have. Over the metres a shove reaches now it is the binding
+     * failure instead: on a bank, ground that legitimately rises a metre over
+     * two is clamped to 0.35 and the car is left buried in it. Measured with the
+     * clamp flat, 20 of 480 hard shoves ended deeper in the level than an
+     * unshoved twin; with the bound below, 17. It is not the whole of that
+     * residual -- see known-issues.md -- but a car standing on a bank it climbed
+     * is the case this one is for.
+     *
+     * So the bound is what a DRIVABLE slope could do over the distance
+     * travelled: the engine's own 46-degree floor cone -- AI_TOP_COS, the angle
+     * carDriveForce calls the difference between a floor and a wall -- times the
+     * horizontal displacement, and never less than the old constant. Anything
+     * steeper than that is not ground the car could be standing on, and is left
+     * clamped for exactly the reason the constant was introduced. */
+    {
+        float lift = AI_BUMP_MAX_LIFT;
+        float horiz = (float)sqrt((double)a->off[0] * a->off[0]
+                                  + (double)a->off[2] * a->off[2]);
+        float tan_cone = (float)(sqrt(1.0 - (double)AI_TOP_COS * AI_TOP_COS)
+                                 / (double)AI_TOP_COS);
+        if (horiz * tan_cone > lift)
+            lift = horiz * tan_cone;
+        if (dy >  lift) dy =  lift;
+        if (dy < -lift) dy = -lift;
+    }
     return dy;
+}
+
+/* HOLD THE OFFSET INSIDE WHAT THE LEVEL ALLOWS -- by refusing to let it GROW
+ * past a wall, and by nothing else.
+ *
+ * TWO VERSIONS OF THIS WERE WRONG BEFORE THIS ONE, both in the same way: they
+ * treated ai_bump_wall's answer as somewhere the car had to BE, and moved it
+ * there. The offset is measured from a pose that is DRIVING, so geometry arrives
+ * beside a held-out car without the car moving at all and the allowed distance
+ * collapses between one tick and the next --
+ *
+ *   - applied at once, that is a teleport. All 60 sustained holds across the ten
+ *     tracks did it, worst 1.95 m gone in a single tick, from 1.95: straight
+ *     home. Reported as "ai car spawns on its way if long push it to side".
+ *   - applied as a grip-limited slide, it is a dart: the correction runs at
+ *     sqrt(2 * accel * excess), which is 4.4 m/s at a metre and a half and moves
+ *     the offset's POSITION, so nothing else in the model sees it as speed.
+ *
+ * A wall arriving next to a car is not a reason to pull the car in. It is a
+ * reason to stop it going further out, and the spring is ALREADY pulling it home
+ * at the car's own grip -- which is the rate a car recovers at and the rate
+ * everything else here runs on. So this refuses growth and nothing more: the
+ * offset may keep whatever it had when the tick began, and may not add to it in
+ * a direction the level has closed. A car caught inside a fence is out of it in
+ * about the second the spring takes, at a speed that reads as a car sliding.
+ *
+ * `h0` is the horizontal offset at the top of the relax, before the spring
+ * integrated -- so "what it had" means before this tick's growth, not after. */
+static void ai_bump_wall_relax(ai_car *a, float h0)
+{
+    float wall = ai_bump_wall(a);
+    double h, allowed, ux, uz, radial;
+
+    if (wall < 0.0f)
+        return;                        /* nothing in the way, or nothing to ask */
+    allowed = (double)wall;
+    if ((double)h0 > allowed)
+        allowed = (double)h0;          /* never take away what it already had */
+    h = sqrt((double)a->off[0] * a->off[0] + (double)a->off[2] * a->off[2]);
+    if (h <= allowed || h < 1e-9)
+        return;
+    ux = a->off[0] / h;
+    uz = a->off[2] / h;
+    a->off[0] = (float)(ux * allowed);
+    a->off[2] = (float)(uz * allowed);
+    /* and the outward velocity goes with it, for the reason ai_bump_clamp's
+       header gives: a car reporting that it is getting out of the way while a
+       wall holds it still is one the contact solve will drive straight into. */
+    radial = (double)a->offv[0] * ux + (double)a->offv[2] * uz;
+    if (radial > 0.0) {
+        a->offv[0] = (float)((double)a->offv[0] - radial * ux);
+        a->offv[2] = (float)((double)a->offv[2] - radial * uz);
+    }
 }
 
 /* Compose the offset onto the recorded pose. IDEMPOTENT -- it always rebuilds
@@ -557,6 +751,96 @@ static void ai_bump_apply(ai_car *a)
     a->bump = (float)sqrt((double)a->off[0] * a->off[0]
                           + (double)a->off[1] * a->off[1]
                           + (double)a->off[2] * a->off[2]);
+}
+
+/* DID THIS SHOVE KILL IT? The player's own two tests, on an opponent -- see
+ * ai.h, "dying". -> nonzero if the car was put back on its line.
+ *
+ * Runs on the composed pose, so it sees where the car actually IS, and only on a
+ * car a shove has actually moved: an opponent on its line is its recording, and
+ * a recording is a lap that was really driven, so there is nowhere better to
+ * send it and declaring it dead would fire every tick for the rest of the race.
+ */
+static int ai_bump_death(ai_car *a, float dt)
+{
+    const rb_world *w = a->rb.world;
+    const rb_body *b = &a->rb.body;
+    float gap;
+    int dead = 0;
+
+    if (a->bump < AI_DEATH_MIN_OFF) {
+        a->buried_for = 0.0f;
+        return 0;                      /* on its line: nothing put it anywhere */
+    }
+
+    /* FELL OUT OF THE WORLD, measured below its own recorded height -- the
+       track's own reference, and the counterpart of the player's spawn height. */
+    if (b->x[1] < a->rec_x[1] - AI_FELL_BELOW) {
+        rlog("[rccars] ai %s: fell out of the world, back on its line\n",
+             a->name);
+        dead = 1;
+    }
+    /* DROWNED. The engine's own answer here is a `car_reset` script volume over
+       the water (0x004f27a0), which the port has no data for; this is main.c's
+       stand-in for it, with main.c's number. */
+    if (!dead && w && w->water
+        && w->water(w->ctx, 0, b->x, &gap) && gap < -AI_DROWN_DEPTH) {
+        rlog("[rccars] ai %s: drowned (%d cm under), back on its line\n",
+             a->name, (int)(-gap * 100.0f));
+        dead = 1;
+    }
+    /* BURIED -- the ground is ABOVE the car. The player has no counterpart to
+     * this because a player drives on the surface and cannot be pushed into it;
+     * an opponent is placed by an offset and a terrain follow, and where the
+     * follow cannot rescue it the car ends up inside a bank. aitest part 9 case
+     * 6 counts them: 14 of 480 hard shoves leave a car deeper in the level than
+     * an unshoved twin, and nothing else in the model ever gets them out.
+     *
+     * One ground probe, not a proxy sweep: the question is only whether the
+     * drivable surface at the car's own column is over its head, and the bound
+     * is the car's own body half-height -- the same extent the wall clearance
+     * uses. It is gated behind the offset test above, so a car on its line never
+     * pays for it. */
+    if (w && w->ground) {
+        float gy, n[3];
+        float half = 0.5f * RB_CARS[a->car].extent[1];
+        if (w->ground(w->ctx, b->x[0], b->x[2], b->x[1] + AI_BUMP_CEIL, &gy, n)
+            && gy > b->x[1] + half) {
+            a->buried_for += dt;
+            /* AND IT HAS TO STICK. A graze against a bank is not being stuck --
+               see ai.h, and the one-in-five respawn rate that testing this on
+               the instant produced. */
+            if (!dead && a->bump_w > 1e-4f
+                && a->buried_for > AI_BURIED_SETTLE / a->bump_w) {
+                rlog("[rccars] ai %s: buried for %.1f s (%d cm of ground"
+                     " overhead), back on its line\n", a->name,
+                     (double)a->buried_for, (int)((gy - b->x[1]) * 100.0f));
+                dead = 1;
+            }
+        } else {
+            a->buried_for = 0.0f;
+        }
+    }
+    if (!dead)
+        return 0;
+
+    /* BACK ON THE LINE, and that is the whole of it: the cursor, the lap, the
+     * distance walked and the rubber-band coefficient are untouched, exactly as
+     * respawn_checkpoint leaves the player's lap alone. What goes is the shove
+     * and everything it was carrying -- including the steering decision, which
+     * was taken about a piece of road the car is no longer beside. */
+    a->off[0] = a->off[1] = a->off[2] = 0.0f;
+    a->offv[0] = a->offv[1] = a->offv[2] = 0.0f;
+    a->off_yaw = a->off_yawv = 0.0f;
+    a->off_gnd = 0.0f;
+    a->off_gnd_at[0] = a->off_gnd_at[1] = 1e30f;
+    a->bump_wall = -1.0f;
+    a->steer_want = a->steer_cmd = a->steer_hold = 0.0f;
+    a->steer_side = 0;
+    a->buried_for = 0.0f;
+    a->respawns++;
+    ai_bump_apply(a);                  /* rebuild the pose from the recording */
+    return 1;
 }
 
 /* Write the pose for the current (cursor, u), then put the bump back on top of
@@ -691,11 +975,13 @@ static int ai_path_ahead(const ai_car *a, float m, float out[3])
     }
 }
 
-/* One car's proxy reach, which is what `bump_limit` is two of (ai_bump_derive).
- * Kept as one expression so the two places that need it cannot disagree. */
+/* One car's proxy reach, measured at load by ai_bump_derive. It used to be
+ * recovered by dividing bump_limit back down, which was right only while the
+ * limit was two reaches; the limit is a slide distance now, so the reach is
+ * stored instead of inferred. */
 static float ai_reach(const ai_car *a)
 {
-    return a->bump_limit * (1.0f / AI_BUMP_LIMIT_REACH);
+    return a->bump_reach;
 }
 
 /* How much room this opponent wants between itself and `other`, centre to
@@ -920,15 +1206,24 @@ static void ai_steer_decide(ai_t *ai, int idx, float px, float py, float pz,
         if (side == 0)
             side = best_lat >= 0.0f ? -1 : 1;   /* go where it is not */
         want = best_lat + (float)side * clear;
-        /* If that side cannot be reached inside the offset budget, try the
-           other one before settling for a pass that does not clear. */
-        if ((want < 0.0f ? -want : want) > a->bump_limit) {
+        /* If that side cannot be reached inside the STEERING budget, try the
+         * other one before settling for a pass that does not clear.
+         *
+         * `bump_ref`, NOT `bump_limit`. This is how far the car will steer
+         * across its own line to get round something, and that is a car-sized
+         * quantity -- two proxy reaches, 0.63 m, which is what it always was.
+         * bump_limit is now how far a SHOVE can carry it, 6.75 m of grip-limited
+         * slide (ai.h), and reading it here let a car commit to a six-metre
+         * swerve to pass another: measured over a minute on each of the ten
+         * tracks with no player, that turned 54 contact car-ticks between
+         * opponents into 111, i.e. deciding made the field touch MORE. */
+        if ((want < 0.0f ? -want : want) > a->bump_ref) {
             float alt = best_lat - (float)side * clear;
-            if ((alt < 0.0f ? -alt : alt) <= a->bump_limit) {
+            if ((alt < 0.0f ? -alt : alt) <= a->bump_ref) {
                 side = -side;
                 want = alt;
             } else {
-                want = want < 0.0f ? -a->bump_limit : a->bump_limit;
+                want = want < 0.0f ? -a->bump_ref : a->bump_ref;
             }
         }
         a->steer_side = side;
@@ -1017,6 +1312,7 @@ static void ai_bump_relax(ai_car *a, float dt, const float want[3],
 {
     double k, c, ax, ay, az, mag, aw, cap_w;
     double ex, ey, ez, eyaw;
+    float h0;
 
     /* THE SPRING'S TARGET IS THE DECISION, and zero when there is none.
      *
@@ -1038,6 +1334,11 @@ static void ai_bump_relax(ai_car *a, float dt, const float want[3],
         && want[0] == 0.0f && want[1] == 0.0f && want[2] == 0.0f
         && yaw_want == 0.0f)
         return;                        /* on its line: exactly the recording */
+
+    /* what the horizontal offset was before this tick's spring ran -- the wall
+       bound below refuses GROWTH against it and never takes anything away */
+    h0 = (float)sqrt((double)a->off[0] * a->off[0]
+                     + (double)a->off[2] * a->off[2]);
 
     k = (double)a->bump_w * a->bump_w;
     c = 2.0 * a->bump_w;
@@ -1069,13 +1370,19 @@ static void ai_bump_relax(ai_car *a, float dt, const float want[3],
        going anywhere and spend it the moment the car came off the limit, which
        reads as a car spat sideways a second after the hit. */
     ai_bump_clamp(a);
+    /* and then the level, which is the one bound that has to know what the
+       offset looked like before the tick */
+    ai_bump_wall_relax(a, h0);
     mag = sqrt((double)a->off[0] * a->off[0] + (double)a->off[1] * a->off[1]
                + (double)a->off[2] * a->off[2]);
 
     /* The yaw, on the same spring. Its acceleration budget is the linear one
-       over the proxy's reach -- the same tyre force, applied at the end of the
-       same lever. */
-    cap_w = (double)a->bump_accel / ((double)a->bump_limit * 0.5);
+       over the proxy's REACH -- the same tyre force, applied at the end of the
+       same lever, and the lever is the car's own size.
+       This used to read bump_limit * 0.5, which was the reach only because the
+       limit was two of them; it is now a slide distance in metres and the two
+       have nothing to do with each other. */
+    cap_w = (double)a->bump_accel / (double)a->bump_reach;
     aw = -(k * eyaw + c * a->off_yawv);
     if (aw >  cap_w) aw =  cap_w;
     if (aw < -cap_w) aw = -cap_w;
@@ -1316,6 +1623,8 @@ void ai_reset(ai_t *ai)
         a->bump = 0.0f;
         /* And its decision with it: a car re-gridded still holding a side would
            set off round an obstacle that is no longer there. */
+        a->buried_for = 0.0f;
+        a->respawns = 0;
         ai_steer_clear(a);
         ai_pose(a);
         a->speed_rec = sample_speed(a, 0);
@@ -1643,6 +1952,10 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
                           (float)(a->steer_cmd * (3.14159265358979 / 180.0)));
         }
         ai_bump_apply(a);
+        /* AND LAST, THE SAME QUESTION THE PLAYER IS ASKED: did that leave the car
+           somewhere it would have died? On the composed pose, because that is
+           where the car is. See ai_bump_death. */
+        ai_bump_death(a, dt);
     }
 
     /* THE PORT'S, and the field's own business rather than the player's:
@@ -2316,7 +2629,8 @@ int ai_within(const ai_t *ai, int i, float x, float y, float z, float d)
  * ONE PASS over the loop, carrying the running distance rather than an array of
  * them: the longest profile is 11 081 samples and the alternative is 88 KB of
  * scratch on a machine with none to spare. */
-static int ai_fit_one(const ai_car *a, const float (*mk)[3], int n_mk, float *g)
+static int ai_fit_one(const ai_car *a, const float (*mk)[3], int n_mk,
+                      float *g, float *at_out)
 {
     double best2[AI_MAX_CP], at[AI_MAX_CP];
     double run = 0.0;
@@ -2363,6 +2677,12 @@ static int ai_fit_one(const ai_car *a, const float (*mk)[3], int n_mk, float *g)
     for (k = 1; k < n_mk; k++)
         if (!(g[k] > g[k-1]))
             return 0;
+    /* AND THE ARCS THEMSELVES, unwrapped and unaveraged, for ai_fit_line: `run`
+       started at the loop's first sample, so `at` is already this loop's own arc
+       and needs no conversion. */
+    if (at_out)
+        for (k = 0; k < n_mk; k++)
+            at_out[k] = (float)at[k];
     return 1;
 }
 
@@ -2378,7 +2698,7 @@ int ai_cp_fractions(const ai_t *ai, const float (*mk)[3], int n_mk,
 
     for (i = 0; i < ai->n; i++) {
         float g[AI_MAX_CP];
-        if (!ai_fit_one(&ai->car[i], mk, n_mk, g))
+        if (!ai_fit_one(&ai->car[i], mk, n_mk, g, NULL))
             continue;
         for (k = 0; k < n_mk; k++) sum[k] += g[k];
         laps += ai->car[i].lap_len;
@@ -2400,6 +2720,91 @@ int ai_cp_fractions(const ai_t *ai, const float (*mk)[3], int n_mk,
     rlog("ai: checkpoint stations fitted off %d of %d recording(s), lap %.1f m\n",
          used, ai->n, (float)(laps / used));
     return 1;
+}
+
+/* THE ROAD, off the first recording that fits. See ai.h at ai_line.
+ *
+ * THE FIRST, not the best or the mean: the window this feeds has to be laid out
+ * on ONE car's line, and the three drives of a track disagree with each other by
+ * 6.5 m on where the checkpoints fall (ai.h). Averaging the stations is right --
+ * they are the answer's units -- and averaging the LINE would be a line nobody
+ * drove. The stations stay ai_cp_fractions', the window is this car's.
+ */
+int ai_fit_line(const ai_t *ai, const float (*mk)[3], int n_mk, ai_line *L)
+{
+    float g[AI_MAX_CP], at[AI_MAX_CP];
+    const ai_car *a = NULL;
+    int i, k, first, n;
+    double run;
+
+    if (!ai || !mk || !L || n_mk <= 0 || n_mk > AI_MAX_CP)
+        return 0;
+    memset(L, 0, sizeof(*L));
+    for (i = 0; i < ai->n; i++)
+        if (ai_fit_one(&ai->car[i], mk, n_mk, g, at)) {
+            a = &ai->car[i];
+            L->from = i;
+            break;
+        }
+    if (!a)
+        return 0;
+
+    first = a->cycle_start > 0 ? a->cycle_start : 0;
+    n = a->n - first;
+    if (n < 2)
+        return 0;
+    L->pt  = (float (*)[2])malloc(sizeof(float) * 2 * (size_t)n);
+    L->cum = (float *)malloc(sizeof(float) * (size_t)n);
+    if (!L->pt || !L->cum) {
+        ai_line_free(L);
+        return 0;
+    }
+    L->n = n;
+    run = 0.0;
+    for (i = 0; i < n; i++) {
+        const float *p = a->s[first + i].p;
+        if (i > 0) {
+            const float *q = a->s[first + i - 1].p;
+            run += sqrt((double)(p[0]-q[0]) * (p[0]-q[0])
+                      + (double)(p[1]-q[1]) * (p[1]-q[1])
+                      + (double)(p[2]-q[2]) * (p[2]-q[2]));
+        }
+        L->pt[i][0] = p[0];
+        L->pt[i][1] = p[2];
+        L->cum[i] = (float)run;
+    }
+    /* THE CLOSING LEG, so the loop is a loop. The replay rejoins at cycle_start
+       and the last sample is within 0.3 m of it on all thirty recordings, so
+       this is a rounding error and not a jump -- but it is measured rather than
+       assumed, because `len` is what one lap of the answer divides by. */
+    {
+        float dx = L->pt[0][0] - L->pt[n-1][0];
+        float dz = L->pt[0][1] - L->pt[n-1][1];
+        L->len = L->cum[n-1] + (float)sqrt((double)dx * dx + (double)dz * dz);
+    }
+    if (!(L->len > 1e-3f)) {
+        ai_line_free(L);
+        return 0;
+    }
+    L->n_cp = n_mk;
+    for (k = 0; k < n_mk; k++) {
+        float v = at[k];
+        while (v < 0.f) v += L->len;
+        while (v >= L->len) v -= L->len;
+        L->at[k] = v;
+    }
+    rlog("ai: the road is %s's lap -- %d samples, %.1f m, %.2f m apart\n",
+         a->name, L->n, L->len, L->len / (float)L->n);
+    return 1;
+}
+
+void ai_line_free(ai_line *L)
+{
+    if (!L)
+        return;
+    if (L->pt)  free(L->pt);
+    if (L->cum) free(L->cum);
+    memset(L, 0, sizeof(*L));
 }
 
 int ai_player_place(const ai_t *ai)

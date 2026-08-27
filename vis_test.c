@@ -1627,6 +1627,50 @@ static void part2_checkpoints(void)
         ck_state_restored("cp_draw");
     }
 
+    /* --- THE ARROW STANDS ON THE PAINT, not on the waypoint -------------
+     *
+     * `cp_N` is a bare MARK node on the racing line; the graffiti is a mesh, and
+     * the engine draws the billboard at the mean of THAT object's vertices
+     * (FUN_0052abc0, 0x52ac66). They are a mean 0.27 m apart on the fifty real
+     * checkpoints and 0.79 m at worst, which is a quarter of the decal -- an
+     * arrow visibly beside its own paint, and a minimap dot beside it too.
+     *
+     * Its own scene, because every check above matches a draw to a checkpoint by
+     * the quad's centre and giving the shared fixture paint would move them all.
+     * The offset used is the worst real one. */
+    {
+        static const char *tx[] = {
+            "cp_ar_2_f1", "cp_ar_2_f2", "cp_ar_2_f3",
+            "cp_ar_3_f1", "cp_ar_3_f2", "cp_ar_3_f3"
+        };
+        scene_t *s3 = make_scene(tx, 6);
+        checkpoints_t d;
+        float e3[3];
+
+        add_marker(s3, "cp_1", 0.f, 0.f, 0.f, 0.f);
+        add_marker(s3, "cp_2", 40.f, 0.f, 0.f, 0.f);
+        add_marker(s3, "acp_2", 40.79f, 0.f, 0.f, 0.f);   /* country_1 cp_4's */
+        /* cp_1 deliberately has NO paint -- the fallback is checked below. */
+
+        cp_init(&d, s3, NULL);
+        d.next = 1;
+        d.t = 0.05f;
+        e3[0] = 40.f; e3[1] = 0.f; e3[2] = -60.f;
+        gl_cap_reset();
+        cp_draw(&d, e3);
+        ck(d.cp[1].has_paint && cp_find_draw(40.79f, 0.f) >= 0
+           && cp_find_draw(40.f, 0.f) < 0,
+           "the arrow stands on the ACP paint, not on the cp_N waypoint",
+           "paint %d, draw at the paint %d, at the waypoint %d",
+           d.cp[1].has_paint, cp_find_draw(40.79f, 0.f),
+           cp_find_draw(40.f, 0.f));
+        /* AND THE FALLBACK IS THE OLD ANSWER, so a scene packed before
+           pack_vsc.py grew `acp_N` still draws its arrows somewhere. */
+        ck(!d.cp[0].has_paint && cp_find_draw(0.f, 0.f) >= 0,
+           "and falls back to the waypoint for a checkpoint with no paint",
+           "paint %d, draw %d", d.cp[0].has_paint, cp_find_draw(0.f, 0.f));
+    }
+
     /* --- and now the SAME drive on all TEN REAL SPINES -------------------
      *
      * A synthetic square and a real track find different bugs, and this is the
@@ -1652,6 +1696,12 @@ static void part2_checkpoints(void)
         };
         int t, bad_fires = 0, bad_order = 0, bad_lap = 0, loaded = 0;
         int cp_ground_n = 0, cp_ground_roof = 0, cp_ground_under = 0;
+        /* THE PAINT each arrow stands on: how many of the fifty carry an
+           `acp_N`, how far it is from the waypoint, and how many are exactly ON
+           it -- which is what a packer that emitted the waypoint instead of the
+           mesh's own mean would look like, and would pass every other check. */
+        int cp_paint_n = 0, cp_paint_far = 0, cp_paint_same = 0;
+        float cp_paint_worst = 0.f;
         int cp_ground_hit = 0, cp_respawn_n = 0, cp_respawn_bad = 0;
         float worst_all = -1.f;
         /* The respawn point, on the real spines: how many checkpoints across all
@@ -1705,6 +1755,15 @@ static void part2_checkpoints(void)
                     cp_ground_n++;
                     if (rc.cp[k2].ground > mk[1] + 0.5f)
                         cp_ground_roof++;
+                    if (rc.cp[k2].has_paint) {
+                        float px2 = rc.cp[k2].paint[0] - mk[0];
+                        float pz2 = rc.cp[k2].paint[2] - mk[2];
+                        float pd = sqrtf(px2 * px2 + pz2 * pz2);
+                        cp_paint_n++;
+                        if (pd > 2.f) cp_paint_far++;
+                        if (pd < 1e-4f) cp_paint_same++;
+                        if (pd > cp_paint_worst) cp_paint_worst = pd;
+                    }
                     /* AND THE PROBE ACTUALLY HIT SOMETHING. cp_init falls back to
                        the marker's own y when nothing is under the ceiling, which
                        is safe but is NOT the ground -- and a ceiling too tight to
@@ -1850,6 +1909,21 @@ static void part2_checkpoints(void)
            "respawn and the animated marker both go where this says",
            "%d of %d above the marker by over 0.5 m",
            cp_ground_roof, cp_ground_n);
+        /* EVERY ONE OF THE FIFTY, because the fallback is silent: a track whose
+           `acp_N` markers went missing draws its arrows back on the waypoints
+           and nothing else changes. */
+        ck(cp_paint_n == cp_ground_n,
+           "and every checkpoint carries the paint its arrow stands on",
+           "%d of %d have an acp_N", cp_paint_n, cp_ground_n);
+        /* NOT ON THE WAYPOINT and not far from it: the paint is 2.4 to 5.3 m
+           across and the markings are 20 m apart at the very closest, so 2 m
+           separates "the artists put the marker off centre" from "this acp_N
+           belongs to a different checkpoint". Exactly 0 would mean the packer
+           wrote the waypoint back out instead of the mesh's own vertex mean. */
+        ck(cp_paint_far == 0 && cp_paint_same == 0,
+           "and it is off the waypoint, but on the same checkpoint",
+           "%d over 2 m, %d exactly on it; worst %.2f m",
+           cp_paint_far, cp_paint_same, cp_paint_worst);
         ck(cp_ground_hit >= 48,
            "and the probe really found terrain under all but a couple -- a "
            "ceiling too tight to clear the floor falls back to the marker's own "

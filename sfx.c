@@ -163,6 +163,7 @@ static struct {
     int track;
     const col_t *col;
     int paused;
+    int no_race;      /* the front end is up -- see sfx_race_active */
 
     int motor[M_COUNT];         /* bank indices for the current car */
     loop_t l_main;              /* car_motor    : idle <-> engine */
@@ -459,29 +460,46 @@ void sfx_set_track(int track_index, const col_t *col)
     S.surf_mat = -1;
 }
 
+/* Every loop this file owns, stopped. Shared by sfx_pause and sfx_race_active,
+   because "nothing about the world is sounding" is one operation however it was
+   asked for. */
+static void sfx_stop_loops(void)
+{
+    int i;
+    audio_lock();
+    loop_stop(&S.l_main);
+    loop_stop(&S.l_idle);
+    loop_stop(&S.l_trans);
+    loop_stop(&S.l_ws);
+    loop_stop(&S.l_surf);
+    loop_stop(&S.l_amb);
+    /* The opponents go quiet too. sfx_ai_motor also declines to start a voice
+       while stopped, so nothing restarts them until the world runs again. */
+    for (i = 0; i < SFX_AI_MAX; i++)
+        loop_stop(&S.l_ai[i]);
+    audio_unlock();
+}
+
 void sfx_pause(int paused)
 {
     if (!S.ok || paused == S.paused) return;
     S.paused = paused;
-    if (paused) {
-        audio_lock();
-        loop_stop(&S.l_main);
-        loop_stop(&S.l_idle);
-        loop_stop(&S.l_trans);
-        loop_stop(&S.l_ws);
-        loop_stop(&S.l_surf);
-        loop_stop(&S.l_amb);
-        /* The opponents go quiet too. sfx_ai_motor also declines to start a
-           voice while paused, so nothing restarts them until the world runs
-           again -- one-shots are deliberately left to ring out, which is what
-           sfx_pause has always done. */
-        {
-            int i;
-            for (i = 0; i < SFX_AI_MAX; i++)
-                loop_stop(&S.l_ai[i]);
-        }
-        audio_unlock();
-    }
+    /* One-shots are deliberately left to ring out, which is what sfx_pause has
+       always done -- a cue that was already sounding when the menu opened is
+       part of what just happened. sfx_race_active is the one that refuses them,
+       because under the front end there is no "just happened". */
+    if (paused)
+        sfx_stop_loops();
+}
+
+/* SEE sfx.h. The front end's own switch, and the reason it is HERE and not three
+   `if' statements in main.c is that it kept being one `if' short. */
+void sfx_race_active(int active)
+{
+    if (!S.ok || S.no_race == !active) return;
+    S.no_race = !active;
+    if (S.no_race)
+        sfx_stop_loops();
 }
 
 /* The car has just been put on the grid. 0x00509ff0 zeroes the whole sound
@@ -542,7 +560,7 @@ void sfx_update(const rb_car *c, const float eye[3], float eye_yaw_deg, float dt
     mix_listener(m, eye[0], eye[1], eye[2], eye_yaw_deg);
     audio_unlock();
 
-    if (S.paused) return;
+    if (S.paused || S.no_race) return;
 
     /* --- read the car ---------------------------------------------------- */
     v[0] = c->body.v[0]; v[1] = c->body.v[1]; v[2] = c->body.v[2];
@@ -724,9 +742,13 @@ void sfx_ui(sfx_ui_t which)
     audio_unlock();
 }
 
+/* THE SIX THAT BELONG TO A RACE -- the checkpoint, the wrong way, the beside
+   cue, the pre-start, the 3-2-1 and the spawn. Every one of them is dropped
+   while there is no race, which is what keeps them off the main menu; sfx_ui is
+   deliberately NOT one of these, because the menu is what needs it. */
 #define SFX_CUE(fn, field, gain)          \
     void fn(void) {                       \
-        if (!S.ok) return;                \
+        if (!S.ok || S.no_race) return;   \
         audio_lock();                     \
         one_shot(S.field, gain, 1.f);     \
         audio_unlock();                   \
@@ -744,7 +766,7 @@ void sfx_prop_hit(int model, const float pos[3], float speed)
     const prop_model_t *pm;
     float g, pitch;
 
-    if (!S.ok || S.paused || !pos)
+    if (!S.ok || S.paused || S.no_race || !pos)
         return;
     if (model < 0 || model >= PROP_N_MODELS)
         return;
@@ -789,7 +811,7 @@ static const struct { float rmin, rmax; } VOICE_R[SFX_VOICE_COUNT] = {
 
 void sfx_char_voice(sfx_voice_t which, const float pos[3], float gain)
 {
-    if (!S.ok || S.paused || !pos)
+    if (!S.ok || S.paused || S.no_race || !pos)
         return;
     if ((int)which < 0 || (int)which >= SFX_VOICE_COUNT)
         return;
@@ -840,7 +862,7 @@ void sfx_ai_motor(int slot, const float pos[3], float speed_ratio, int active)
         return;
 
     audio_lock();
-    if (!active || S.paused) {
+    if (!active || S.paused || S.no_race) {
         loop_stop(l);
         audio_unlock();
         return;
@@ -868,7 +890,7 @@ void sfx_car_hit(float speed)
 {
     float g;
 
-    if (!S.ok || S.snd_cdt_car < 0 || S.paused)
+    if (!S.ok || S.snd_cdt_car < 0 || S.paused || S.no_race)
         return;
     if (speed < PROP_MIN_SPEED)
         return;                     /* a nudge, not a hit */
@@ -904,7 +926,7 @@ void sfx_car_hit(float speed)
 
 void sfx_bullet(const float pos[3])
 {
-    if (!S.ok || S.paused || !pos || S.snd_bullet < 0)
+    if (!S.ok || S.paused || S.no_race || !pos || S.snd_bullet < 0)
         return;
     if (S.bullet_cool > 0.f)
         return;
@@ -917,7 +939,7 @@ void sfx_bullet(const float pos[3])
 
 void sfx_bullet_hit(void)
 {
-    if (!S.ok || S.paused || S.snd_cdt_bullet < 0)
+    if (!S.ok || S.paused || S.no_race || S.snd_cdt_bullet < 0)
         return;
     audio_lock();
     one_shot(S.snd_cdt_bullet, 1.f, 1.f);

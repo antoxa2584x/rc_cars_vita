@@ -8,6 +8,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Spelt out rather than taken from M_PI, which is not in ANSI C's math.h and is
@@ -62,6 +63,29 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
                 break;
         }
         c->n = k;
+    }
+
+    /* THE PAINT each checkpoint is drawn over -- `acp_N`, the mean of the ACP
+       mesh's vertices, which pack_vsc.py works out because a .vsc drops mesh
+       names. This is the engine's own anchor for the animated arrow and it is
+       NOT cp_N; see cp_t.paint. A scene packed before the packer grew these
+       has none, and then the anchor is cp_N as it was. */
+    for (k = 0; k < c->n; k++) {
+        char want[16];
+        c->cp[k].paint[0] = c->cp[k].p[0][0];
+        c->cp[k].paint[1] = c->cp[k].p[0][1];
+        c->cp[k].paint[2] = c->cp[k].p[0][2];
+        c->cp[k].has_paint = 0;
+        sprintf(want, "acp_%d", k + 1);
+        for (i = 0; i < scene->n_markers; i++) {
+            if (!strcmp(scene->markers[i].name, want)) {
+                c->cp[k].paint[0] = scene->markers[i].x;
+                c->cp[k].paint[1] = scene->markers[i].y;
+                c->cp[k].paint[2] = scene->markers[i].z;
+                c->cp[k].has_paint = 1;
+                break;
+            }
+        }
     }
 
     /* The terrain under each checkpoint, so the marker can stand ON the ground
@@ -134,6 +158,9 @@ void cp_init(checkpoints_t *c, const scene_t *scene, const col_t *col)
     c->prog = c->spine_len;
     c->prog_odo = 0.f;
     c->prog_ok = 0;
+    /* The memset above already dropped any road -- cp_free is the caller's job
+       and this is why the header says so. -1 is "the stretch's own start". */
+    c->line_prev = -1.f;
     /* THE ARC STATIONS UNTIL A RECORDING SAYS OTHERWISE. cp_set_stations
        replaces them with where the checkpoints really fall round a lap; a track
        with no usable recording keeps these, which is what shipped before the
@@ -167,6 +194,142 @@ int cp_set_stations(checkpoints_t *c, const float *frac, int n, float lap_len)
     }
     c->road_len = lap_len;
     return 1;
+}
+
+void cp_free(checkpoints_t *c)
+{
+    if (!c)
+        return;
+    if (c->line_pt)  free(c->line_pt);
+    if (c->line_cum) free(c->line_cum);
+    c->line_pt = NULL;
+    c->line_cum = NULL;
+    c->line_n = 0;
+    c->line_ok = 0;
+}
+
+int cp_set_line(checkpoints_t *c, const float (*pt)[2], const float *cum,
+                int n, float len, const float *at, int n_cp)
+{
+    int i;
+
+    if (!c)
+        return 0;
+    cp_free(c);
+    c->line_prev = -1.f;
+    if (!pt || !cum || !at || n < 2 || n_cp != c->n || n_cp <= 0
+        || n_cp > CP_MAX || !(len > 1e-3f))
+        return 0;
+    /* THE ARCS HAVE TO BE ON THE LOOP and in the spine's own order. A fit that
+       came back with two checkpoints at the same arc, or with one outside the
+       loop it was measured on, describes a road this cannot window on -- and the
+       odometer, whatever else is wrong with it, is never ambiguous.
+     *
+       IN ORDER FROM cp_0, NOT FROM ZERO. The loop begins where the replay
+       rejoins, which is a few metres PAST the start/finish -- so cp_0 sits near
+       the loop's end (428 m of 443 on beach_1) and the raw arcs wrap. What has to
+       increase is the forward distance from cp_0, which is what ai_fit_one's own
+       fractions are and what the windowing below measures in. */
+    for (i = 0; i < n_cp; i++)
+        if (!(at[i] >= 0.f) || !(at[i] < len))
+            return 0;
+    {
+        float prev = 0.f;
+        for (i = 1; i < n_cp; i++) {
+            float f = at[i] - at[0];
+            while (f < 0.f) f += len;
+            while (f >= len) f -= len;
+            if (!(f > prev))
+                return 0;
+            prev = f;
+        }
+    }
+
+    c->line_pt  = (float (*)[2])malloc(sizeof(float) * 2 * (size_t)n);
+    c->line_cum = (float *)malloc(sizeof(float) * (size_t)n);
+    if (!c->line_pt || !c->line_cum) {
+        cp_free(c);
+        return 0;
+    }
+    memcpy(c->line_pt, pt, sizeof(float) * 2 * (size_t)n);
+    memcpy(c->line_cum, cum, sizeof(float) * (size_t)n);
+    c->line_n = n;
+    c->line_len = len;
+    for (i = 0; i < n_cp; i++)
+        c->line_at[i] = at[i];
+    c->line_ok = 1;
+    return 1;
+}
+
+/* Forward along the loop from `a` to `b`, 0 .. line_len. */
+static float cp_line_fwd(const checkpoints_t *c, float a, float b)
+{
+    float d = b - a;
+    while (d < 0.f) d += c->line_len;
+    while (d >= c->line_len) d -= c->line_len;
+    return d;
+}
+
+/* The largest i with line_cum[i] <= arc. Binary search, because the window is
+   re-derived from the LATCH each frame rather than walked forward from the last
+   answer -- there is no cursor to carry and none to get out of step. */
+static int cp_line_index(const checkpoints_t *c, float arc)
+{
+    int lo = 0, hi = c->line_n - 1;
+    if (arc <= c->line_cum[0])
+        return 0;
+    if (arc >= c->line_cum[hi])
+        return hi;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) >> 1;
+        if (c->line_cum[mid] <= arc) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+/* The nearest point on the loop to (x, z), searching arc `lo` forward for `span`
+   metres. -> its arc. The projection is onto SEGMENTS and clamped to each, so
+   the answer is continuous as the car drives -- the same rule cp_spine_dist_near
+   uses, on a polyline that is actually the road. */
+static float cp_line_arc(const checkpoints_t *c, float x, float z,
+                         float lo, float span)
+{
+    float best = 1e30f, arc = lo;
+    int i, i0 = cp_line_index(c, lo), n = c->line_n;
+
+    if (span > c->line_len) span = c->line_len;
+    for (i = 0; i < n; i++) {
+        int j = i0 + i, j2;
+        float ca, cb, seg, dx, dz, len2, t, px, pz, d2;
+        if (j >= n) j -= n;
+        j2 = (j + 1 == n) ? 0 : j + 1;
+        ca = c->line_cum[j];
+        cb = c->line_cum[j2];
+        seg = cp_line_fwd(c, ca, cb);
+        /* The first segment is the one `lo` falls in, so its own start is BEHIND
+           the window -- included whatever its offset says. Every later one is
+           ahead, and the walk stops at the first past the span. */
+        if (i > 0 && cp_line_fwd(c, lo, ca) > span)
+            break;
+        if (!(seg > 1e-6f))
+            continue;
+        dx = c->line_pt[j2][0] - c->line_pt[j][0];
+        dz = c->line_pt[j2][1] - c->line_pt[j][1];
+        len2 = dx * dx + dz * dz;
+        t = (len2 > 1e-9f)
+            ? ((x - c->line_pt[j][0]) * dx + (z - c->line_pt[j][1]) * dz) / len2
+            : 0.f;
+        if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+        px = c->line_pt[j][0] + dx * t;
+        pz = c->line_pt[j][1] + dz * t;
+        d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+        if (d2 < best) {
+            best = d2;
+            arc = ca + seg * t;
+            if (arc >= c->line_len) arc -= c->line_len;
+        }
+    }
+    return arc;
 }
 
 static float dist2_xz(const float *p, float x, float z)
@@ -257,6 +420,10 @@ void cp_resync(checkpoints_t *c, float x, float y, float z)
     c->prog = (c->last < 0) ? c->grid_arc : c->station[c->last];
     c->prog_odo = 0.f;
     c->prog_ok = 0;
+    /* And the window's anchor with it: a teleport is not driving, so the next
+       frame starts the projection at the stretch's own beginning, which is where
+       both callers have just put the car. */
+    c->line_prev = -1.f;
 }
 
 void cp_restart(checkpoints_t *c, float x, float y, float z)
@@ -298,6 +465,7 @@ void cp_restart(checkpoints_t *c, float x, float y, float z)
     c->prog = c->grid_arc;
     c->prog_odo = 0.f;
     c->prog_ok = 0;
+    c->line_prev = -1.f;
 }
 
 int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
@@ -422,6 +590,10 @@ static void cp_cursor_step(checkpoints_t *c, float x, float z)
        with the new stretch's own station on this very frame, whatever the last
        stretch had accumulated. See there. */
     c->prog_odo = 0.f;
+    /* The window is re-anchored the same way and for the same reason: the stretch
+       it is clamped to is the one the latch names, and the car is AT the marker
+       that begins it. -1 says exactly that without needing the arc. */
+    c->line_prev = -1.f;
 }
 
 void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
@@ -633,6 +805,74 @@ static void cp_prog_step(checkpoints_t *c, float x, float z)
     if (to < from)
         to = from;
 
+    /* THE ROAD, when there is one: WHERE THE CAR IS on it, not how far it has
+     * driven. Everything below this block is the odometer, which is the fallback
+     * for a track whose recordings would not fit -- see checkpoints_t.line_pt for
+     * why it cannot be the answer.
+     *
+     * The stretch is the latch's, exactly as below, and the window is
+     * CP_LINE_BACK/CP_LINE_FWD around the last answer intersected with it. An
+     * anchor that has fallen off the stretch -- a reset, or the frame after a
+     * pass -- starts at the stretch's own beginning, which is where the car is.
+     *
+     * `t` comes out EXACTLY LINEAR IN ROAD DISTANCE by construction, because the
+     * line's arc IS road distance; that is the same quantity an opponent's
+     * progress is, which is the whole point. */
+    if (c->line_ok) {
+        float lo, hi, span, p0, w0, w1, arc, tt;
+        if (a < 0) {
+            /* THE GRID. The loop has no run-up on it -- the replay rejoins at
+               cycle_start and never drives the approach again -- so the opening
+               stretch is the road immediately BEFORE cp_0, taken back from it by
+               the grid's own distance to the line. In road metres, because that
+               is what the line measures in and grid_arc is in the placing's. */
+            float run = c->spine_len - c->grid_arc;
+            if (c->spine_len > 1e-3f)
+                run *= c->road_len / c->spine_len;
+            if (run > c->line_len) run = c->line_len;
+            lo = c->line_at[0] - run;
+            while (lo < 0.f) lo += c->line_len;
+            hi = c->line_at[0];
+        } else {
+            lo = c->line_at[a];
+            hi = c->line_at[b];
+        }
+        span = cp_line_fwd(c, lo, hi);
+        if (!(span > 1e-3f))
+            span = c->line_len;
+        /* WHERE THE WINDOW SITS. -1 is a reset or the frame after a pass, and
+           both mean the stretch's own start -- there is no other way for the
+           anchor to be off this stretch, because the search below can never
+           answer outside it. A p0 past the far end is the last frame's answer
+           having clamped AT that end, and it CLAMPS FORWARD: reading it as "not
+           on this stretch" and starting the window over at the beginning threw
+           the projection 174 m back up beach_3's own lap, once per checkpoint
+           per lap, on all ten tracks. */
+        p0 = (c->line_prev < 0.f) ? 0.f : cp_line_fwd(c, lo, c->line_prev);
+        if (p0 > span)
+            p0 = span;
+        w0 = p0 - CP_LINE_BACK;
+        if (w0 < 0.f) w0 = 0.f;
+        w1 = p0 + CP_LINE_FWD;
+        if (w1 > span) w1 = span;
+        if (!(w1 > w0)) w1 = span;
+        arc = cp_line_arc(c, x, z, lo + w0 >= c->line_len
+                                   ? lo + w0 - c->line_len : lo + w0,
+                          w1 - w0);
+        c->line_prev = arc;
+        /* The dead-reckoning anchor is kept CURRENT but not accumulated: nothing
+           on this path reads the odometer, and a stale position left behind here
+           would be differenced against a teleport if anything ever did. */
+        c->prog_odo = 0.f;
+        c->prog_ok = 1;
+        c->prog_x = x;
+        c->prog_z = z;
+        tt = cp_line_fwd(c, lo, arc) / span;
+        if (tt < 0.f) tt = 0.f; else if (tt > 1.f) tt = 1.f;
+        c->prog = from + (to - from) * tt;
+        return;
+    }
+
     m = c->cp[b].p[0];
     dx = m[0] - x;
     dz = m[2] - z;
@@ -791,7 +1031,10 @@ void cp_draw(checkpoints_t *c, const float eye[3])
     glDisable(GL_CULL_FACE);
 
     for (k = 0; k < c->n; k++) {
-        const float *p = c->cp[k].p[0];
+        /* THE PAINT, not the waypoint -- FUN_0052abc0 draws at the mean of the
+           ACP object's vertices and that is a mean 0.27 m (worst 0.79 m) from
+           cp_N. See cp_t.paint. */
+        const float *p = c->cp[k].paint;
         vtx_t q[4];
         float dx = p[0] - eye[0];
         float dz = p[2] - eye[2];
@@ -840,7 +1083,12 @@ void cp_draw(checkpoints_t *c, const float eye[3])
            for why both of these bend the recovered numbers */
         {
             const float half = CP_SIZE * CP_SIZE_SCALE;
-            float base = CP_GROUND ? c->cp[k].ground : p[1];
+            /* The paint's own mean height IS the ground under it plus the
+               centimetre the decal is draped by, so it needs no probe; the
+               probe under cp_N is the fallback for a scene with no `acp_N`. */
+            float base = CP_GROUND
+                         ? (c->cp[k].has_paint ? p[1] : c->cp[k].ground)
+                         : p[1];
             cy = base + half;
             q[0].x = p[0] - rx * half; q[0].y = cy - half; q[0].z = p[2] - rz * half;
             q[1].x = p[0] + rx * half; q[1].y = cy - half; q[1].z = p[2] + rz * half;

@@ -636,8 +636,8 @@ int col_sphere(const col_t *c, const float centre[3], float radius,
     float best_d2[8];
     int n = 0, i, j;
 
-    *n_hits = 0;
-    if (!c->ntris || max_hits <= 0)
+    if (n_hits) *n_hits = 0;
+    if (!c->ntris || max_hits <= 0 || !hits)
         return 0;
     if (max_hits > 8) max_hits = 8;
     COL_PROF(sphere, 1);
@@ -699,7 +699,7 @@ int col_sphere(const col_t *c, const float centre[3], float radius,
             }
         }
     }
-    *n_hits = n;
+    if (n_hits) *n_hits = n;
     return n > 0;
 }
 

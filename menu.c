@@ -16,7 +16,7 @@ static const char *const ROW_LABEL[MENU_ROWS] = {
     "Track", "Car", "Skin", "Tires", "Resonator", "Booster",
     "Sound volume", "Music volume", "Texture quality", "Texture colours",
     "Car lighting",
-    "Restart at race start", "Resume", "Quit"
+    "Restart at race start", "Resume", "Main menu"
 };
 
 static int wrap(int v, int n)

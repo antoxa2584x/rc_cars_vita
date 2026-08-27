@@ -108,6 +108,17 @@ struct rb_car;
  * someone kicks) and it is a trap for a fixture: parking a moving car on a man
  * to test the kick measures the run-over. See chartest part 16.
  */
+
+/*
+ * THE HEADROOM SPHERE. The radius the engine asks the world about before it
+ * lets a person pick the car up over its head (can_lift, off 0x510ea0) -- an
+ * immediate built at 0x510f0b rather than a .data read, which is why it is here
+ * and not in the generated char_data.h. Here rather than in char.c because the
+ * query it feeds is the one clause of the reaction that reads the collision
+ * grid, and a fixture has to be able to pin it.
+ */
+#define CHR_LIFT_RADIUS 1.5f            /* 0x3fc00000, built at 0x510f0b */
+
 /*
  * DROPPING A CHARACTER ONTO THE GROUND, and why it takes two probes.
  *

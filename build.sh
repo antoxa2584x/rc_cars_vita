@@ -38,6 +38,7 @@
 #   4. cars     three rigged cars with shadow, env-map and effects (pack_vsc.py)
 #   5b. chars   the 59 people, animals and road cars, per track     (pack_chars.py)
 #   5. props    the 13 knockable props, one file for all tracks    (pack_props.py)
+#   5c. menu    the main menu's art, out of Interface.sb            (pack_vsc.py)
 #   6. sound    the sound bank and the music                       (pack_snd.py)
 #   7. tables   tracks.h, the menu font, the bubble and LiveArea   (gen_*.py)
 #   8. ai       ai_data.h and ten .aip opponent paths       (gen_ai_data/pack_ai)
@@ -65,7 +66,7 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 
 JOBS="$(nproc 2>/dev/null || echo 4)"
 FORCE=0
-STAGES="unpack lightmap tracks cars props chars sound tables ai check build"
+STAGES="unpack lightmap tracks cars props chars menu sound tables ai check build"
 WANT=""
 NO_MUSIC=0
 CLEAN=0
@@ -564,6 +565,53 @@ if wanted props; then
             --src "$DB/stone.sb" --texroot "$EXTRACTED" \
             --texroot2 "$GAME/Language/English" \
             --extra-tex "msg_hits,msg_321_s_f,$HUDTEX"
+    fi
+fi
+
+# ------------------------------------------------------- 5c. the front end ---
+# menu.vsc: the MAIN MENU's art, and nothing else. Interface.sb carries no
+# geometry at all -- it is the engine's own MANIFEST of what the interface is
+# made of, in named folders ("Dialog Textures", "Shot textures", "Track
+# preview", "Control sounds") -- so packing it produces a scene of 0 batches and
+# 30 textures, which is exactly what mainmenu.c wants.
+#
+# THE LIST IS THAT MANIFEST'S, filtered to what this port's front end draws:
+# the four Podl frame tiles and the Desktop under them, the header and button
+# skins, the NINE per-row wedges, the Race and Back buttons, the badge, one
+# photograph per track and one player portrait.
+#
+# --imgdir IS FOR THE PORTRAIT. FacesSys/ ships its nine as TARGA, not .csi --
+# the pack stores them the way the artists saved them, and Faces/descript.txt
+# invites the player to drop more in beside them. It is a FALLBACK, not an
+# override: a name with a real .csi never reaches it.
+#
+# THE TWO FONTS ARE NOT IN THIS LIST and are not missing: Smash20 and Smash26 are
+# in game_data/Language/, not in the pack, so --csidir cannot see them -- they
+# ride in props.vsc, which is packed with --texroot2 pointed there. main.c falls
+# back to props.vsc for both, which is where the HUD already gets them. Asking
+# for them here only produced a MISSING line on every build.
+if wanted menu; then
+    step "Packing the front end"
+    IFACE=Desktop,Podl_LeftTop,Podl_RightTop,Podl_LeftBottom,Podl_RightBottom
+    IFACE=$IFACE,HeaderSkin,ButtonsTextures,Button_race,Button_back,logoRC_Main
+    for i in 1 2 3 4 5 6 7 8 9; do IFACE=$IFACE,ButtonPodl_right_$i; done
+    for t in beach1 beach2 beach3 beach4 country1 country2 country3 country4 \
+             urban1 urban2; do IFACE=$IFACE,shot_${t}_0; done
+    IFACE=$IFACE,Face1,enumarrows,messagebox_empty
+    # AND THE DRIVERS' OWN PORTRAITS, for the finish screen's table. ai_data.h
+    # names the .tga each of the seven is pictured with (AIPlayer<n>Face in
+    # ailayouts.ini); FacesSys ships nine, and all of them go because which
+    # drivers a race fields is a per-track question and 128x256 is 64 KB each.
+    for fc in BabyShark Daisy Dakilla Doc Face2 Johny MCJocker MaxXMad; do
+        IFACE=$IFACE,$fc
+    done
+    if current "$ASSETS/menu.vsc" "$DB/Interface.sb" "$RE/pack_vsc.py"; then
+        skip "menu.vsc"
+    else
+        run python3 "$RE/pack_vsc.py" "$DB/Interface.sb" "$ASSETS/menu.vsc" \
+            --extra-tex "$IFACE" \
+            --csidir "$EXTRACTED" --embdir "$EMB" \
+            --imgdir "$EXTRACTED/FacesSys"
     fi
 fi
 

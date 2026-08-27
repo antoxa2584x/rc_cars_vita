@@ -62,12 +62,16 @@ void antenna_init(antenna_t *a, scene_t *car, int car_index)
     batch_t *b = NULL;
 
     memset(a, 0, sizeof(*a));
+    a->part = -1;
     if (!car || !car->has_rig)
         return;
     for (i = 0; i < car->rig.n; i++)
         if (!strcmp(car->rig.part[i].name, "ANTENNA")) { part = i; break; }
     if (part < 0)
         return;
+    /* Recorded before the early returns below: the menu's framing wants to know
+       which part the whip is even on a scene whose chain cannot be bound. */
+    a->part = part;
     for (i = 0; i < (int)car->n_batches; i++)
         if ((int)car->batches[i].part == part) { b = &car->batches[i]; break; }
     if (!b || !b->nverts || !scene_keep_rest(b))
