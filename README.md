@@ -10,7 +10,9 @@
 [![status](https://img.shields.io/badge/status-playable-2ea043?style=flat-square)](#roadmap)
 [![fps](https://img.shields.io/badge/on%20hardware-45--60%20FPS%20%40%20960x544-orange?style=flat-square)](#)
 
-10 tracks · 3 cars · a grid of four · 59 characters · 129 knockable props · the game's own physics, transcribed
+10 tracks · 3 cars · a grid of four · 59 characters · 129 knockable props<br>
+the game's own front end, Garage and `.scp` save format · up to four Vitas on one Wi-Fi<br>
+the game's own physics, transcribed
 
 Runs on a **real Vita** at 45–60 FPS, full 960×544.
 
@@ -42,7 +44,8 @@ build script:
 
 ```bash
 mkdir game_data
-cp -r "/path/to/RC Cars"/{RCCars.pack,RCCarsDB,Tracks,Autoexec.gm,GameIcon.ico} game_data/
+cp -r "/path/to/RC Cars"/{RCCars.pack,RCCarsDB,Tracks,Autoexec.gm,\
+                          GameIcon.ico,RCCars.exe,Language} game_data/
 ./build.sh
 ```
 
@@ -63,10 +66,12 @@ Either way you end up with `build/rccars_viewer.vpk`, ready for VitaShell.
 | file | used for |
 |---|---|
 | `RCCars.pack` | the textures, the wavs, Settings and Splines |
-| `RCCarsDB/` | the `.sb` scene databases — tracks, cars, props, characters |
-| `Tracks/` | the soundtrack MP3s |
+| `RCCarsDB/` | the `.sb` scene databases — tracks, cars, props, characters, the interface |
+| `Tracks/` | the soundtrack MP3s, and `Intro.dat` — the three launch movies |
 | `Autoexec.gm` | the playlist that orders them |
 | `GameIcon.ico` | the bubble icon |
+| `RCCars.exe` | the dialog tables, the minimap transforms, the economy — read, never run |
+| `Language/` | the engine's own Smash fonts, and `Game/english.tbl`, every string the front end shows |
 | `header.jpg` | the LiveArea wallpaper and gate — **optional**, and without it the LiveArea is derived from the icon instead |
 
 Nothing under `game_data/` is written to, and none of it is in this repository.
@@ -78,7 +83,7 @@ Nothing under `game_data/` is written to, and none of it is in this repository.
 
 <br>
 
-`build.sh` runs eleven stages and skips any whose output is already newer than
+`build.sh` runs fourteen stages and skips any whose output is already newer than
 its input, so the second run goes straight to compiling.
 
 | stage | tool | output |
@@ -89,11 +94,18 @@ its input, so the second run goes straight to compiling.
 | `cars` | `pack_vsc.py` | three rigged cars, with shadow and env-map data |
 | `props` | `pack_props.py` | the 13 knockable models, one file for all tracks |
 | `chars` | `pack_chars.py` | the 59 placed characters, one `.chr` per track |
+| `menu` | `pack_vsc.py` | `menu.vsc` — the front end's own art, out of `Interface.sb` |
+| `faces` | `pack_faces.py` | `faces.bin` — the nine portraits as the raw pixels a `.scp` carries |
+| `intro` | `pack_vid.py`, `pack_vsc.py` | `intro.vid`, the three launch movies transcoded to H.264, and `boot.vsc`, the loading screen |
 | `sound` | `pack_snd.py` | 118 sounds at 22050 Hz, plus 18 MP3s |
-| `tables` | `gen_tracks.py`, `gen_font.py`, `gen_char_data.py`, `gen_hud_data.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, `char_data.h`, `hud_data.h`, the app art |
+| `tables` | `gen_tracks.py`, `gen_font.py`, `gen_char_data.py`, `gen_hud_data.py`, `gen_dlg_data.py`, `gen_str_data.py`, `gen_champ_data.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, `char_data.h`, `hud_data.h`, `dlg_data.h`, `str_data.h`, `champ_data.h`, the app art |
 | `ai` | `gen_ai_data.py`, `pack_ai.py` | `ai_data.h` and ten `.aip` opponent paths |
 | `check` | `vsc_check.py` | every packed scene, against its source `.sb` — exit 0 is clean |
 | `build` | cmake + make | `build/rccars_viewer.vpk` |
+
+The movies are ~21 MB on the card and the port does not need them: deleting
+`assets/intro.vid` is how you turn the launch sequence off, which is what the
+original's own `AutoRunIntro 0` does.
 
 ```
 -s, --stage S     run only these stages          -f, --force       redo everything
@@ -111,6 +123,13 @@ one somewhere else.
 
 ## 🎮 Controls
 
+The front end is driven with the d-pad and **✕**, or with the touch screen —
+every button, bar and row on it is a touch target. **○** goes back a page. A
+logo movie is skipped one part at a time with **✕**, **○** or a touch, which is
+what the original's own ESC does.
+
+In a race:
+
 | input | action |
 |:--|:--|
 | **R** / **L** | throttle / brake · reverse |
@@ -118,17 +137,18 @@ one somewhere else.
 | **right stick** | camera orbit — springs back |
 | **✕** | boost |
 | **○** | jump; on the roof or a side, rights the car where it stands |
-| **START** | menu — track, car, skin, tuning parts, texture quality, quit |
+| **START** | pause — track, car, skin, tuning parts, volumes, texture quality, restart, main menu |
 | **□** | toggle shadow, water animation and checkpoint arrows |
 | **△** | log an inventory of what is near the eye, and cycle the isolate modes |
 | **SELECT** | free-fly camera |
 
 ## 🚧 Roadmap
 
-The port races. A grid of four holds for the countdown, the laps are counted off
-the checkpoint chain, the HUD says where you are in the field — and what is left
-is the game *around* the race, most of it already sitting in the data, recovered
-and unused.
+The port races, and it now races from the game's own front end: the launch
+movies, the main menu, a profile in the game's own save format, the Garage that
+spends the game's own money, a finish screen at the flag, and up to four Vitas
+on one Wi-Fi. What is left is mostly the **championship** — the structure that
+turns single races into a career, sitting unread in `championship.ini`.
 
 #### The race
 
@@ -141,9 +161,19 @@ and unused.
       next checkpoint and falls three times as fast when it turns back, and the
       banner is the message layer's own slot 2, held for the 5.5 s the poster's
       recovered hold asks for
-- [ ] A finish. `FINISH` is recovered, packed and addressable in the countdown's
-      own artwork, and nothing raises it because there is nothing to end
-- [ ] Results and standings screens
+- [x] **A finish.** The lap limit the setup page sets ends the race, the clock
+      stops, and every racer's time, gap, best lap and average speed is a number
+      the frame already had
+- [x] **Results**, on the engine's own `dlgFINISH` — six columns and a portrait
+      apiece on `Settings/dlgFINISH.ini`'s own rectangles, Race again and Quit.
+      A racer still driving shows `---` and the metres it was behind, because
+      inventing a time for it would be inventing a result
+- [x] **Standings kept across a launch**: the record book behind `Track stats`,
+      one row per racer per track, on the game's own four `Sort results by`
+      values
+- [ ] `FINISH` in the countdown's own lettering. It is recovered, packed and
+      addressable as `CD_CELL_FINISH`; what goes up at the flag today is the
+      message layer's banner instead
 
 #### AI opponents
 
@@ -151,8 +181,15 @@ and unused.
       a real lap on this same physics, walked at a rubber-banded speed in the one
       dimension the original rubber-bands
 - [x] Solid: bumpable, with the impulse split by mass, throwing their own dust
-      and taking the env-map glance
+      and taking the env-map glance. A shove now travels as **v²** off the car's
+      own recovered grip rather than saturating at one constant, it stops at the
+      level rather than through it, and an opponent knocked somewhere it cannot
+      drive out of dies the player's own two deaths plus one he cannot have
+      (buried) and returns to its own recorded line
 - [x] One positional `motorAI_accel1` loop each
+- [x] **Each driver in its own paint and parts** — `ailayouts.ini` names one per
+      driver, `ai_data.h` carries it and `carparts.c` fits the field the same way
+      it fits the player's car, so the grid is no longer four cars in skin 1
 - [ ] The original's **second** mode: a fully simulated steering controller
       (`FUN_004fe1f0`), recovered and deliberately not transcribed — a simulated
       opponent is another `rb_car_tick`, which is why the original has `AIEmu`
@@ -185,33 +222,79 @@ and unused.
 - [x] In-race HUD: the minimap, the place, the two clocks and the two gauges,
       laid out off the original's own `opt_cock_all` artwork
 - [x] `!HIT!` when the car knocks a prop, in the game's own lettering
-- [ ] A real front end: the original's `Interface.sb` and `RaceTextures.sb` are
-      right there in `RCCarsDB/`
-- [ ] Replace the debug menu with something that is not a debug menu
-- [ ] An options row for the things that only exist as a call today — the speed
-      dial's units, for one
+- [x] **The front end is the game's own**, art and words and layout: `Interface.sb`'s
+      textures, the exe's own dialog tables, `Settings/*.ini`'s own rectangles,
+      the engine's Smash fonts, and every string decoded out of
+      `Language/Game/english.tbl` — 892 of them. Quick race and its setup page,
+      Map and info, Track stats, the Garage, Select player, Multiplayer, Options
+      and Credits, on the pad or on the touch screen. Nothing it shows is written
+      by this port any more
+- [x] **The launch sequence**, which is a 29-state machine in the retail exe and
+      three of its states here: the three logo movies out of `Tracks/Intro.dat`,
+      transcoded once offline and decoded on the Vita's own H.264 hardware,
+      **paced against the audio clock** rather than a frame timer, skippable a
+      part at a time — and the loading screen the engine draws over the interface
+      load, on its own 2 MB `boot.vsc` so it is up before `menu.vsc`'s 29 MB is
+      read
+- [x] The in-race **START** menu is a pause menu now — resume, restart, main
+      menu, the two volumes and the texture rows — and not the debug menu it was
+- [ ] Championship, Ghost race and Demo play: the three rows still drawn in the
+      artists' own grey
+- [ ] The multiplayer lobby's chat lines — `editChat`, in three of its dialogs
+- [ ] An options row for the things that are still only a call — the speed dial's
+      units, for one
 
 #### Progression
 
-- [ ] Championship structure over the ten tracks; `championship.ini` pays
-      `Place1`..`Place3` per track and is the reason the field is four
-- [ ] Upgrades: the three tyre levels and the turbo sets are already packed per
-      car, and `carparts.c` already shows the fitted parts on the model — as it
-      does the car's paint, four skins each, which the menu can already pick
-- [ ] Give each AI driver its own skin: `ailayouts.ini` names one per driver and
-      `ai_data.h` already carries it, and since the player's Skin row packed the
-      alternate atlases into every car, an opponent has them resident for free
-- [ ] Unlocks — cars, tracks, parts
-- [ ] Prize money and a shop
+- [x] **The Garage**, and every figure in it is shipped: buy and sell cars, three
+      levels each of booster, resonator and tyres, and four paints, on
+      `Scripts/championship.ini`'s own prices — which agree with the game's own
+      screenshots to the dollar. The engine's own four part states and its own
+      refusals, and what a profile owns is what the model shows and what the
+      physics drives
+- [ ] Championship structure over the ten tracks. `championship.ini`'s ten track
+      sections carry `AccessCash`, `RaceTariff` and `Place1`..`Place3` — the
+      entry fees and the prize money, and the reason the field is four — and
+      nothing reads them yet, which is also why `dlgFINISH`'s two bonus rows stay
+      empty
+- [ ] Unlocks — cars, tracks, parts. The profile already has room for them
 
 #### Save data
 
-- [ ] Player profile in `ux0:data/` — only the log is written there today
-- [ ] Best laps and ghosts — the install has a `GhostRecords/` folder to learn the format from
+- [x] **The player profile, in the game's own `.scp` format — read and written.**
+      A profile copied off a PC install opens here and one written here opens
+      there: `player_test` parses the real saves, writes them back and compares
+      byte for byte, all 152,994 of them including the 128 KB portrait, whose
+      160-byte header is carried through verbatim
+- [x] **Multiple profiles**, on the game's own Select player page: the roster,
+      the sort, create / select / remove with their own refusals, the nine
+      shipped portraits, and the Vita's own keyboard for the name
 - [x] Settings persistence, so texture colours and camera choices survive a
       restart — the menu's rows are written to `ux0:data/` and read back before
       the first load, since the two texture rows are consumed at upload time
-- [ ] Multiple profiles, as the original's `Players/` does
+- [x] Best laps, per track and per racer, kept in `ux0:data/rccars/records.txt`
+- [ ] Ghosts — the install has a `GhostRecords/` folder to learn the format from,
+      and Ghost race is grey until there is one
+
+#### Multiplayer
+
+- [x] **Two to four Vitas on one network**, over `sceNet` and UDP: the host
+      broadcasts its game twice a second, a peer joins, the lobby carries the
+      settings and the roster four times a second, and in the race every peer
+      sends its own car straight to every other — no relay
+- [x] **The race packet is `ai_sample`**, which is the one thing here that is not
+      invented: a remote car is replayed exactly the way a recorded opponent is,
+      same struct and same unpack, so its springs compress, its wheels turn and
+      its steering moves. 36 bytes a car a packet
+- [x] The grid slot is the roster slot, seated on the track's own authored
+      starting grid out of its `.aip` first samples, and a receiver draws a car
+      *between* the last two states rather than on the last one
+- [ ] Ad hoc (`sceNetAdhoc`). A gap and not a decision against it: the emulator
+      implements `sceNet` and not ad hoc, so an ad-hoc port would be code nobody
+      could run
+- [ ] Chat, and a lobby that survives the host leaving
+- [ ] Nobody is authoritative over the physics, so two Vitas can disagree about a
+      bump. Rollback would need a determinism this port has not got
 
 #### Graphics
 
@@ -241,7 +324,15 @@ and unused.
 
 <br>
 
-- The race has no end: laps count up and nothing raises `FINISH`.
+- **There is no championship.** A race is a single race: the ten track sections
+  of `championship.ini` — the entry fees and the `Place1`..`Place3` prize money —
+  are read by nothing, so no race pays anything and the Garage is spent out of
+  the profile's starting $100. Championship, Ghost race and Demo play are the
+  three main-menu rows that open nothing.
+- The `FINISH` banner in the countdown's own lettering is packed and addressable
+  and still unraised; the message layer's banner goes up at the flag instead.
+- Multiplayer has no authority over the physics and no rollback, so two Vitas can
+  disagree about a bump; there is no ad hoc, and the lobby's chat is not built.
 - The collision **proxy** does not cover the car, though the queries do: a car
   can be driven into anything thicker than the proxy's own sphere radii and then
   rest inside it, because `col_sphere` is a closest-point test and a sphere
@@ -250,8 +341,8 @@ and unused.
   simulated mode is recovered and not transcribed.
 - The character behaviour machines are the port's own, on the game's constants —
   the engine's own character AI is not recovered.
-- No player profile, best laps or ghosts yet — the menu's own settings persist,
-  but nothing about a race does.
+- No ghosts yet, and no `GhostRecords/` reader. Profiles, best laps and the
+  menu's own settings do persist.
 - `CenterMassOY` is recovered and used (the com sits 0.0000 / 0.0323 / 0.0323 m
   above the model origin), but the body collision proxy's roof stations and its X
   offset are still fitted rather than read from the game's data.
@@ -285,15 +376,25 @@ scene.c               .vsc loader and draw
 shadow.c water.c      projected car shadow, animated water
 checkpoint.c fx.c     checkpoint arrows, particles and tyre marks
 trace.c envmap.c      tyre marks on the ground, body env-mapping
+carlight.c            the car lit by the level's own lightmap, off the .col
 sun.c                 the sun disc and its lens flare
 prop.c                the 13 knockable prop models, 129 placements
 ai.c                  the opponents: the shipped profiles, replayed
 char.c                the 59 characters: keyframed rigs, paths and behaviour
 carparts.c antenna.c  the fitted upgrades, and the animated aerial
 race_ui.c hud.c       the HUD: minimap, place, clocks, gauges, !HIT!
+dirarrow.c msg.c      the checkpoint arrow and the banner layer
 countdown.c           3, 2, 1, GO!
+results.c             the finish screen, on the engine's own dlgFINISH
+mainmenu.c            the front end: every page, on the game's own art
+garage.c              the shop's rules, on championship.ini's own prices
+player.c              the .scp profile, read and written
+records.c             the record book behind Track stats
+net.c                 two to four Vitas on one Wi-Fi, over sceNet
+intro.c avc.c         the launch movies, and the Vita's H.264 decoder
 mix.c audio.c sfx.c   mixer thread, sceAudioOut, positional sound
-menu.c ui.c font.h    in-game menu
+menu.c ui.c font.h    the in-race pause menu
+sfont.c touch.c ime.c the engine's Smash fonts, the touch screen, the keyboard
 settings.c            the menu's rows, saved to ux0:data/ and read back at boot
 rlog.c                the memory-card log, off the game thread
 *_data.h tracks.h     generated tables — regenerate, do not hand-edit
@@ -326,6 +427,8 @@ simply leave the newer subsystems dark.
 | COL1 | uniform XZ grid, downward ray |
 | COL2 | one material byte per triangle |
 | COL3 | the water surface height per cell |
+| COL4 | the engine's own surface class per triangle |
+| COL5 | how bright the level's lightmap is on each triangle |
 
 </details>
 
