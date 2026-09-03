@@ -29,17 +29,24 @@ chrfloat
 colprof
 cpground
 curb
+finishshot
 flipped
+garage_test
 hudshot
+introtest
 inv
 mainmenu_test
 menu_test
 menuframe
+menushot
 meshalign
+net_test
 placechk
+player_test
 progchk
 proptest
 rb_test
+results_test
 rockroll
 settings_test
 ui_test
@@ -51,7 +58,12 @@ wideline
 # Logs from the Vita and from the build
 *.log
 
-# What settings_test writes and removes again; left here for a run it killed
+# What the file-backed harnesses write and remove again; left here for a run
+# something killed half way.
 settings_test.tmp
 settings_test.tmp.new
 rccars_settings.txt
+player_test.tmp/
+mainmenu_test.tmp/
+menushot.tmp/
+rccars_players/

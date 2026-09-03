@@ -102,6 +102,18 @@ void  ui_arc(float cx, float cy, float r0, float r1, float a0, float a1,
              float cu, float cv, float tr0, float tr1, int tex_mirror,
              float r, float g, float b, float a);
 
+/* THE ALPHA TEST, between draws. ui_begin turns it OFF -- the scene's own 0.5
+ * cutout would eat the text -- so this is how a caller asks for it back for one
+ * element and then gives it up again. `ref` <= 0 disables it; anything else is
+ * glAlphaFunc(GL_GREATER, ref), the same call main.c makes around the world.
+ *
+ * ONE THING NEEDS IT AND THE ART IS WHY. `trackmap_<n>' paints the track's route
+ * at alpha 255 and everything else -- terrain, water, the flat halo round it --
+ * BELOW that, and dlgMAPINFO draws the route over the whole page while the
+ * terrain stays inside its panel. Keying on 254/255 is the artists' own division
+ * of that texture, not a threshold picked to look right. Leave it off. */
+void  ui_alpha_test(float ref);
+
 /* Layout helpers, in the same pixel space. */
 float ui_text_w(float scale, const char *s);
 float ui_text_h(float scale);

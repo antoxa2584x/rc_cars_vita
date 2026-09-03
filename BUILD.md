@@ -17,6 +17,12 @@ dlg_data.h        the engine's own DIALOG LAYOUTS, out of Settings/dlg*.ini
                   (rccars_re/gen_dlg_data.py)
     assets/props.vsc  the 13 knockable props + the !HIT! banner, VSC8
                       (rccars_re/pack_props.py)
+    assets/boot.vsc   THE LOADING SCREEN's four textures and nothing else --
+                      Desktop, logoRC, logo1C, logoCR (2 MB, so the screen is up
+                      before menu.vsc's 29 MB is read)
+    assets/intro.vid  THE LAUNCH MOVIE, H.264 + a frame index + the part table
+    assets/intro_N.mp3  each of the movie's three parts' own audio
+                      (both from rccars_re/pack_vid.py; see intro.h)
     sce_sys/          bubble icon + LiveArea art (rccars_re/gen_sce_sys.py)
     mintest/          20-line vitaGL app, used to isolate runtime failures
 
@@ -405,6 +411,57 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
     # --rate 44100 doubles the bank; --no-music skips the copy.
     python3 $RE/pack_snd.py --out assets
 
+    # THE LAUNCH SEQUENCE's assets. Reads the SHIPPED CONFIGURATION -- the part
+    # ranges come out of Scripts/intro.ini, not out of this line -- and needs
+    # ffmpeg with libx264 and libmp3lame on the PATH.
+    #
+    # The Vita has no MPEG-1 decoder, so Tracks/Intro.dat's three parts are
+    # transcoded to H.264 once, here. Two of the encoder settings are not
+    # preferences: `-bf 0' so decode order is display order and one access unit
+    # gives one picture, and `repeat-headers=1' so SPS/PPS ride in every IDR --
+    # parts 2 and 3 begin mid-stream and a skip means the decoder has never seen
+    # the sequence header when it gets there. An IDR is forced on each part's
+    # first frame. pack_vid.py checks that last one and refuses to write a file
+    # where it did not happen.
+    #
+    # TWO OF THESE ARGUMENTS ARE THIS PORT'S CHOICES, not the game's, and they are
+    # made HERE rather than in the app because the runtime's job is to play every
+    # part its table names -- which is what the engine does with intro.ini's.
+    #
+    # --parts 2,3 DROPS THE 1C LOGO: ten seconds of a publisher's logo every
+    # launch. The packer then TRIMS -- only the frames the kept parts span are
+    # written and the table is rebased onto them, so the dropped part's 2.5 MB
+    # comes back. introtest DERIVES which of intro.ini's parts each shipped one
+    # is, by matching lengths, so the ranges are still held against the shipped
+    # configuration.
+    #
+    # --crop 640:368:0:56 REMOVES THE FILM'S BAKED-IN LETTERBOX. The source is a
+    # 640x368 picture inside a 640x480 frame: 56 rows of STUDIO black -- Y = 16,
+    # not 0 -- top and bottom, which is why `cropdetect' at its default threshold
+    # of 24 reports crop=640:480:0:0 and sees nothing at all. Measured by taking
+    # the per-row MAXIMUM of the luma plane over seven frames across the film and
+    # counting rows at or below 18. Both 640 and 368 are multiples of 16, which
+    # sceAvcdec requires and the packer checks. 640x368 is 1.739:1 against the
+    # screen's 1.765, so it fills the screen at a 1.5% stretch; the Creat Studios
+    # logo's content is rows 104..367 and survives with room either side.
+    #
+    # ~18 MB of video and 1.5 MB of audio. --width scales the picture down (the
+    # frame is converted from NV12 and uploaded every tick); --crf and --maxrate
+    # trade size for quality. DELETING assets/intro.vid is how this port spells
+    # Config.gm's `AutoRunIntro' 0 -- the launch then goes straight to the
+    # loading screen, which is what the engine does too.
+    python3 $RE/pack_vid.py .cache/extracted/Scripts "$GAME/Tracks" assets \
+        --parts 2,3 --crop 640:368:0:56
+
+    # and the loading screen the movies hand over to: FOUR textures, its own
+    # file. Not a corner of menu.vsc, because the whole point of the screen is
+    # to be up BEFORE menu.vsc is read -- which is what the engine does as well
+    # (FUN_004a25c0 case 0x13 loads these four by name, on demand, rather than
+    # out of the interface manifest). main.c releases it after the last load.
+    python3 $RE/pack_vsc.py "$DB/Interface.sb" assets/boot.vsc \
+        --extra-tex Desktop,logoRC,logo1C,logoCR \
+        --csidir .cache/extracted --embdir .cache/lightmaps/embedded
+
     # the track table the menu and the spawn read, and the menu font.
     # gen_tracks.py also reads each track's ambient sound bed out of its own
     # MOD_SNDCHANNEL node, so regenerate tracks.h whenever that changes.
@@ -459,7 +516,8 @@ leaves the previous binary sitting there to answer for it:
     rm -f rb_test vis_test carparts_test menuframe menu_test settings_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
           colprof flipped antheight aitest chrfloat curb hudshot wideline \
-          mainmenu_test menushot results_test finishshot
+          mainmenu_test menushot results_test finishshot introtest player_test \
+          garage_test net_test
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -482,6 +540,11 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -Itestgl -O2 rccars_re/menuframe.c scene.c carparts.c \
         antenna.c carani.c rb.c contact.c collide.c rlog.c carlight.c \
         -o menuframe -lm             # the MAIN MENU's car viewport framing
+                            # AND IT IS WHAT SIZES THE CAR. MENU_CAR_MARGIN is
+                            # 0.84 because this is the tightest value all three
+                            # cars still frame at: 0.80 clips the Buggy sideways
+                            # and 0.78 clips all three. Keep MARGIN here in step
+                            # with main.c's and re-run after changing it.
                             # antenna.c is on this line because the framing has
                             # to leave the WHIP out of what it aims at, and
                             # antenna.c is the file that knows which rig part
@@ -536,6 +599,22 @@ leaves the previous binary sitting there to answer for it:
                             # through settings_set_path and removes them again.
                             # 64 checks; 21 of 23 mutants die, and the two that
                             # live are named in the file's own header.
+    gcc -I. -O2 rccars_re/player_test.c player.c rlog.c -lm -o player_test
+                            # THE PLAYER PROFILE and the game's own `.scp` format.
+                            # Its first part is the one that matters and it needs
+                            # a retail install:
+                            #
+                            #   ./player_test --game "/mnt/c/Games/RC Cars"
+                            #
+                            # It parses every profile in that install's Players/
+                            # into player_t, writes it back and compares BYTE FOR
+                            # BYTE -- 152,994 of them, the 128 KB portrait
+                            # included. Without --game that part says SKIPPED
+                            # rather than passing on nothing. The rest is the
+                            # blank profile, the rank ladder rung by rung, create
+                            # / select / remove with its refusals, the portraits
+                            # through assets/faces.bin, and what a malformed file
+                            # costs. 81 checks; 13 of 13 mutants die.
     gcc -I. -Itestgl -O2 rccars_re/ui_test.c ui.c hud.c countdown.c \
         race_ui.c dirarrow.c msg.c -lm -o ui_test
                             # menu drawing, the !HIT! banner, the 3-2-1-GO race
@@ -619,7 +698,8 @@ leaves the previous binary sitting there to answer for it:
                             # odometer (still the fallback) run on the same
                             # frames as its control. Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c touch.c \
-        ui.c sfont.c -lm -o mainmenu_test
+        ui.c sfont.c records.c rlog.c player.c garage.c net.c ime.c \
+        -lm -o mainmenu_test
                             # THE MAIN MENU's input and its HIT BOXES -- the half
                             # a picture cannot answer. The focus ring skipping the
                             # five unbuilt rows, a drag off a button cancelling it,
@@ -631,9 +711,22 @@ leaves the previous binary sitting there to answer for it:
                             # line, every row reaching the right edge -- not
                             # against a copy of its own table, and the QUICK
                             # RACE page's four enums walked a full lap each.
+                            #
+                            # AND THE THREE SIBLING PAGES: the navigation column,
+                            # the per-page focus ring (every live stop visited
+                            # once, no dead one landed on, a full lap coming
+                            # home), dlgMAPINFO's WRAPPING shot list and every
+                            # thumbnail of it being touchable, dlgSTAT's sort
+                            # enum, and CIRCLE stepping back one page rather than
+                            # out of the front end. Plus str_data.h's track order
+                            # held against tracks.h through the engine's own
+                            # internal names, and the record book behind
+                            # `Track stats' -- the merge, the sort with `n/a'
+                            # last, and a round trip through its own file.
                             # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/menushot.c rccars_re/glrec.c \
-        mainmenu.c touch.c ui.c sfont.c -lm -o menushot
+        mainmenu.c touch.c ui.c sfont.c records.c rlog.c player.c garage.c \
+        net.c ime.c -lm -o menushot
                             # and hudshot's twin for the menu: it PRINTS the
                             # front end's triangles and rccars_re/hudshot.py
                             # composites them over the real .csi and .tga art.
@@ -647,9 +740,73 @@ leaves the previous binary sitting there to answer for it:
                             #       menu.png            # beside the original
                             #   ./menushot 960 544 rrdd | ...   # two right, two down
                             #   ./menushot 960 544 t900,180 | ...  # a touch
+                            #   ./menushot 800 600 m | ...      # Map and info
+                            #   ./menushot 800 600 srr | ...    # Track stats,
+                            #                                   # sorted by 5 laps
+                            #   ./menushot 800 600 p | ...      # Select player
+                            #   ./menushot 800 600 n | ...      # ...its name modal
+                            #   ./menushot 800 600 y | ...      # ...Remove player?
+                            #   ./menushot 800 600 e | ...      # ...the refusal
+                            #   ./menushot 800 600 g | ...      # THE GARAGE
+                            #   ./menushot 800 600 B | ...      # ...its booster
+                            #   ./menushot 800 600 E | ...      # ...engine
+                            #   ./menushot 800 600 T | ...      # ...and tyre page
+                            #   ./menushot 800 600 Brr | ...    # ...picker two up
+                            #   ./menushot 800 600 M | ...      # MULTIPLAYER
+                            #   ./menushot 800 600 L | ...      # ...the LOBBY,
+                            #                                   # and I / C / R
+                            #
+                            # `L', `I', `C' and `R' OPEN A REAL SOCKET and host a
+                            # real game with a real second peer injected over the
+                            # loopback -- the roster is what those pages are, and
+                            # an empty table is a picture of nothing.
+                            #
+                            # `g', `B', `E' and `T' seed a roster too -- every
+                            # figure on those two screens comes out of a profile
+                            # and with none the four money bars all deny.
+                            #
+                            # `p', `n', `y' and `e' seed a roster of three
+                            # profiles in menushot.tmp/ off fixed arithmetic, for
+                            # the same reason `s' seeds the record book.
+                            #
+                            # `s' seeds the record book off fixed arithmetic, so
+                            # the stats table has rows and the same run twice
+                            # gives the same picture.
                             #
                             # 800x600 is the size to compare at: it is the frame
                             # every constant in mainmenu.c was measured in.
+    gcc -I. -O2 -Wall rccars_re/net_test.c net.c rlog.c -lm -o net_test
+                            # MULTIPLAYER, over two REAL sockets: it forks, the
+                            # child hosts, the parent joins, and every datagram
+                            # between them is a real one through net.c's POSIX
+                            # backend. Discovery, the join, the roster, who owns
+                            # the settings, the restrictions, the start, a car
+                            # state crossing and being dead-reckoned, a kick, a
+                            # bye, a peer that goes silent and a peer whose build
+                            # is not ours -- and part 11, a remote car drawn
+                            # BETWEEN two states: the midpoint of every field,
+                            # the quaternion's hemisphere, the handover into
+                            # dead reckoning, and a reordered datagram refused.
+                            # 108 checks, 13 of 14 mutants dead (the survivor is
+                            # shown equivalent in the file) plus 8 of 8 on the
+                            # interpolation, exits non-zero. It binds UDP 3658
+                            # and 3659 on the loopback; nothing leaves the
+                            # machine.
+    gcc -I. -O2 -Wall rccars_re/garage_test.c garage.c player.c rlog.c \
+        -lm -o garage_test
+                            # THE SHOP behind dlgSETCAR and dlgSETDETAIL: what a
+                            # part costs, what it fetches back, which of the
+                            # three levels may be bought or sold, and that
+                            # nobody can sell their way out of a garage. The
+                            # four figures the game's own screenshots pin --
+                            # $100 of cash, $900 to sell the Overkill, $50 for
+                            # its first booster, $65 for its first engine -- are
+                            # asserted against championship.ini's tables rather
+                            # than against a second copy of the numbers, and so
+                            # is the one that looks like a typo and is not: the
+                            # tyres are charged the RESONATOR's column, because
+                            # that is what the retail exe does. 53 checks,
+                            # 10 of 10 mutants dead, exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/results_test.c results.c touch.c \
         ui.c sfont.c -lm -o results_test
                             # THE FINISH SCREEN's ordering and its hit boxes.
@@ -671,6 +828,44 @@ leaves the previous binary sitting there to answer for it:
                             # picture -- `---' for a time it never set and a
                             # distance for its gap. It is what caught the column
                             # indexing being one out.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/introtest.c intro.c avc.c audio.c \
+        mix.c ui.c touch.c rlog.c -lm -o introtest
+                            # THE LAUNCH SEQUENCE. No H.264 decoder on the host,
+                            # so NO CHECK IN IT IS ABOUT A PICTURE -- it says so
+                            # out loud, and asserts that avc_open really did
+                            # fail, so nobody reads it as if the pictures had
+                            # been checked. What it does check is the half that
+                            # can be quietly wrong:
+                            #
+                            # the shipped .vid's part table re-derived from the
+                            # shipped Scripts/intro.ini and the header's own
+                            # frame rate -- not from a copy of pack_vid.py's
+                            # answer, which would only prove the file is itself;
+                            # every part's first frame being an IDR, which is
+                            # what a skip lands on; the frame index tiling the
+                            # file exactly; intro_frame_at walked over all 2,616
+                            # frames; the part sequence against FUN_004a3030,
+                            # including that ONE press skips ONE logo and not the
+                            # sequence (the thing a port is most tempted to get
+                            # wrong, since "ESC skips the intro" is what it looks
+                            # like from outside); seven kinds of lying header
+                            # being refused; and the loading screen's layout
+                            # against the recovered rects at three resolutions --
+                            # all three logos SQUARE, which is why the port does
+                            # not simply multiply the fractions by 960x544.
+                            #
+                            # AND EACH PART'S AUDIO BEING AT LEAST AS LONG AS ITS
+                            # VIDEO, which is the one check here that guards a
+                            # HANG rather than a wrong picture: the part ends when
+                            # its frames are spent AND its clock has passed its
+                            # length, and the clock is the audio. Exits non-zero.
+                            # Shown to fail on six mutations: a part start moved
+                            # off its IDR, an mp3 truncated, an mp3 deleted, the
+                            # logos stretched instead of boxed, one skip made to
+                            # end the whole sequence, and a shipped part's LENGTH
+                            # shifted by 30 frames -- which is what the intro.ini
+                            # derivation catches, and the reason that check
+                            # matches on length rather than on frame number.
     gcc -I. -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
     gcc -I. -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \

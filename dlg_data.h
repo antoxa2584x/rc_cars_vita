@@ -4,7 +4,10 @@
  * one file per screen, each a list of `Key "<control><field>"' with
  * X0/Y0/SX/SY in the 800x600 frame the whole interface is authored
  * in (HUD_REF_W/H). A key with a `Mask float' is a percent carried as
- * an integer and comes out here as a FRACTION.
+ * an integer and comes out here as a FRACTION. A key whose slider
+ * runs 0..900 or 0..700 is SIGNED -- its value carries a +100 bias,
+ * taken off here, so the number below is the real one and a control
+ * placed off the top or left of the frame reads negative.
  *
  * The exe reads these through the same config getter every other .ini
  * goes through, which is why `tableWidth%i' is in the binary as a
@@ -108,8 +111,8 @@
 #define DLG_RACESUM_staticCarInfoY0              413.f
 #define DLG_RACESUM_staticCarInfoSX              225.f
 #define DLG_RACESUM_staticCarInfoSY              110.f
-#define DLG_RACESUM_staticClosedInfoX0           159.f
-#define DLG_RACESUM_staticClosedInfoY0           196.f
+#define DLG_RACESUM_staticClosedInfoX0           59.f   /* signed slider, 159 - 100 */
+#define DLG_RACESUM_staticClosedInfoY0           96.f   /* signed slider, 196 - 100 */
 #define DLG_RACESUM_staticClosedInfoSX           100.f
 #define DLG_RACESUM_staticClosedInfoSY           25.f
 
@@ -139,5 +142,323 @@
 #define DLG_MAIN_chatRaceY0                      260.f
 #define DLG_MAIN_chatRaceSX                      400.f
 #define DLG_MAIN_chatRaceSY                      170.f
+
+/* dlgMAPINFO.ini -- 42 keys */
+#define DLG_MAPINFO_shotListX0                   349.f
+#define DLG_MAPINFO_shotListY0                   387.f
+#define DLG_MAPINFO_shotListSX                   199.f
+#define DLG_MAPINFO_shotListSY                   152.f
+#define DLG_MAPINFO_shotListBoundL               25.f
+#define DLG_MAPINFO_shotListBoundR               686.f
+#define DLG_MAPINFO_shotListBoundUp              402.f
+#define DLG_MAPINFO_shotListBoundDn              478.f
+#define DLG_MAPINFO_shotListSpace                5.f
+#define DLG_MAPINFO_enumShotX0                   312.f
+#define DLG_MAPINFO_enumShotY0                   492.f
+#define DLG_MAPINFO_enumShotSX                   272.f
+#define DLG_MAPINFO_enumShotSY                   35.f
+#define DLG_MAPINFO_staticShortListTextX0        119.f
+#define DLG_MAPINFO_staticShortListTextY0        484.f
+#define DLG_MAPINFO_staticShortListTextSX        180.f
+#define DLG_MAPINFO_staticShortListTextSY        25.f
+#define DLG_MAPINFO_staticTrackInfoX0            361.f
+#define DLG_MAPINFO_staticTrackInfoY0            174.f
+#define DLG_MAPINFO_staticTrackInfoSX            230.f
+#define DLG_MAPINFO_staticTrackInfoSY            156.f
+#define DLG_MAPINFO_shotTrackEnumX0              361.f
+#define DLG_MAPINFO_shotTrackEnumY0              135.f
+#define DLG_MAPINFO_shotTrackEnumSX              152.f
+#define DLG_MAPINFO_shotTrackEnumSY              25.f
+#define DLG_MAPINFO_shotTrackViewX0              -44.f   /* signed slider, 56 - 100 */
+#define DLG_MAPINFO_shotTrackViewY0              -13.f   /* signed slider, 87 - 100 */
+#define DLG_MAPINFO_shotTrackViewSX              512.f
+#define DLG_MAPINFO_shotTrackViewSY              512.f
+#define DLG_MAPINFO_staticClosedInfoX0           106.f   /* signed slider, 206 - 100 */
+#define DLG_MAPINFO_staticClosedInfoY0           216.f   /* signed slider, 316 - 100 */
+#define DLG_MAPINFO_staticClosedInfoSX           100.f
+#define DLG_MAPINFO_staticClosedInfoSY           25.f
+#define DLG_MAPINFO_editChatX0                   121.f
+#define DLG_MAPINFO_editChatY0                   490.f
+#define DLG_MAPINFO_editChatSX                   443.f
+#define DLG_MAPINFO_editChatSY                   22.f
+#define DLG_MAPINFO_editChatSE                   0.2400f   /* 24% */
+#define DLG_MAPINFO_chatX0                       119.f
+#define DLG_MAPINFO_chatY0                       410.f
+#define DLG_MAPINFO_chatSX                       425.f
+#define DLG_MAPINFO_chatSY                       61.f
+
+/* dlgSTAT.ini -- 29 keys */
+#define DLG_STAT_staticTrackNameX0               115.f
+#define DLG_STAT_staticTrackNameY0               85.f
+#define DLG_STAT_staticTrackNameSX               215.f
+#define DLG_STAT_staticTrackNameSY               25.f
+#define DLG_STAT_staticTrackInfoX0               114.f
+#define DLG_STAT_staticTrackInfoY0               112.f
+#define DLG_STAT_staticTrackInfoSX               220.f
+#define DLG_STAT_staticTrackInfoSY               73.f
+#define DLG_STAT_shotTrackX0                     336.f
+#define DLG_STAT_shotTrackY0                     60.f
+#define DLG_STAT_shotTrackSX                     181.f
+#define DLG_STAT_shotTrackSY                     136.f
+#define DLG_STAT_enumStatTypeX0                  319.f
+#define DLG_STAT_enumStatTypeY0                  504.f
+#define DLG_STAT_enumStatTypeSX                  166.f
+#define DLG_STAT_enumStatTypeSY                  25.f
+#define DLG_STAT_staticShowResultX0              115.f
+#define DLG_STAT_staticShowResultY0              490.f
+#define DLG_STAT_staticShowResultSX              182.f
+#define DLG_STAT_staticShowResultSY              25.f
+#define DLG_STAT_tableStatX0                     88.f
+#define DLG_STAT_tableStatY0                     210.f
+#define DLG_STAT_tableStatSX                     434.f
+#define DLG_STAT_tableStatSY                     273.f
+#define DLG_STAT_shotTrackViewSY                 437.f
+#define DLG_STAT_staticClosedInfoX0              277.f   /* signed slider, 377 - 100 */
+#define DLG_STAT_staticClosedInfoY0              60.f   /* signed slider, 160 - 100 */
+#define DLG_STAT_staticClosedInfoSX              100.f
+#define DLG_STAT_staticClosedInfoSY              25.f
+
+/* dlgSETCAR.ini -- 24 keys */
+#define DLG_SETCAR_enumCarX0                     290.f
+#define DLG_SETCAR_enumCarY0                     121.f
+#define DLG_SETCAR_enumCarSX                     280.f
+#define DLG_SETCAR_enumCarSY                     25.f
+#define DLG_SETCAR_staticCarInfoLeftX0           241.f
+#define DLG_SETCAR_staticCarInfoLeftY0           439.f
+#define DLG_SETCAR_staticCarInfoLeftSX           320.f
+#define DLG_SETCAR_staticCarInfoLeftSY           100.f
+#define DLG_SETCAR_staticCarInfoRightX0          364.f
+#define DLG_SETCAR_staticCarInfoRightY0          439.f
+#define DLG_SETCAR_staticCarInfoRightSX          320.f
+#define DLG_SETCAR_staticCarInfoRightSY          100.f
+#define DLG_SETCAR_staticUpgradesX0              114.f
+#define DLG_SETCAR_staticUpgradesY0              410.f
+#define DLG_SETCAR_staticUpgradesSX              426.f
+#define DLG_SETCAR_staticUpgradesSY              25.f
+#define DLG_SETCAR_staticStatusX0                85.f
+#define DLG_SETCAR_staticStatusY0                350.f
+#define DLG_SETCAR_staticStatusSX                260.f
+#define DLG_SETCAR_staticStatusSY                50.f
+#define DLG_SETCAR_staticPriceX0                 342.f
+#define DLG_SETCAR_staticPriceY0                 336.f
+#define DLG_SETCAR_staticPriceSX                 200.f
+#define DLG_SETCAR_staticPriceSY                 50.f
+
+/* dlgSETDETAIL.ini -- 24 keys */
+#define DLG_SETDETAIL_shotlistUpgradeX0          350.f
+#define DLG_SETDETAIL_shotlistUpgradeY0          412.f
+#define DLG_SETDETAIL_shotlistUpgradeSX          197.f
+#define DLG_SETDETAIL_shotlistUpgradeSY          149.f
+#define DLG_SETDETAIL_enumUpgradesX0             310.f
+#define DLG_SETDETAIL_enumUpgradesY0             424.f
+#define DLG_SETDETAIL_enumUpgradesSX             277.f
+#define DLG_SETDETAIL_enumUpgradesSY             25.f
+#define DLG_SETDETAIL_staticUpgradeNameX0        115.f
+#define DLG_SETDETAIL_staticUpgradeNameY0        410.f
+#define DLG_SETDETAIL_staticUpgradeNameSX        185.f
+#define DLG_SETDETAIL_staticUpgradeNameSY        25.f
+#define DLG_SETDETAIL_staticUpgradeInfoX0        105.f
+#define DLG_SETDETAIL_staticUpgradeInfoY0        437.f
+#define DLG_SETDETAIL_staticUpgradeInfoSX        200.f
+#define DLG_SETDETAIL_staticUpgradeInfoSY        125.f
+#define DLG_SETDETAIL_staticCarEnumX0            290.f
+#define DLG_SETDETAIL_staticCarEnumY0            121.f
+#define DLG_SETDETAIL_staticCarEnumSX            280.f
+#define DLG_SETDETAIL_staticCarEnumSY            25.f
+#define DLG_SETDETAIL_staticUpgradeStatusX0      350.f
+#define DLG_SETDETAIL_staticUpgradeStatusY0      474.f
+#define DLG_SETDETAIL_staticUpgradeStatusSX      197.f
+#define DLG_SETDETAIL_staticUpgradeStatusSY      78.f
+
+/* dlgCARSCOMM.ini -- 21 keys */
+#define DLG_CARSCOMM_animCarPreviewX0            0.f
+#define DLG_CARSCOMM_animCarPreviewY0            19.f
+#define DLG_CARSCOMM_animCarPreviewSX            504.f
+#define DLG_CARSCOMM_animCarPreviewSY            403.f
+#define DLG_CARSCOMM_staticCarExplainX0          339.f
+#define DLG_CARSCOMM_staticCarExplainY0          198.f
+#define DLG_CARSCOMM_staticCarExplainSX          205.f
+#define DLG_CARSCOMM_staticCarExplainSY          240.f
+#define DLG_CARSCOMM_staticCarNameX0             115.f
+#define DLG_CARSCOMM_staticCarNameY0             108.f
+#define DLG_CARSCOMM_staticCarNameSX             185.f
+#define DLG_CARSCOMM_staticCarNameSY             25.f
+#define DLG_CARSCOMM_staticPlayerCashX0          315.f
+#define DLG_CARSCOMM_staticPlayerCashY0          80.f
+#define DLG_CARSCOMM_staticPlayerCashSX          120.f
+#define DLG_CARSCOMM_staticPlayerCashSY          25.f
+#define DLG_CARSCOMM_staticCashTextX0            115.f
+#define DLG_CARSCOMM_staticCashTextY0            75.f
+#define DLG_CARSCOMM_staticCashTextSX            185.f
+#define DLG_CARSCOMM_staticCashTextSY            25.f
+#define DLG_CARSCOMM_shift2                      115.f
+
+/* dlgPLRSCOMM.ini -- 32 keys */
+#define DLG_PLRSCOMM_shotFaceX0                  99.f
+#define DLG_PLRSCOMM_shotFaceY0                  79.f
+#define DLG_PLRSCOMM_shotFaceSX                  130.f
+#define DLG_PLRSCOMM_shotFaceSY                  157.f
+#define DLG_PLRSCOMM_staticNameX0                240.f
+#define DLG_PLRSCOMM_staticNameY0                70.f
+#define DLG_PLRSCOMM_staticNameSX                280.f
+#define DLG_PLRSCOMM_staticNameSY                40.f
+#define DLG_PLRSCOMM_staticInfoX0                240.f
+#define DLG_PLRSCOMM_staticInfoY0                112.f
+#define DLG_PLRSCOMM_staticInfoSX                280.f
+#define DLG_PLRSCOMM_staticInfoSY                160.f
+#define DLG_PLRSCOMM_staticCashX0                240.f
+#define DLG_PLRSCOMM_staticCashY0                186.f
+#define DLG_PLRSCOMM_staticCashSX                280.f
+#define DLG_PLRSCOMM_staticCashSY                26.f
+#define DLG_PLRSCOMM_shotMainFaceX0              100.f
+#define DLG_PLRSCOMM_shotMainFaceY0              79.f
+#define DLG_PLRSCOMM_shotMainFaceSX              130.f
+#define DLG_PLRSCOMM_shotMainFaceSY              157.f
+#define DLG_PLRSCOMM_staticMainNameX0            240.f
+#define DLG_PLRSCOMM_staticMainNameY0            70.f
+#define DLG_PLRSCOMM_staticMainNameSX            280.f
+#define DLG_PLRSCOMM_staticMainNameSY            40.f
+#define DLG_PLRSCOMM_staticMainInfoX0            240.f
+#define DLG_PLRSCOMM_staticMainInfoY0            112.f
+#define DLG_PLRSCOMM_staticMainInfoSX            280.f
+#define DLG_PLRSCOMM_staticMainInfoSY            160.f
+#define DLG_PLRSCOMM_staticMainCashX0            240.f
+#define DLG_PLRSCOMM_staticMainCashY0            186.f
+#define DLG_PLRSCOMM_staticMainCashSX            280.f
+#define DLG_PLRSCOMM_staticMainCashSY            26.f
+
+/* dlgMULTIPLAYER.ini -- 21 keys */
+#define DLG_MULTIPLAYER_animPrevCarX0            188.f
+#define DLG_MULTIPLAYER_animPrevCarY0            197.f
+#define DLG_MULTIPLAYER_animPrevCarSX            320.f
+#define DLG_MULTIPLAYER_animPrevCarSY            240.f
+#define DLG_MULTIPLAYER_shotListTracksX0         223.f
+#define DLG_MULTIPLAYER_shotListTracksY0         269.f
+#define DLG_MULTIPLAYER_shotListTracksSX         199.f
+#define DLG_MULTIPLAYER_shotListTracksSY         152.f
+#define DLG_MULTIPLAYER_shotListTracksBoundL     12.f
+#define DLG_MULTIPLAYER_shotListTracksBoundUp    303.f
+#define DLG_MULTIPLAYER_shotListTracksBoundR     632.f
+#define DLG_MULTIPLAYER_shotListTracksBoundSY    76.f
+#define DLG_MULTIPLAYER_shotListTracksBoundSpace 3.f
+#define DLG_MULTIPLAYER_staticInfoHeaderX0       233.f
+#define DLG_MULTIPLAYER_staticInfoHeaderY0       417.f
+#define DLG_MULTIPLAYER_staticInfoHeaderSX       174.f
+#define DLG_MULTIPLAYER_staticInfoHeaderSY       30.f
+#define DLG_MULTIPLAYER_staticInfoX0             234.f
+#define DLG_MULTIPLAYER_staticInfoY0             449.f
+#define DLG_MULTIPLAYER_staticInfoSX             240.f
+#define DLG_MULTIPLAYER_staticInfoSY             140.f
+
+/* dlgWAITPLAYERS_RACESUM.ini -- 35 keys */
+#define DLG_WAITPLAYERS_RACESUM_enumNLapsX0      115.f
+#define DLG_WAITPLAYERS_RACESUM_enumNLapsY0      124.f
+#define DLG_WAITPLAYERS_RACESUM_enumNLapsSX      360.f
+#define DLG_WAITPLAYERS_RACESUM_enumNLapsSY      25.f
+#define DLG_WAITPLAYERS_RACESUM_enumNLapsSE      0.4700f   /* 47% */
+#define DLG_WAITPLAYERS_RACESUM_enumTrackX0      115.f
+#define DLG_WAITPLAYERS_RACESUM_enumTrackY0      87.f
+#define DLG_WAITPLAYERS_RACESUM_enumTrackSX      360.f
+#define DLG_WAITPLAYERS_RACESUM_enumTrackSY      25.f
+#define DLG_WAITPLAYERS_RACESUM_enumTrackSE      0.4700f   /* 47% */
+#define DLG_WAITPLAYERS_RACESUM_tableX0          86.f
+#define DLG_WAITPLAYERS_RACESUM_tableY0          174.f
+#define DLG_WAITPLAYERS_RACESUM_tableSX          466.f
+#define DLG_WAITPLAYERS_RACESUM_tableSY          195.f
+#define DLG_WAITPLAYERS_RACESUM_tableWidth0      0.0000f   /* 0% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth1      0.1900f   /* 19% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth2      0.2600f   /* 26% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth3      0.1300f   /* 13% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth4      0.1300f   /* 13% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth5      0.1300f   /* 13% */
+#define DLG_WAITPLAYERS_RACESUM_tableWidth6      0.0000f   /* 0% */
+#define DLG_WAITPLAYERS_RACESUM_tableHeaderHeight 0.1300f   /* 13% */
+#define DLG_WAITPLAYERS_RACESUM_tableItemHeight  0.1400f   /* 14% */
+#define DLG_WAITPLAYERS_RACESUM_editChatX0       121.f
+#define DLG_WAITPLAYERS_RACESUM_editChatY0       490.f
+#define DLG_WAITPLAYERS_RACESUM_editChatSX       443.f
+#define DLG_WAITPLAYERS_RACESUM_editChatSY       22.f
+#define DLG_WAITPLAYERS_RACESUM_editChatSE       0.2400f   /* 24% */
+#define DLG_WAITPLAYERS_RACESUM_chatX0           119.f
+#define DLG_WAITPLAYERS_RACESUM_chatY0           386.f
+#define DLG_WAITPLAYERS_RACESUM_chatSX           425.f
+#define DLG_WAITPLAYERS_RACESUM_chatSY           90.f
+#define DLG_WAITPLAYERS_RACESUM_koefDrawSkin     0.5000f   /* 50% */
+#define DLG_WAITPLAYERS_RACESUM_shiftDrawSkinX   6.f
+#define DLG_WAITPLAYERS_RACESUM_sizeDrawSkinY    9.f
+
+/* dlgWAITPLAYERS_CARSETUP.ini -- 29 keys */
+#define DLG_WAITPLAYERS_CARSETUP_enumBoostX0     320.f
+#define DLG_WAITPLAYERS_CARSETUP_enumBoostY0     180.f
+#define DLG_WAITPLAYERS_CARSETUP_enumBoostSX     228.f
+#define DLG_WAITPLAYERS_CARSETUP_enumBoostSY     25.f
+#define DLG_WAITPLAYERS_CARSETUP_enumBoostSE     0.4300f   /* 43% */
+#define DLG_WAITPLAYERS_CARSETUP_enumResonX0     320.f
+#define DLG_WAITPLAYERS_CARSETUP_enumResonY0     220.f
+#define DLG_WAITPLAYERS_CARSETUP_enumResonSX     228.f
+#define DLG_WAITPLAYERS_CARSETUP_enumResonSY     25.f
+#define DLG_WAITPLAYERS_CARSETUP_enumResonSE     0.4300f   /* 43% */
+#define DLG_WAITPLAYERS_CARSETUP_enumTiresX0     320.f
+#define DLG_WAITPLAYERS_CARSETUP_enumTiresY0     260.f
+#define DLG_WAITPLAYERS_CARSETUP_enumTiresSX     228.f
+#define DLG_WAITPLAYERS_CARSETUP_enumTiresSY     25.f
+#define DLG_WAITPLAYERS_CARSETUP_enumTiresSE     0.4300f   /* 43% */
+#define DLG_WAITPLAYERS_CARSETUP_chatX0          119.f
+#define DLG_WAITPLAYERS_CARSETUP_chatY0          386.f
+#define DLG_WAITPLAYERS_CARSETUP_chatSX          425.f
+#define DLG_WAITPLAYERS_CARSETUP_chatSY          90.f
+#define DLG_WAITPLAYERS_CARSETUP_enumCarX0       317.f
+#define DLG_WAITPLAYERS_CARSETUP_enumCarY0       121.f
+#define DLG_WAITPLAYERS_CARSETUP_enumCarSX       230.f
+#define DLG_WAITPLAYERS_CARSETUP_enumCarSY       25.f
+#define DLG_WAITPLAYERS_CARSETUP_enumCarSE       0.0000f   /* 0% */
+#define DLG_WAITPLAYERS_CARSETUP_editChatX0      121.f
+#define DLG_WAITPLAYERS_CARSETUP_editChatY0      490.f
+#define DLG_WAITPLAYERS_CARSETUP_editChatSX      443.f
+#define DLG_WAITPLAYERS_CARSETUP_editChatSY      22.f
+#define DLG_WAITPLAYERS_CARSETUP_editChatSE      0.2400f   /* 24% */
+
+/* dlgWAITPLAYERS_CARRESTR.ini -- 32 keys */
+#define DLG_WAITPLAYERS_CARRESTR_enumCar1X0      115.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar1Y0      165.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar1SX      400.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar1SY      25.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar1SE      0.4000f   /* 40% */
+#define DLG_WAITPLAYERS_CARRESTR_enumCar2X0      115.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar2Y0      217.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar2SX      400.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar2SY      25.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar2SE      0.4000f   /* 40% */
+#define DLG_WAITPLAYERS_CARRESTR_enumCar3X0      115.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar3Y0      269.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar3SX      400.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar3SY      25.f
+#define DLG_WAITPLAYERS_CARRESTR_enumCar3SE      0.4000f   /* 40% */
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader1X0 115.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader1Y0 105.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader1SX 400.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader1SY 25.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader2X0 275.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader2Y0 105.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader2SX 240.f
+#define DLG_WAITPLAYERS_CARRESTR_staticHeader2SY 25.f
+#define DLG_WAITPLAYERS_CARRESTR_editChatX0      121.f
+#define DLG_WAITPLAYERS_CARRESTR_editChatY0      490.f
+#define DLG_WAITPLAYERS_CARRESTR_editChatSX      443.f
+#define DLG_WAITPLAYERS_CARRESTR_editChatSY      22.f
+#define DLG_WAITPLAYERS_CARRESTR_editChatSE      0.2400f   /* 24% */
+#define DLG_WAITPLAYERS_CARRESTR_chatX0          119.f
+#define DLG_WAITPLAYERS_CARRESTR_chatY0          386.f
+#define DLG_WAITPLAYERS_CARRESTR_chatSX          425.f
+#define DLG_WAITPLAYERS_CARRESTR_chatSY          90.f
+
+/* network.ini -- the multiplayer state rate. Emitted with its
+   own declared RANGE, because the reading is not certain: the
+   key is called a `FrameRate' and its slider runs 1..50, which
+   fits both `sends per second' and `every Nth frame'. net.c
+   takes it as Hz and says so; at 60 fps the two readings are a
+   factor of 2.4 apart and nothing else in Settings/ resolves
+   it. */
+#define DLG_NET_sendFrameRate                    5
 
 #endif /* DLG_DATA_H */

@@ -467,6 +467,13 @@ void mix_music_write(mix_t *m, const short *stereo, unsigned frames)
     __atomic_store_n(&m->music.wr, wr + frames, __ATOMIC_RELEASE);
 }
 
+unsigned mix_music_played(const mix_t *m)
+{
+    if (!m->music.cap) return 0;
+    /* acquire, pairing with mix_render's release store */
+    return __atomic_load_n(&m->music.rd, __ATOMIC_ACQUIRE);
+}
+
 void mix_music_reset(mix_t *m)
 {
     m->music.wr = m->music.rd = 0;

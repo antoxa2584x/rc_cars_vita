@@ -70,10 +70,16 @@
 #include "dirarrow.h"
 #include "msg.h"
 #include "mainmenu.h"
+#include "intro.h"
 #include "touch.h"
 #include "results.h"
 #include "menu.h"
 #include "settings.h"
+#include "records.h"
+#include "player.h"
+#include "garage.h"
+#include "net.h"
+#include "ime.h"
 #include "ai.h"
 #include "carparts.h"
 #include "audio.h"
@@ -120,7 +126,30 @@ static scene_t props_scene;
    Desktop covers every pixel and 40,000 triangles under an opaque background is
    40,000 triangles of nothing. See mainmenu.h. */
 static scene_t     menu_scene;
+/* THE LAUNCH SEQUENCE's own scene -- Desktop and the three logos, 2 MB, and
+   nothing else. Its own file rather than a corner of menu.vsc because the
+   loading screen has to be UP before menu.vsc's 29 MB is read, which is exactly
+   what the engine does: FUN_004a25c0 case 0x13 loads those four textures by
+   name, on demand, and draws them while FUN_004dd5e0 loads the interface.
+   Released the moment the last load finishes. */
+static scene_t     boot_scene;
+static intro_tex   boot_tex;
 static mainmenu_t  mm;
+/* THE RACE IS A NETWORK RACE. One bit, and everything it changes is downstream
+ * of it: the field is the roster instead of a recording, ai_step is not called
+ * at all, our own state goes out once every `sendFrameRate' and everybody
+ * else's is posed from what arrived. See net.h.
+ *
+ * SEPARATE FROM `in_main_menu' rather than folded into it, because a network
+ * race is a race -- the world is simulated, the HUD is up, the countdown runs
+ * -- and the only things that differ are who fills the other cars and who is
+ * allowed to end it. */
+static int         net_race;
+/* WHICH ai SLOT EACH NETWORK SLOT GOT. The roster has holes in it -- slot 2 can
+   be used with slot 1 empty -- and our own slot is not in the field at all, so
+   the two indices are not the same number and one table says which. -1 for a
+   network slot with no car of ours. */
+static int         net_ai_slot[NET_MAX];
 static touch_state g_touch;
 static int         in_main_menu = 1;
 
@@ -180,6 +209,24 @@ static const char *const DBG_ISOLATE[] = {
 static int cur_track = 0, cur_car = 0;
 static sun_t sun;
 static menu_t menu;
+
+/* ---- THE PROFILE AND THE PORT'S OWN STATE, in both directions.
+ *
+ * The `.scp` carries the engine's own race setup -- four ints it hands straight
+ * to its globals the moment a profile is selected (FUN_004e8440). Three of the
+ * four are inferred from the ORDER it hands them over in and from a fresh
+ * profile's own values, and only ONE of them is settled: 0x52 is the lap count,
+ * because the setter it goes to is the `nlaps' console command's own and the
+ * default is 3.
+ *
+ * So the lap count is the only one applied. The other three are WRITTEN from
+ * what this port chose, so an exchanged file carries a real setup, and read
+ * only for the card's "Current car" line -- which the original's card reads out
+ * of that same field, and where a wrong pairing would cost a wrong car NAME and
+ * nothing else. Loading a car off a field this port has not proved would cost
+ * the wrong car; see docs/traps.md on inheriting an unverified convention. */
+static void apply_player(void);
+static void store_player(void);
 
 /* The upgrade parts the car wears: which exhaust, and which tyres. Rebound with
    the car scene, reapplied whenever the menu changes a level. */
@@ -284,6 +331,44 @@ static shadow_t ai_shadow[3];
 static int      ai_model[3];        /* 1 once loaded and rig-bound */
 static ai_track ai_tr;
 
+/* THE OPPONENTS' OWN PARTS, and the reason they are per MODEL while the look is
+ * per CAR is the same reason carani_bind is per model and carani_update is per
+ * car: pack_vsc.py flattens the whole car subtree, so one car%d.vsc holds all
+ * four exhausts and every skin atlas, and which of them is *shown* is a
+ * property of the batch list that scene_t owns -- shared by every opponent on
+ * that model. So the binding happens once at load and the application happens
+ * in draw_ai, immediately before that car's own draw.
+ *
+ * WITHOUT THIS the field drew whatever the model was packed wearing: skin 1 on
+ * every car whatever its driver picked -- reported as "default skin is shown
+ * even if other skin selected for opponent" -- level-1 tyres, and all FOUR
+ * exhausts stacked on top of each other, which is the very bug carparts.h was
+ * written to fix on the player's car and which nobody had ever looked for on an
+ * opponent's.
+ *
+ * `ai_shown' is what each MODEL is currently wearing, so a field of four cars
+ * on one model does not re-bind 30 textures per car per frame when they all
+ * look the same. Keyed on the packed triple, and -1 means "nothing applied
+ * yet", which is not a look any car can have. */
+static carparts_t ai_parts[3];
+static int        ai_shown[3];
+
+static int ai_look_key(const ai_car *a)
+{
+    return ((a->boost & 3) << 6) | ((a->tires & 3) << 4)
+           | ((a->skin & 3) << 2) | 1;
+}
+
+/* Put slot `i's look on the scene it shares. Cheap when it is already there. */
+static void ai_wear(int c, const ai_car *a)
+{
+    const int key = ai_look_key(a);
+    if (ai_shown[c] == key)
+        return;
+    carparts_apply(&ai_parts[c], &ai_scene[c], a->tires, a->boost, a->skin);
+    ai_shown[c] = key;
+}
+
 /* ONE EMITTER PER OPPONENT, into the player's shared particle pool.
  *
  * Not one fx_t per car: that is 123 KB of particles and a second fx_draw each,
@@ -330,9 +415,16 @@ static void tick_world_step(void *ctx)
     prop_step(&props, &rc, RBCAR_TICK_DT);
     /* ONE TICK AT A TIME and never ticks*dt in one go: ai_step's acceleration
        limit and cursor walk are written for a 1/60 tick, and handing it 2/60
-       would quietly halve the resolution of both. */
-    ai_step(&ai, cps.enabled ? &ai_tr : NULL, rc.body.x[0], rc.body.x[1],
-            rc.body.x[2], cps.lap, RBCAR_TICK_DT);
+       would quietly halve the resolution of both.
+     *
+       AND NOT AT ALL IN A NETWORK RACE. The other cars are other people; there
+       is no recording to walk, no rubber band to apply and nothing this machine
+       is entitled to decide about them. ai_car.remote is the second gate, in
+       ai_step itself -- see ai.h -- so a third caller cannot start simulating
+       somebody else's car by accident. */
+    if (!net_race)
+        ai_step(&ai, cps.enabled ? &ai_tr : NULL, rc.body.x[0], rc.body.x[1],
+                rc.body.x[2], cps.lap, RBCAR_TICK_DT);
     /* Solid opponents, immediately after the step so the contact sees the pose
        it just wrote. */
     h = ai_collide_player(&ai, &rc, RBCAR_TICK_DT);
@@ -529,11 +621,150 @@ static void place_car(float x, float z, float ref_y, float yaw)
 }
 
 /* The race is starting: the grid, and everything that only a start resets. */
+/* THE GRID, and a network race needs one where a single race does not.
+ *
+ * `tracks.h' carries ONE start per track -- the position of that level's own
+ * `Players/Player' instance -- because in a single race that is the only human
+ * car and the field starts on its recorded laps. In a network race every peer
+ * is a human car and every one of them was placed on that single marker, so
+ * they spawned inside each other and the contact solve threw them apart.
+ * Reported as "car spawns in each other".
+ *
+ * SO THE GRID IS THE GAME'S OWN, and it was in the shipped data all along: a
+ * recording begins on its car's grid slot, so the first sample of each profile
+ * in a track's `.aip' IS that track's authored starting grid. `ai_grid' reads
+ * twelve bytes per profile and keeps nothing (ai.h). Measured on all ten
+ * tracks, the pitch it gives is about 0.6 m across the line and 1.0 m back,
+ * three cars abreast and two behind -- and that is the spacing the engine's own
+ * field starts on, which is a better answer than any number this port could
+ * pick.
+ *
+ * BUT THE OFFSETS, NOT THE POSITIONS. The player's marker is not on the AI grid
+ * on every track: it is 0.8 m from a slot on beach_1 but 11.8 m BEHIND the
+ * whole field on beach_4, so seating the peers on the authored slots directly
+ * would hand three of the four a head start of ten metres. What is authored and
+ * portable is the grid's SHAPE, so slot 0 keeps the marker and slot k is offset
+ * from it by (grid[k] - grid[0]) -- the game's own pitch, anchored on the
+ * game's own player start, and identical on every machine because both come out
+ * of the same shipped files. */
+#define NET_GRID_ACROSS 1.6f    /* proxy reaches, sideways -- fallback only */
+#define NET_GRID_BACK   2.2f    /* proxy reaches, backwards -- fallback only */
+
+/* THE ROOM A CAR WANTS, for the fallback below, and it is the WIDEST of the
+ * three models rather than the one we happen to be driving. Every peer computes
+ * its own slot's offset off its own car, so if the spacing were per-car a 0.42 m
+ * Buggy in slot 1 would place itself 0.67 m from a 0.53 m Hummer in slot 0 and
+ * the two would still start inside each other. One number, the same on every
+ * machine, and every pair of slots is then clear whoever fills them.
+ *
+ * Measured, not tabled: rb_gather_spheres over a bare rb_car of each model, the
+ * same quantity ai_bump_derive takes off a live opponent. Once per process. */
+static float net_grid_reach(void)
+{
+    static float cached = 0.f;
+    int c;
+
+    if (cached > 0.f)
+        return cached;
+    for (c = 0; c < 3; c++) {
+        float sp[RB_MAX_SPHERES][4];
+        rb_car t;
+        int ns, k;
+        /* NULL world, origin, no yaw -- exactly as a remote slot is built. The
+           proxy is model-relative, so where the body sits does not matter. */
+        rbcar_init(&t, c, NULL, 0.f, 0.f, 0.f, 0.f);
+        ns = rb_gather_spheres(&t, sp);
+        for (k = 0; k < ns; k++) {
+            const float dx0 = sp[k][0] - t.body.x[0];
+            const float dy0 = sp[k][1] - t.body.x[1];
+            const float dz0 = sp[k][2] - t.body.x[2];
+            const float r = (float)sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0)
+                            + sp[k][3];
+            if (r > cached) cached = r;
+        }
+    }
+    /* A proxy that gathered nothing would space the grid at zero, which is the
+       bug this exists to fix -- so fall back rather than trust it. 0.55 m is
+       just over the widest of the three as measured. */
+    if (cached < 1e-3f)
+        cached = 0.55f;
+    return cached;
+}
+
+/* dx,dz per roster slot, world metres, relative to the track's own marker. */
+#if AI_MAX_OPPONENTS < NET_MAX
+#error "a network grid needs at least NET_MAX authored slots to read"
+#endif
+static float net_grid[NET_MAX][2];
+static int   net_grid_track = -1;
+static int   net_grid_authored;
+
+static void net_grid_build(int track)
+{
+    float g[AI_MAX_OPPONENTS][3];
+    int n, k;
+
+    if (net_grid_track == track)
+        return;
+    net_grid_track = track;
+    memset(net_grid, 0, sizeof net_grid);
+
+    n = ai_grid(track, "app0:assets", g, AI_MAX_OPPONENTS);
+    /* ALL of them or none: a partial authored grid mixed with the invented one
+       below could put two cars in the same place, which is the bug. Every
+       shipped track carries five profiles, so the fallback is for a track this
+       port has not seen. */
+    net_grid_authored = n >= NET_MAX;
+    if (net_grid_authored) {
+        for (k = 0; k < NET_MAX; k++) {
+            net_grid[k][0] = g[k][0] - g[0][0];
+            net_grid[k][1] = g[k][2] - g[0][2];
+        }
+        rlog("[rccars] grid: authored, %d slot(s) off %s.aip\n", n,
+             TRACKS[track].base);
+        return;
+    }
+
+    /* THE FALLBACK, and it is the port's own: two abreast then two behind, in
+     * units of the proxy reach, across the start's own heading and BEHIND it so
+     * a stagger cannot put a car through the start/finish line and count a lap
+     * on the first frame.
+     *
+     * The start's own axes, MEASURED through the transform rbcar_init builds
+     * rather than inherited: at the yaw rbcar_init takes, local +Z lands on
+     * (sin yaw, 0, cos yaw) and local +X on (cos yaw, 0, -sin yaw). */
+    {
+        const float reach = net_grid_reach();
+        const float yaw = TRACKS[track].yaw * 3.14159265f / 180.f;
+        const float fx = (float)sin(yaw), fz = (float)cos(yaw);
+        const float rx = (float)cos(yaw), rz = -(float)sin(yaw);
+        for (k = 1; k < NET_MAX; k++) {
+            const float side = (k & 1) ? 1.f : -1.f;
+            const float across = side * NET_GRID_ACROSS * reach;
+            const float back = (float)(k / 2) * NET_GRID_BACK * reach;
+            net_grid[k][0] = rx * across - fx * back;
+            net_grid[k][1] = rz * across - fz * back;
+        }
+        rlog("[rccars] grid: no authored grid for %s -- staggered at %.2f m\n",
+             TRACKS[track].base, reach);
+    }
+}
+
 static void respawn(void)
 {
     const track_info *t = &TRACKS[cur_track];
+    float sx = t->x, sz = t->z;
 
-    place_car(t->x, t->z, t->y, t->yaw);
+    /* OUR OWN GRID SLOT IS OUR OWN ROSTER SLOT, which is what makes it unique:
+       the host is 0 and every client got its slot from the host, so no two
+       peers can compute the same offset. Outside a network race the offset is
+       zero and this is the marker it always was. */
+    if (net_race && net_slot() > 0 && net_slot() < NET_MAX) {
+        net_grid_build(cur_track);
+        sx += net_grid[net_slot()][0];
+        sz += net_grid[net_slot()][1];
+    }
+    place_car(sx, sz, t->y, t->yaw);
 
     /* The spine cursor. cp_restart is what puts the arrow on CHECKPOINT 0 -- the
        start/finish -- which is the first thing a race crosses; it no longer
@@ -551,6 +782,26 @@ static void respawn(void)
     /* A restart puts the field back on its own grid. ai_reset also drops every
        cursor, so an opponent does not keep the lap it was on. */
     ai_reset(&ai);
+
+    /* AND EVERY OTHER PEER ON ITS OWN SLOT, until its first packet lands. The
+       remote bodies are solid (ai_collide_player), and the origin is 2.9 m from
+       the player's start on urban_2 -- so an unparked field was a stack of cars
+       inside the player's during the countdown. Each one gets the same ground
+       probe place_car just did for ours, since the world is here. */
+    if (net_race) {
+        int i;
+        net_grid_build(cur_track);
+        for (i = 0; i < NET_MAX; i++) {
+            const int a = net_ai_slot[i];
+            float gx = t->x + net_grid[i][0], gz = t->z + net_grid[i][1];
+            float gy = t->y, q0, q1, q2;
+            if (a < 0)
+                continue;
+            if (!col_ground_at(&col, gx, gz, t->y + 1.0f, &gy, &q0, &q1, &q2))
+                gy = t->y;
+            ai_remote_park(&ai, a, gx, gy, gz, t->yaw);
+        }
+    }
     /* And the characters, for the reason ai_reset exists: a Dog left chasing
        across the finish line is state from the previous run. */
     char_reset(&chars);
@@ -671,18 +922,33 @@ static void respawn_checkpoint(void)
  */
 #define MENU_CAR_FOV   34.f     /* the lens */
 #define MENU_CAR_PITCH 14.f     /* degrees above the car, as the game's shot has */
-#define MENU_CAR_SPIN  22.f     /* degrees a second */
+#define MENU_CAR_SPIN  45.f     /* degrees a second -- 8 seconds a turn */
 /* How much of the frustum the car's own bounding box fills, inverted: 1.0 puts
- * the widest point of the turn exactly on the viewport's edge.
+ * the widest point of the BOX exactly on the viewport's edge.
  *
- * IT IS THE KNOB, and it now has less to hide. The box takes in the ANTENNA --
- * 0.67 m up on the Overkill -- so the car's ink is smaller than its bounds and
- * 1.0 leaves a real margin, and the margin is what the re-aim below spends.
- * What matters is that the box is per-car and consistent (0.79 / 0.73 / 1.09 on
- * the three, which is their true order), so changing car reframes instead of
- * clipping -- which is what the fixed 0.78 m distance this replaced could not
- * do. rccars_re/menuframe.c is what says the margin is still there. */
-#define MENU_CAR_MARGIN 1.0f
+ * 0.84, NOT 1.0, and the game's own quick-race screen is what says so: it shows
+ * the car spanning about 60% of animCar's width and this port showed 44%, which
+ * is a car photographed from across the room. The box is not the ink -- it is
+ * axis-aligned and the ink is a turned car inside it -- so 1.0 leaves a real
+ * margin that nothing spends, and 0.84 is where the widest angle of the turn
+ * puts the BODY on the frame's own edge instead. It stands the camera 119, 117
+ * and 142 cm off the three where 1.0 stood it 142, 140 and 170.
+ *
+ * IT IS THE TIGHTEST VALUE THAT STILL FRAMES ALL THREE. rccars_re/menuframe.c
+ * projects every drawn vertex at 24 spin angles and fails the moment any of the
+ * body leaves the frame sideways: 0.80 clips the BUGGY, which is the longest of
+ * the three, and 0.78 clips all three. So this number is measured, not chosen,
+ * and the harness is the thing that measures it.
+ *
+ * What matters as much is that the distance is per-car and consistent, so
+ * changing car reframes instead of clipping -- which is what the fixed 0.78 m
+ * distance this replaced could not do. */
+/* 0.68, NOT 1.0: measured off the game's own quick-race shot, where the car's
+ * ink spans 64% of animCar's 374 px, against the 44% a margin of 1.0 gave --
+ * the preview read as a car photographed from across the room. The cost is the
+ * whip, which already ran off the top edge and now runs further; that trade was
+ * taken once already, above, and the body is what the player is choosing. */
+#define MENU_CAR_MARGIN 0.84f
 
 /* THE FRAME, SOLVED ONCE PER CAR. scene_frame_turntable projects every drawn
  * vertex at twelve spin angles, six times over, which is a few hundred thousand
@@ -936,6 +1202,11 @@ static void load_ai(int idx)
             carani_bind(&ai_scene[c].rig, &ai.car[i].rb);
         /* ShadowSize and ShadowShift are per-car, so the decal is per model too. */
         shadow_init(&ai_shadow[c], &ai_scene[c], c);
+        /* The parts, ONCE per model -- carparts_bind only resolves names against
+           textures the scene already holds, so this loads nothing. The look
+           itself is applied per car in draw_ai; see ai_parts. */
+        carparts_bind(&ai_parts[c], &ai_scene[c]);
+        ai_shown[c] = -1;
         ai_model[c] = 1;
     }
 
@@ -1071,6 +1342,11 @@ static int load_car(int idx)
        atlases has exactly one -- so it is handed over here, before the apply, and
        the stored per-car choice is clamped into what is really available. */
     menu.skins = parts.n_skin > 0 ? parts.n_skin : 1;
+    /* AND THE GARAGE'S Next skin ROW WRAPS OVER THE SAME COUNT. It is the one
+       fact on that page neither the profile nor the dialog data carries -- how
+       much paint a car has is a property of the packed scene -- so it is handed
+       to the front end here, at the one place that knows. */
+    mm.gskins = menu.skins;
     if (menu.skin[idx] >= menu.skins)
         menu.skin[idx] = 0;
     carparts_apply(&parts, &car, menu.tires, menu.boost, menu.skin[idx]);
@@ -1157,6 +1433,10 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
 
         if (sc->has_rig)
             carani_update(&sc->rig, &a->rb);
+        /* ITS OWN PAINT AND ITS OWN EXHAUST, here and not at load, for the same
+           reason the rig is animated here: two opponents can share one scene_t
+           and they do not share a look. See ai_parts. */
+        ai_wear(c, a);
         if (show_vis)
             shadow_draw(&ai_shadow[c], &col, ai_matrix(&ai, i));
 
@@ -1226,6 +1506,91 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
     }
 }
 
+/* ONE FRAME OF THE LOADING SCREEN, between two blocking loads.
+ *
+ * The engine draws this from its own per-frame state machine (FUN_004a25c0 case
+ * 0x13, while the intro's state is past 0xb) because its interface load is
+ * itself a state machine. On this port a load is a blocking call that takes
+ * seconds, so the screen is drawn and PRESENTED at each seam and the card does
+ * the rest of the work with that frame still on the display.
+ *
+ * `progress` is therefore a count of seams passed, not of bytes -- which is why
+ * the caption says what is being loaded: the step's name is the honest part of
+ * the measure, and the bar only exists because a page that never changes cannot
+ * be told from one that has hung. */
+/* See the note beside their declarations. */
+/* THE PROFILE'S PARTS AND ITS PAINT, for the car the front end has selected,
+ * pushed into the live tuning menu.c already owns.
+ *
+ * THE PROFILE IS THE AUTHORITY on what is fitted, because that is where the
+ * Garage buys and sells it and where the engine keeps it -- pl_car.up[0..3] per
+ * car, which is booster, engine, tyres and paint (garage.h). menu.c's three
+ * indices and its per-car skin stay what the model and the settings file read,
+ * so this is a PUSH and not a second home: one direction, at three moments --
+ * a profile selected, the Garage acting, and a car loaded.
+ *
+ * NOT PER FRAME. The START menu's own tuning rows write the same three numbers,
+ * and a push every frame would take that menu's answer away the moment it was
+ * given. */
+static void apply_garage(void)
+{
+    const player_t *p = player_cur();
+    const int c = (mm.car >= 0 && mm.car < MENU_N_CARS) ? mm.car : 0;
+    if (!p)
+        return;
+    menu.boost = garage_level(p, GAR_BOOSTER, c);
+    menu.reso  = garage_level(p, GAR_ENGINE, c);
+    menu.tires = garage_level(p, GAR_TIRES, c);
+    /* CLAMPED INTO WHAT THE MODEL HAS. A profile carrying skin 3 for a car
+       packed with one atlas would repaint nothing and read as a dead button;
+       load_car does the same clamp on menu.skin for the same reason. */
+    /* AND THE PAINT IS NOT CLAMPED HERE. `menu.skins' is the count of the
+       LOADED car's skins, and this runs before the first load_car as well as
+       after it -- so clamping against it at boot would zero a perfectly good
+       skin 2 because the count was still 1. load_car does the clamp, with the
+       authoritative count, immediately after it reads one off the model. */
+    menu.skin[c] = garage_skin(p, c);
+}
+
+static void apply_player(void)
+{
+    const player_t *p = player_cur();
+    int i;
+    if (!p)
+        return;
+    for (i = 0; i < MM_N_LAPS; i++)
+        if (MM_LAPS[i] == p->laps) {
+            mm.laps = p->laps;
+            race_laps = p->laps;
+        }
+    /* AND ITS GARAGE. A profile carries what each of its cars is fitted with, so
+       selecting one fits its parts -- the same moment the engine hands its four
+       race-setup ints over (FUN_004e8440). */
+    apply_garage();
+}
+
+static void store_player(void)
+{
+    player_t *p = player_cur();
+    if (!p)
+        return;
+    if (p->sel_track != pl_track_slot(mm.track)
+        || p->sel_car != mm.car || p->laps != mm.laps
+        || p->skill != mm.skill)
+        p->dirty = 1;
+    p->sel_track = pl_track_slot(mm.track);
+    p->sel_car = mm.car;
+    p->laps = mm.laps;
+    p->skill = mm.skill;
+}
+
+static void boot_screen(const char *what, float progress)
+{
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    intro_load_screen(&boot_tex, SCR_W, SCR_H, what, progress);
+    vglSwapBuffers(GL_FALSE);
+}
+
 int main(void)
 {
     /* THE LOG FIRST, before anything that might have something to say.
@@ -1258,6 +1623,32 @@ int main(void)
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
     vglInitExtended(0, SCR_W, SCR_H, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
 
+    /* THE RENDERER'S INITIAL STATE, and it used to be set immediately before the
+       frame loop -- i.e. after every load. It is up here now because the LAUNCH
+       SEQUENCE draws before any of them: the launch movies and then the loading
+       screen are what covers those loads, and ui.c needs GL_TEXTURE_2D and both
+       client arrays enabled to draw a textured quad at all. Nothing between here
+       and the loop cared: scene_load uploads textures, which no enable affects. */
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    /* Foliage and signage are alpha-keyed quads. Without this they draw as
+       opaque rectangles with the cut-out region showing black. Opaque textures
+       are unaffected: RGB565 has no alpha channel and the RGBA decoder fills
+       alpha with 255, so every texel passes the test. */
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glClearColor(0.42f, 0.68f, 0.87f, 1.f);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    /* AND THE FONT, for the same reason -- intro.c's loading screen has a caption
+       and the START menu is not the first thing on the screen any more. Only
+       needs the GL context, which vglInitExtended has just built. */
+    ui_init();
+
     /* The menu holds the selections; start it on the track's own default car,
        which every track names in its Players/Player instance (all ten say
        Car1). load_car/load_track then build everything from those. */
@@ -1269,6 +1660,25 @@ int main(void)
        nothing until something forced a reload. A missing or unreadable file
        leaves menu_init's defaults exactly as they are. */
     settings_load(&menu);
+    /* AND THE RECORD BOOK, which is `Track stats' -- read once here beside the
+       settings and written only when a race finishes. Its own file, because it
+       is a log of results rather than a set of preferences and the two have
+       nothing to say to each other. Missing is not an error: an empty book is
+       an empty table, which is what the original shows on a fresh install. */
+    records_load();
+    /* AND THE ROSTER. `ux0:data/rccars/Players', in the game's own .scp format,
+       so a profile copied off a PC install opens here and one made here opens
+       there -- player.h. The nine portraits' pixels come up with it, because a
+       profile this port writes has to carry one the original can draw.
+       An empty directory is the FIRST LAUNCH and is not an error: the front end
+       opens on Select player with the name modal up, which is what the game
+       does when it has nobody to race as. */
+    player_faces_init();
+    player_scan();
+    /* AND THE MACHINE'S OWN KEYBOARD, which the Select player page types names
+       on. Not fatal: `ime_open` failing is what puts the port's own on-screen
+       grid up instead (ime.h). */
+    ime_init();
     scene_set_tex_quality(menu.tex_quality);
     scene_set_tex_swap_rb(menu.tex_swap_rb);
 
@@ -1286,6 +1696,73 @@ int main(void)
        race cues -- the frame loop's own call keeps it in step after that. */
     sfx_race_active(!in_main_menu);
 
+    /* ------------------------------------------------------ THE LAUNCH SEQUENCE
+     *
+     * IN THE GAME'S OWN ORDER, which is FUN_004a25c0's: the intro's own state
+     * machine at its state 0x0f, the interface load at 0x12, and the loading
+     * screen drawn at 0x13 for as long as that lasts -- then the front end. Both
+     * halves were recovered whole out of the retail exe; see intro.h.
+     *
+     * The loading screen's four textures come first and out of their own 2 MB
+     * scene, because the whole point of the screen is to be up BEFORE the 29 MB
+     * menu.vsc is read. That is what the engine does too: case 0x13 loads
+     * `Desktop', `logoRC', `logo1C' and `logoCR' by name, on demand, rather than
+     * out of the interface manifest.
+     */
+    if (!scene_load("app0:assets/boot.vsc", &boot_scene))
+        rlog("[rccars] no boot.vsc -- the loading screen falls back to flat "
+             "colour and the compiled-in font\n");
+    boot_tex.desktop = scene_tex(&boot_scene, "Desktop");
+    boot_tex.logo_rc = scene_tex(&boot_scene, "logoRC");
+    boot_tex.logo_1c = scene_tex(&boot_scene, "logo1C");
+    boot_tex.logo_cr = scene_tex(&boot_scene, "logoCR");
+    rlog("[rccars] loading screen: Desktop %d logoRC %d logo1C %d logoCR %d\n",
+         !!boot_tex.desktop, !!boot_tex.logo_rc, !!boot_tex.logo_1c,
+         !!boot_tex.logo_cr);
+
+    /* THE THREE MOVIES -- 1C, Creat Studios, then the SmashCars film. Its own
+     * loop, deliberately: it runs before anything is loaded, so there is no
+     * world for the frame loop to step around it, and it ends by giving the
+     * decoder's 6 MB of physically contiguous memory back before the first
+     * 36 MB scene asks for room. A missing assets/intro.vid is not an error --
+     * it is how this port spells Config.gm's `AutoRunIntro' 0. */
+    {
+        intro_t intro;
+        if (intro_open(&intro, "app0:assets/intro.vid", "app0:assets")) {
+            SceCtrlData ipad;
+            SceRtcTick ia, ib;
+            double ihz = (double)sceRtcGetTickResolution();
+            unsigned int iprev;
+            /* SEEDED from a real read, not from 0: a player who launched the app
+               with CROSS may still be holding it, and `buttons & ~prev' over a
+               zero would read that as a skip of the first logo. */
+            sceCtrlPeekBufferPositive(0, &ipad, 1);
+            iprev = ipad.buttons;
+            sceRtcGetCurrentTick(&ia);
+            for (;;) {
+                float idt;
+                sceCtrlPeekBufferPositive(0, &ipad, 1);
+                sceRtcGetCurrentTick(&ib);
+                idt = (float)((double)(ib.tick - ia.tick) / ihz);
+                ia = ib;
+                if (idt > 0.5f) idt = 0.5f;
+                touch_step(&g_touch, SCR_W, SCR_H);
+                if (intro_step(&intro, ipad.buttons, iprev, &g_touch, idt)
+                        == INTRO_DONE)
+                    break;
+                iprev = ipad.buttons;
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                intro_draw(&intro, SCR_W, SCR_H);
+                vglSwapBuffers(GL_FALSE);
+            }
+        }
+        intro_close(&intro);
+    }
+
+    /* AND FROM HERE THE LOADING SCREEN COVERS EVERY LOAD, one presented frame at
+       each seam. The fractions are the seams, not the bytes -- see boot_screen. */
+    boot_screen("Loading", 0.00f);
+
     /* The three visual subsystems come up inside load_track/load_car. All are
        no-ops if the track was packed before --markers existed (no surface flags,
        no markers) or the car without --shadow-tex, so an old .vsc still runs. */
@@ -1294,6 +1771,7 @@ int main(void)
        the props simply do not appear. */
     if (!scene_load("app0:assets/props.vsc", &props_scene))
         rlog("[rccars] no props.vsc -- the track's props will not appear\n");
+    boot_screen("Loading interface", 0.20f);
 
     /* THE FRONT END'S ART, out of its own texture-only scene. Interface.sb is the
      * game's manifest -- "Dialog Textures", "Shot textures", "Track preview" --
@@ -1320,10 +1798,16 @@ int main(void)
         mt.podl_rb  = scene_tex(&menu_scene, "Podl_RightBottom");
         mt.header   = scene_tex(&menu_scene, "HeaderSkin");
         mt.buttons  = scene_tex(&menu_scene, "ButtonsTextures");
+        mt.radio    = scene_tex(&menu_scene, "RadioButtonsTextures");
         mt.race     = scene_tex(&menu_scene, "Button_race");
         mt.back     = scene_tex(&menu_scene, "Button_back");
         mt.logo     = scene_tex(&menu_scene, "logoRC_Main");
-        mt.face     = scene_tex(&menu_scene, "Face1");
+        /* ALL NINE PORTRAITS, not one. `Face1' was the only one the card ever
+           drew; the Select player page picks between them and a profile stores
+           which, so they all come up here -- and they are already in menu.vsc,
+           because the finish screen's table needed them. */
+        for (i = 0; i < PL_N_FACES; i++)
+            mt.face[i] = scene_tex(&menu_scene, PL_FACE_NAME[i]);
         mt.arrows   = scene_tex(&menu_scene, "enumarrows");
         /* THE FINISH SCREEN's own handles, out of the same scene. The portraits
            are matched to the drivers by NAME through ai_data.h's roster, which
@@ -1345,7 +1829,17 @@ int main(void)
         }
         /* `shot_beach1_0`, not `shot_beach_1_0`: the shot names drop the track
            name's underscore, which is the artists' own spelling and the reason
-           this is built from TRACKS[].base rather than typed out again. */
+           this is built from TRACKS[].base rather than typed out again.
+         *
+           ALL FIVE OF THEM, not just the first: dlgMAPINFO's shotList is a
+           picker over shot_<track>_0..4 and this port loaded one of the five for
+           the carousel and called the rest absent.
+         *
+           AND THE PAINTED MAP, `trackmap_<n>' -- by the ENGINE's number, which
+           is what MAP_TRACKMAP carries, since championship.ini orders the ten
+           levels differently from TRACKS[]. It already rides in each track's own
+           .vsc for the HUD; the front end needs all ten before any track is
+           loaded, so menu.vsc carries them too. */
         for (i = 0; i < N_TRACKS; i++) {
             char nm[40], base[24];
             const char *b = TRACKS[i].base;
@@ -1353,9 +1847,43 @@ int main(void)
             for (; b[j] && k < (int)sizeof base - 1; j++)
                 if (b[j] != '_') base[k++] = b[j];
             base[k] = 0;
-            snprintf(nm, sizeof nm, "shot_%s_0", base);
-            mt.shot[i] = scene_tex(&menu_scene, nm);
+            for (j = 0; j < MM_N_SHOTS; j++) {
+                snprintf(nm, sizeof nm, "shot_%s_%d", base, j);
+                mt.shot[i][j] = scene_tex(&menu_scene, nm);
+            }
+            snprintf(nm, sizeof nm, "trackmap_%d", MAP_TRACKMAP[i]);
+            mt.trackmap[i] = scene_tex(&menu_scene, nm);
         }
+        /* THE TWENTY-SEVEN UPGRADE PHOTOGRAPHS, out of Interface.sb's own
+           `Upgrades' folder: `upgr_boost<L>_<car+1>' and the reson and tires
+           families, three levels by three cars each. THE LEVEL IS THE FIRST
+           NUMBER -- the engine builds the name with
+           sprintf("upgr_boost%i_%i", level, car + 1) (FUN_0049fdc0) and the
+           pictures agree -- so a loop written the other way round would put the
+           Hummer's exhaust on the Overkill's page and still find nine
+           textures. garage.h says how that was checked. */
+        {
+            int k, cc, lv;
+            for (k = 0; k < GAR_N_KINDS; k++)
+                for (cc = 0; cc < PL_N_CARS; cc++)
+                    for (lv = 0; lv < GAR_N_LEVELS; lv++) {
+                        char nm[32];
+                        /* THROUGH garage_part_tex, which is the one place the
+                           name is spelt -- the packer's own list, this loop and
+                           menushot's table all have to agree with the engine's
+                           `sprintf("upgr_boost%i_%i", level, car + 1)', and
+                           three copies of that is three chances to swap the two
+                           numbers. `garage_test' asserts the one copy. */
+                        garage_part_tex(k, cc, lv + 1, nm, sizeof nm);
+                        mt.upgr[k][cc][lv] = scene_tex(&menu_scene, nm);
+                    }
+        }
+        /* dlgSTAT's scroll bar and dlgMAPINFO's window frame. */
+        mt.scrollbar = scene_tex(&menu_scene, "scrollbar");
+        /* Interface.sb's own skin-icon sheet, which the multiplayer lobby's
+           roster table draws one cell of per row. */
+        mt.skinicons = scene_tex(&menu_scene, "skin_ik_vse");
+        mt.panel     = scene_tex(&menu_scene, "messagebox_empty");
         /* The engine's own letters, which the HUD already loads from the track's
            scene -- but the menu is up before any track has to be, so they come
            from here as well. */
@@ -1367,16 +1895,41 @@ int main(void)
         mainmenu_set_car_draw(&mm, menu_car_draw, NULL);
         mm.track = menu.track;
         mm.car = menu.car;
+        /* THE FIRST LAUNCH OPENS ON SELECT PLAYER, with the name modal already
+           up: there is nobody to race as, and making somebody is the one thing
+           there is to do. With a roster, the profile's own choices are what the
+           front end comes up on -- which is what the engine does the moment a
+           profile is selected (FUN_004e8440 hands its four straight to the race
+           setup globals). */
+        if (player_count() == 0) {
+            mainmenu_open_players(&mm, 1);
+        } else {
+            mainmenu_players_sync(&mm);
+            apply_player();
+        }
         rlog("[rccars] main menu: desktop %d frame %d/%d/%d/%d buttons %d "
              "wedges %d race %d logo %d face %d shots %d font %d/%d\n",
              !!mt.desktop, !!mt.podl_lt, !!mt.podl_rt, !!mt.podl_lb,
              !!mt.podl_rb, !!mt.buttons,
              (mt.wedge[0] && mt.wedge[8]) ? 9 : 0, !!mt.race, !!mt.logo,
-             !!mt.face,
-             (int)(!!mt.shot[0] + !!mt.shot[1] + !!mt.shot[2] + !!mt.shot[3]
-                   + !!mt.shot[4] + !!mt.shot[5] + !!mt.shot[6] + !!mt.shot[7]
-                   + !!mt.shot[8] + !!mt.shot[9]),
+             !!mt.face[0],
+             (int)(!!mt.shot[0][0] + !!mt.shot[1][0] + !!mt.shot[2][0]
+                   + !!mt.shot[3][0] + !!mt.shot[4][0] + !!mt.shot[5][0]
+                   + !!mt.shot[6][0] + !!mt.shot[7][0] + !!mt.shot[8][0]
+                   + !!mt.shot[9][0]),
              !!mt.font_big, !!mt.font_small);
+        {
+            int shots = 0, maps = 0;
+            for (i = 0; i < N_TRACKS; i++) {
+                int j;
+                for (j = 0; j < MM_N_SHOTS; j++)
+                    shots += !!mt.shot[i][j];
+                maps += !!mt.trackmap[i];
+            }
+            rlog("[rccars] quick-race pages: %d/%d screenshots, %d/%d maps, "
+                 "scrollbar %d frame %d\n", shots, N_TRACKS * MM_N_SHOTS,
+                 maps, N_TRACKS, !!mt.scrollbar, !!mt.panel);
+        }
     }
 
     /* The start light is bound HERE, before the first respawn(), because
@@ -1428,6 +1981,7 @@ int main(void)
        back to the first one rather than taking the app down -- the index is
        already clamped into range, so a failure here means an asset this build
        does not have, which is not the settings file's fault to die of. */
+    boot_screen("Loading track", 0.45f);
     if (!load_track(menu.track)) {
         if (menu.track == 0 || !load_track(0)) {
             sceKernelExitProcess(0);
@@ -1437,10 +1991,16 @@ int main(void)
              menu.track);
         menu.track = 0;
     }
+    boot_screen("Loading car", 0.80f);
     load_car(menu.car);          /* optional -- the track alone is still useful */
     respawn();
+    boot_screen("Loading", 1.00f);
+    /* AND THE LOADING SCREEN IS DONE WITH. Its 2 MB goes back here rather than
+       at exit: the front end is up next and it has its own copy of `Desktop' in
+       menu.vsc, so nothing below reads any of these four again. */
+    scene_release(&boot_scene);
+    memset(&boot_tex, 0, sizeof boot_tex);
 
-    ui_init();
     /* The game's own HIT banner. It rides in props.vsc rather than in every
        track because that scene is loaded once, before the first track, and never
        reloaded -- so the binding never has to be renewed. scene_tex returns 0 on
@@ -1504,21 +2064,6 @@ int main(void)
                   audio_music_count(AUDIO_MUSIC_MENU),
                   sfx_resident_bytes() / 1024u,
                   TRACKS[cur_track].ambient[0] ? TRACKS[cur_track].ambient : "-");
-
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glEnable(GL_TEXTURE_2D);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    /* Foliage and signage are alpha-keyed quads. Without this they draw as
-       opaque rectangles with the cut-out region showing black. Opaque textures
-       are unaffected: RGB565 has no alpha channel and the RGBA decoder fills
-       alpha with 255, so every texel passes the test. */
-    glEnable(GL_ALPHA_TEST);
-    glAlphaFunc(GL_GREATER, 0.5f);
-    glClearColor(0.42f, 0.68f, 0.87f, 1.f);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 
     SceCtrlData pad;
     unsigned int prev_buttons = 0, frames = 0;
@@ -1592,6 +2137,14 @@ unsigned int acc_ticks = 0;
             }
         }
 
+        /* THE SOCKET, ONCE A FRAME AND BEFORE ANYTHING READS THE ROSTER.
+           `net_step' is a no-op until a multiplayer page has opened one, so it
+           costs nothing on every other launch -- and it is driven with the raw
+           frame clock rather than `dt', because a paused game must still hear
+           the host and still answer it. A peer that went quiet because its
+           owner opened the START menu would be dropped in five seconds. */
+        net_step(frame_dt);
+
         /* THE FRONT END. The panel is read every frame whatever is up, because
            touch.h's edges are differences and a frame that skipped the read
            would turn the next press into a phantom drag; the menu only ACTS on
@@ -1664,6 +2217,12 @@ unsigned int acc_ticks = 0;
                    the settings file stay the authority on what is loaded --
                    there is one car picker in the app, on two screens. */
                 race_laps = mm.laps;
+                /* THE PROFILE REMEMBERS THE SETUP, which is what the engine
+                   stores in those four ints -- and this is the moment there is
+                   something to remember. One file, on one event, like every
+                   other save in this app. */
+                store_player();
+                player_save_cur_if_dirty();
                 ai_set_skill_field(1);
                 ai_skill = mm.skill;
                 if (mm.car != cur_car) {
@@ -1678,16 +2237,130 @@ unsigned int acc_ticks = 0;
                    is built by load_track. */
                 menu.track = mm.track;
                 load_track(mm.track);
+                net_race = 0;
                 race_over = 0;
                 in_main_menu = 0;
                 /* AFTER the mode bit, because respawn() is what starts the
                    countdown and the countdown must not tick under the menu. */
                 respawn();
                 break;
+            case MM_ACT_NET_RACE:
+                /* THE NETWORK RACE, and the difference from the one above is
+                 * WHO FILLS THE OTHER CARS. Not `ai_init' and not a recording:
+                 * `ai_remote_init' builds one slot per other peer, on the model
+                 * that peer said it was driving, and every one of them is posed
+                 * from the wire (ai.h). The rest -- the track, the car, the
+                 * countdown, the HUD -- is a race like any other.
+                 *
+                 * THE HOST'S SETTINGS ARE THE RACE'S. The track and the lap
+                 * limit came out of NET_LOBBY, so `mm' already carries them and
+                 * `menu.track' follows the same way it does for a quick race.
+                 */
+                {
+                    unsigned char cars[NET_MAX];
+                    int i, n = 0;
+                    const net_settings *ns = net_settings_now();
+                    for (i = 0; i < NET_MAX; i++)
+                        net_ai_slot[i] = -1;
+                    race_laps = ns->laps > 0 ? ns->laps : mm.laps;
+                    store_player();
+                    player_save_cur_if_dirty();
+                    if (mm.car != cur_car) {
+                        menu.car = mm.car;
+                        load_car(mm.car);
+                    }
+                    menu.track = mm.track;
+                    load_track(mm.track);
+                    /* AFTER load_track, which is what builds the world the
+                       remote bodies collide against -- and after it has run
+                       ai_init for the single-race field, which this then
+                       replaces wholesale. */
+                    for (i = 0; i < NET_MAX; i++) {
+                        const net_peer *q = net_peer_at(i);
+                        if (!q || !q->used || i == net_slot())
+                            continue;
+                        cars[n++] = q->car;
+                        net_ai_slot[i] = n - 1;
+                    }
+                    ai_remote_init(&ai, mm.track, col_rb_world(&col),
+                                   cars, n);
+                    /* AND WHAT EACH OF THEM LOOKS LIKE. A second pass rather
+                     * than a wider ai_remote_init: the model has to be settled
+                     * before the scene is chosen, the paint and the parts are
+                     * retexturings of that scene and can follow.
+                     *
+                     * THEN THE EXHAUST EMITTERS AGAIN. load_track ran load_ai,
+                     * which built one emitter per car of the SINGLE-RACE field
+                     * off that car's booster level -- and ai_remote_init has
+                     * just replaced the whole roster. Left alone, a remote car
+                     * smoked from the pipe of whatever recorded opponent used
+                     * to hold its slot. */
+                    for (i = 0; i < NET_MAX; i++) {
+                        const net_peer *q = net_peer_at(i);
+                        int a = net_ai_slot[i];
+                        if (a < 0 || !q)
+                            continue;
+                        ai_remote_look(&ai, a, q->up, q->skin);
+                    }
+                    for (i = 0; i < ai.n; i++) {
+                        int c = ai.car[i].car;
+                        fx_emitter_init(&ai_em[i]);
+                        if (c < 0 || c > 2 || !ai_model[c]
+                            || !ai_scene[c].has_rig)
+                            continue;
+                        fx_pipe_from_rig(&ai_em[i], &ai_scene[c].rig,
+                                         ai.car[i].boost, rbcar_com_oy(c));
+                    }
+                    net_race_begin();
+                    net_race = 1;
+                    race_over = 0;
+                    in_main_menu = 0;
+                    respawn();
+                    /* THE GRID OFFSET IN THE LOG, because "the cars spawned
+                       in each other" is answered from a log line and not from a
+                       screenshot -- two machines' logs side by side say whether
+                       they picked different slots. */
+                    rlog("[rccars] NET RACE -- track %d, %d lap(s), %d remote"
+                         " car(s), slot %d%s, grid offset (%.2f, %.2f)%s\n",
+                         mm.track, race_laps, n, net_slot(),
+                         net_is_host() ? " (host)" : "",
+                         net_grid[net_slot() & (NET_MAX - 1)][0],
+                         net_grid[net_slot() & (NET_MAX - 1)][1],
+                         net_grid_authored ? " authored" : " staggered");
+                }
+                break;
+            case MM_ACT_PLAYER:
+                /* THE PROFILE CHANGED -- selected, created or removed. The lap
+                   count is the one field of its setup this port trusts; see
+                   apply_player. */
+                apply_player();
+                break;
+            case MM_ACT_GARAGE:
+                /* THE GARAGE SPENT OR FETCHED SOMETHING: a part, a car or the
+                   paint. What it changed is in the PROFILE, so the live tuning
+                   is re-read from there and the profile is written out -- one
+                   file on one event, and this is the event. The frame loop
+                   below already re-applies carparts and the physics indices
+                   when menu.tires/boost/skin move, so nothing here has to
+                   reload anything except a car that was sold out from under the
+                   picker, which the mm.car sync above does. */
+                apply_garage();
+                player_save_cur_if_dirty();
+                break;
             case MM_ACT_OPTIONS:
                 menu.open = 1;
                 break;
             case MM_ACT_QUIT:
+                /* THE LAST WRITE. Play time and the race setup are the two
+                   things a session changes without a race finishing, and the
+                   Quit button is the only way out of the app. */
+                store_player();
+                player_save_cur_if_dirty();
+                /* AND TELL ANYBODY WE ARE IN A GAME WITH. A host that walks out
+                   of the app without a NP_BYE leaves three clients on a
+                   five-second timeout looking at a lobby that is already
+                   dead. */
+                net_close();
                 menu.req_quit = 1;
                 break;
             default:
@@ -1888,6 +2561,12 @@ unsigned int acc_ticks = 0;
             int k;
             race_over = 1;
             race_ui_stop(&race_ui);
+            /* TELL EVERYBODY, once. Their own tables show us home even though
+               they are still driving, which is the whole reason the packet
+               exists -- a peer that finished and then went quiet would look
+               like a peer that crashed. */
+            if (net_race)
+                net_send_finished(race_t, race_ui.best_lap);
             msg_post(&msgs, MSG_FINISH, MSG_BEST_LIFE, 0.f, 1);
             rlog("[rccars] FINISH -- %d lap(s), %.2f s, best %.2f s\n",
                  race_laps, (double)race_t, (double)race_ui.best_lap);
@@ -1963,9 +2642,56 @@ unsigned int acc_ticks = 0;
                          (double)results.row[k].time,
                          (double)results.row[k].best_lap,
                          (double)results.row[k].av_speed);
+
+                /* AND INTO THE RECORD BOOK, which is what `Track stats' shows.
+                 * The same table, one row at a time; records.c keeps the best
+                 * of each stat per racer and decides what a race over this many
+                 * laps contributes. See records.h for whose rows these are and
+                 * why they are not the original's player profiles.
+                 *
+                 * A RACER WHO DID NOT FINISH FILES NO TOTAL -- `time' is the
+                 * clock at the player's own flag for those, not a result -- but
+                 * its best lap still counts, because a lap it actually turned
+                 * is a lap it actually turned.
+                 *
+                 * The car is the one that racer drove: menu.car for the player,
+                 * and the opponent entry's own `car' for the rest, which is the
+                 * model ai.c really put on the grid rather than the one the
+                 * driver is pictured with in the shop (ai_data.h says the two
+                 * disagree). */
+                for (k = 0; k < results.n; k++) {
+                    const results_row *w = &results.row[k];
+                    int car = -1, j;
+                    if (w->is_player) {
+                        car = menu.car;
+                    } else {
+                        for (j = 0; j < ai.n; j++)
+                            if (!strcmp(ai.car[j].name, w->name)) {
+                                car = ai.car[j].car;
+                                break;
+                            }
+                    }
+                    records_note(menu.track, w->name, car, w->best_lap,
+                                 race_laps, w->finished ? w->time : 0.f);
+                }
+                /* WRITTEN HERE AND NOT ON THE WAY OUT. A race is the only thing
+                   that changes this file, the finish is a frame the player is
+                   already watching a banner on, and the alternative -- writing
+                   when the app closes -- loses the result to a PS button. The
+                   same ~50 ms a settings save costs, once per race. */
+                records_save_if_changed();
+                /* AND THE PROFILE, for the same reason and in the same frame:
+                   `Play time' on the player card is the seconds a race took,
+                   and a finish is the one moment there are new ones to file. */
+                store_player();
+                player_save_cur_if_dirty();
             }
         }
         race_ui_step(&race_ui, dt);
+        /* PLAY TIME is time spent RACING, which is what the card's clock counts:
+           `dt` is already 0 under either menu and while the app is paused, so
+           this needs no gate of its own. */
+        player_add_play_time(dt);
 
         /* THE DIRECTION ARROW and the WRONG WAY test. Every input is a plain
            number, the way hud.c's and race_ui.c's are -- dirarrow.c never sees
@@ -2211,6 +2937,104 @@ unsigned int acc_ticks = 0;
                 acc_phys += (double)(t_p1.tick - t_p0.tick) / hz;
                 if (ticks > 0)
                     acc_ticks += (unsigned)ticks;
+
+                /* ---------------------------------- THE NETWORK EXCHANGE
+                 *
+                 * OUR OWN CAR OUT, EVERYBODY ELSE'S IN, and both in the shape
+                 * the recorded laps already use: `ai_sample'. Right after the
+                 * tick, so what goes out is the pose the frame will draw --
+                 * sending before the step would put every peer one frame behind
+                 * its own sender for nothing.
+                 *
+                 * `net_send_state' is rate-limited inside net.c, at
+                 * `sendFrameRate'; calling it every frame is what lets that one
+                 * decision live in one place. */
+                if (net_race) {
+                    ai_sample me;
+                    float y[RB_STATE_N];
+                    int k, i;
+                    rb_car_get_state(&rc, y);
+                    memset(&me, 0, sizeof me);
+                    for (k = 0; k < 3; k++)
+                        me.p[k] = y[k];
+                    for (k = 0; k < 4; k++)
+                        me.q[k] = (short)(y[3 + k] * AI_Q_SCALE);
+                    /* THE SPEED, not the momentum. State slots 7..9 are the
+                       linear momentum P and the field is a metres-per-second
+                       speed (ai.h's own note under ai_sample), so it is divided
+                       by the mass on the way out and multiplied back on the way
+                       in -- which is the bug that ran every opponent at half
+                       speed, in the other direction. */
+                    for (k = 0; k < 3; k++) {
+                        const float v = rc.body.mass > 1e-6f
+                                        ? y[7 + k] / rc.body.mass : 0.f;
+                        me.mom[k] = (short)(v * AI_VEL_SCALE);
+                    }
+                    for (k = 0; k < 6; k++) {
+                        float l = y[13 + k] * (255.0f / AI_SUSP_FULL);
+                        if (l < 0.f) l = 0.f;
+                        if (l > 255.f) l = 255.f;
+                        me.susp[k] = (unsigned char)l;
+                    }
+                    me.steer = (short)(y[25] * AI_STEER_SCALE);
+                    /* THE PLACE IS ASKED FOR HERE rather than read off the
+                       HUD's own frame struct, which is filled later in the
+                       frame and is a local of the drawing block. ai_player_place
+                       is the same call that fills it. */
+                    net_send_state(&me, cps.lap, ai_player_place(&ai),
+                                   race_ui.best_lap);
+                    /* AND THE REMOTES, posed from whatever last arrived and
+                       dead-reckoned to now. One roster slot to one ai slot
+                       through net_ai_slot, because the roster has holes and our
+                       own slot is not in the field. */
+                    for (i = 0; i < NET_MAX; i++) {
+                        ai_sample s;
+                        const int a = net_ai_slot[i];
+                        const net_peer *q = net_peer_at(i);
+                        if (a < 0 || a >= ai.n)
+                            continue;
+                        if (!net_remote_pose(i, &s))
+                            continue;
+                        ai_remote_pose(&ai, a, &s);
+                        /* AND ITS PROGRESS, measured HERE and not sent. A
+                         * recorded opponent's `spine_dist' is what the placing
+                         * ranks on (ai_player_place), and a remote car has no
+                         * recording to get one from -- so the spine is asked
+                         * where this car is, on this machine, and the peer's
+                         * own reported lap supplies the whole laps.
+                         *
+                         * MEASURED RATHER THAN SENT because the two ends would
+                         * otherwise have to agree about a float, and the spine
+                         * is the same polyline on both: asking it locally is
+                         * one query and cannot disagree with the ranking it
+                         * feeds. Without this every remote car sits at 0 and
+                         * the player is always first. */
+                        if (cps.enabled && ai_tr.spine && q) {
+                            float d = 0.f;
+                            int cp = 0;
+                            if (ai_tr.spine(ai_tr.ctx, s.p[0], s.p[1], s.p[2],
+                                            -1.f, &d, &cp))
+                                ai.car[a].spine_dist =
+                                    d + (float)q->lap * ai_tr.spine_len;
+                        }
+                    }
+                    /* AND THEIR WHEELS TURN, which is not part of the pose.
+                     * The rolling angle is not in the state vector and so not
+                     * on the wire (ai.h at ai_remote_spin); it is integrated,
+                     * and this is where. AFTER the pose loop, because the
+                     * contact test it starts with reads the suspension and the
+                     * body matrix that loop has just written, and on the
+                     * FRAME's dt rather than the tick loop's, because the pose
+                     * it works from is interpolated to this frame.
+                     *
+                     * ON `frame_dt', NOT `dt', for the same reason net_step
+                     * takes it: the menu zeroes `dt' to freeze OUR world, but
+                     * it does not freeze the wire -- net.c's clock runs on
+                     * frame_dt and keeps interpolating the remote cars, so a
+                     * player who opened the START menu would otherwise watch
+                     * the others drive past on locked wheels. */
+                    ai_remote_spin(&ai, frame_dt);
+                }
                 /* The props advance on the SAME banked time the car does --
                    rbcar_step_frame returns how many 1/60 ticks it actually
                    spent, so feeding them the measured frame time instead would
@@ -3233,7 +4057,11 @@ unsigned int acc_ticks = 0;
 
 frame_end:
         sceRtcGetCurrentTick(&t_swap0);
-        vglSwapBuffers(GL_FALSE);
+        /* GL_TRUE IS WHAT PUTS THE SYSTEM KEYBOARD ON SCREEN. It is the flag
+           vitaGL turns into `sceCommonDialogUpdate`, and with it false the IME
+           dialog runs, takes the input and draws NOTHING -- which reads as the
+           app having hung on the frame the player asked for a name. See ime.h. */
+        vglSwapBuffers(ime_active() ? GL_TRUE : GL_FALSE);
         sceRtcGetCurrentTick(&t_swap1);
         acc_sim  += (double)(t_draw0.tick - tf.tick) / hz;
         acc_draw += (double)(t_swap0.tick - t_draw0.tick) / hz;

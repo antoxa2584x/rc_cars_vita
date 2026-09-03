@@ -8,6 +8,12 @@
 #include "rb_data.h"        /* AI_RACES, AI_PLAYERS -- the roster per track */
 #include "tracks.h"
 #include "dlg_data.h"
+#include "str_data.h"       /* the game's own authored text, decoded */
+#include "records.h"        /* the record book behind Track stats */
+#include "player.h"         /* the roster dlgPLRSCOMM is a view of */
+#include "garage.h"         /* the shop behind dlgSETCAR/dlgSETDETAIL */
+#include "net.h"            /* the transport behind dlgMULTIPLAYER */
+#include "ime.h"            /* the machine's own keyboard, or a stub */
 
 #include <stdio.h>
 #include <string.h>
@@ -36,37 +42,78 @@ static const float MM_CY[MM_N_ROWS] = {
     144.5f, 189.5f, 234.5f, 279.5f, 324.5f, 369.5f, 434.5f, 479.5f
 };
 static const float MM_X0[MM_N_ROWS] = {
-    583.f, 605.f, 618.f, 630.f, 636.f, 638.f, 634.f, 598.f
+    583.f, 605.f, 618.f, 630.f, 636.f, 638.f, 634.f, 628.f
 };
-#define MM_BAR_H     30.f      /* the bar's art is 30 of a 32-row cell; its strict-red core measures 23 */
+/* CREDITS' 628 IS A CORRECTION, and the shape of the oval is what says so. The
+   other seven walk 583, 605, 618, 630, 636, 638, 634 -- a bulge that opens and
+   closes by a dozen pixels at a time -- and the eighth was measured at 598, a
+   36 px step no leg of that curve makes. It was measured off a shot with
+   CREDITS FOCUSED: a focused row slides its cap out to the left (MM_SLIDE), and
+   the number that came back was the slid position, not the row's. On a shot
+   with the focus elsewhere every one of the five visible rows puts its cap
+   exactly MM_WEDGE_TIP left of its own wedge's tip, and Credits' lands at 628. */
+#define MM_BAR_H     31.f      /* the cell is 32 rows and 31 of them are opaque */
 #define MM_BAR_R    800.f      /* every row ends at the frame's right edge */
 #define MM_TEXT_PAD   8.f      /* the label's right margin inside the bar */
 
-/* THE WEDGE under each row. The texture is 256x64 with its plate on rows 12..50,
-   so drawing the whole cell into a box `MM_WEDGE_H` tall puts the plate's top
-   edge 12/64 of the way down -- which is where the bar sits. Drawn from
-   MM_WEDGE_OVER to the left of the bar's own left end so the tip shows. */
-#define MM_WEDGE_H   44.f
-#define MM_WEDGE_TOP 12.f      /* the plate's first opaque row, of 64 */
-/* THE WEDGE STARTS AT THE BAR'S OWN LEFT END and its taper is the texture's,
-   not a number here: ButtonPodl_right_1's plate begins 35 px into a 256 px cell,
-   _5's 102 and _9's 60, so drawing the whole cell across [bar_left, right edge]
-   puts each plate's tip where that row's oval is. Starting it further left
-   instead drew a silver slab out past the bar's rounded cap. */
-#define MM_WEDGE_OVER 0.f
+/* THE WEDGE under each row -- ButtonPodl_right_1..9, AT THE ART'S OWN SIZE.
+ *
+ * The cell is 256x64 with the silver plate on rows 12..50 -- 39 rows -- and a
+ * slanted tip at a different column in each of the nine, which is what glues a
+ * row to the oval. Two numbers place it, and both are measured off the game's
+ * own 800x600 screens (five rows of the main menu, four of the quick-race page,
+ * and every one of the nine agrees to the pixel):
+ *
+ *   the plate's TOP EDGE lands 3 px above the bar's, so it stands proud of it
+ *   top and bottom -- the silver tray the bars sit on;
+ *   the plate's TIP lands 7 px right of the bar's own left cap.
+ *
+ * THE FIRST BUILD DREW IT INVISIBLE. It squeezed the whole 64-row cell into a
+ * 44 px box, which makes the 39-row plate 27 px -- SHORTER than the 31 px bar --
+ * and put all nine of them entirely behind the bars they belong under. The
+ * screen had bars floating on bare orange where the original has a tray.
+ *
+ * MM_WEDGE_TIP_U is each cell's own tip column, read off the alpha at plate row
+ * 13; anchoring on it is what makes one placement rule serve nine textures.
+ */
+#define MM_WEDGE_CELL 64.f     /* the cell's height, drawn 1:1 in the design frame */
+#define MM_WEDGE_TOP  12.f     /* the plate's first opaque row, of 64 */
+#define MM_WEDGE_RISE  3.f     /* how far the plate stands above the bar's top */
+#define MM_WEDGE_TIP   7.f     /* how far its tip stands right of the bar's cap */
+static const float MM_WEDGE_TIP_U[9] = {
+    36.f, 61.f, 80.f, 94.f, 103.f, 107.f, 105.f, 99.f, 76.f
+};
 
-/* THE HEADER, top left: HeaderSkin's first cell, whose plate is 242 of 256 wide
-   and 40 of 64 tall. Drawn off the left edge so its rounded cap is cut the way
-   the screenshot's is. */
-#define MM_HDR_X   -8.f
-#define MM_HDR_Y    28.f
-/* THE TITLE, 5 SCREEN pixels lower than the bar's own 18% put it. Asked for in
-   screen pixels on a 544-tall panel, so 5 / (544/600) = 5.5 here -- every
-   constant in this file is in the 800x600 frame and a raw 5 would move it 4.5
-   px on the panel it was judged on. */
-#define MM_HDR_TEXT_DY 5.5f
-#define MM_HDR_W   262.f
-#define MM_HDR_H    66.f
+/* THE HEADER, top left: TWO of HeaderSkin's three cells, one on the other.
+ *
+ * The port drew the red plate alone and the original does not: under it is the
+ * PLAIN SILVER BAR -- the same third cell the Quit button already sits on --
+ * and it is 12 texels wider and 10 taller, so it shows as a rim along the top
+ * and a thick rounded cap on the right. Without it the header ended in a bare
+ * red cap and read as the wrong shape.
+ *
+ * AND IT IS THE SECOND RED CELL, not the first. HeaderSkin carries the header
+ * twice, v 12..51 with a RED triangle and v 76..115 with a WHITE one, and every
+ * shot of the real menu has the white one.
+ *
+ * AT THE ART'S OWN PIXEL SIZE, which the first build stretched: measured off
+ * the 800x600 screen, the atlas's left edge sits at x -10 (so the rounded left
+ * cap is cut the way the original's is), the silver's 50 rows run y 23..73 and
+ * the red's 40 run y 28..68. That puts the red plate's right cap at 231 and the
+ * silver's at 243, which is where the screenshot has them, 11 px apart. */
+#define MM_HDR_X   (-10.f)
+#define MM_HDR_W    256.f      /* 1:1 -- the cell is not stretched to a box */
+#define MM_HDR_SIL_Y  23.f
+#define MM_HDR_SIL_H  50.f
+#define MM_HDR_RED_Y  28.f
+#define MM_HDR_RED_H  40.f
+/* THE TITLE IS RIGHT-ALIGNED AGAINST THE TRIANGLE, which is baked into the cell
+   at texel 206; the original leaves 9 px of red between the last letter and it.
+   The first build left-aligned it at 24% of a stretched box, which on a 960
+   wide panel opened a hand's width of empty bar between the word and the ▼. */
+#define MM_HDR_TEXT_R (206.f - 9.f)
+/* and 2 screen pixels above the plate's own centre, which is where the ink is. */
+#define MM_HDR_TEXT_DY (-2.f)
 
 /* THE CAR VIEWPORT'S NUDGE, off dlgRACESUM's own (306, 254): 20 screen pixels
  * left and 30 down, asked for by eye on the 960x544 panel.
@@ -192,6 +239,98 @@ static const float MM_SM_X[4] = { 16.f, 121.f, 437.f, 542.f };
 #define MM_V_GREY    (192.f / 256.f)
 #define MM_V_CELL    (32.f / 256.f)
 
+/* RadioButtonsTextures' three 256x32 cells, over a 256x128 atlas: red with a
+   dark DOT, red with a white one, and grey. THE QUICK-RACE PAGE'S FIRST THREE
+   ROWS ARE RADIO BUTTONS -- they pick which of the four sibling dialogs is up,
+   and the game's own shot of that page has a dot on Race summary, Map and info
+   and Track stats and an ARROW on Garage, which is the only one of the four
+   that goes somewhere else. The port drew all four off ButtonsTextures and had
+   four arrows; this texture is in the pack for exactly this. */
+#define MM_V_RAD      (0.f / 128.f)
+#define MM_V_RAD_ON   (32.f / 128.f)
+#define MM_V_RAD_OFF  (64.f / 128.f)
+#define MM_V_RAD_CELL (32.f / 128.f)
+
+/* --------------------------------------------- the engine's own button curves
+ *
+ * Splines/ButtonFocSpline.spl, ButtonUnFocSpline.spl and ButtonEnterSpline.spl,
+ * SHIPPED and read off rather than invented. Each file is a count and then that
+ * many chains of four `<t> <value>' control points -- a cubic Bezier in both
+ * axes, t running 0..1 across the whole chain -- so a value is found by solving
+ * the t axis for the parameter and reading the other axis off it.
+ *
+ * WHAT THE VALUE MEANS is not in the file, and the screen says it. On the game's
+ * own quick-race shot the three unfocused rows each put their left cap exactly
+ * MM_WEDGE_TIP left of their wedge's tip; the FOCUSED row's cap stands 23 px
+ * further out than that. ButtonFocSpline settles at 0.361, and 23 / 0.361 = 64
+ * -- the button cell's own height, and the unit the rest of the curve is in.
+ *
+ * So a focused button SLIDES OUT to the left by MM_SLIDE * spline(t), through an
+ * overshoot of 50 px (0.789) on the way. ButtonUnFocSpline runs the other way
+ * and dips to -0.754, the bar pulling IN past its rest before it stops, and
+ * ButtonEnterSpline is the PRESS: it starts where a focused button stands and
+ * recoils through the same dip. The wedge under a row does not move with any of
+ * it -- on the original's screen the focused bar runs out over a wedge that
+ * stayed where it was, which is how the 23 px was measurable in the first place.
+ */
+#define MM_SLIDE      64.f     /* the cell height, which is the curves' unit */
+/* WHERE ButtonFocSpline SETTLES, i.e. how far a focused -- or, on the pages
+   whose bars are radio buttons, a SELECTED -- row stands out: 0.361 * 64 is
+   23 px. Measured on the quick-race page's own bars at 25 and 28 and on the
+   Garage's at 26; the spline is what says 0.361. */
+#define MM_SETTLED    0.361f
+#define MM_ANIM_FOC   0.30f    /* seconds a focus or unfocus takes */
+#define MM_ANIM_PRESS 0.26f    /* seconds a press takes */
+
+static const float MM_SPL_FOC[16][2] = {
+    { 0.000f,  0.000f }, { 0.141f,  0.000f }, { 0.286f, -0.009f }, { 0.348f, 0.143f },
+    { 0.348f,  0.143f }, { 0.410f,  0.295f }, { 0.447f,  0.789f }, { 0.520f, 0.728f },
+    { 0.520f,  0.728f }, { 0.592f,  0.666f }, { 0.608f,  0.377f }, { 0.670f, 0.366f },
+    { 0.670f,  0.366f }, { 0.733f,  0.355f }, { 0.945f,  0.364f }, { 1.000f, 0.361f }
+};
+static const float MM_SPL_UNFOC[12][2] = {
+    { 0.000f,  0.361f }, { 0.159f,  0.395f }, { 0.252f, -0.754f }, { 0.402f, -0.699f },
+    { 0.402f, -0.699f }, { 0.552f, -0.644f }, { 0.677f, -0.007f }, { 0.779f,  0.000f },
+    { 0.779f,  0.000f }, { 0.881f,  0.006f }, { 0.934f, -0.003f }, { 1.000f, -0.001f }
+};
+static const float MM_SPL_ENTER[12][2] = {
+    { 0.000f,  0.355f }, { 0.059f,  0.388f }, { 0.252f, -0.754f }, { 0.402f, -0.699f },
+    { 0.402f, -0.699f }, { 0.552f, -0.644f }, { 0.677f, -0.007f }, { 0.779f,  0.000f },
+    { 0.779f,  0.000f }, { 0.881f,  0.006f }, { 0.934f, -0.003f }, { 1.000f, -0.001f }
+};
+
+static float mm_bez(float a, float b, float c, float d, float u)
+{
+    const float v = 1.f - u;
+    return v * v * v * a + 3.f * v * v * u * b + 3.f * v * u * u * c
+         + u * u * u * d;
+}
+
+/* One of the three curves at time `t'. The t axis is monotone inside a segment,
+   so the parameter is bisected out of it rather than assumed to equal t -- the
+   control points are NOT evenly spaced in t and reading the value off u = t
+   flattens the overshoot the artists drew. */
+static float mm_spline(const float (*p)[2], int nseg, float t)
+{
+    int s, i;
+    float lo = 0.f, hi = 1.f, u;
+
+    if (!(t > 0.f))  return p[0][1];
+    if (t >= 1.f)    return p[nseg * 4 - 1][1];
+    for (s = 0; s < nseg - 1; s++)
+        if (t <= p[s * 4 + 3][0])
+            break;
+    p += s * 4;
+    for (i = 0; i < 20; i++) {
+        u = (lo + hi) * 0.5f;
+        if (mm_bez(p[0][0], p[1][0], p[2][0], p[3][0], u) < t)
+            lo = u;
+        else
+            hi = u;
+    }
+    return mm_bez(p[0][1], p[1][1], p[2][1], p[3][1], (lo + hi) * 0.5f);
+}
+
 /* THE FRAME IS 768 x 768 AND IT DOES NOT STRETCH TO THE WINDOW.
  *
  * The four Podl tiles reassemble into one 768x768 picture (mainmenu.h), and the
@@ -316,35 +455,196 @@ static void mm_gbox(const mmframe *f, float ax, float x, float y,
 #define MM_Q_BULLET 14.f
 #define MM_Q_BULLET_GAP 20.f
 
+/* THE PITCH OF A MULTI-LINE BLURB, and it is NOT the control's height divided
+   by its lines. dlgMAPINFO's staticTrackInfo is 156 tall over five lines (31.2)
+   and dlgSTAT's is 73 over three (24.3), and on the game's own screenshots BOTH
+   set their lines 25 design pixels apart -- so the pitch is the font's, not the
+   box's, and the box is simply generous on one page. Measured off the five lines
+   of Surf's description and the three of its short one. */
+#define MM_LINE_H 25.f
+
 /* The page's own right-hand column sits in the main menu's first four measured
    row positions, so its bars and wedges land on the oval with nothing new to
-   get wrong -- the one thing here that is the port's and not the .ini's. */
+   get wrong -- the one thing here that is the port's and not the .ini's. The
+   four words are the string table's own, 10015..10017 and 10052. */
 static const char *const MM_QB_NAME[MM_QB_N] = {
-    "Race summary", "Map and info", "Track stats", "Garage"
+    STR_UI_RACE_SUMMARY, STR_UI_MAP_AND_INFO, STR_UI_TRACK_STATS, STR_UI_GARAGE
 };
 
-/* Each enum's rectangle and its SE split, straight out of dlgRACESUM.ini. */
-static const float MM_Q_RECT[MM_Q_N_ROWS][5] = {
-    { DLG_RACESUM_enumTrackX0, DLG_RACESUM_enumTrackY0,
-      DLG_RACESUM_enumTrackSX, DLG_RACESUM_enumTrackSY,
-      DLG_RACESUM_enumTrackSE },
-    { DLG_RACESUM_enumNLapsX0, DLG_RACESUM_enumNLapsY0,
-      DLG_RACESUM_enumNLapsSX, DLG_RACESUM_enumNLapsSY,
-      DLG_RACESUM_enumNLapsSE },
-    { DLG_RACESUM_enumSkillX0, DLG_RACESUM_enumSkillY0,
-      DLG_RACESUM_enumSkillSX, DLG_RACESUM_enumSkillSY,
-      DLG_RACESUM_enumSkillSE },
-    { DLG_RACESUM_enumCarX0, DLG_RACESUM_enumCarY0,
-      DLG_RACESUM_enumCarSX, DLG_RACESUM_enumCarSY,
-      DLG_RACESUM_enumCarSE },
+const int MM_QB_PAGE[MM_QB_N] = {
+    MM_PAGE_QUICK, MM_PAGE_MAPINFO, MM_PAGE_STATS,
+    MM_PAGE_GARAGE              /* dlgSETCAR -- and it is built now */
 };
 
-static const char *const MM_Q_LABEL[MM_Q_N_ROWS] = {
-    /* enumTrack and enumCar have no label of their own -- the photograph and
-       the car ARE the value, and the word `Car' on screen is staticCarName,
-       which is a control in its own right. */
-    "", "Number of laps", "Opponents skill", ""
+/* AN ENUM ROW, and the same four numbers describe one on any of the three
+   pages: the .ini rectangle, its SE split and the label to its left (empty for
+   the three whose VALUE is a picture and which therefore have no label). */
+typedef struct {
+    float x0, y0, sx, sy, se;
+    const char *label;
+} mm_enum;
+
+/* The pages' enums, each straight out of its own dlg*.ini. Indexed by
+   MM_PAGE_*, so MM_PAGE_MAIN's empty row is deliberate -- the main menu is not
+   one of these and has no enums. */
+static const mm_enum MM_Q_ENUM[MM_N_PAGES][MM_Q_N_ROWS] = {
+    /* MM_PAGE_MAIN -- none */
+    { { 0.f, 0.f, 0.f, 0.f, 0.f, "" } },
+    /* MM_PAGE_QUICK -- dlgRACESUM's four */
+    { { DLG_RACESUM_enumTrackX0, DLG_RACESUM_enumTrackY0,
+        DLG_RACESUM_enumTrackSX, DLG_RACESUM_enumTrackSY,
+        DLG_RACESUM_enumTrackSE, "" },
+      { DLG_RACESUM_enumNLapsX0, DLG_RACESUM_enumNLapsY0,
+        DLG_RACESUM_enumNLapsSX, DLG_RACESUM_enumNLapsSY,
+        DLG_RACESUM_enumNLapsSE, STR_UI_N_LAPS },
+      { DLG_RACESUM_enumSkillX0, DLG_RACESUM_enumSkillY0,
+        DLG_RACESUM_enumSkillSX, DLG_RACESUM_enumSkillSY,
+        DLG_RACESUM_enumSkillSE, STR_UI_SKILL },
+      { DLG_RACESUM_enumCarX0, DLG_RACESUM_enumCarY0,
+        DLG_RACESUM_enumCarSX, DLG_RACESUM_enumCarSY,
+        DLG_RACESUM_enumCarSE, "" } },
+    /* MM_PAGE_MAPINFO -- the track picker over the description, and the
+       screenshot picker under the strip. Both are all value, no label: the
+       track's NAME sits between the first pair and the word `Screenshots' is
+       staticShortListText, a control of its own to the left. */
+    { { DLG_MAPINFO_shotTrackEnumX0, DLG_MAPINFO_shotTrackEnumY0,
+        DLG_MAPINFO_shotTrackEnumSX, DLG_MAPINFO_shotTrackEnumSY, 0.f, "" },
+      { DLG_MAPINFO_enumShotX0, DLG_MAPINFO_enumShotY0,
+        DLG_MAPINFO_enumShotSX, DLG_MAPINFO_enumShotSY, 0.f, "" } },
+    /* MM_PAGE_STATS -- `Sort results by', whose label is staticShowResult and
+       therefore also not the enum's own. */
+    { { DLG_STAT_enumStatTypeX0, DLG_STAT_enumStatTypeY0,
+        DLG_STAT_enumStatTypeSX, DLG_STAT_enumStatTypeSY, 0.f, "" } },
 };
+static const int MM_Q_NENUM[MM_N_PAGES] = { 0, 4, 2, 1 };
+
+/* ------------------------------------------------- dlgMAPINFO's shot list
+ *
+ * FIVE SCREENSHOTS PER TRACK, and the pack has carried them since the beginning
+ * as shot_<track>_0..4 -- this port loaded the first of the five and these notes
+ * called the other four absent. `shotList' is the SELECTED one, at its own
+ * (349, 387) 199x152; the rest are shrunk into the band the four Bound keys
+ * describe, y 402..478, and step outward from the selected one with `Space'
+ * between.
+ *
+ * A THUMBNAIL'S WIDTH IS NOT IN THE FILE and it is not a free choice: the band
+ * is 76 tall and the shot's own framed ink is 202 x 152, so a thumbnail that is
+ * not a squashed photograph is 76 * 202/152 = 101.0 wide. That drops the three
+ * to the left of the selection at 243, 137 and 31 -- and 31 is inside
+ * BoundL = 25 by six pixels, with the fourth slot outside it, which is exactly
+ * where the game's own screenshot puts them (measured 243, 136 and one running
+ * off the oval). The width falls out of the aspect and the aspect is the art's.
+ */
+#define MM_SHOTLIST_H  (DLG_MAPINFO_shotListBoundDn - DLG_MAPINFO_shotListBoundUp)
+#define MM_SHOTLIST_W  (MM_SHOTLIST_H * ((MM_SHOT_U1 - MM_SHOT_U0) \
+                                         / (MM_SHOT_V1 - MM_SHOT_V0)))
+
+/* -------------------------------------------------- dlgSTAT's results table
+ *
+ * dlgSTAT.ini gives the table's rectangle and NOTHING ELSE -- no `tableWidth%i',
+ * no header or item height, which dlgFINISH.ini does ship. So these five are
+ * measured off the game's own screenshot of the page, the same method the main
+ * menu's rows came from and the same one this file's header warns about:
+ *
+ *   the header's rule lands at y 237 and the four row rules at 265, 292, 319
+ *   and 347 -- a pitch of 27.3, which is 0.10 of the table's 273, and the same
+ *   0.10 for the header (dlgFINISH's own two are 0.10 and 0.15, so the shape of
+ *   the answer is the engine's);
+ *   the Player column's text starts at x 114, the middle column CENTRES on
+ *   312.5 and the Car column on 447.5 -- 0.060, 0.517 and 0.828 of the table's
+ *   434 from its own left edge;
+ *   the rule under each player name runs 114..252, so it stops 0.378 across.
+ *
+ * WHAT IS NOT MODELLED: the table's closing rule and the scrollbar's foot both
+ * land at 478 on the original and at Y0 + SY = 483 here. Five pixels, and it is
+ * not on the row grid either way, so there is no rule to recover from it. */
+#define MM_ST_HEAD_H   0.10f    /* of tableStatSY */
+#define MM_ST_ITEM_H   0.10f
+#define MM_ST_COL0     0.060f   /* of tableStatSX, the name's left edge */
+#define MM_ST_COL1     0.517f   /* the stat column's CENTRE */
+#define MM_ST_COL2     0.828f   /* the car column's centre */
+#define MM_ST_RULE0    0.378f   /* where the per-name rule stops */
+#define MM_ST_MARK     7.f      /* the row marker, design px right of X0 */
+
+/* THE SCROLLBAR, `scrollbar.csi': 256x64, eight 32-wide cells with 26 px of ink
+ * in each -- the TOP cap with an up-arrow in grey, red and hollow, the BOTTOM
+ * cap with a down-arrow in the same three, the red thumb, and the plain trough.
+ * Measured on the original at x 524..549 and y 237..478, which is the table's
+ * own right edge plus 2, the width of the art's ink, and the rows area.
+ *
+ * IT CANNOT MOVE IN THIS PORT and it is drawn anyway. REC_MAX_ROWS is 8 and
+ * nine rows fit, so the thumb is always full height -- but the bar is what the
+ * original draws in that same situation (its own screenshot has four rows and a
+ * bar), and the row cap is a decision that could change. */
+#define MM_SB_CELL_W   (32.f / 256.f)
+#define MM_SB_INK_W    26.f
+#define MM_SB_CAP_H    64.f
+#define MM_SB_GAP      2.f      /* between the table's right edge and the bar */
+#define MM_SB_THUMB_H  50.f
+
+/* ------------------------------------------------- dlgMAPINFO's map panel
+ *
+ * THE MAP IS DRAWN TWICE, and the shipped art is what says so. `trackmap_<n>'
+ * paints the ROUTE -- the ribbon, its arrows and its checkpoint discs -- at
+ * alpha 255 and paints everything else below it: the terrain and the water at
+ * 129..254, and a flat halo over the rest of the 512 at exactly 128. Held
+ * against the game's own screenshot of this page, pixel for pixel:
+ *
+ *   outside the panel the halo is NOT there -- the desktop reads (237,165,23),
+ *   its own orange, where the texture would have put (128,82,41);
+ *   outside the panel the ROUTE is there, at the texture's own colour;
+ *   inside the panel the terrain IS there, blended over that same desktop --
+ *   at one sample the texture's (72,56,79) at alpha 202 over the desktop gives
+ *   (107,79,67) and the screenshot has (108,83,61).
+ *
+ * So: the terrain is clipped to the panel and the route is not. One pass with
+ * the whole texture cannot do both. The route pass keys on 254/255, which is
+ * the artists' own division of the alpha channel and not a threshold picked by
+ * eye -- see ui_alpha_test.
+ *
+ * THE PANEL'S RECTANGLE IS MEASURED and dlgMAPINFO.ini does not carry it: the
+ * silver frame's four edges land at x 70..325 and y 100..352 on the 800x600
+ * original, found by thresholding for low-saturation bright pixels the way the
+ * main menu's own rows were. Its frame is `messagebox_empty', a 128x128 rounded
+ * rectangle with a silver rim and nothing inside it -- the one piece of the
+ * interface manifest that is a window rather than a bar.
+ *
+ * AND WHAT THE ORIGINAL PUTS INSIDE THAT PANEL IS NOT THIS TEXTURE. Held against
+ * the screenshot at the panel's own edge, where `trackmap_1' has only its flat
+ * halo -- (25, 4, 57) at alpha 128 -- the original reads (31, 71, 95), a
+ * saturated blue no blend of that halo over anything on this page produces. The
+ * control is called shotTrackVIEW, and dlgRACESUM's `animCar' next door is a
+ * live 3D viewport, so the likeliest reading is that this one is too: the level
+ * rendered from above into the panel, with the painted map over it. This port
+ * does not do that -- it would mean loading a 15 MB scene to change the
+ * carousel -- so the panel holds the painting alone, over the dark plate
+ * race_ui.c already puts under the same map in the HUD. The terrain and the
+ * route are the game's; the water is dimmer toward the panel's edges than the
+ * original's. known-issues.md.
+ */
+#define MM_MAP_X   70.f
+#define MM_MAP_Y  100.f
+#define MM_MAP_W  255.f
+#define MM_MAP_H  252.f
+#define MM_MAP_KEY (254.f / 255.f)   /* the route, and only the route */
+/* race_ui.h's RUI_PLATE_ALPHA, not included from here: mainmenu.c owns no HUD.
+   Without it the painting's own soft edge lets the graffiti desktop through and
+   the panel reads as a hole rather than as a window. */
+#define MM_MAP_PLATE 0.55f
+
+/* messagebox_empty IS HALF A FRAME. The 128x128 cell carries the rounded rim
+ * down its LEFT side -- both left corners and the top and bottom rails running
+ * off the right edge -- and nothing else; the interior and the whole right end
+ * are transparent. So it is meant to be MIRRORED, and stretching the cell over
+ * a 255 px panel instead multiplies its 27-texel corner radius by two, which is
+ * three times the ~20 px radius the original's panel actually has.
+ *
+ * Drawn as a nine-slice with the corners at the ART'S OWN size and only the
+ * rails stretched: four corners out of the left half (U mirrored for the right
+ * pair, V for the bottom pair), four rails out of a straight slice of each. */
+#define MM_MBE_CORNER 32.f      /* design px, and 32 of the cell's 128 texels */
+#define MM_MBE_CU     (32.f / 128.f)
+#define MM_MBE_RAIL   (40.f / 128.f)   /* a straight slice, past the corner */
 
 const int MM_LAPS[MM_N_LAPS] = { 3, 5, 7 };
 
@@ -385,7 +685,14 @@ static const char *const MM_NAME[MM_N_ROWS] = {
 
 int mainmenu_row_live(int row)
 {
-    return row == MM_QUICK_RACE || row == MM_OPTIONS || row == MM_CREDITS;
+    /* CHANGE PLAYER IS LIVE NOW. It was one of the five drawn in the artists'
+       own grey because "this port does not read that format"; it does, so the
+       row opens the game's own Select player page (dlgPLRSCOMM). */
+    /* AND MULTIPLAYER IS LIVE NOW: it opens dlgMULTIPLAYER, which is Create
+       game and Join game over `net.c'. Championship, Ghost race and Demo play
+       are the three that are left in the artists' grey. */
+    return row == MM_QUICK_RACE || row == MM_CHANGE_PLAYER
+        || row == MM_MULTIPLAYER || row == MM_OPTIONS || row == MM_CREDITS;
 }
 
 const char *mainmenu_row_name(int row)
@@ -396,8 +703,10 @@ const char *mainmenu_row_name(int row)
     return MM_NAME[row];
 }
 
-/* The bar's rect on screen. The wedge under it is taller and starts further
-   left; the HIT BOX is the bar, because that is what the player is aiming at. */
+/* The bar's rect on screen AT REST. The wedge under it is taller and starts
+   further left; the HIT BOX is this rect, not the animated one, because a row
+   that is mid-slide is still the same button and a hit box that breathes is a
+   hit box that misses. */
 static void mm_bar_rect(const mmframe *f, int row,
                         float *x, float *y, float *w, float *h)
 {
@@ -405,6 +714,55 @@ static void mm_bar_rect(const mmframe *f, int row,
     *y = py(f, MM_CY[row] - MM_BAR_H * 0.5f);
     *w = px(f, MM_BAR_R) - *x;
     *h = py(f, MM_CY[row] + MM_BAR_H * 0.5f) - *y;
+}
+
+float mainmenu_row_slide(const mainmenu_t *m, int row)
+{
+    if (!m || row < 0)
+        return 0.f;
+    if (row == m->press_row && m->press_t >= 0.f)
+        return MM_SLIDE * mm_spline(MM_SPL_ENTER, 3,
+                                    m->press_t / MM_ANIM_PRESS);
+    if (row == m->focus)
+        return MM_SLIDE * mm_spline(MM_SPL_FOC, 4, m->anim_t / MM_ANIM_FOC);
+    if (row == m->anim_prev)
+        return MM_SLIDE * mm_spline(MM_SPL_UNFOC, 3, m->anim_t / MM_ANIM_FOC);
+    return 0.f;
+}
+
+/* The bar as DRAWN: the rest rect with its left cap pulled out by the slide.
+   Only the cap moves -- the right end is the screen edge on every row, so the
+   label, which is right-aligned, does not walk about while a row animates. */
+static void mm_bar_draw_rect(const mainmenu_t *m, const mmframe *f, int row,
+                             float slide,
+                             float *x, float *y, float *w, float *h)
+{
+    (void)m;
+    mm_bar_rect(f, row, x, y, w, h);
+    *x -= px(f, slide);
+    *w += px(f, slide);
+}
+
+/* THE WEDGE UNDER ONE ROW, anchored on its own tip. It does not take the slide:
+   see MM_SPL_*. The right edge is carried to MM_BAR_R where the cell would stop
+   short of it -- a tip column of 99 leaves the plate 8 px shy of the frame's
+   edge, and those 8 px are the only ones the bar does not cover. */
+static void mm_draw_wedge(const mainmenu_t *m, const mmframe *f, int row)
+{
+    const float top = MM_CY[row] - MM_BAR_H * 0.5f
+                      - MM_WEDGE_RISE - MM_WEDGE_TOP;
+    float x0, x1;
+
+    if (row < 0 || row >= 9 || !m->tex.wedge[row])
+        return;
+    x0 = MM_X0[row] + MM_WEDGE_TIP - MM_WEDGE_TIP_U[row];
+    x1 = x0 + 256.f;
+    if (x1 < MM_BAR_R)
+        x1 = MM_BAR_R;
+    ui_image(px(f, x0), py(f, top),
+             px(f, x1) - px(f, x0),
+             py(f, top + MM_WEDGE_CELL) - py(f, top),
+             m->tex.wedge[row], 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
 }
 
 static void mm_race_rect(const mmframe *f, float *x, float *y,
@@ -472,32 +830,147 @@ int mainmenu_row_at(const mainmenu_t *m, int screen_w, int screen_h,
 
 /* An enum's two arrows on screen. `back' is the one at the SE split, `fwd' the
    one at the far end; both are MM_Q_ARROW square and centred on the row. */
-static void mm_q_arrows(const mmframe *f, int row,
+static void mm_q_arrows(const mmframe *f, int page, int row,
                         float *bx, float *fx, float *ay, float *sz)
 {
-    const float *R = MM_Q_RECT[row];
+    const mm_enum *e = &MM_Q_ENUM[page][row];
     *sz = MM_Q_ARROW * f->us;
-    *ay = py(f, R[1] + R[3] * 0.5f) - *sz * 0.5f;
-    *bx = px(f, R[0] + R[2] * R[4]);
-    *fx = px(f, R[0] + R[2]) - *sz;
+    *ay = py(f, e->y0 + e->sy * 0.5f) - *sz * 0.5f;
+    *bx = px(f, e->x0 + e->sx * e->se);
+    *fx = px(f, e->x0 + e->sx) - *sz;
+}
+
+/* THE FOCUS RING OF ONE SIBLING PAGE, in the order the pad walks it: the page's
+   own enums down the left, then the four navigation bars down the right, then
+   the green Race button, then Main menu. The Garage bar is in the ring's TABLE
+   and is skipped by mainmenu_q_stop's caller the way the main menu skips its
+   five dead rows -- a focus that lands somewhere it cannot act reads as the pad
+   being broken. */
+static int mm_q_ring(int page, int *out)
+{
+    int n = 0, i;
+
+    if (page < 0 || page >= MM_N_PAGES)
+        return 0;
+    for (i = 0; i < MM_Q_NENUM[page]; i++)
+        out[n++] = i;
+    for (i = 0; i < MM_QB_N; i++)
+        if (MM_QB_PAGE[i] >= 0)
+            out[n++] = MM_Q_NAV + i;
+    out[n++] = MM_Q_RACE;
+    out[n++] = MM_Q_BACK;
+    return n;
+}
+
+int mainmenu_q_nfocus(int page)
+{
+    int ring[MM_Q_N_FOCUS];
+    return mm_q_ring(page, ring);
+}
+
+int mainmenu_q_stop(int page, int i)
+{
+    int ring[MM_Q_N_FOCUS];
+    const int n = mm_q_ring(page, ring);
+    if (n <= 0)
+        return -1;
+    while (i < 0) i += n;
+    return ring[i % n];
+}
+
+/* Where `focus' sits in the ring, or 0 if it is not on this page at all --
+   which is what a page switch leaves behind, and starting the new page at its
+   first stop is the right answer to it. */
+static int mm_q_index(int page, int focus)
+{
+    int ring[MM_Q_N_FOCUS];
+    const int n = mm_q_ring(page, ring);
+    int i;
+    for (i = 0; i < n; i++)
+        if (ring[i] == focus)
+            return i;
+    return 0;
+}
+
+/* ONE SLOT'S BOX in the shot list, in design pixels, and WHICH SHOT IS IN IT.
+ *
+ * THE LIST WRAPS. `slot' is an offset from the selection, -3..+1, and the shot
+ * it shows is (selected + slot) MODULO five -- the same ring the main menu's
+ * carousel walks. The game's own screenshot of this page is what says so: its
+ * big slot holds shot_beach1_0, the default, and to its LEFT stand 2, 3 and 4
+ * in that order with 1 to its right. Read as absolute indices instead, the
+ * strip came out rotated by two and the big picture was the wrong photograph.
+ *
+ * The selected slot is the big rectangle; the rest step outward from it and are
+ * dropped when they fall outside the list's own bounds, which is what leaves
+ * three thumbnails to the left and one to the right. */
+static int mm_shot_slot(const mainmenu_t *m, int slot, int *shot,
+                        float *x, float *y, float *w, float *h)
+{
+    const float pitch = MM_SHOTLIST_W + DLG_MAPINFO_shotListSpace;
+    const int d = slot;
+
+    if (shot)
+        *shot = ((m->shot + slot) % MM_N_SHOTS + MM_N_SHOTS) % MM_N_SHOTS;
+    if (slot <= -MM_N_SHOTS || slot >= MM_N_SHOTS)
+        return 0;
+    if (d == 0) {
+        *x = DLG_MAPINFO_shotListX0;
+        *y = DLG_MAPINFO_shotListY0;
+        *w = DLG_MAPINFO_shotListSX;
+        *h = DLG_MAPINFO_shotListSY;
+        return 1;
+    }
+    *y = DLG_MAPINFO_shotListBoundUp;
+    *w = MM_SHOTLIST_W;
+    *h = MM_SHOTLIST_H;
+    if (d < 0)
+        *x = DLG_MAPINFO_shotListX0 - DLG_MAPINFO_shotListSpace
+             + (float)d * pitch + (pitch - MM_SHOTLIST_W);
+    else
+        *x = DLG_MAPINFO_shotListX0 + DLG_MAPINFO_shotListSX
+             + DLG_MAPINFO_shotListSpace + (float)(d - 1) * pitch;
+    return *x >= DLG_MAPINFO_shotListBoundL
+        && *x + *w <= DLG_MAPINFO_shotListBoundR;
+}
+
+int mainmenu_shot_at(const mainmenu_t *m, int screen_w, int screen_h,
+                     float x, float y)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    int slot;
+
+    if (!m || m->page != MM_PAGE_MAPINFO)
+        return -1;
+    for (slot = -(MM_N_SHOTS - 1); slot < MM_N_SHOTS; slot++) {
+        float dx, dy, dw, dh, bx, by, bw, bh;
+        int sh;
+        if (!mm_shot_slot(m, slot, &sh, &dx, &dy, &dw, &dh))
+            continue;
+        mm_box(&f, dx, dy, dw, dh, &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return sh;
+    }
+    return -1;
 }
 
 int mainmenu_q_row_at(const mainmenu_t *m, int screen_w, int screen_h,
                       float x, float y, int *left)
 {
     const mmframe f = mm_frame(screen_w, screen_h);
+    const int page = (m && MM_PAGE_IS_QUICK(m->page)) ? m->page : MM_PAGE_QUICK;
     float bx, by, bw, bh;
     int i;
 
-    (void)m;
     if (left) *left = 0;
-    for (i = 0; i < MM_Q_N_ROWS; i++) {
+    for (i = 0; i < MM_Q_NENUM[page]; i++) {
         float ax, fx, ay, sz;
-        mm_q_arrows(&f, i, &ax, &fx, &ay, &sz);
+        mm_q_arrows(&f, page, i, &ax, &fx, &ay, &sz);
         /* THE ARROWS ARE THE BUTTONS, and each is grown by half its own size so
            a thumb has something to hit -- 34 design px is 31 on a 544-tall
            panel, which is under the 9 mm a fingertip covers. The two boxes
-           cannot meet: the narrowest enum is enumCar's 304 px between them. */
+           cannot meet: the narrowest enum is dlgSTAT's enumStatType, 166 px
+           wide, which still leaves 98 between its two arrows. */
         if (touch_in(x, y, ax - sz * 0.25f, ay - sz * 0.25f,
                      sz * 1.5f, sz * 1.5f)) {
             if (left) *left = 1;
@@ -506,6 +979,15 @@ int mainmenu_q_row_at(const mainmenu_t *m, int screen_w, int screen_h,
         if (touch_in(x, y, fx - sz * 0.25f, ay - sz * 0.25f,
                      sz * 1.5f, sz * 1.5f))
             return i;
+    }
+    /* THE FOUR NAVIGATION BARS, on the main menu's own first four row rects --
+       the hit box is the bar AT REST, not the slid one, for the reason
+       mm_bar_rect gives. A DEAD bar still answers, so a touch on the Garage can
+       deny rather than do nothing. */
+    for (i = 0; i < MM_QB_N; i++) {
+        mm_bar_rect(&f, i, &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return MM_Q_NAV + i;
     }
     mm_race_rect(&f, &bx, &by, &bw, &bh);
     if (touch_in(x, y, bx, by, bw, bh))
@@ -571,15 +1053,53 @@ void mainmenu_init(mainmenu_t *m, const mainmenu_tex *tex)
         m->tex = *tex;
     m->focus = MM_QUICK_RACE;      /* the one live mode */
     m->qfocus = MM_Q_TRACK;
+    m->shot = 0;                   /* shot_<track>_0, the carousel's own */
+    m->stat = REC_STAT_BEST_LAP;
     m->laps = MM_LAPS_DEF;
     m->skill = 1;                  /* normal, which is what ai_init was passed */
     m->armed = -1;
+    /* the focus starts SETTLED, not sliding: the menu opens with Quick race
+       already out, the way the game's own screen is, rather than animating a
+       button in on the first frame the player sees. */
+    m->anim_t = MM_ANIM_FOC;
+    m->anim_prev = -1;
+    m->press_t = -1.f;
+    m->press_row = -1;
+    m->pfocus = MM_P_LIST;
+    m->parmed = -1;
+    m->marmed = -1;
+    m->psort = MM_SORT_SCORE;
+    /* The Garage's own state. `gskins' is 1 rather than 0 because it is a COUNT
+       and every wrap divides by it -- see garage_next_skin; the caller writes
+       the loaded car's real one after every load_car. */
+    m->gfocus = MM_G_TAB + MM_GB_SELECT;
+    m->gkind = GAR_BOOSTER;
+    m->gsel = 0;
+    m->garmed = -1;
+    m->gskins = 1;
+    mainmenu_players_sync(m);
+}
+
+/* The focus moves, and both rows start animating: the one arriving on the focus
+   curve, the one leaving on the unfocus curve. One clock drives the pair. */
+static void mm_set_focus(mainmenu_t *m, int row)
+{
+    if (row == m->focus)
+        return;
+    m->anim_prev = m->focus;
+    m->focus = row;
+    m->anim_t = 0.f;
 }
 
 /* ------------------------------------------------------------------ a step */
 
 static void mm_fire(mainmenu_t *m, int focus)
 {
+    /* THE PRESS ANIMATES whatever it lands on, live or not -- a denied button
+       that does not move under the thumb reads as a dropped input rather than
+       as a refusal. */
+    m->press_row = focus;
+    m->press_t = 0.f;
     switch (focus) {
     case MM_QUICK_RACE:
         /* THE SETUP SCREEN, not the race. dlgRACESUM is what this button opens
@@ -590,6 +1110,16 @@ static void mm_fire(mainmenu_t *m, int focus)
         break;
     case MM_FOCUS_RACE:
         m->action = MM_ACT_RACE;
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_CHANGE_PLAYER:
+        mainmenu_open_players(m, player_count() == 0);
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_MULTIPLAYER:
+        /* dlgMULTIPLAYER. Like Quick race, the button opens the SETUP and not a
+           race; nothing has touched the socket yet. */
+        mainmenu_open_multi(m);
         m->cue = MM_CUE_PRESS;
         break;
     case MM_OPTIONS:
@@ -620,9 +1150,29 @@ static void mm_move_track(mainmenu_t *m, int dir)
 
 /* One step of an enum: `d` is +1 or -1, wrapping. Every row wraps, including
    Laps -- one press past nine is one, which is what every picker in menu.c does
-   except the two volumes, and for the same reason: there is no "off" here. */
+   except the two volumes, and for the same reason: there is no "off" here.
+   `row' is an index into the CURRENT page's enums, so the same 0 is the track
+   picker on two pages and the sort key on the third. */
 static void mm_q_move(mainmenu_t *m, int row, int d)
 {
+    if (row < 0 || row >= MM_Q_NENUM[m->page])
+        return;
+    if (m->page == MM_PAGE_MAPINFO) {
+        if (row == MM_Q_MI_TRACK) {
+            m->track += d;
+            while (m->track < 0) m->track += N_TRACKS;
+            while (m->track >= N_TRACKS) m->track -= N_TRACKS;
+        } else {
+            m->shot = (m->shot + d + MM_N_SHOTS) % MM_N_SHOTS;
+        }
+        m->cue = MM_CUE_ARROW;
+        return;
+    }
+    if (m->page == MM_PAGE_STATS) {
+        m->stat = (m->stat + d + REC_N_STAT) % REC_N_STAT;
+        m->cue = MM_CUE_ARROW;
+        return;
+    }
     switch (row) {
     case MM_Q_TRACK:
         m->track += d;
@@ -648,33 +1198,76 @@ static void mm_q_move(mainmenu_t *m, int row, int d)
     m->cue = MM_CUE_ARROW;
 }
 
+/* Open one of the four sibling views. THE FOCUS STAYS ON THE BAR that opened
+   it, rather than jumping to the new page's first control: the player is walking
+   the tabs, and a focus that leaves the column after every press makes the
+   second tab two presses away. It is also what the game's own screenshots of
+   these two pages show -- every enum arrow on both of them is at rest.
+ *
+   THE GARAGE IS THE EXCEPTION, because it is not a view of this race: it is a
+   screen of its own with its own header, its own four bars and its own focus
+   ring, so it is opened rather than switched to -- which is exactly why the
+   game's own shot of this page draws an ARROW on that bar and a dot on the
+   other three. */
+static void mm_q_nav(mainmenu_t *m, int bar)
+{
+    if (bar < 0 || bar >= MM_QB_N)
+        return;
+    if (MM_QB_PAGE[bar] == MM_PAGE_GARAGE) {
+        mainmenu_open_garage(m, -1);
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    m->page = MM_QB_PAGE[bar];
+    m->qfocus = MM_Q_NAV + bar;
+    m->cue = MM_CUE_PRESS;
+}
+
+/* What the focused stop does when CROSS lands on it. */
+static void mm_q_fire(mainmenu_t *m, int focus)
+{
+    if (focus == MM_Q_RACE) {
+        m->action = MM_ACT_RACE;
+        m->cue = MM_CUE_PRESS;
+    } else if (focus == MM_Q_BACK) {
+        m->page = MM_PAGE_MAIN;
+        m->cue = MM_CUE_PRESS;
+    } else if (focus >= MM_Q_NAV) {
+        mm_q_nav(m, focus - MM_Q_NAV);
+    } else {
+        mm_q_move(m, focus, +1);   /* CROSS on a picker steps it */
+    }
+}
+
 static void mm_step_quick(mainmenu_t *m, unsigned int down,
                           const touch_state *tp, int screen_w, int screen_h)
 {
+    const int page = m->page;
+    const int n = mainmenu_q_nfocus(page);
+
+    if (n <= 0)
+        return;
     if (down & SCE_CTRL_DOWN) {
-        m->qfocus = (m->qfocus + 1) % MM_Q_N_FOCUS;
+        m->qfocus = mainmenu_q_stop(page, mm_q_index(page, m->qfocus) + 1);
         m->cue = MM_CUE_FOCUS;
     }
     if (down & SCE_CTRL_UP) {
-        m->qfocus = (m->qfocus + MM_Q_N_FOCUS - 1) % MM_Q_N_FOCUS;
+        m->qfocus = mainmenu_q_stop(page, mm_q_index(page, m->qfocus) - 1);
         m->cue = MM_CUE_FOCUS;
     }
     if (down & SCE_CTRL_LEFT)  mm_q_move(m, m->qfocus, -1);
     if (down & SCE_CTRL_RIGHT) mm_q_move(m, m->qfocus, +1);
-    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
-        if (m->qfocus == MM_Q_RACE) {
-            m->action = MM_ACT_RACE;
-            m->cue = MM_CUE_PRESS;
-        } else if (m->qfocus == MM_Q_BACK) {
-            m->page = MM_PAGE_MAIN;
-            m->cue = MM_CUE_PRESS;
-        } else {
-            mm_q_move(m, m->qfocus, +1);   /* CROSS on a picker steps it */
-        }
-    }
-    /* CIRCLE is back, everywhere. */
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mm_q_fire(m, m->qfocus);
+    /* CIRCLE is back, everywhere. From a sibling view it goes to Race summary
+       first and only then to the main menu, because that is the screen the
+       player opened it from -- one CIRCLE per step in, the way every other back
+       button in this app behaves. */
     if (down & SCE_CTRL_CIRCLE) {
-        m->page = MM_PAGE_MAIN;
+        if (page != MM_PAGE_QUICK)
+            mm_q_nav(m, MM_QB_SUMMARY);
+        else
+            m->page = MM_PAGE_MAIN;
         m->cue = MM_CUE_PRESS;
     }
 
@@ -688,28 +1281,53 @@ static void mm_step_quick(mainmenu_t *m, unsigned int down,
             m->qfocus = m->armed;
             m->cue = MM_CUE_FOCUS;
         }
+        /* A SCREENSHOT IS A BUTTON TOO, and the selected one is not -- the same
+           rule the main menu's carousel follows, and the same reason: tapping
+           the picture you are looking at should do nothing. */
+        {
+            const int sh = mainmenu_shot_at(m, screen_w, screen_h, tp->x, tp->y);
+            if (sh >= 0 && sh != m->shot) {
+                m->shot = sh;
+                m->cue = MM_CUE_ARROW;
+            }
+        }
     }
     if (tp->released) {
         int left;
         const int row = mainmenu_q_row_at(m, screen_w, screen_h,
                                           tp->x, tp->y, &left);
         if (row >= 0 && row == m->armed) {
-            if (row == MM_Q_RACE) {
-                m->action = MM_ACT_RACE;
-                m->cue = MM_CUE_PRESS;
-            } else if (row == MM_Q_BACK) {
-                m->page = MM_PAGE_MAIN;
-                m->cue = MM_CUE_PRESS;
-            } else {
+            if (row < MM_Q_RACE) {
                 /* THE BAR'S OWN TRIANGLE GOES BACK, the rest goes on -- so one
                    row walks both ways under a thumb and neither direction needs
                    a second control. */
                 mm_q_move(m, row, left ? -1 : +1);
+            } else {
+                mm_q_fire(m, row);
             }
         }
         m->armed = -1;
     }
 }
+
+/* dlgPLRSCOMM's own step, defined with the rest of that page below -- it needs
+   the layout helpers the drawing half is written against. So are the Garage's
+   own step and the modal machinery both pages share. */
+static void mm_step_players(mainmenu_t *m, unsigned int down,
+                            const touch_state *tp, int screen_w, int screen_h);
+static void mm_step_garage(mainmenu_t *m, unsigned int down,
+                           const touch_state *tp, int screen_w, int screen_h);
+static void mm_step_multi(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h);
+static void mm_step_lobby(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h);
+/* The server list's own modal, defined with the roster page's panel because it
+   stands on that panel's rectangle. */
+static void mm_s_step(mainmenu_t *m, unsigned int down, const touch_state *tp,
+                      int screen_w, int screen_h);
+static void mm_s_draw(const mainmenu_t *m, const mmframe *f);
+static void mm_step_modal(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h);
 
 void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
                    int screen_w, int screen_h, float dt)
@@ -721,6 +1339,22 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
     m->action = MM_ACT_NONE;
     m->cue = MM_CUE_NONE;
     m->t += dt;
+
+    /* THE ANIMATION CLOCKS. A press runs to its end and then HANDS BACK to the
+       focus curve -- Enter finishes at 0 and a focused button rests at 0.361,
+       so replaying Foc from zero is what carries it back out. That chain is the
+       engine's own: three splines, and Enter is the one with no resting value
+       of its own. */
+    m->anim_t += dt;
+    if (m->press_t >= 0.f) {
+        m->press_t += dt;
+        if (m->press_t > MM_ANIM_PRESS) {
+            m->press_t = -1.f;
+            m->press_row = -1;
+            m->anim_t = 0.f;
+            m->anim_prev = -1;
+        }
+    }
 
     down = buttons & ~m->prev_buttons;   /* edges only */
     m->prev_buttons = buttons;
@@ -735,17 +1369,53 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
         return;
     }
 
-    if (m->page == MM_PAGE_QUICK) {
+    /* A MODAL OWNS EVERY INPUT WHILE IT IS UP, on whichever page raised it --
+       the roster's three and the Garage's question are one machine now, so the
+       gate is here rather than inside one page's step. */
+    if (m->modal) {
+        /* THE SERVER LIST IS ITS OWN MODAL: a list and a Cancel, not a
+           question and not a keyboard, so it does not go through the roster's
+           Ok/Cancel machine. It still OWNS the frame, which is the only thing
+           every modal here has in common. */
+        if (m->modal == MM_MODAL_SERVERS)
+            mm_s_step(m, down, tp, screen_w, screen_h);
+        else
+            mm_step_modal(m, down, tp, screen_w, screen_h);
+        /* AND A JOIN THAT LANDED closes it, which the page below has to see --
+           so the multiplayer page's own step still runs under it. */
+        if (m->page == MM_PAGE_MULTI && net_mode_now() == NET_JOINED) {
+            m->modal = MM_MODAL_NONE;
+            mainmenu_open_lobby(m, MM_L_RACESUM);
+        }
+        return;
+    }
+    if (m->page == MM_PAGE_PLAYERS) {
+        mm_step_players(m, down, tp, screen_w, screen_h);
+        return;
+    }
+    if (MM_PAGE_IS_QUICK(m->page)) {
         mm_step_quick(m, down, tp, screen_w, screen_h);
+        return;
+    }
+    if (MM_PAGE_IS_CAR(m->page)) {
+        mm_step_garage(m, down, tp, screen_w, screen_h);
+        return;
+    }
+    if (m->page == MM_PAGE_MULTI) {
+        mm_step_multi(m, down, tp, screen_w, screen_h);
+        return;
+    }
+    if (m->page == MM_PAGE_LOBBY) {
+        mm_step_lobby(m, down, tp, screen_w, screen_h);
         return;
     }
 
     if (down & SCE_CTRL_DOWN) {
-        m->focus = mm_next_focus(m->focus, +1);
+        mm_set_focus(m, mm_next_focus(m->focus, +1));
         m->cue = MM_CUE_FOCUS;
     }
     if (down & SCE_CTRL_UP) {
-        m->focus = mm_next_focus(m->focus, -1);
+        mm_set_focus(m, mm_next_focus(m->focus, -1));
         m->cue = MM_CUE_FOCUS;
     }
     if (down & SCE_CTRL_LEFT)
@@ -767,7 +1437,7 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
         if (m->armed >= 0 && mm_focus_live(m->armed)) {
             if (m->focus != m->armed)
                 m->cue = MM_CUE_FOCUS;
-            m->focus = m->armed;
+            mm_set_focus(m, m->armed);
         }
         /* A PHOTOGRAPH IS A BUTTON TOO, and the centre one is not: tapping the
            selection again does nothing, tapping a neighbour walks the carousel
@@ -853,17 +1523,11 @@ static void mm_draw_rows(const mainmenu_t *m, const mmframe *f)
         const int live = mainmenu_row_live(i);
         const int lit = live && m->focus == i;
 
-        mm_bar_rect(f, i, &bx, &by, &bw, &bh);
-
-        /* The wedge first: it is behind the bar and taller, and its plate's top
-           row (12 of 64) is what the bar's top edge sits on. */
-        if (m->tex.wedge[i]) {
-            const float wh = py(f, MM_WEDGE_H);
-            const float wx = bx - px(f, MM_WEDGE_OVER);
-            ui_image(wx, by - wh * (MM_WEDGE_TOP / 64.f),
-                     px(f, MM_BAR_R) - wx, wh, m->tex.wedge[i],
-                     0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
-        }
+        /* The wedge first: it is behind the bar, taller, and it stays put
+           while the bar slides out over it. */
+        mm_draw_wedge(m, f, i);
+        mm_bar_draw_rect(m, f, i, mainmenu_row_slide(m, i),
+                         &bx, &by, &bw, &bh);
 
         v = !live ? MM_V_GREY : (lit ? MM_V_RED_F : MM_V_RED);
         if (m->tex.buttons)
@@ -894,8 +1558,37 @@ static void mm_draw_race(const mainmenu_t *m, const mmframe *f)
     mm_race_rect(f, &x, &y, &w, &h);
     /* 0 disabled, 1-2 the normal pair, 3-4 the focused pair -- the pairs are
        frames of the little car's wheels, not two moods. */
-    cell = ((m->page == MM_PAGE_QUICK) ? (m->qfocus == MM_Q_RACE)
-                                       : (m->focus == MM_FOCUS_RACE))
+    /* CELL 0 IS THE DISABLED PLATE, and the multiplayer front page is the one
+       screen that needs it: there is no game to race in until Create or Join
+       has made one, and the game's own screenshot of that page draws the button
+       grey. */
+    if (m->page == MM_PAGE_MULTI && !mainmenu_m_live(m, MM_M_RACE)) {
+        const sfont sf = sf_big(m->tex.font_big);
+        const float sc = f->us * MM_TS_RACE;
+        const float tx = x + w * 0.30f;
+        if (m->tex.race)
+            ui_image(x, y, w, h, m->tex.race, 0.f, 0.f, 1.f, 64.f / 512.f,
+                     1.f, 1.f, 1.f, 1.f);
+        else
+            ui_rect(x, y, w, h, 0.28f, 0.30f, 0.28f, 1.f);
+        /* AND IT KEEPS ITS WORD, dimmed to the 0.82 the main menu's dead rows
+           use -- the game's own screenshot of this page has `Race' on the grey
+           plate, and a button with no label reads as a button that failed to
+           draw. */
+        if (sf.tex)
+            sf_text(&sf, tx, y + (h - sf_h(&sf, sc)) * 0.5f, sc,
+                    0.82f, 0.82f, 0.84f, 1.f, STR_UI_RACE);
+        else
+            ui_text(tx, y + (h - ui_text_h(sc)) * 0.5f, sc,
+                    0.82f, 0.82f, 0.84f, 1.f, STR_UI_RACE);
+        return;
+    }
+    cell = (m->page == MM_PAGE_PLAYERS ? (m->pfocus == MM_P_RACE)
+            : (MM_PAGE_IS_QUICK(m->page) ? (m->qfocus == MM_Q_RACE)
+            : (MM_PAGE_IS_CAR(m->page) ? (m->gfocus == MM_G_RACE)
+            : (m->page == MM_PAGE_MULTI ? (m->mfocus_multi == MM_M_RACE)
+            : (m->page == MM_PAGE_LOBBY ? (m->lfocus == MM_LB_RACE)
+                                        : (m->focus == MM_FOCUS_RACE))))))
            ? 3 : 1;
     if ((int)(m->t / MM_RACE_ANIM) & 1)
         cell += 1;
@@ -912,19 +1605,27 @@ static void mm_draw_race(const mainmenu_t *m, const mmframe *f)
         const float tx = x + w * 0.30f;
         if (sf.tex)
             sf_text(&sf, tx, y + (h - sf_h(&sf, sc)) * 0.5f, sc,
-                    1.f, 1.f, 1.f, 1.f, "Race");
+                    1.f, 1.f, 1.f, 1.f, STR_UI_RACE);
         else
             ui_text(tx, y + (h - ui_text_h(sc)) * 0.5f, sc,
-                    1.f, 1.f, 1.f, 1.f, "Race");
+                    1.f, 1.f, 1.f, 1.f, STR_UI_RACE);
     }
 }
 
 static void mm_draw_quit(const mainmenu_t *m, const mmframe *f)
 {
     float x, y, w, h;
-    const int lit = (m->page == MM_PAGE_QUICK)
-                    ? (m->qfocus == MM_Q_BACK)
-                    : (m->focus == MM_FOCUS_QUIT);
+    const int lit = m->page == MM_PAGE_PLAYERS
+                    ? (m->pfocus == MM_P_CONTINUE)
+                    : (MM_PAGE_IS_QUICK(m->page)
+                       ? (m->qfocus == MM_Q_BACK)
+                    : (MM_PAGE_IS_CAR(m->page)
+                       ? (m->gfocus == MM_G_BACK)
+                    : (m->page == MM_PAGE_MULTI
+                       ? (m->mfocus_multi == MM_M_BACK)
+                    : (m->page == MM_PAGE_LOBBY
+                       ? (m->lfocus == MM_LB_BACK)
+                       : (m->focus == MM_FOCUS_QUIT)))));
 
     /* HeaderSkin's third cell is the plain silver bar the orange one sits on. */
     if (m->tex.header)
@@ -941,33 +1642,62 @@ static void mm_draw_quit(const mainmenu_t *m, const mmframe *f)
                  1.f, lit ? 64.f / 128.f : 32.f / 128.f, 1.f, 1.f, 1.f, 1.f);
     else
         ui_rect(x, y, w, h, 0.90f, 0.55f, 0.04f, 1.f);
+    /* THE BOTTOM-RIGHT BUTTON SAYS WHERE IT GOES, and on the car pages that is
+       BACK -- 10003, and the word on the game's own Garage screenshot. */
     mm_label(m, f, x, y, w, h,
-             m->page == MM_PAGE_QUICK ? "Main menu" : "Quit",
+             m->page == MM_PAGE_PLAYERS ? STR_UI_CONTINUE
+             : (MM_PAGE_IS_QUICK(m->page) ? STR_UI_MAIN_MENU
+             : (MM_PAGE_IS_CAR(m->page) ? STR_UI_BACK
+             : (m->page == MM_PAGE_MULTI ? STR_UI_MAIN_MENU
+             : (m->page == MM_PAGE_LOBBY ? STR_UI_DISCONNECT
+                                         : STR_UI_QUIT)))),
              1.f, 1.f, 1.f);
 }
 
 static void mm_draw_header(const mainmenu_t *m, const mmframe *f)
 {
-    const float x = px(f, MM_HDR_X), y = py(f, MM_HDR_Y);
+    const float x = px(f, MM_HDR_X);
     const float w = px(f, MM_HDR_X + MM_HDR_W) - x;
-    const float h = py(f, MM_HDR_Y + MM_HDR_H) - y;
+    const float ry = py(f, MM_HDR_RED_Y);
+    const float rh = py(f, MM_HDR_RED_Y + MM_HDR_RED_H) - ry;
 
-    if (m->tex.header)
-        ui_image(x, y, w, h, m->tex.header, 0.f, 0.f, 1.f, 64.f / 256.f,
+    if (m->tex.header) {
+        /* the plain silver bar (cell 3) under the red plate (cell 2, the one
+           with the WHITE triangle) -- see MM_HDR_X. */
+        const float sy = py(f, MM_HDR_SIL_Y);
+        ui_image(x, sy, w, py(f, MM_HDR_SIL_Y + MM_HDR_SIL_H) - sy,
+                 m->tex.header, 0.f, 135.f / 256.f, 1.f, 185.f / 256.f,
                  1.f, 1.f, 1.f, 1.f);
+        ui_image(x, ry, w, rh,
+                 m->tex.header, 0.f, 76.f / 256.f, 1.f, 116.f / 256.f,
+                 1.f, 1.f, 1.f, 1.f);
+    }
     {
         const sfont sf = sf_big(m->tex.font_big);
         const float sc = f->us * MM_TS_HEAD;
-        const float tx = x + w * 0.24f;
-        const char *title = (m->page == MM_PAGE_QUICK) ? "Quick race"
-                                                       : "Main menu";
-        const float ty = y + h * 0.18f + py(f, MM_HDR_TEXT_DY);
+        /* "Garage" on BOTH car pages, which is what all four of the game's own
+           shots of them have -- the part page does not retitle itself. */
+        const char *title = m->page == MM_PAGE_PLAYERS ? STR_UI_SELECT_PLAYER
+                          : (MM_PAGE_IS_QUICK(m->page) ? STR_UI_QUICK_RACE
+                          : (MM_PAGE_IS_CAR(m->page) ? STR_UI_GARAGE
+                          : (m->page == MM_PAGE_MULTI ? STR_UI_MULTIPLAYER
+                          : (m->page == MM_PAGE_LOBBY ? STR_UI_WAIT_PLAYERS
+                                                      : STR_UI_MAIN_MENU))));
+        /* right-aligned against the triangle the cell already carries */
+        const float tr = px(f, MM_HDR_X + MM_HDR_TEXT_R);
+        const float tw = sf.tex ? sf_w(&sf, sc, title) : ui_text_w(sc, title);
+        const float th = sf.tex ? sf_h(&sf, sc) : ui_text_h(sc);
+        const float tx = tr - tw;
+        const float ty = ry + (rh - th) * 0.5f + f->us * MM_HDR_TEXT_DY;
         if (sf.tex)
             sf_text(&sf, tx, ty, sc, 1.f, 1.f, 1.f, 1.f, title);
         else
             ui_text(tx, ty, sc, 1.f, 1.f, 1.f, 1.f, title);
     }
-    if (m->tex.logo) {
+    /* THE BADGE IS THE MAIN MENU'S ALONE. The game's own screenshots of Map and
+       info and of Track stats both have bare oval where logoRC_Main would be,
+       and the port drew it on every page. */
+    if (m->tex.logo && m->page == MM_PAGE_MAIN) {
         float lx, ly, lw, lh;
         mm_box(f, MM_LOGO_X, MM_LOGO_Y, MM_LOGO_W, MM_LOGO_H,
                &lx, &ly, &lw, &lh);
@@ -986,9 +1716,11 @@ static void mm_draw_card(const mainmenu_t *m, const mmframe *f)
 {
     const sfont big = sf_big(m->tex.font_big);
     const sfont small_ = sf_small(m->tex.font_small);
+    const player_t *p = player_cur();
     float x, y, w, h;
     float tx, ty;
-    char line[96];
+    char line[96], t[24];
+    int face;
 
     /* ON THE SAME ANCHOR as the carousel, so the whole left block is one group:
        the card's text column and the track's name under the photographs line
@@ -999,69 +1731,89 @@ static void mm_draw_card(const mainmenu_t *m, const mmframe *f)
     /* THE COLUMN HANGS OFF THE PORTRAIT rather than being mapped on its own, so
        the gap between the two stays the gap the artists left. See gx(). */
     tx = x + w + (MM_INFO_X - (MM_FACE_X + MM_FACE_W)) * f->us;
-    /* The portrait brings its own silver frame -- see MM_FACE_U0. A missing one
-       leaves a plate where the layout says the card is, so the row of text
-       beside it still reads as a card. */
-    if (m->tex.face)
-        ui_image(x, y, w, h, m->tex.face,
+    /* THE PORTRAIT IS THE PROFILE'S, out of the nine, and it brings its own
+       silver frame -- see MM_FACE_U0. A missing one leaves a plate where the
+       layout says the card is, so the row of text beside it still reads as a
+       card. */
+    face = p && p->face >= 0 && p->face < PL_N_FACES ? p->face : 0;
+    if (m->tex.face[face])
+        ui_image(x, y, w, h, m->tex.face[face],
                  MM_FACE_U0, MM_FACE_V0, MM_FACE_U1, MM_FACE_V1,
                  1.f, 1.f, 1.f, 1.f);
     else
         ui_rect(x, y, w, h, 0.20f, 0.22f, 0.28f, 1.f);
 
     ty = MM_INFO_Y;
+    snprintf(line, sizeof line, "Welcome, %s",
+             p ? p->name : STR_UI_DEFAULT_NAME);
     if (big.tex) {
         const float sc = f->us * MM_TS_WELCOME;
-        sf_text_shadowed(&big, tx, py(f, ty), sc,
-                         1.f, 1.f, 1.f, 1.f, "Welcome, Player");
+        sf_text_shadowed(&big, tx, py(f, ty), sc, 1.f, 1.f, 1.f, 1.f, line);
     } else {
-        ui_text(tx, py(f, ty), f->us,
-                1.f, 1.f, 1.f, 1.f, "Welcome, Player");
+        ui_text(tx, py(f, ty), f->us, 1.f, 1.f, 1.f, 1.f, line);
     }
     mm_rule_at(f, tx, py(f, ty + 26.f), 290.f * f->us);
     ty += 34.f;
 
-    /* THE THREE FACTS THE PORT ACTUALLY KNOWS. The original's card reads Rank,
-       Current car, Play time, Scores and Cash, and every one of those is a
-       PROFILE field -- the Players/ .scp files, which this port does not read and Change
-       player does not open. What is here instead is true: the car the settings
-       file is on, the track the carousel is on, and the field it fields. */
+    /* THE FIVE FACTS THE ORIGINAL'S CARD READS -- Rank, Current car, Play time,
+     * Scores and Cash -- and every one of them is a PROFILE field. This file
+     * used to say that the `Players/' .scp files were a format the port did not
+     * read; player.c reads and writes them, so the card is the game's own again.
+     *
+     * With no profile at all -- a first launch, before Create player -- what is
+     * here instead is what was here before: the car, the track and the size of
+     * the field, out of tracks.h and ai_data.h. Those are true without a
+     * profile; Rank and Cash are not. */
     {
-        const int car = TRACKS[m->track].car;
-        static const char *const CARNAME[3] = { "Overkill", "Buggy", "Hummer" };
-        snprintf(line, sizeof line, "Car: %s",
-                 CARNAME[car >= 0 && car < 3 ? car : 0]);
-        if (small_.tex)
-            sf_text_shadowed(&small_, tx, py(f, ty),
-                             f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
-        else
-            ui_text(tx, py(f, ty), f->us * 0.9f,
-                    1.f, 1.f, 1.f, 1.f, line);
-        ty += 22.f;
-        snprintf(line, sizeof line, "Track: %s", MAP_TRACK_NAME[m->track]);
-        if (small_.tex)
-            sf_text_shadowed(&small_, tx, py(f, ty),
-                             f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
-        else
-            ui_text(tx, py(f, ty), f->us * 0.9f,
-                    1.f, 1.f, 1.f, 1.f, line);
-        ty += 22.f;
-        snprintf(line, sizeof line, "Field: %d opponents",
-                 AI_RACES[m->track].n);
-        if (small_.tex)
-            sf_text_shadowed(&small_, tx, py(f, ty),
-                             f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
-        else
-            ui_text(tx, py(f, ty), f->us * 0.9f,
-                    1.f, 1.f, 1.f, 1.f, line);
+        int i, n = 0;
+        const char *l[5];
+        char buf[5][96];
+        if (p) {
+            snprintf(buf[0], sizeof buf[0], "%s: %s", STR_UI_RANK,
+                     player_rank(p));
+            snprintf(buf[1], sizeof buf[1], "%s: %s", STR_UI_CURRENT_CAR,
+                     STR_CAR_NAME[p->sel_car >= 0 && p->sel_car < STR_N_CARS
+                                  ? p->sel_car : 0]);
+            player_time_str(p->play_time, t, sizeof t);
+            snprintf(buf[2], sizeof buf[2], "%s: %s", STR_UI_PLAY_TIME, t);
+            snprintf(buf[3], sizeof buf[3], "%s: %d    %s: $%d",
+                     STR_UI_SCORES, p->scores, STR_UI_CASH, p->cash);
+            n = 4;
+        } else {
+            const int car = TRACKS[m->track].car;
+            snprintf(buf[0], sizeof buf[0], "Car: %s",
+                     STR_CAR_NAME[car >= 0 && car < 3 ? car : 0]);
+            snprintf(buf[1], sizeof buf[1], "Track: %s",
+                     STR_TRACK_NAME[m->track]);
+            snprintf(buf[2], sizeof buf[2], "Field: %d opponents",
+                     AI_RACES[m->track].n);
+            n = 3;
+        }
+        for (i = 0; i < n; i++)
+            l[i] = buf[i];
+        for (i = 0; i < n; i++) {
+            if (small_.tex)
+                sf_text_shadowed(&small_, tx, py(f, ty),
+                                 f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, l[i]);
+            else
+                ui_text(tx, py(f, ty), f->us * 0.9f,
+                        1.f, 1.f, 1.f, 1.f, l[i]);
+            ty += 22.f;
+        }
     }
 }
 
-static void mm_draw_carousel(const mainmenu_t *m, const mmframe *f)
+/* THE CAROUSEL, and `with_caption' 0 leaves the track's name and its blurb to
+   the caller. dlgMULTIPLAYER draws the same five photographs but puts that text
+   at ITS own two rectangles -- staticInfoHeader (233, 417) and staticInfo
+   (234, 449) -- which are not the main menu's MM_NAME_Y and MM_DESC_Y. Drawn
+   both ways it came out twice, overlapping, which is what the picture showed. */
+static void mm_draw_carousel_at(const mainmenu_t *m, const mmframe *f,
+                                int with_caption)
 {
     const sfont big = sf_big(m->tex.font_big);
     const sfont small_ = sf_small(m->tex.font_small);
-    int slot, i;
+    int slot;
     char line[96];
     float ty, nx;
 
@@ -1071,8 +1823,8 @@ static void mm_draw_carousel(const mainmenu_t *m, const mmframe *f)
         mm_slot_rect(f, slot, &x, &y, &w, &h);
         /* The photograph brings its own rounded silver frame -- the measured box
            IS the framed picture, so nothing is drawn behind it. */
-        if (m->tex.shot[t])
-            ui_image(x, y, w, h, m->tex.shot[t],
+        if (m->tex.shot[t][0])
+            ui_image(x, y, w, h, m->tex.shot[t][0],
                      MM_SHOT_U0, MM_SHOT_V0, MM_SHOT_U1, MM_SHOT_V1,
                      1.f, 1.f, 1.f, 1.f);
         else
@@ -1082,50 +1834,40 @@ static void mm_draw_carousel(const mainmenu_t *m, const mmframe *f)
     /* THE NAME AND ITS LINES sit under the big photograph and move with it --
        gx() again, so the block does not drift off the picture it describes. */
     nx = gx(f, MM_GROUP_X, MM_NAME_X);
+    if (!with_caption)
+        return;
     if (big.tex)
         sf_text_shadowed(&big, nx, py(f, MM_NAME_Y),
                          f->us * MM_TS_TRACK, 1.f, 1.f, 1.f, 1.f,
-                         MAP_TRACK_NAME[m->track]);
+                         STR_TRACK_NAME[m->track]);
     else
         ui_text(nx, py(f, MM_NAME_Y), f->us * MM_TS_TRACK,
-                1.f, 1.f, 1.f, 1.f, MAP_TRACK_NAME[m->track]);
+                1.f, 1.f, 1.f, 1.f, STR_TRACK_NAME[m->track]);
     mm_rule_at(f, nx, py(f, MM_NAME_Y + 28.f), 180.f * f->us);
 
-    /* WHAT THE ORIGINAL PUTS HERE IS THREE LINES OF AUTHORED PROSE, and it is
-       in Language/Game/english.tbl, whose DSRC chunk is obfuscated behind the
-       key in its LSRC -- not read yet (known-issues.md). Rather than invent a
-       description, this states the track's own roster, which IS shipped data:
-       ailayouts.ini's drivers for this race, through ai_data.h. */
+    /* THREE LINES OF THE AUTHORS' OWN PROSE, 40040 + t -- and the line this
+       file's header quotes as measured off the original's screen,
+       "Start the race along the sea", is the first of Surf's three. These notes
+       recorded this text as lost behind an unread string table and put the
+       track's AI roster here instead; str_data.h carries it now. */
     ty = MM_DESC_Y;
     {
-        const ai_race *r = &AI_RACES[m->track];
-        int n = 0;
-        line[0] = 0;
-        for (i = 0; i < r->n && n < 3; i++) {
-            /* `ref` is 1-based into ailayouts.ini's AIPlayer<n> list. */
-            const int p = r->op[i].ref - 1;
-            if (p < 0 || p >= AI_N_PLAYERS)
-                continue;
-            if (n)
-                strncat(line, ", ", sizeof line - strlen(line) - 1);
-            strncat(line, AI_PLAYERS[p].name, sizeof line - strlen(line) - 1);
-            n++;
+        const char *info = STR_TRACK_MENU[m->track];
+        while (*info) {
+            const char *nl = strchr(info, '\n');
+            size_t len = nl ? (size_t)(nl - info) : strlen(info);
+            if (len >= sizeof line) len = sizeof line - 1;
+            memcpy(line, info, len);
+            line[len] = 0;
+            if (small_.tex)
+                sf_text_shadowed(&small_, nx, py(f, ty),
+                                 f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
+            else
+                ui_text(nx, py(f, ty), f->us * 0.9f, 1.f, 1.f, 1.f, 1.f, line);
+            ty += MM_DESC_LH;
+            if (!nl) break;
+            info = nl + 1;
         }
-        if (small_.tex)
-            sf_text_shadowed(&small_, nx, py(f, ty),
-                             f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
-        else
-            ui_text(nx, py(f, ty), f->us * 0.9f,
-                    1.f, 1.f, 1.f, 1.f, line);
-        ty += MM_DESC_LH;
-        snprintf(line, sizeof line, "Rubber band %d%%",
-                 (int)(r->coeff_common * 100.f + 0.5f));
-        if (small_.tex)
-            sf_text_shadowed(&small_, nx, py(f, ty),
-                             f->us * MM_TS_INFO, 1.f, 1.f, 1.f, 1.f, line);
-        else
-            ui_text(nx, py(f, ty), f->us * 0.9f,
-                    1.f, 1.f, 1.f, 1.f, line);
     }
 }
 
@@ -1189,27 +1931,58 @@ static void mm_arrow(const mainmenu_t *m, float x, float y, float sz,
              1.f, 1.f, 1.f, 1.f);
 }
 
-/* The value a row shows. Every one of them is shipped data or a count of it. */
+/* The four values of `Sort results by', 40607..40610. */
+static const char *const MM_ST_NAME[REC_N_STAT] = {
+    STR_UI_BEST_LAP, STR_UI_3_LAPS, STR_UI_5_LAPS, STR_UI_7_LAPS
+};
+
+/* AND THE TWO LAP LISTS HAVE TO AGREE. MM_LAPS is the picker's and REC_LAPS is
+   the record book's, and the stats page indexes one with the other. Two copies
+   of one list is how a 5-lap time ends up in the "3 laps" column. */
+typedef char mm_laps_agree[(MM_N_LAPS == REC_N_LAPS) ? 1 : -1];
+
+/* The value a row shows BETWEEN ITS TWO ARROWS, or "" for the three enums whose
+   value is a picture -- the track photograph and the car viewport on Race
+   summary, the screenshot strip on Map and info. Every one is shipped data or a
+   count of it. */
 static void mm_q_value(const mainmenu_t *m, int row, char *out, int n)
 {
+    out[0] = 0;
+    if (m->page == MM_PAGE_MAPINFO) {
+        if (row == MM_Q_MI_TRACK)
+            snprintf(out, n, "%s", STR_TRACK_NAME[m->track]);
+        return;
+    }
+    if (m->page == MM_PAGE_STATS) {
+        const int k = (m->stat < 0 || m->stat >= REC_N_STAT) ? 0 : m->stat;
+        snprintf(out, n, "%s", MM_ST_NAME[k]);
+        return;
+    }
     switch (row) {
-    case MM_Q_TRACK:
-        snprintf(out, n, "%s", MAP_TRACK_NAME[m->track]);
-        break;
     case MM_Q_LAPS:
         snprintf(out, n, "%d", m->laps);
         break;
     case MM_Q_SKILL:
         snprintf(out, n, "%s", mainmenu_skill_name(m->skill));
         break;
-    case MM_Q_CAR:
-        snprintf(out, n, "%s", RB_CARS[m->car < 0 || m->car >= MM_N_CARS
-                                       ? 0 : m->car].name);
-        break;
     default:
-        out[0] = 0;
         break;
     }
+}
+
+/* A time as the game writes one: `1:00.62'. Hundredths, because that is the
+   precision the original's own table shows and the precision race_ui keeps.
+   A time of zero or less is `n/a', which is the string table's own word for a
+   racer with no record on this track. */
+static void mm_time(char *out, int n, float t)
+{
+    int cs;
+    if (!(t > 0.f)) {
+        snprintf(out, n, "%s", STR_UI_NA);
+        return;
+    }
+    cs = (int)(t * 100.f + 0.5f);
+    snprintf(out, n, "%d:%02d.%02d", cs / 6000, (cs / 100) % 60, cs % 100);
 }
 
 /* A line of text, left- or right-aligned in design space. */
@@ -1228,50 +2001,151 @@ static void mm_q_text(const mainmenu_t *m, const mmframe *f, int big_font,
         ui_text(px_, py(f, y), sc, 1.f, 1.f, 1.f, alpha, s);
 }
 
+/* A blurb, one line per '\n', at the pitch MM_LINE_H records. The game's own
+   descriptions are three or five lines and arrive from str_data.h with their
+   newlines intact, so nothing here has to wrap. */
+static void mm_q_lines(const mainmenu_t *m, const mmframe *f, int big_font,
+                       float x, float y, float ts, const char *s)
+{
+    char line[128];
+    while (s && *s) {
+        const char *nl = strchr(s, '\n');
+        size_t len = nl ? (size_t)(nl - s) : strlen(s);
+        if (len >= sizeof line)
+            len = sizeof line - 1;
+        memcpy(line, s, len);
+        line[len] = 0;
+        mm_q_text(m, f, big_font, x, y, ts, 0, 1.f, line);
+        y += MM_LINE_H;
+        if (!nl)
+            break;
+        s = nl + 1;
+    }
+}
+
+/* One screenshot of the current track, at a box already in design pixels. The
+   photograph brings its own rounded silver frame -- MM_SHOT_U0 -- so nothing is
+   drawn behind it. */
+static void mm_q_shot(const mainmenu_t *m, const mmframe *f, int idx,
+                      float dx, float dy, float dw, float dh)
+{
+    float x, y, w, h;
+    const unsigned int t = (idx >= 0 && idx < MM_N_SHOTS)
+                           ? m->tex.shot[m->track][idx] : 0;
+    mm_box(f, dx, dy, dw, dh, &x, &y, &w, &h);
+    if (t)
+        ui_image(x, y, w, h, t, MM_SHOT_U0, MM_SHOT_V0, MM_SHOT_U1, MM_SHOT_V1,
+                 1.f, 1.f, 1.f, 1.f);
+    else
+        ui_rect(x, y, w, h, 0.25f, 0.28f, 0.34f, 1.f);
+}
+
+/* ------------------------------------------------ the three pages' furniture
+ *
+ * THE NAVIGATION COLUMN, shared by all three. The first three bars are RADIO
+ * buttons out of RadioButtonsTextures -- red with a dark dot, red with a WHITE
+ * one, grey -- and the page you are on is the white one. Only the Garage is an
+ * arrow, off ButtonsTextures' grey cell, because it is the one of the four that
+ * is not built.
+ *
+ * THE ROW YOU ARE ON STANDS OUT, at the focus curve's own settled 0.361, and
+ * that is measured: on the game's shot of Map and info that bar's cap sits 25 px
+ * left of where its siblings' do, and on the shot of Track stats it is 28. The
+ * FOCUSED row slides too, on the same curve -- the art has no focused radio
+ * cell, so the slide is the only signal the artists left for it, and a row that
+ * is both takes the larger of the two.
+ */
+static void mm_draw_qnav(const mainmenu_t *m, const mmframe *f)
+{
+    int i;
+
+    for (i = 0; i < MM_QB_N; i++) {
+        float bx, by, bw, bh, v, slide;
+        const int live = MM_QB_PAGE[i] >= 0;
+        const int here = MM_QB_PAGE[i] == m->page;
+        const int lit = live && m->qfocus == MM_Q_NAV + i;
+
+        slide = here ? MM_SLIDE * MM_SETTLED : 0.f;
+        if (lit && MM_SLIDE * MM_SETTLED > slide)
+            slide = MM_SLIDE * MM_SETTLED;
+        mm_draw_wedge(m, f, i);
+        mm_bar_draw_rect(m, f, i, slide, &bx, &by, &bw, &bh);
+
+        /* THE FIRST THREE ARE RADIO CELLS and the GARAGE IS AN ARROW, which is
+           what the game's own shot of this page has: a dot on the three views of
+           this race and a triangle on the one bar that goes to a screen of its
+           own. It used to be the grey cell, because the Garage was not built. */
+        if (live && i != MM_QB_GARAGE && m->tex.radio) {
+            v = here ? MM_V_RAD_ON : MM_V_RAD;
+            ui_image(bx, by, bw, bh, m->tex.radio,
+                     0.f, v, 1.f, v + MM_V_RAD_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else if (m->tex.buttons) {
+            v = live ? (here ? MM_V_RED_F : MM_V_RED) : MM_V_GREY;
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else {
+            ui_rect(bx, by, bw, bh, live ? 0.72f : 0.45f,
+                    live ? 0.09f : 0.45f, live ? 0.11f : 0.47f, 1.f);
+        }
+        mm_label(m, f, bx, by, bw, bh, MM_QB_NAME[i],
+                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
+    }
+}
+
+/* THE PAGE'S ENUMS: label, marker, back arrow, value, forward arrow. One loop
+   for all three pages, because an enum is the same four numbers everywhere --
+   see mm_enum. */
+static void mm_draw_qenums(const mainmenu_t *m, const mmframe *f)
+{
+    char line[96];
+    int i;
+
+    for (i = 0; i < MM_Q_NENUM[m->page]; i++) {
+        const mm_enum *e = &MM_Q_ENUM[m->page][i];
+        const int lit = (m->qfocus == i);
+        float ax, fx, ay, sz;
+        mm_q_arrows(f, m->page, i, &ax, &fx, &ay, &sz);
+
+        if (e->label[0]) {
+            /* the small marker the game draws beside a LABELLED row, and on
+               none of the rows that have no label */
+            mm_arrow(m, px(f, e->x0 - MM_Q_BULLET_GAP),
+                     py(f, e->y0 + e->sy * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
+                     MM_Q_BULLET * f->us, lit ? 1 : 0, 0);
+            mm_q_text(m, f, 0, e->x0, e->y0, MM_TS_LABEL, 0, 1.f, e->label);
+            mm_rule_at(f, px(f, e->x0), py(f, e->y0 + 24.f),
+                       (e->sx * e->se - 30.f) * f->us);
+        }
+        mm_arrow(m, ax, ay, sz, lit ? 1 : 0, 0);
+        mm_arrow(m, fx, ay, sz, lit ? 1 : 0, 1);
+
+        /* the value, centred between the two arrows */
+        mm_q_value(m, i, line, sizeof line);
+        if (line[0]) {
+            const sfont sf = sf_small(m->tex.font_small);
+            const float sc = f->us * MM_TS_LABEL;
+            const float w = sf.tex ? sf_w(&sf, sc, line) : ui_text_w(sc, line);
+            const float cx = (ax + sz + fx) * 0.5f;
+            const float ty = py(f, e->y0 + e->sy * 0.5f)
+                             - (sf.tex ? sf_h(&sf, sc) : ui_text_h(sc)) * 0.5f;
+            if (sf.tex)
+                sf_text_shadowed(&sf, cx - w * 0.5f, ty, sc,
+                                 1.f, 1.f, 1.f, 1.f, line);
+            else
+                ui_text(cx - w * 0.5f, ty, sc, 1.f, 1.f, 1.f, 1.f, line);
+        }
+    }
+}
+
 static void mm_draw_quick(const mainmenu_t *m, const mmframe *f)
 {
     const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
     const rb_car_data *cd = &RB_CARS[c];
     char line[96];
-    int i;
-
-    /* --- the page's own navigation, in the main menu's row positions ----- */
-    for (i = 0; i < MM_QB_N; i++) {
-        float bx, by, bw, bh, v;
-        /* Only the page you are on is live. The other three are dlgMAPINFO,
-           dlgSTAT and dlgSETCAR, which this port does not build. */
-        const int live = (i == MM_QB_SUMMARY);
-        mm_bar_rect(f, i, &bx, &by, &bw, &bh);
-        if (m->tex.wedge[i]) {
-            const float wh = py(f, MM_WEDGE_H);
-            ui_image(bx, by - wh * (MM_WEDGE_TOP / 64.f),
-                     px(f, MM_BAR_R) - bx, wh, m->tex.wedge[i],
-                     0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
-        }
-        v = live ? MM_V_RED : MM_V_GREY;
-        if (m->tex.buttons)
-            ui_image(bx, by, bw, bh, m->tex.buttons,
-                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
-        else
-            ui_rect(bx, by, bw, bh, live ? 0.72f : 0.45f,
-                    live ? 0.09f : 0.45f, live ? 0.11f : 0.47f, 1.f);
-        mm_label(m, f, bx, by, bw, bh, MM_QB_NAME[i],
-                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
-    }
 
     /* --- shotTrack, between enumTrack's two arrows ----------------------- */
-    {
-        float x, y, w, h;
-        mm_box(f, DLG_RACESUM_shotTrackX0, DLG_RACESUM_shotTrackY0,
-               DLG_RACESUM_shotTrackSX, DLG_RACESUM_shotTrackSY,
-               &x, &y, &w, &h);
-        if (m->tex.shot[m->track])
-            ui_image(x, y, w, h, m->tex.shot[m->track],
-                     MM_SHOT_U0, MM_SHOT_V0, MM_SHOT_U1, MM_SHOT_V1,
-                     1.f, 1.f, 1.f, 1.f);
-        else
-            ui_rect(x, y, w, h, 0.25f, 0.28f, 0.34f, 1.f);
-    }
+    mm_q_shot(m, f, 0, DLG_RACESUM_shotTrackX0, DLG_RACESUM_shotTrackY0,
+              DLG_RACESUM_shotTrackSX, DLG_RACESUM_shotTrackSY);
 
     /* --- animCar: the chosen car, turning, in its own 374x304 viewport ---- */
     {
@@ -1305,37 +2179,29 @@ static void mm_draw_quick(const mainmenu_t *m, const mmframe *f)
         }
     }
 
-    /* --- staticTrackName and staticTrackInfo ----------------------------- */
+    /* --- staticTrackName and staticTrackInfo -----------------------------
+     *
+     * THE DESCRIPTION IS THE GAME'S OWN, at last. These notes recorded it as
+     * lost behind an unread string table and this page showed the track's AI
+     * roster instead; str_data.h now carries all ten, three lines each, and the
+     * roster line moved under them where it is an addition rather than a
+     * substitute. */
     mm_q_text(m, f, 1, DLG_RACESUM_staticTrackNameX0,
               DLG_RACESUM_staticTrackNameY0, MM_TS_TRACK, 0, 1.f,
-              MAP_TRACK_NAME[m->track]);
+              STR_TRACK_NAME[m->track]);
     mm_rule_at(f, px(f, DLG_RACESUM_staticTrackNameX0),
                py(f, DLG_RACESUM_staticTrackNameY0 + 28.f),
                DLG_RACESUM_staticTrackNameSX * f->us);
     {
-        /* THE AUTHORED DESCRIPTION IS IN THE ENCRYPTED STRING TABLE
-           (known-issues.md), so what fills staticTrackInfo is the track's own
-           roster and the field this skill fields -- shipped data either way. */
         const ai_race *r = &AI_RACES[m->track];
-        float ty = DLG_RACESUM_staticTrackInfoY0;
-        int n = 0;
-        line[0] = 0;
-        for (i = 0; i < r->n && n < 3; i++) {
-            const int p = r->op[i].ref - 1;
-            if (p < 0 || p >= AI_N_PLAYERS)
-                continue;
-            if (n)
-                strncat(line, ", ", sizeof line - strlen(line) - 1);
-            strncat(line, AI_PLAYERS[p].name, sizeof line - strlen(line) - 1);
-            n++;
-        }
-        mm_q_text(m, f, 0, DLG_RACESUM_staticTrackInfoX0, ty,
-                  MM_TS_INFO, 0, 1.f, line);
-        ty += 22.f;
+        mm_q_lines(m, f, 0, DLG_RACESUM_staticTrackInfoX0,
+                   DLG_RACESUM_staticTrackInfoY0, MM_TS_INFO,
+                   STR_TRACK_MENU[m->track]);
         snprintf(line, sizeof line, "%d opponents, rubber band %d%%",
                  mainmenu_field_size(m->track, m->skill),
                  (int)(r->coeff_common * 100.f + 0.5f));
-        mm_q_text(m, f, 0, DLG_RACESUM_staticTrackInfoX0, ty,
+        mm_q_text(m, f, 0, DLG_RACESUM_staticTrackInfoX0,
+                  DLG_RACESUM_staticTrackInfoY0 + 3.f * MM_LINE_H,
                   MM_TS_INFO, 0, 1.f, line);
     }
 
@@ -1348,56 +2214,3880 @@ static void mm_draw_quick(const mainmenu_t *m, const mmframe *f)
     {
         const float rx_ = DLG_RACESUM_staticCarInfoX0 + DLG_RACESUM_staticCarInfoSX;
         float ty = DLG_RACESUM_staticCarInfoY0;
-        mm_q_text(m, f, 1, rx_, ty, MM_TS_WELCOME, 1, 1.f, cd->name);
+        /* THE CAR'S OWN NAME AND ITS OWN SPEC BLOCK, both the game's --
+           "Road Rage RR" and the three lines under it were the example this
+           file used to give of what the unread string table was costing. The
+           three-line form is the one that fits staticCarInfo's 110 px. */
+        mm_q_text(m, f, 1, rx_, ty, MM_TS_WELCOME, 1, 1.f, STR_CAR_NAME[c]);
         ty += 26.f;
-        /* rb_data.h's own numbers. The original names the three upgrades here
-           ("WHB Devastator" and the rest) and those are in the string table. */
-        snprintf(line, sizeof line, "%.0f cm, %.1f kg",
-                 cd->extent[2] * 100.f, cd->mass);
-        mm_q_text(m, f, 0, rx_, ty, MM_TS_INFO, 1, 1.f, line);
-        ty += 22.f;
-        snprintf(line, sizeof line, "%.0f deg of steering", cd->steer_max_deg);
-        mm_q_text(m, f, 0, rx_, ty, MM_TS_INFO, 1, 1.f, line);
-    }
-
-    /* --- the four enums: label, back arrow, value, forward arrow --------- */
-    for (i = 0; i < MM_Q_N_ROWS; i++) {
-        const float *R = MM_Q_RECT[i];
-        const int lit = (m->qfocus == i);
-        float ax, fx, ay, sz;
-        mm_q_arrows(f, i, &ax, &fx, &ay, &sz);
-
-        if (MM_Q_LABEL[i][0]) {
-            /* the small marker the game draws beside a LABELLED row, and on
-               neither of the two that have no label */
-            mm_arrow(m, px(f, R[0] - MM_Q_BULLET_GAP),
-                     py(f, R[1] + R[3] * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
-                     MM_Q_BULLET * f->us, lit ? 1 : 0, 0);
-            mm_q_text(m, f, 0, R[0], R[1], MM_TS_LABEL, 0, 1.f, MM_Q_LABEL[i]);
-            mm_rule_at(f, px(f, R[0]), py(f, R[1] + 24.f),
-                       (R[2] * R[4] - 30.f) * f->us);
-        }
-        mm_arrow(m, ax, ay, sz, lit ? 1 : 0, 0);
-        mm_arrow(m, fx, ay, sz, lit ? 1 : 0, 1);
-
-        /* the value, centred between the two arrows */
-        if (i == MM_Q_LAPS || i == MM_Q_SKILL) {
-            const sfont sf = sf_small(m->tex.font_small);
-            const float sc = f->us * MM_TS_LABEL;
-            float w;
-            mm_q_value(m, i, line, sizeof line);
-            w = sf.tex ? sf_w(&sf, sc, line) : ui_text_w(sc, line);
-            {
-                const float cx = (ax + sz + fx) * 0.5f;
-                if (sf.tex)
-                    sf_text_shadowed(&sf, cx - w * 0.5f, py(f, R[1]), sc,
-                                     1.f, 1.f, 1.f, 1.f, line);
-                else
-                    ui_text(cx - w * 0.5f, py(f, R[1]), sc,
-                            1.f, 1.f, 1.f, 1.f, line);
+        {
+            const char *info = STR_CAR_INFO_SHORT[c];
+            while (*info) {
+                const char *nl = strchr(info, '\n');
+                size_t len = nl ? (size_t)(nl - info) : strlen(info);
+                if (len >= sizeof line) len = sizeof line - 1;
+                memcpy(line, info, len);
+                line[len] = 0;
+                mm_q_text(m, f, 0, rx_, ty, MM_TS_INFO, 1, 1.f, line);
+                ty += MM_LINE_H;
+                if (!nl) break;
+                info = nl + 1;
             }
         }
     }
+
+}
+
+
+/* ------------------------------------------------------- dlgMAPINFO
+ *
+ * THE MAP IS NOT DRAWN, IT IS SHIPPED. `trackmap_<n>' is a 512x512 painting of
+ * the track from above with the route, its direction arrows and its checkpoint
+ * discs already on it -- the same texture race_ui.c puts the minimap marker over
+ * during a race, and the reason the port has ten of them already. dlgMAPINFO
+ * draws it AT ITS OWN PIXEL SIZE with its origin at (-44, -13): shotTrackView's
+ * (56, 87) is a signed slider carrying a +100 bias (gen_dlg_data.py), and the
+ * negative origin is what lets the painting hang off the top and left of the
+ * frame the way it does on the game's own screen. Verified by matching the four
+ * checkpoint discs painted into trackmap_1 against the same four on that
+ * screenshot: scale 1.000, offset (-43.5, -14.5).
+ *
+ * The engine numbers its maps in championship.ini's order and this port does
+ * not, which is what MAP_TRACKMAP is for -- main.c asks for `trackmap_<n>' by
+ * the engine's number and hands the handle back in the port's own track order.
+ */
+/* THE NINE SLICES' OWN UVs, in one place, because there are two drawers over
+ * this texture and they used to carry a copy each.
+ *
+ * `messagebox_empty` is 128x128 and is a LEFT-HAND C: a top rail at texel rows
+ * 4..7, a left rail at columns 4..10 with both of its arcs, and a BOTTOM RAIL
+ * AT ROWS 120..127. Read off the alpha, not assumed. So the right-hand side is
+ * the left one with U mirrored -- and the bottom is NOT the top mirrored, it is
+ * the art's own.
+ *
+ * THAT V FLIP WAS THE BUG. Both drawers sampled the bottom slice as v 1 -> 1-cu,
+ * which turns a 32-texel band upside down and puts its 8 rows of ink at the TOP
+ * of the destination -- 24 design pixels above the frame's own bottom edge. On
+ * the Select player page's create dialog that put the rail under the Ok and
+ * Cancel buttons, which drew over it, and the panel came up with no bottom at
+ * all; on dlgMAPINFO's window it was a rim sitting 24 px inside its own frame,
+ * which reads as a frame that is merely small. One rule, one copy, and both
+ * call sites fixed by fixing it here -- traps.md, "grep for the rule".
+ *
+ * `part`: 0..3 the corners (bit 0 right, bit 1 bottom), 4 top rail, 5 bottom
+ * rail, 6 left rail, 7 right rail.
+ */
+static void mm_frame9_uv(int part, float *u0, float *v0, float *u1, float *v1)
+{
+    const float cu = MM_MBE_CU, r0 = MM_MBE_RAIL, r1 = MM_MBE_RAIL + 0.05f;
+    int right = 0, bottom = 0;
+
+    if (part < 4) {
+        right = part & 1;
+        bottom = (part >> 1) & 1;
+    } else if (part == 5) {
+        bottom = 1;
+    } else if (part == 7) {
+        right = 1;
+    }
+    if (part >= 4 && part <= 5) {          /* the horizontal rails */
+        *u0 = r0; *u1 = r1;
+    } else {                               /* corners and vertical rails */
+        *u0 = right ? cu : 0.f;
+        *u1 = right ? 0.f : cu;
+    }
+    if (part >= 6) {                       /* the vertical rails */
+        *v0 = r0; *v1 = r1;
+    } else {
+        *v0 = bottom ? 1.f - cu : 0.f;
+        *v1 = bottom ? 1.f : cu;
+    }
+}
+
+/* One nine-sliced frame: `x, y, w, h` in design pixels, corners at their own
+   size. Nothing is drawn in the middle -- this is a rim. */
+/* THE NINE-SLICE, IN SCREEN PIXELS -- and `x, y, w, h' are screen pixels, not
+ * design ones, which is the whole of a bug that shipped.
+ *
+ * The first version took a DESIGN rectangle and put each of the eight slices
+ * through `mm_box' on its own. mm_box maps a centre through px()/py() and then
+ * sizes the box UNIFORMLY -- which is right for one photograph and wrong for a
+ * row of boxes that have to touch, and mainmenu.h's own "a GROUP moves
+ * together" note says so at length. On a 960x544 panel the pieces come apart:
+ * for dlgMAPINFO's own 255 px window the top-left corner ends at x 112.5 and
+ * the top rail starts at 145.9, a THIRTY-THREE PIXEL GAP, and the assembled
+ * frame reads as two disconnected arcs with a rail floating between them.
+ *
+ * SO THE CALLER MAPS ONCE and this lays the slices out inside that: the corners
+ * at their own uniform size (MM_MBE_CORNER * us, so a rounded corner stays
+ * round) and only the rails stretched to fill between them. That is what
+ * `mp_frame9' -- the roster page's twin of this -- had been doing correctly all
+ * along, which is the second time these two drawers have disagreed about the
+ * same nine slices: they already share `mm_frame9_uv' because the first
+ * disagreement was over which way up the bottom rail goes (ui.md). There is one
+ * of them now.
+ */
+static void mm_frame9(const mmframe *f, float x, float y, float w, float h,
+                      unsigned int tex)
+{
+    const float c = MM_MBE_CORNER * f->us;
+    int i;
+
+    if (!tex || w < c * 2.f || h < c * 2.f)
+        return;
+    for (i = 0; i < 8; i++) {
+        float u0, v0, u1, v1;
+        const int right = (i < 4) ? (i & 1) : (i == 7);
+        const int bottom = (i < 4) ? ((i >> 1) & 1) : (i == 5);
+        const float sx = (i == 4 || i == 5) ? x + c : (right ? x + w - c : x);
+        const float sy = (i >= 6) ? y + c : (bottom ? y + h - c : y);
+        const float sw = (i == 4 || i == 5) ? w - c * 2.f : c;
+        const float sh = (i >= 6) ? h - c * 2.f : c;
+        mm_frame9_uv(i, &u0, &v0, &u1, &v1);
+        ui_image(sx, sy, sw, sh, tex, u0, v0, u1, v1, 1.f, 1.f, 1.f, 1.f);
+    }
+}
+
+static void mm_draw_mapinfo(const mainmenu_t *m, const mmframe *f)
+{
+    int i;
+
+    /* the map first: everything else on this page sits over it */
+    if (m->tex.trackmap[m->track]) {
+        const unsigned int tm = m->tex.trackmap[m->track];
+        const float mx = DLG_MAPINFO_shotTrackViewX0;
+        const float my = DLG_MAPINFO_shotTrackViewY0;
+        const float ms = DLG_MAPINFO_shotTrackViewSX;
+        const float mt = DLG_MAPINFO_shotTrackViewSY;
+        float x, y, w, h;
+
+        /* the frame, then the slice of the painting that falls inside it. The
+           slice is an axis-aligned sub-rect with its own UVs rather than a
+           scissor, which ui.c has no notion of; the frame's rounded corners are
+           drawn over it afterwards and cover the square ones. */
+        /* ONE rectangle for the plate, the slice of the painting AND the
+           frame -- see mm_frame9 on why the frame is handed screen pixels. */
+        mm_box(f, MM_MAP_X, MM_MAP_Y, MM_MAP_W, MM_MAP_H, &x, &y, &w, &h);
+        ui_rect(x, y, w, h, 0.f, 0.f, 0.f, MM_MAP_PLATE);
+        {
+            const float u0 = (MM_MAP_X - mx) / ms;
+            const float v0 = (MM_MAP_Y - my) / mt;
+            const float u1 = (MM_MAP_X + MM_MAP_W - mx) / ms;
+            const float v1 = (MM_MAP_Y + MM_MAP_H - my) / mt;
+            ui_image(x, y, w, h, tm, u0, v0, u1, v1, 1.f, 1.f, 1.f, 1.f);
+        }
+        mm_frame9(f, x, y, w, h, m->tex.panel);
+
+        /* and the route, over the whole page */
+        mm_box(f, mx, my, ms, mt, &x, &y, &w, &h);
+        ui_alpha_test(MM_MAP_KEY);
+        ui_image(x, y, w, h, tm, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
+        ui_alpha_test(0.f);
+    }
+
+    /* staticTrackInfo -- the five-line description, 40030 + t */
+    mm_q_lines(m, f, 0, DLG_MAPINFO_staticTrackInfoX0,
+               DLG_MAPINFO_staticTrackInfoY0, MM_TS_INFO,
+               STR_TRACK_LONG[m->track]);
+
+    /* shotList: the selected screenshot big, the rest wrapping outward from it
+       and dropped where they fall outside the list's own bounds. */
+    for (i = -(MM_N_SHOTS - 1); i < MM_N_SHOTS; i++) {
+        float dx, dy, dw, dh;
+        int sh;
+        if (mm_shot_slot(m, i, &sh, &dx, &dy, &dw, &dh))
+            mm_q_shot(m, f, sh, dx, dy, dw, dh);
+    }
+
+    /* staticShortListText -- the word, and the rule the screen puts under it */
+    mm_q_text(m, f, 0, DLG_MAPINFO_staticShortListTextX0,
+              DLG_MAPINFO_staticShortListTextY0, MM_TS_LABEL, 0, 1.f,
+              STR_UI_SCREENSHOTS);
+    mm_rule_at(f, px(f, DLG_MAPINFO_staticShortListTextX0),
+               py(f, DLG_MAPINFO_staticShortListTextY0 + 24.f),
+               DLG_MAPINFO_staticShortListTextSX * f->us);
+}
+
+/* ---------------------------------------------------------- dlgSTAT
+ *
+ * The table's rows are the record book's -- see records.h for whose they are and
+ * why they are not the original's player profiles. Everything else on the page
+ * is the game's: the name and the three-line blurb out of the string table, the
+ * screenshot the sibling page is standing on, and the four words of
+ * `Sort results by'.
+ */
+static void mm_draw_scrollbar(const mainmenu_t *m, const mmframe *f,
+                              float x0, float y0, float y1,
+                              int first, int rows, int shown)
+{
+    const float u = 1.f / 8.f;      /* eight 32-wide cells over 256 */
+    float bx, by, bw, bh, cap;
+    float tx, ty, tw, th, frac, top;
+
+    if (!m->tex.scrollbar)
+        return;
+    /* the two caps at the art's own size, and the trough between them taken
+       from the top cell's own straight shaft so nothing is invented */
+    cap = MM_SB_CAP_H;
+    if (cap * 2.f > y1 - y0)
+        cap = (y1 - y0) * 0.5f;
+    mm_box(f, x0, y0, MM_SB_INK_W, cap, &bx, &by, &bw, &bh);
+    ui_image(bx, by, bw, bh, m->tex.scrollbar,
+             MM_SB_CELL_W * 0.f + 3.f / 256.f, 0.f,
+             MM_SB_CELL_W * 0.f + 29.f / 256.f, cap / MM_SB_CAP_H,
+             1.f, 1.f, 1.f, 1.f);
+    mm_box(f, x0, y1 - cap, MM_SB_INK_W, cap, &bx, &by, &bw, &bh);
+    ui_image(bx, by, bw, bh, m->tex.scrollbar,
+             u * 3.f + 3.f / 256.f, 1.f - cap / MM_SB_CAP_H,
+             u * 3.f + 29.f / 256.f, 1.f, 1.f, 1.f, 1.f, 1.f);
+    if (y1 - y0 > cap * 2.f) {
+        mm_box(f, x0, y0 + cap, MM_SB_INK_W, y1 - y0 - cap * 2.f,
+               &bx, &by, &bw, &bh);
+        /* two rows of the top cell's straight shaft, stretched */
+        ui_image(bx, by, bw, bh, m->tex.scrollbar,
+                 3.f / 256.f, 60.f / 64.f, 29.f / 256.f, 62.f / 64.f,
+                 1.f, 1.f, 1.f, 1.f);
+    }
+    /* THE THUMB AT THE ART'S OWN SIZE, which is what the original does -- its
+       screenshot of this page has four rows in a table that holds nine and a
+       50 px pill sitting at the top of the trough, not a pill stretched to fill
+       it. `frac' is how far down the list the view is: 0 on a table that fits,
+       which is every table dlgSTAT can build (REC_MAX_ROWS is under the rows it
+       shows), and a real fraction on the player list, which holds twenty. */
+    frac = rows > shown ? (float)first / (float)(rows - shown) : 0.f;
+    if (frac < 0.f) frac = 0.f;
+    if (frac > 1.f) frac = 1.f;
+    th = MM_SB_THUMB_H;
+    top = y0 + cap + (y1 - y0 - cap * 2.f - th) * frac;
+    mm_box(f, x0, top, MM_SB_INK_W, th, &tx, &ty, &tw, &th);
+    ui_image(tx, ty, tw, th, m->tex.scrollbar,
+             u * 6.f + 3.f / 256.f, 0.f, u * 6.f + 29.f / 256.f, 1.f,
+             1.f, 1.f, 1.f, 1.f);
+}
+
+static void mm_draw_stats(const mainmenu_t *m, const mmframe *f)
+{
+    const float tx0 = DLG_STAT_tableStatX0, ty0 = DLG_STAT_tableStatY0;
+    const float tsx = DLG_STAT_tableStatSX, tsy = DLG_STAT_tableStatSY;
+    const float head = tsy * MM_ST_HEAD_H, item = tsy * MM_ST_ITEM_H;
+    const float col0 = tx0 + tsx * MM_ST_COL0;
+    const float col1 = tx0 + tsx * MM_ST_COL1;
+    const float col2 = tx0 + tsx * MM_ST_COL2;
+    const int shown = (int)((tsy - head) / item);
+    const int stat = (m->stat < 0 || m->stat >= REC_N_STAT) ? 0 : m->stat;
+    const rec_row *rows[REC_MAX_ROWS];
+    char line[96];
+    int n, i;
+
+    /* staticTrackName, its rule, and the three-line blurb under it */
+    mm_q_text(m, f, 1, DLG_STAT_staticTrackNameX0, DLG_STAT_staticTrackNameY0,
+              MM_TS_TRACK, 0, 1.f, STR_TRACK_NAME[m->track]);
+    mm_rule_at(f, px(f, DLG_STAT_staticTrackNameX0),
+               py(f, DLG_STAT_staticTrackNameY0 + 24.f),
+               DLG_STAT_staticTrackNameSX * f->us);
+    mm_q_lines(m, f, 0, DLG_STAT_staticTrackInfoX0, DLG_STAT_staticTrackInfoY0,
+               MM_TS_INFO, STR_TRACK_SHORT[m->track]);
+
+    /* shotTrack -- the SAME screenshot the shot list is standing on */
+    mm_q_shot(m, f, m->shot, DLG_STAT_shotTrackX0, DLG_STAT_shotTrackY0,
+              DLG_STAT_shotTrackSX, DLG_STAT_shotTrackSY);
+
+    /* the header: Player / <the chosen stat> / Car, and the rule under it */
+    mm_q_text(m, f, 0, col0, ty0 + (head - MM_LINE_H) * 0.5f, MM_TS_LABEL,
+              0, 1.f, STR_UI_COL_PLAYER);
+    {
+        const sfont sf = sf_small(m->tex.font_small);
+        const float sc = f->us * MM_TS_LABEL;
+        const float hy = py(f, ty0 + (head - MM_LINE_H) * 0.5f);
+        const char *h1 = MM_ST_NAME[stat], *h2 = STR_UI_COL_CAR;
+        const float w1 = sf.tex ? sf_w(&sf, sc, h1) : ui_text_w(sc, h1);
+        const float w2 = sf.tex ? sf_w(&sf, sc, h2) : ui_text_w(sc, h2);
+        if (sf.tex) {
+            sf_text_shadowed(&sf, px(f, col1) - w1 * 0.5f, hy, sc,
+                             1.f, 1.f, 1.f, 1.f, h1);
+            sf_text_shadowed(&sf, px(f, col2) - w2 * 0.5f, hy, sc,
+                             1.f, 1.f, 1.f, 1.f, h2);
+        } else {
+            ui_text(px(f, col1) - w1 * 0.5f, hy, sc, 1.f, 1.f, 1.f, 1.f, h1);
+            ui_text(px(f, col2) - w2 * 0.5f, hy, sc, 1.f, 1.f, 1.f, 1.f, h2);
+        }
+    }
+    mm_rule_at(f, px(f, col0), py(f, ty0 + head),
+               (tx0 + tsx - col0) * f->us);
+
+    /* the rows */
+    n = records_sorted(m->track, stat, rows, REC_MAX_ROWS);
+    if (n > shown)
+        n = shown;
+    for (i = 0; i < n; i++) {
+        const rec_row *r = rows[i];
+        const float ry = ty0 + head + item * (float)i;
+        const float txt = ry + (item - MM_LINE_H) * 0.5f;
+        const sfont sf = sf_small(m->tex.font_small);
+        const float sc = f->us * MM_TS_INFO;
+        const int mine = strcmp(r->name, "Player") == 0;
+
+        /* the marker beside each row: the game's own enumarrows cell, RED on
+           the row that is the player's and grey on the rest -- which is what
+           its shot of this page has beside the profile that is signed in.
+           State 0 is the red cell and state 1 the silver one; see mm_arrow. */
+        mm_arrow(m, px(f, tx0 + MM_ST_MARK),
+                 py(f, ry + item * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
+                 MM_Q_BULLET * f->us, mine ? 0 : 2, 0);
+
+        mm_q_text(m, f, 0, col0, txt, MM_TS_INFO, 0, 1.f, r->name);
+        mm_rule_at(f, px(f, col0), py(f, ry + item - 3.f),
+                   (tx0 + tsx * MM_ST_RULE0 - col0) * f->us);
+
+        mm_time(line, sizeof line, records_value(r, stat));
+        {
+            const float w = sf.tex ? sf_w(&sf, sc, line) : ui_text_w(sc, line);
+            if (sf.tex)
+                sf_text_shadowed(&sf, px(f, col1) - w * 0.5f, py(f, txt), sc,
+                                 1.f, 1.f, 1.f, 1.f, line);
+            else
+                ui_text(px(f, col1) - w * 0.5f, py(f, txt), sc,
+                        1.f, 1.f, 1.f, 1.f, line);
+        }
+        snprintf(line, sizeof line, "%s",
+                 (r->car >= 0 && r->car < MM_N_CARS) ? STR_CAR_NAME[r->car]
+                                                     : STR_UI_NA);
+        {
+            const float w = sf.tex ? sf_w(&sf, sc, line) : ui_text_w(sc, line);
+            if (sf.tex)
+                sf_text_shadowed(&sf, px(f, col2) - w * 0.5f, py(f, txt), sc,
+                                 1.f, 1.f, 1.f, 1.f, line);
+            else
+                ui_text(px(f, col2) - w * 0.5f, py(f, txt), sc,
+                        1.f, 1.f, 1.f, 1.f, line);
+        }
+    }
+    /* the table's closing rule */
+    mm_rule_at(f, px(f, col0), py(f, ty0 + tsy), (tx0 + tsx - col0) * f->us);
+
+    mm_draw_scrollbar(m, f, tx0 + tsx + MM_SB_GAP, ty0 + head, ty0 + tsy,
+                      0, records_track(m->track)->n, shown);
+
+    /* staticShowResult -- the label enumStatType does not carry itself */
+    mm_q_text(m, f, 0, DLG_STAT_staticShowResultX0,
+              DLG_STAT_staticShowResultY0, MM_TS_LABEL, 0, 1.f, STR_UI_SORT_BY);
+    mm_rule_at(f, px(f, DLG_STAT_staticShowResultX0),
+               py(f, DLG_STAT_staticShowResultY0 + 24.f),
+               DLG_STAT_staticShowResultSX * f->us);
+}
+
+/* ================================ dlgSETCAR / dlgSETDETAIL -- THE GARAGE
+ *
+ * TWO PAGES, and between them SEVENTEEN CONTROLS, every one of them out of the
+ * exe's own dialog tables with its rectangle out of the shipped `.ini' beside
+ * it. The tables are at 0x56f890 and 0x56f780 -- `{ u32 id; u32 type;
+ * char *name; u32 0 }' records terminated by a zero one, the same shape
+ * dlgRACESUM's is:
+ *
+ *   dlgSETCAR, ids 0x898..0x89d
+ *     0x898 &ENM  enumCar             the car, between two arrows
+ *     0x899 &STT  staticCarInfoLeft   "Booster: / Engine: / Tires:"
+ *     0x89a &STT  staticCarInfoRight  what each one is fitted with
+ *     0x89b &STT  staticUpgrades      the "Current upgrades" heading
+ *     0x89c &STT  staticStatus        "You can buy this car" / "Not available"
+ *     0x89d &STT  staticPrice         "Buy price: $n" / "Sell price: $n"
+ *
+ *   dlgSETDETAIL, ids 0x9c6..0x9cc
+ *     0x9c6 &SHS  shotlistUpgrade     the part's own photograph
+ *     0x9c7 &ENM  enumUpgrades        the three levels, the picture between its
+ *                                     arrows -- SE 0, like enumTrack
+ *     0x9c8 &STT  staticUpgradeName   the heading: Booster / Engine / Tires
+ *     0x9c9 &STT  staticUpgradeInfo   the part, its effects and its price
+ *     0x9ca &ENM  staticCarEnum       the car again, READ-ONLY -- an &ENM whose
+ *                                     name begins `static', and whose arrows are
+ *                                     grey on all three of the game's own shots
+ *     0x9cb &STT  staticUpgradeStatus INSTALLED / Not available / sell-first
+ *     0x9cc &STT  staticUpgradeStatus  (declared twice, one name)
+ *
+ * AND THE FURNITURE UNDER BOTH IS dlgCARSCOMM's, which is why neither dialog's
+ * own file carries a rectangle for any of it: animCarPreview (the car in 3D),
+ * staticCashText and staticPlayerCash (the "Your cash / $100" line),
+ * staticCarName (the "Car" heading) and staticCarExplain (the seven-line spec
+ * block). CARSCOMM is cars-common; both car screens stand on it, which is the
+ * reading under which every one of these five lands where the picture has it.
+ *
+ * WHAT WAS MEASURED HERE, and only these, off the game's own 800x600 shots of
+ * the four states:
+ *
+ *  - A HEADING'S RULE IS ITS BOX'S OWN BOTTOM EDGE, run its full width. The
+ *    "Your cash" rule lands at y 100 spanning x 116..302 and staticCashText is
+ *    (115, 75) 185 x 25 -- 75 + 25 = 100 and 115 + 185 = 300, to the pixel. The
+ *    same holds for "Current upgrades": its rule is at 435 across 114..539
+ *    against staticUpgrades' (114, 410) 426 x 25. So mg_rule is not a guess.
+ *  - THE BLOCKS ARE SET AT THE SMALL FONT'S OWN LINE PITCH, not at the 25 the
+ *    quick-race pages use. The spec block's eight lines land at y 204, 225, 249,
+ *    274, 297, 319, 342, 363 -- a flat 22.7 -- and smash20.ini's own letSizeY is
+ *    28 with lineSpace -5, i.e. 23. That is the number, and it comes out of
+ *    hud_data.h rather than off the picture.
+ *  - THE SPEC BLOCK AND THE PART BLOCK ARE RIGHT-ALIGNED, on their own boxes'
+ *    right edges: every one of the spec block's eight lines ends at x 542
+ *    against staticCarExplain's 339 + 205 = 544, and every one of the part
+ *    block's four ends at 303 against staticUpgradeInfo's 105 + 200 = 305.
+ *  - THE PRICE IS THE SPEC BLOCK'S EIGHTH LINE. staticPrice's own rectangle is
+ *    (342, 336) 200 x 50 -- its right edge, 542, is the spec block's, but its Y
+ *    is nowhere near where the line actually lands. On the picture that line
+ *    continues the block at its own pitch, so that is where it is drawn and
+ *    staticPrice supplies only the right edge it shares. Said out loud because
+ *    it is the one place these two pages depart from a shipped rectangle.
+ *  - THE FOUR BARS ARE ROWS 0..3 of the main menu's own eight, Next skin is row
+ *    4, row 5 is EMPTY on both pages, and rows 6 and 7 carry the money buttons.
+ *    Measured off the trays: their tops land at y 131, 176, 221, 266, 326, 421
+ *    and 481 -- a flat 45 with the same one gap the main menu has, and every one
+ *    4.5 px below where MM_CY puts the main menu's. The bars use MM_CY anyway:
+ *    one row table for five pages, and a 4.5 px absolute correction would have
+ *    to be re-checked against every one of them. known-issues.md.
+ *  - AND THE BAR YOU ARE ON STANDS OUT 26 PX, which is MM_SLIDE at the focus
+ *    curve's own settled MM_SETTLED (23) to within the read: Select car's cap is
+ *    at 557 against its siblings' 583 on the Garage shot and Upgrade booster's
+ *    at 579 against 605 on the booster shot.
+ *
+ * THE ENUM ARROWS ARE DRAWN AT MM_Q_ARROW, like every other enum in the front
+ * end, and that is a deliberate rounding: on these two shots the cell measures
+ * 32 design px at the art's own size (the red cell's ink is 25 x 26 of 32 x 32
+ * and lands 23 x 25 on screen) where MM_Q_ARROW is 34. One arrow size across
+ * five pages is worth more than two pixels. Their PLACEMENT is dlg_data.h's
+ * through the same SE rule -- see MM_Q_ENUM -- and dlgSETDETAIL's enumUpgrades
+ * confirms it on the picture: its forward arrow's cell right edge measures 581
+ * against enumUpgrades' own 310 + 277 = 587. dlgSETCAR's enumCar does NOT: its
+ * pair measures 35 px inside its own rectangle at BOTH ends, on the same shot,
+ * and no reading of SE produces that. known-issues.md carries it.
+ */
+
+/* ButtonsTextures' sixth cell: GREY WITH A DOT, v 224. Its fifth (v 192) is
+   grey with a triangle, and the difference matters here -- every bar on these
+   two pages carries a dot, so a denying one has to come out of the dotted grey
+   or its cap changes shape when it goes dead. */
+#define MM_V_GREY_DOT (224.f / 256.f)
+
+/* THE CAR PAGES' LINE PITCH, which is the small font's own and not the 25
+   MM_LINE_H carries: SF_SMALL_SIZE_Y + SF_SMALL_LINE is 28 - 5 = 23, and the
+   spec block measures 22.7 on the game's own screenshot. */
+#define MM_G_LINE_H (SF_SMALL_SIZE_Y + SF_SMALL_LINE)
+
+/* One bar per part kind plus the Garage itself; the compiler holds the two
+   counts together rather than a comment doing it. */
+typedef char mm_gb_agree[(MM_GB_N == GAR_N_KINDS + 1) ? 1 : -1];
+typedef char mm_gcar_agree[(MM_N_CARS == PL_N_CARS) ? 1 : -1];
+
+/* dlgPLRSCOMM's player card, which the multiplayer front page draws as well --
+   defined with that page below, because it is written against its layout.
+   `scores_only' is dlgMULTIPLAYER's own difference; see that page. */
+static void mp_draw_card_at(const mainmenu_t *m, const mmframe *f,
+                            int scores_only);
+
+/* A heading's rule: the bottom edge of its own box, its full width. */
+static void mg_rule(const mmframe *f, float x0, float y0, float sx, float sy)
+{
+    mm_rule_at(f, px(f, x0), py(f, y0 + sy), sx * f->us);
+}
+
+/* A blurb, one line per '\n', left- or right-aligned, at that pitch. Returns
+   the y the line AFTER the last one would be at, so a caller can go on adding
+   to the block -- which is what the price line is. */
+static float mg_lines(const mainmenu_t *m, const mmframe *f, float x, float y,
+                      int right, float alpha, const char *s)
+{
+    char line[128];
+    while (s && *s) {
+        const char *nl = strchr(s, '\n');
+        size_t len = nl ? (size_t)(nl - s) : strlen(s);
+        if (len >= sizeof line)
+            len = sizeof line - 1;
+        memcpy(line, s, len);
+        line[len] = 0;
+        mm_q_text(m, f, 0, x, y, MM_TS_INFO, right, alpha, line);
+        y += MM_G_LINE_H;
+        if (!nl)
+            break;
+        s = nl + 1;
+    }
+    return y;
+}
+
+/* One texture in a design-space box, sampling the framed ink the track shots
+   and the upgrade art BOTH carry -- they have identical bounds, x 28..227 and
+   y 53..202 of 256 x 256, so MM_SHOT_U0.. serves both and nothing here draws a
+   border of its own. */
+static void mg_shot(const mmframe *f, unsigned int tex,
+                    float dx, float dy, float dw, float dh)
+{
+    float x, y, w, h;
+    mm_box(f, dx, dy, dw, dh, &x, &y, &w, &h);
+    if (tex)
+        ui_image(x, y, w, h, tex, MM_SHOT_U0, MM_SHOT_V0, MM_SHOT_U1,
+                 MM_SHOT_V1, 1.f, 1.f, 1.f, 1.f);
+    else
+        ui_rect(x, y, w, h, 0.25f, 0.28f, 0.34f, 1.f);
+}
+
+/* The four bars' own words -- 10059 and 10057/10058/10056, the string table's. */
+static const char *const MM_GB_NAME[MM_GB_N] = {
+    STR_UI_SELECT_CAR, STR_UI_UP_BOOSTER, STR_UI_UP_ENGINE, STR_UI_UP_TIRES
+};
+
+/* Which part kind a bar opens its page on; -1 for the Garage, which has none. */
+static int mg_tab_kind(int tab)
+{
+    return (tab > MM_GB_SELECT && tab < MM_GB_N) ? tab - MM_GB_PART : -1;
+}
+
+/* Whether the page you are on is this bar's -- which is what puts the WHITE dot
+   on it and slides it out. */
+static int mg_tab_here(const mainmenu_t *m, int tab)
+{
+    if (tab == MM_GB_SELECT)
+        return m->page == MM_PAGE_GARAGE;
+    return m->page == MM_PAGE_DETAIL && m->gkind == mg_tab_kind(tab);
+}
+
+/* Which of the eight measured rows a stop's bar is, and whether it is drawn in
+   the ORANGE cell rather than the red -- Next skin, Sell car and Upgrade are
+   orange on the game's own shots and the four tabs are red. */
+static int mg_bar_row(int stop, int *orange)
+{
+    if (orange) *orange = 0;
+    if (stop >= MM_G_TAB && stop < MM_G_TAB + MM_GB_N)
+        return stop - MM_G_TAB;             /* rows 0..3 */
+    switch (stop) {
+    case MM_G_SKIN: if (orange) *orange = 1; return 4;
+    /* ROW 5 IS EMPTY on both pages, and that is the game's own gap: the trays on
+       its screenshots run 131, 176, 221, 266, 326 and then nothing until 421. */
+    case MM_G_BUY:  if (orange) *orange = 1; return 6;
+    case MM_G_SELL: if (orange) *orange = 1; return 7;
+    default: return -1;
+    }
+}
+
+/* WHAT THE TWO MONEY BARS SAY, which is the whole difference between the two
+   pages' columns: 10013/10060 on the Garage, 10010/10061 on the part page. */
+static const char *mg_bar_name(const mainmenu_t *m, int stop)
+{
+    const int garage = m->page == MM_PAGE_GARAGE;
+    switch (stop) {
+    case MM_G_SKIN: return STR_UI_NEXT_SKIN;
+    case MM_G_BUY:  return garage ? STR_UI_BUY_CAR : STR_UI_UPGRADE;
+    case MM_G_SELL: return garage ? STR_UI_SELL_CAR : STR_UI_DOWNGRADE;
+    default:
+        if (stop >= MM_G_TAB && stop < MM_G_TAB + MM_GB_N)
+            return MM_GB_NAME[stop - MM_G_TAB];
+        return "";
+    }
+}
+
+/* ------------------------------------------------------------- the ring */
+
+/* The page's own stops in the order the pad walks them. MM_G_SKIN is on the
+   Garage and not on the part page, which is the one difference. */
+static int mg_ring(int page, int *out)
+{
+    int n = 0, i;
+    if (!MM_PAGE_IS_CAR(page))
+        return 0;
+    out[n++] = MM_G_ENUM;
+    for (i = 0; i < MM_GB_N; i++)
+        out[n++] = MM_G_TAB + i;
+    if (page == MM_PAGE_GARAGE)
+        out[n++] = MM_G_SKIN;
+    out[n++] = MM_G_BUY;
+    out[n++] = MM_G_SELL;
+    out[n++] = MM_G_RACE;
+    out[n++] = MM_G_BACK;
+    return n;
+}
+
+int mainmenu_g_nfocus(int page)
+{
+    int ring[MM_G_N_FOCUS];
+    return mg_ring(page, ring);
+}
+
+int mainmenu_g_stop(int page, int i)
+{
+    int ring[MM_G_N_FOCUS];
+    const int n = mg_ring(page, ring);
+    if (n <= 0)
+        return -1;
+    while (i < 0) i += n;
+    return ring[i % n];
+}
+
+static int mg_index(int page, int stop)
+{
+    int ring[MM_G_N_FOCUS];
+    const int n = mg_ring(page, ring);
+    int i;
+    for (i = 0; i < n; i++)
+        if (ring[i] == stop)
+            return i;
+    return 0;
+}
+
+/* WHETHER A STOP CAN ACT RIGHT NOW, which on these two pages is a question
+   about the PROFILE and not only about the build -- the two money bars answer
+   for the car or the part they are pointed at, and the game's own screenshots
+   show both of them denying: Buy car grey beside a car already in the garage,
+   Downgrade grey beside a part at Default. The focus ring still visits them, so
+   a press can say WHY; the main menu's dead rows are skipped instead, because
+   there is nothing there to say. */
+int mainmenu_g_live(const mainmenu_t *m, int stop)
+{
+    const player_t *p;
+    if (!m || !MM_PAGE_IS_CAR(m->page))
+        return 0;
+    p = player_cur();
+    switch (stop) {
+    case MM_G_BUY:
+        return m->page == MM_PAGE_GARAGE
+               ? garage_can_buy_car(p, m->car) == GAR_OK
+               : garage_can_buy_part(p, m->gkind, m->car, m->gsel) == GAR_OK;
+    case MM_G_SELL:
+        return m->page == MM_PAGE_GARAGE
+               ? garage_can_sell_car(p, m->car) == GAR_OK
+               : garage_can_sell_part(p, m->gkind, m->car, m->gsel) == GAR_OK;
+    /* NEXT SKIN NEEDS PAINT TO OFFER. `gskins' is the loaded car's own count and
+       is 1 until one is loaded, so the row denies rather than repainting a car
+       with the paint it already has. */
+    case MM_G_SKIN:
+        return m->gskins > 1 && (!p || garage_owns_car(p, m->car));
+    /* RACE NEEDS A CAR YOU OWN. The picker walks all three, because reaching a
+       car is how you buy one, so the Garage is the one page in the front end
+       where the green button can be pointed at a car that is not yours. */
+    case MM_G_RACE:
+        return !p || garage_owns_car(p, m->car);
+    default:
+        return 1;
+    }
+}
+
+/* ---------------------------------------------------------- the geometry */
+
+/* The page's own enum: enumCar on the Garage, enumUpgrades on the part page --
+   and dlgSETDETAIL's staticCarEnum, the read-only one, is NOT a stop. Both come
+   straight out of dlg_data.h with SE 0, which is what an enum whose value is a
+   picture or a bare name has. */
+static void mg_enum_rect(const mainmenu_t *m, float *x0, float *y0,
+                         float *sx, float *sy)
+{
+    if (m->page == MM_PAGE_GARAGE) {
+        *x0 = DLG_SETCAR_enumCarX0;  *y0 = DLG_SETCAR_enumCarY0;
+        *sx = DLG_SETCAR_enumCarSX;  *sy = DLG_SETCAR_enumCarSY;
+    } else {
+        *x0 = DLG_SETDETAIL_enumUpgradesX0; *y0 = DLG_SETDETAIL_enumUpgradesY0;
+        *sx = DLG_SETDETAIL_enumUpgradesSX; *sy = DLG_SETDETAIL_enumUpgradesSY;
+    }
+}
+
+static void mg_arrows(const mainmenu_t *m, const mmframe *f,
+                      float *bx, float *fx, float *ay, float *sz)
+{
+    float x0, y0, sx, sy;
+    mg_enum_rect(m, &x0, &y0, &sx, &sy);
+    *sz = MM_Q_ARROW * f->us;
+    *ay = py(f, y0 + sy * 0.5f) - *sz * 0.5f;
+    *bx = px(f, x0);                    /* SE is 0 on both */
+    *fx = px(f, x0 + sx) - *sz;
+}
+
+int mainmenu_g_row_at(const mainmenu_t *m, int screen_w, int screen_h,
+                      float x, float y, int *left)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float bx, by, bw, bh, ax, fx, ay, sz;
+    int i;
+
+    if (left) *left = 0;
+    if (!m || !MM_PAGE_IS_CAR(m->page))
+        return -1;
+    mg_arrows(m, &f, &ax, &fx, &ay, &sz);
+    /* Grown by half its own size, for the reason mainmenu_q_row_at gives; the
+       two boxes cannot meet, the narrower of these two enums being 277 wide. */
+    if (touch_in(x, y, ax - sz * 0.25f, ay - sz * 0.25f, sz * 1.5f, sz * 1.5f)) {
+        if (left) *left = 1;
+        return MM_G_ENUM;
+    }
+    if (touch_in(x, y, fx - sz * 0.25f, ay - sz * 0.25f, sz * 1.5f, sz * 1.5f))
+        return MM_G_ENUM;
+    /* The bars, on the main menu's own rects AT REST -- a hit box that breathes
+       with the slide is a hit box that misses. A DENYING one still answers, so a
+       touch on it says why rather than going quiet. */
+    for (i = 0; i < MM_G_N_FOCUS; i++) {
+        const int row = mg_bar_row(i, NULL);
+        if (row < 0 || (i == MM_G_SKIN && m->page != MM_PAGE_GARAGE))
+            continue;
+        mm_bar_rect(&f, row, &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return i;
+    }
+    mm_race_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_G_RACE;
+    mm_quit_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_G_BACK;
+    return -1;
+}
+
+/* -------------------------------------------------------------- the step */
+
+void mainmenu_open_garage(mainmenu_t *m, int kind)
+{
+    if (!m)
+        return;
+    if (kind >= 0 && kind < GAR_N_KINDS) {
+        m->page = MM_PAGE_DETAIL;
+        m->gkind = kind;
+    } else {
+        m->page = MM_PAGE_GARAGE;
+    }
+    /* THE PICKER OPENS ON THE LEVEL YOU COULD BUY NEXT, which is the one the
+       engine's own status text prints a price on -- and at level 3 it opens on
+       the top one, the one marked INSTALLED. Opening at 0 every time would put
+       "You have to sell previous upgrade first!" under the picture of a car
+       whose parts are all fitted. */
+    if (m->page == MM_PAGE_DETAIL) {
+        const int up = garage_level(player_cur(), m->gkind, m->car);
+        m->gsel = up < GAR_N_LEVELS ? up : GAR_N_LEVELS - 1;
+    }
+    m->gfocus = MM_G_TAB + (m->page == MM_PAGE_GARAGE
+                            ? MM_GB_SELECT : MM_GB_PART + m->gkind);
+    m->garmed = -1;
+}
+
+/* THE SHOP'S FOUR ACTIONS, which is what MM_MODAL_ASK's Yes commits. */
+enum { MG_ASK_BUY_CAR = 0, MG_ASK_SELL_CAR, MG_ASK_BUY_PART,
+       MG_ASK_SELL_PART,
+       /* AND THE LOBBY'S OWN, which is not the Garage's business but
+          shares its Yes/No panel: 42930, "Do you really want to
+          disconnect?". One modal machine, four questions. */
+       MG_ASK_DISCONNECT };
+
+/* WHETHER THE PICKER CAN GO THAT WAY, and the two pages answer differently --
+ * which is measured off the arrows themselves.
+ *
+ * THE CAR PICKER WRAPS. On the game's own Garage shot the car is the FIRST of
+ * the three and BOTH its arrows are red, so there is no end to walk off.
+ *
+ * THE LEVEL PICKER CLAMPS. On all three of the game's own part-page shots the
+ * picker is on level 1 and its LEFT arrow is grey where its right one is red --
+ * the only reading of that is a list with ends, and the ends grey out. Which is
+ * also the right shape for it: the three levels are a ladder, not a ring, and
+ * the status text under the picture is written per level (`Not available' below
+ * what you own, `INSTALLED' on it) rather than per step.
+ */
+static int mg_can_move(const mainmenu_t *m, int d)
+{
+    if (m->page == MM_PAGE_GARAGE)
+        return 1;
+    return d < 0 ? m->gsel > 0 : m->gsel < GAR_N_LEVELS - 1;
+}
+
+/* One step of the page's picker. On the Garage it walks the CAR -- all three,
+   because reaching one is how you buy it -- and on the part page the three
+   levels of the part the page is on. */
+static void mg_move(mainmenu_t *m, int d)
+{
+    if (!mg_can_move(m, d)) {
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    if (m->page == MM_PAGE_GARAGE)
+        m->car = (m->car + d + MM_N_CARS) % MM_N_CARS;
+    else
+        m->gsel += d;
+    m->cue = MM_CUE_ARROW;
+}
+
+/* The three fitted parts, for 40801's `details' field. Every word is the
+   game's -- the part names out of str_data.h and "Default" where nothing is
+   fitted; the comma between them is the only thing here the port wrote. */
+static const char *mg_parts_line(const mainmenu_t *m, int car)
+{
+    static char buf[128];
+    int k, n = 0;
+    buf[0] = 0;
+    for (k = 0; k < GAR_N_KINDS; k++) {
+        const char *s = garage_part_name(k, car,
+                                         garage_level(player_cur(), k, car));
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%s%s",
+                      k ? ", " : "", s);
+        if (n < 0 || (size_t)n >= sizeof buf)
+            break;
+    }
+    (void)m;
+    return buf;
+}
+
+static void mg_say(mainmenu_t *m, const char *line)
+{
+    m->modal = MM_MODAL_SAY;
+    m->msay = line;
+    m->mfocus = MM_MODAL_OK;
+    m->marmed = -1;
+}
+
+/* The question, and it opens on NO. Every one of these spends or gives up
+   something this screen cannot undo, so the destructive answer is never the one
+   a thumb lands on by reflex -- the rule the roster's "Do you want to remove
+   current player?" already follows. */
+static void mg_ask(mainmenu_t *m, int what, const char *line)
+{
+    m->modal = MM_MODAL_ASK;
+    m->gask = what;
+    m->msay = line;
+    m->mfocus = MM_MODAL_CANCEL;
+    m->marmed = -1;
+}
+
+/* `Cash remainder $n' -- 40709, the engine's own question line, with the figure
+   the purchase would leave. Both of the part page's buttons ask with it, which
+   is what the exe's own two handlers do. */
+static void mg_ask_cash(mainmenu_t *m, int what, int cash_after)
+{
+    char money[24];
+    garage_cash(money, sizeof money, cash_after);
+    snprintf(m->gline, sizeof m->gline, STR_UI_CASH_LEFT, money);
+    mg_ask(m, what, m->gline);
+}
+
+static void mg_fire(mainmenu_t *m, int stop)
+{
+    player_t *p = player_cur();
+    const int garage = m->page == MM_PAGE_GARAGE;
+    gar_result r;
+
+    if (stop >= MM_G_TAB && stop < MM_G_TAB + MM_GB_N) {
+        const int tab = stop - MM_G_TAB;
+        if (!mg_tab_here(m, tab))
+            mainmenu_open_garage(m, mg_tab_kind(tab));
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    switch (stop) {
+    case MM_G_ENUM:
+        mg_move(m, +1);                 /* CROSS on a picker steps it */
+        return;
+    case MM_G_RACE:
+        if (!mainmenu_g_live(m, stop)) {
+            /* A car that is not in the garage cannot be raced, and the engine
+               has a word for a car you do not have. */
+            mg_say(m, garage_reason(GAR_NOT_OWNED));
+            m->cue = MM_CUE_DENY;
+            return;
+        }
+        m->action = MM_ACT_RACE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_G_BACK:
+        /* BACK GOES TO THE PAGE YOU CAME IN BY: a part page steps back to the
+           Garage and the Garage to the quick-race summary, which is the bar
+           that opened it. One press per step in, like every other back button
+           in this app. */
+        if (m->page == MM_PAGE_DETAIL) {
+            mainmenu_open_garage(m, -1);
+        } else {
+            /* AND IT LEAVES THE FOCUS ON THE BAR THAT OPENED IT, not on Race
+               summary's own -- one press in and one press out, landing where
+               the thumb already was. mm_q_nav would put it on the summary bar,
+               which is right when a tab SWITCHES a view and wrong when a Back
+               unwinds a step. */
+            m->page = MM_PAGE_QUICK;
+            m->qfocus = MM_Q_NAV + MM_QB_GARAGE;
+        }
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_G_SKIN:
+        if (!mainmenu_g_live(m, stop)) {
+            m->cue = MM_CUE_DENY;
+            return;
+        }
+        /* THE ENGINE'S OWN LINE, and it SAVES: FUN_004d62a0 does
+           `up[3] = (up[3] + 1) % nskins' and writes the profile out. A paint is
+           a property of the car and has to survive the launch. */
+        garage_set_skin(p, m->car,
+                        garage_next_skin(garage_skin(p, m->car), m->gskins));
+        m->action = MM_ACT_GARAGE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_G_BUY:
+    case MM_G_SELL:
+        break;
+    default:
+        return;
+    }
+
+    /* The four money buttons. Each ASKS in the engine's own words, and the
+       refusals are the engine's own words too -- garage.h has the table. `p' is
+       never dereferenced below without a guard having passed, and every guard
+       answers GAR_NO_PROFILE first when there is none. */
+    if (garage && stop == MM_G_BUY) {
+        char money[24];
+        r = garage_can_buy_car(p, m->car);
+        if (r != GAR_OK) { mg_say(m, garage_reason(r)); m->cue = MM_CUE_DENY; return; }
+        garage_cash(money, sizeof money, p->cash - garage_car_price(m->car));
+        snprintf(m->gline, sizeof m->gline, "%s %s?  %s",
+                 STR_UI_BUY_CAR_ASK, STR_CAR_NAME[m->car], money);
+        mg_ask(m, MG_ASK_BUY_CAR, m->gline);
+    } else if (garage) {
+        r = garage_can_sell_car(p, m->car);
+        if (r != GAR_OK) { mg_say(m, garage_reason(r)); m->cue = MM_CUE_DENY; return; }
+        snprintf(m->gline, sizeof m->gline, STR_UI_SELL_CAR_ASK,
+                 STR_CAR_NAME[m->car], mg_parts_line(m, m->car));
+        mg_ask(m, MG_ASK_SELL_CAR, m->gline);
+    } else if (stop == MM_G_BUY) {
+        r = garage_can_buy_part(p, m->gkind, m->car, m->gsel);
+        if (r != GAR_OK) { mg_say(m, garage_reason(r)); m->cue = MM_CUE_DENY; return; }
+        mg_ask_cash(m, MG_ASK_BUY_PART,
+                    p->cash - garage_part_price(m->gkind, m->car, m->gsel + 1));
+    } else {
+        r = garage_can_sell_part(p, m->gkind, m->car, m->gsel);
+        if (r != GAR_OK) { mg_say(m, garage_reason(r)); m->cue = MM_CUE_DENY; return; }
+        mg_ask_cash(m, MG_ASK_SELL_PART,
+                    p->cash + garage_part_sell(m->gkind, m->car, m->gsel + 1));
+    }
+    m->cue = MM_CUE_PRESS;
+}
+
+/* What Yes does. Every one of these goes back through garage.c, so the guard
+   that answered the button is the guard that answers here as well: a modal can
+   sit on screen while something else moves, and asking twice costs nothing. */
+static void mg_commit(mainmenu_t *m)
+{
+    player_t *p = player_cur();
+    gar_result r = GAR_NO_PROFILE;
+
+    m->modal = MM_MODAL_NONE;
+    switch (m->gask) {
+    case MG_ASK_BUY_CAR:   r = garage_buy_car(p, m->car); break;
+    case MG_ASK_SELL_CAR:
+        r = garage_sell_car(p, m->car);
+        if (r == GAR_OK) {
+            /* THE CAR YOU SOLD CANNOT STAY SELECTED. The picker moves to the
+               next one in the garage; there is always one, because selling the
+               last is only allowed when the money can buy another and
+               garage_can_sell_car is what enforces that. */
+            const int nxt = garage_next_owned_car(p, m->car);
+            if (nxt >= 0)
+                m->car = nxt;
+        }
+        break;
+    case MG_ASK_BUY_PART:
+        r = garage_buy_part(p, m->gkind, m->car, m->gsel);
+        break;
+    case MG_ASK_SELL_PART:
+        r = garage_sell_part(p, m->gkind, m->car, m->gsel);
+        break;
+    case MG_ASK_DISCONNECT:
+        /* THE LOBBY'S OWN. Leaving is not a purchase and has no reason code:
+           tell the other end, drop the socket's session and go back to the page
+           the game was made on. */
+        net_leave();
+        mainmenu_open_multi(m);
+        m->cue = MM_CUE_PRESS;
+        return;
+    default:
+        break;
+    }
+    if (r != GAR_OK) {
+        mg_say(m, garage_reason(r));
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    m->action = MM_ACT_GARAGE;
+    m->cue = MM_CUE_PRESS;
+}
+
+static void mm_step_garage(mainmenu_t *m, unsigned int down,
+                           const touch_state *tp, int screen_w, int screen_h)
+{
+    const int page = m->page;
+    const int n = mainmenu_g_nfocus(page);
+
+    if (n <= 0)
+        return;
+    if (down & SCE_CTRL_DOWN) {
+        m->gfocus = mainmenu_g_stop(page, mg_index(page, m->gfocus) + 1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & SCE_CTRL_UP) {
+        m->gfocus = mainmenu_g_stop(page, mg_index(page, m->gfocus) - 1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    /* LEFT and RIGHT walk the page's own picker wherever the focus is, which is
+       what they do on the main menu's carousel: the picker is the page's
+       subject, and reaching it should not cost a trip round the ring. */
+    if (down & SCE_CTRL_LEFT)  mg_move(m, -1);
+    if (down & SCE_CTRL_RIGHT) mg_move(m, +1);
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mg_fire(m, m->gfocus);
+    if (down & SCE_CTRL_CIRCLE) {
+        mg_fire(m, MM_G_BACK);
+        return;
+    }
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        int left;
+        m->garmed = mainmenu_g_row_at(m, screen_w, screen_h,
+                                      tp->x, tp->y, &left);
+        if (m->garmed >= 0 && m->gfocus != m->garmed) {
+            m->gfocus = m->garmed;
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    if (tp->released) {
+        int left;
+        const int row = mainmenu_g_row_at(m, screen_w, screen_h,
+                                          tp->x, tp->y, &left);
+        if (row >= 0 && row == m->garmed) {
+            if (row == MM_G_ENUM)
+                mg_move(m, left ? -1 : +1);   /* the back arrow goes back */
+            else
+                mg_fire(m, row);
+        }
+        m->garmed = -1;
+    }
+}
+
+/* -------------------------------------------------------------- the draw */
+
+/* The four radio bars and the page's own two or three money bars, on the main
+   menu's own eight row rects. */
+static void mg_draw_bars(const mainmenu_t *m, const mmframe *f)
+{
+    int i;
+
+    for (i = 0; i < MM_G_N_FOCUS; i++) {
+        float bx, by, bw, bh, slide = 0.f;
+        int orange = 0;
+        const int row = mg_bar_row(i, &orange);
+        const int tab = i >= MM_G_TAB && i < MM_G_TAB + MM_GB_N;
+        const int here = tab && mg_tab_here(m, i - MM_G_TAB);
+        const int lit = m->gfocus == i;
+        const int live = tab ? 1 : mainmenu_g_live(m, i);
+
+        if (row < 0 || (i == MM_G_SKIN && m->page != MM_PAGE_GARAGE))
+            continue;
+        if (here || lit)
+            slide = MM_SLIDE * MM_SETTLED;
+        mm_draw_wedge(m, f, row);
+        mm_bar_draw_rect(m, f, row, slide, &bx, &by, &bw, &bh);
+
+        /* THE FOUR TABS ARE RADIO CELLS and the money bars are not, and the art
+           is what says so: the game's shots put a DOT on every bar on these two
+           pages, and ButtonsTextures' orange and grey cells carry one of their
+           own (v 96 and v 224) where its red cells carry a triangle. So the tabs
+           come out of RadioButtonsTextures and the rest out of the two dotted
+           cells that already have it. */
+        if (tab && m->tex.radio) {
+            const float v = here ? MM_V_RAD_ON : MM_V_RAD;
+            ui_image(bx, by, bw, bh, m->tex.radio,
+                     0.f, v, 1.f, v + MM_V_RAD_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else if (m->tex.buttons) {
+            const float v = !live ? MM_V_GREY_DOT
+                                  : (orange ? (lit ? MM_V_ORANGE_F : MM_V_ORANGE)
+                                            : (lit ? MM_V_RED_F : MM_V_RED));
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else {
+            ui_rect(bx, by, bw, bh, live ? 0.72f : 0.45f,
+                    live ? 0.09f : 0.45f, live ? 0.11f : 0.47f, 1.f);
+        }
+        mm_label(m, f, bx, by, bw, bh, mg_bar_name(m, i),
+                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
+    }
+}
+
+/* dlgCARSCOMM's furniture, which both pages stand on: the car itself, the cash
+   line and the "Car" heading. */
+static void mg_draw_common(const mainmenu_t *m, const mmframe *f)
+{
+    const player_t *p = player_cur();
+    const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
+    char money[24];
+
+    /* animCarPreview -- the car in 3D, out of ui.c's ortho and back in, exactly
+       as animCar is on the quick-race page. */
+    {
+        float x, y, w, h;
+        mm_box(f, DLG_CARSCOMM_animCarPreviewX0, DLG_CARSCOMM_animCarPreviewY0,
+               DLG_CARSCOMM_animCarPreviewSX, DLG_CARSCOMM_animCarPreviewSY,
+               &x, &y, &w, &h);
+        if (m->car_draw) {
+            ui_end();
+            m->car_draw(m->car_ctx, x, y, w, h);
+            ui_begin((int)f->w, (int)f->h);
+        } else {
+            const sfont sf = sf_big(m->tex.font_big);
+            const float sc = f->us * MM_TS_TRACK;
+            const char *s = STR_CAR_NAME[c];
+            const float tw = sf.tex ? sf_w(&sf, sc, s) : ui_text_w(sc, s);
+            if (sf.tex)
+                sf_text_shadowed(&sf, x + w * 0.5f - tw * 0.5f, y + h * 0.55f,
+                                 sc, 1.f, 1.f, 1.f, 0.45f, s);
+            else
+                ui_text(x + w * 0.5f - tw * 0.5f, y + h * 0.55f, sc,
+                        1.f, 1.f, 1.f, 0.45f, s);
+        }
+    }
+
+    /* staticCashText / staticPlayerCash -- "Your cash" over its own rule, with
+       the figure to its right. Both left-aligned on their own X0, which is what
+       the screenshot has: the word starts at 116 and the figure at 317. */
+    mm_q_text(m, f, 0, DLG_CARSCOMM_staticCashTextX0,
+              DLG_CARSCOMM_staticCashTextY0, MM_TS_LABEL, 0, 1.f,
+              STR_UI_YOUR_CASH);
+    mg_rule(f, DLG_CARSCOMM_staticCashTextX0, DLG_CARSCOMM_staticCashTextY0,
+            DLG_CARSCOMM_staticCashTextSX, DLG_CARSCOMM_staticCashTextSY);
+    garage_cash(money, sizeof money, p ? p->cash : CHAMP_DEFAULT_CASH);
+    mm_q_text(m, f, 0, DLG_CARSCOMM_staticPlayerCashX0,
+              DLG_CARSCOMM_staticPlayerCashY0, MM_TS_LABEL, 0, 1.f, money);
+
+    /* staticCarName -- the word "Car" and its rule, 41500. */
+    mm_q_text(m, f, 0, DLG_CARSCOMM_staticCarNameX0,
+              DLG_CARSCOMM_staticCarNameY0, MM_TS_LABEL, 0, 1.f, STR_UI_CAR);
+    mg_rule(f, DLG_CARSCOMM_staticCarNameX0, DLG_CARSCOMM_staticCarNameY0,
+            DLG_CARSCOMM_staticCarNameSX, DLG_CARSCOMM_staticCarNameSY);
+}
+
+/* The Garage's own half: the spec block with its price line, the status line,
+   and the "Current upgrades" table. */
+static void mg_draw_setcar(const mainmenu_t *m, const mmframe *f)
+{
+    const player_t *p = player_cur();
+    const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
+    const int owned = garage_owns_car(p, c);
+    const float rx = DLG_CARSCOMM_staticCarExplainX0
+                     + DLG_CARSCOMM_staticCarExplainSX;
+    char money[24], line[96];
+    float y;
+    int k;
+
+    /* staticCarExplain -- the car's own SEVEN-line spec block, right-aligned,
+       and then the price as its eighth line. See the section header on why the
+       price line is here rather than at staticPrice's own Y. */
+    y = mg_lines(m, f, rx, DLG_CARSCOMM_staticCarExplainY0, 1, 1.f,
+                 STR_CAR_INFO[c]);
+    garage_cash(money, sizeof money,
+                owned ? garage_car_sell(p, c) : garage_car_price(c));
+    snprintf(line, sizeof line,
+             owned ? STR_UI_SELL_PRICE : STR_UI_BUY_PRICE, money);
+    mm_q_text(m, f, 0, DLG_SETCAR_staticPriceX0 + DLG_SETCAR_staticPriceSX,
+              y, MM_TS_INFO, 1, 1.f, line);
+
+    /* staticStatus -- only a car you do NOT own has anything to say here, which
+       is the engine's own branch: 40807 when the cash covers it and 40808 when
+       it does not. */
+    if (!owned)
+        mg_lines(m, f, DLG_SETCAR_staticStatusX0, DLG_SETCAR_staticStatusY0,
+                 0, 1.f,
+                 garage_can_buy_car(p, c) == GAR_OK ? STR_UI_CAN_BUY_CAR
+                                                    : STR_UI_NOT_AVAILABLE);
+
+    /* staticUpgrades / staticCarInfoLeft / staticCarInfoRight -- the heading
+       with its rule, the three labels as the engine's own one string, and the
+       three fitted parts beside them. */
+    mm_q_text(m, f, 0, DLG_SETCAR_staticUpgradesX0,
+              DLG_SETCAR_staticUpgradesY0, MM_TS_LABEL, 0, 1.f,
+              STR_UI_CUR_UPGRADES);
+    mg_rule(f, DLG_SETCAR_staticUpgradesX0, DLG_SETCAR_staticUpgradesY0,
+            DLG_SETCAR_staticUpgradesSX, DLG_SETCAR_staticUpgradesSY);
+    mg_lines(m, f, DLG_SETCAR_staticCarInfoLeftX0,
+             DLG_SETCAR_staticCarInfoLeftY0, 0, 1.f, STR_UI_UPGRADE_LABELS);
+    y = DLG_SETCAR_staticCarInfoRightY0;
+    for (k = 0; k < GAR_N_KINDS; k++) {
+        mm_q_text(m, f, 0, DLG_SETCAR_staticCarInfoRightX0, y, MM_TS_INFO, 0,
+                  1.f, garage_part_name(k, c, garage_level(p, k, c)));
+        y += MM_G_LINE_H;
+    }
+}
+
+/* The part page's own half: the heading, the part's block with its price line,
+   the photograph between the picker's arrows, and the status word. */
+static void mg_draw_setdetail(const mainmenu_t *m, const mmframe *f)
+{
+    const player_t *p = player_cur();
+    const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
+    const int kind = (m->gkind < 0 || m->gkind >= GAR_N_KINDS) ? 0 : m->gkind;
+    const int sel = (m->gsel < 0 || m->gsel >= GAR_N_LEVELS) ? 0 : m->gsel;
+    const gar_state st = garage_state(p, kind, c, sel);
+    const float rx = DLG_SETDETAIL_staticUpgradeInfoX0
+                     + DLG_SETDETAIL_staticUpgradeInfoSX;
+    char money[24], line[96];
+    float y;
+
+    /* staticCarExplain again -- the SEVEN-line block with no price line, which
+       is what all three of the game's own part-page shots have. */
+    mg_lines(m, f, DLG_CARSCOMM_staticCarExplainX0
+                   + DLG_CARSCOMM_staticCarExplainSX,
+             DLG_CARSCOMM_staticCarExplainY0, 1, 1.f, STR_CAR_INFO[c]);
+
+    /* staticUpgradeName -- Booster / Engine / Tires, with its rule. */
+    mm_q_text(m, f, 0, DLG_SETDETAIL_staticUpgradeNameX0,
+              DLG_SETDETAIL_staticUpgradeNameY0, MM_TS_LABEL, 0, 1.f,
+              garage_kind_name(kind));
+    mg_rule(f, DLG_SETDETAIL_staticUpgradeNameX0,
+            DLG_SETDETAIL_staticUpgradeNameY0,
+            DLG_SETDETAIL_staticUpgradeNameSX,
+            DLG_SETDETAIL_staticUpgradeNameSY);
+
+    /* staticUpgradeInfo -- the part's name, its two-line effect block and then
+       its price: four right-aligned lines at the small font's own pitch. The
+       fourth depends on which of the four states the picker is in -- a price on
+       the one you may buy, what it fetches back on the one you own, and nothing
+       at all on the two you cannot act on. */
+    y = mg_lines(m, f, rx, DLG_SETDETAIL_staticUpgradeInfoY0, 1, 1.f,
+                 garage_part_name(kind, c, sel + 1));
+    y = mg_lines(m, f, rx, y, 1, 1.f, garage_part_info(kind, c, sel + 1));
+    if (st == GAR_ST_PRICE || st == GAR_ST_INSTALLED) {
+        garage_cash(money, sizeof money,
+                    st == GAR_ST_PRICE
+                    ? garage_part_price(kind, c, sel + 1)
+                    : garage_part_sell(kind, c, sel + 1));
+        snprintf(line, sizeof line, "%s: %s",
+                 st == GAR_ST_PRICE ? STR_UI_PRICE : STR_UI_SELL_PART_FOR,
+                 money);
+        mm_q_text(m, f, 0, rx, y, MM_TS_INFO, 1, 1.f, line);
+    }
+
+    /* shotlistUpgrade -- `upgr_<fam><level>_<car+1>', the LEVEL first; see
+       garage.h, which says how that came out and how it was checked. */
+    mg_shot(f, m->tex.upgr[kind][c][sel],
+            DLG_SETDETAIL_shotlistUpgradeX0, DLG_SETDETAIL_shotlistUpgradeY0,
+            DLG_SETDETAIL_shotlistUpgradeSX, DLG_SETDETAIL_shotlistUpgradeSY);
+
+    /* staticUpgradeStatus -- the word under the picture. The buyable state says
+       nothing here (its price is in the block above), which is what the game's
+       own three shots have: all three are at Default with the picker on level 1
+       and none of them carries a status word. `Not available' is drawn at the
+       engine's own 0.5 -- FUN_004d4fc0 writes 0x3f000000 beside that string and
+       beside no other. */
+    if (st != GAR_ST_PRICE)
+        mg_lines(m, f, DLG_SETDETAIL_staticUpgradeStatusX0,
+                 DLG_SETDETAIL_staticUpgradeStatusY0, 0,
+                 st == GAR_ST_NOT_AVAIL ? 0.5f : 1.f,
+                 st == GAR_ST_NOT_AVAIL ? STR_UI_NOT_AVAILABLE
+                 : (st == GAR_ST_INSTALLED ? STR_UI_INSTALLED
+                                           : STR_UI_SELL_PREV));
+}
+
+/* One enum's value, centred between its two arrows -- the car's name, which is
+   what both of these pages put there. */
+static void mg_value(const mainmenu_t *m, const mmframe *f, float ax, float sz,
+                     float fx, float cy, float alpha, const char *s)
+{
+    const sfont sf = sf_small(m->tex.font_small);
+    const float sc = f->us * MM_TS_LABEL;
+    const float w = sf.tex ? sf_w(&sf, sc, s) : ui_text_w(sc, s);
+    const float h = sf.tex ? sf_h(&sf, sc) : ui_text_h(sc);
+    const float x = (ax + sz + fx) * 0.5f - w * 0.5f;
+    if (sf.tex)
+        sf_text_shadowed(&sf, x, cy - h * 0.5f, sc, 1.f, 1.f, 1.f, alpha, s);
+    else
+        ui_text(x, cy - h * 0.5f, sc, 1.f, 1.f, 1.f, alpha, s);
+}
+
+/* The page's enum arrows, drawn last so the pair either side of the part
+   photograph sits over it -- the order the game's own screens have. */
+static void mg_draw_enum(const mainmenu_t *m, const mmframe *f)
+{
+    const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
+    float ax, fx, ay, sz, x0, y0, sx, sy;
+    const int lit = m->gfocus == MM_G_ENUM;
+
+    mg_arrows(m, f, &ax, &fx, &ay, &sz);
+    mg_enum_rect(m, &x0, &y0, &sx, &sy);
+    /* AN ARROW THAT CANNOT MOVE IS GREY, which is the artists' own third cell
+       and what the game's own part-page shots have on the LEFT one at level 1.
+       A focused pair is silver; the disabled cell wins over both. */
+    mm_arrow(m, ax, ay, sz, !mg_can_move(m, -1) ? 2 : (lit ? 1 : 0), 0);
+    mm_arrow(m, fx, ay, sz, !mg_can_move(m, +1) ? 2 : (lit ? 1 : 0), 1);
+
+    /* THE GARAGE'S ENUM SHOWS THE CAR'S NAME between its arrows; the part
+       page's value is the PHOTOGRAPH and carries no text at all, which is what
+       enumTrack does with the track's picture on dlgRACESUM. */
+    if (m->page == MM_PAGE_GARAGE)
+        mg_value(m, f, ax, sz, fx, py(f, y0 + sy * 0.5f), 1.f,
+                 STR_CAR_NAME[c]);
+
+    /* AND THE PART PAGE CARRIES A SECOND, DEAD PAIR: staticCarEnum, an &ENM the
+       exe's own table names `static', at dlgSETCAR's enumCar rectangle. Its
+       arrows are GREY on all three of the game's shots and its value is the
+       car's name -- you cannot change car from a part page, and the control says
+       so in the artists' own disabled cell. */
+    if (m->page == MM_PAGE_DETAIL) {
+        const float asz = MM_Q_ARROW * f->us;
+        const float cy = py(f, DLG_SETDETAIL_staticCarEnumY0
+                               + DLG_SETDETAIL_staticCarEnumSY * 0.5f);
+        const float bx = px(f, DLG_SETDETAIL_staticCarEnumX0);
+        const float fx2 = px(f, DLG_SETDETAIL_staticCarEnumX0
+                                + DLG_SETDETAIL_staticCarEnumSX) - asz;
+        mm_arrow(m, bx, cy - asz * 0.5f, asz, 2, 0);
+        mm_arrow(m, fx2, cy - asz * 0.5f, asz, 2, 1);
+        mg_value(m, f, bx, asz, fx2, cy, 0.82f, STR_CAR_NAME[c]);
+    }
+}
+
+static void mm_draw_garage(const mainmenu_t *m, const mmframe *f)
+{
+    mg_draw_bars(m, f);
+    mg_draw_common(m, f);
+    if (m->page == MM_PAGE_GARAGE)
+        mg_draw_setcar(m, f);
+    else
+        mg_draw_setdetail(m, f);
+    mg_draw_enum(m, f);
+}
+
+/* ============================== dlgMULTIPLAYER and dlgWAITPLAYERS_* -- NET
+ *
+ * TWO SCREENS, SIX DIALOGS' WORTH OF CONTROLS, and every rectangle is shipped.
+ * `net.h' is the transport; see mainmenu.h for what is deliberately NOT built
+ * here (Two players, Chat, Options) and why.
+ *
+ * THE EXE'S OWN CONTROL TABLES, the same `{ id, type, name, label }' records
+ * dlgRACESUM's are -- and the fourth field, which the pages built before this
+ * one all had zero in, turns out to be a STRING ID: the control's own label.
+ * That is a general fact about the whole table and it is what makes these three
+ * dialogs readable without measuring a single word:
+ *
+ *   dlgMULTIPLAYER @ 0x56f0b8, ids 0xede..0xee1
+ *     0xede &SHS  shotListTracks      the track carousel
+ *     0xedf &APV  animPrevCar         behind it, and unused -- dlgMAIN has the
+ *                                     same pair and the main menu draws no car
+ *     0xee0 &STT  staticInfoHeader    the track's NAME, with a rule
+ *     0xee1 &STT  staticInfo          its three-line blurb
+ *
+ *   dlgWAITPLAYERS_RACESUM @ 0x570130, ids 0x1450..0x1455
+ *     0x1450 &ENM  enumNLaps   label 42904 `N laps'
+ *     0x1451 &ENM  enumTrack   label 42906 `Map'
+ *     0x1452 &TBL  table
+ *     0x1454 &CHA  chat        the message panel
+ *     0x1455 &EDT  editChat    -- not built
+ *
+ *   dlgWAITPLAYERS_CARSETUP @ 0x56ffc8, ids 0x14b4..0x14ba
+ *     0x14b4 &ENM  enumBoost   label 43000 `Booster:'
+ *     0x14b5 &ENM  enumReson   label 43001 `Engine:'
+ *     0x14b6 &ENM  enumTires   label 43002 `Tires:'
+ *     0x14b7 &ENM  enumCar
+ *     0x14b8 &CHA  chat
+ *     0x14b9 &EDT  editChat    -- not built
+ *     0x14ba &BTN  none        label 10012 `Next skin'  <- row 7
+ *
+ *   dlgWAITPLAYERS_CARRESTR @ 0x56ff08, ids 0x157c..0x1582
+ *     0x157c &ENM  enumCar1    label 40100 `Road Rage RR'
+ *     0x157d &ENM  enumCar2    label 40104 `Tornado Buggy TB'
+ *     0x157e &ENM  enumCar3    label 40108 `Warhammer WH'
+ *     0x157f &STT  staticHeader1 label 43211 `Car type'
+ *     0x1580 &STT  staticHeader2 label 43212 `Car enabled'
+ *     0x1581 &CHA  chat
+ *     0x1582 &EDT  editChat    -- not built
+ *
+ * AND THE PLAYER CARD ON THE FRONT PAGE IS dlgPLRSCOMM's, to the pixel. That is
+ * measured, off the game's own screenshot of dlgMULTIPLAYER: the name's ink at
+ * y 89 from x 240, its rule at 110 running 240..519, three info lines at 119,
+ * 142 and 164 on a flat 23 pitch, the second rule at 184 and `Scores' at 191 --
+ * which is MP_NAME_Y, MP_RULE1_Y, MP_RULE_W, MP_INFO_Y, MP_INFO_LH, MP_RULE2_Y
+ * and MP_CASH_Y, every one of them, with nothing to change. So `mp_draw_card'
+ * draws it, and dlgPLRSCOMM.ini's four rectangles are in `dlg_data.h' now
+ * rather than only in that page's measured constants.
+ *
+ * ONE THING ON IT IS NOT THE ROSTER PAGE'S: this page's `Scores' line is
+ * LEFT-aligned at 240 and carries no `Cash' beside it, where the roster page
+ * right-aligns the pair on 520. Measured on the same shot -- the line runs
+ * 240..306 -- so the card takes a flag rather than being copied.
+ *
+ * WHAT WAS MEASURED FOR THE REST, and only these:
+ *
+ *  - THE BOTTOM BLOCK'S RULE IS ITS BOX'S OWN BOTTOM EDGE, run its full width,
+ *    which is the same rule the Garage's headings follow: `Surf' ink at 426..442
+ *    from x 233 with its rule at 447 spanning 233..406, against
+ *    staticInfoHeader's (233, 417) 174x30 -- 417 + 30 and 233 + 174, exactly.
+ *    The three blurb lines then sit at 456, 479 and 501, a flat 22.7, which is
+ *    the small font's own 23 (SF_SMALL_SIZE_Y + SF_SMALL_LINE) and not the 25
+ *    the quick-race pages use.
+ *  - THE CAROUSEL IS THE MAIN MENU'S. shotListTracks is (223, 269) 199x152 with
+ *    bounds L 12, R 632, band 303..379 and space 3, which places the four
+ *    thumbnails at 15, 119, 425 and 529 at 101 px wide -- and the game's own
+ *    screenshot of this page has its left pair at exactly 15..114 and 119..219.
+ *    So `mm_draw_carousel' draws it, and the 12 px by which the main menu's own
+ *    measured right pair (437, 542) differs from the shipped 425 and 529 is a
+ *    gap in `known-issues.md' rather than a second carousel.
+ *  - THE SIX TABS ARE ROWS 0..5 of the main menu's own eight and the page's own
+ *    button is row 7, measured off the trays: 131, 176, 221, 266, 311, 356 and
+ *    then 466 on the Race summary shot (Kick player off) and 481 on the Car
+ *    setup one (Next skin, orange, so the mask sees less of it). Four tabs are
+ *    built, so they take rows 0..3.
+ *  - AND THE TABLE'S COLUMNS ARE CENTRED, except the first. Off the header's own
+ *    ink -- Player 113..157, Car 241..264, Boost 320..357, Engine 374..415,
+ *    Tires 436..468, Status 493..536, with the header's rule at y 196 -- against
+ *    tableWidth1..5 of 19, 26, 13, 13, 13 percent of 466 from x 86 and the last
+ *    column taking the 16% the file never names. Centred, the last column lands
+ *    at 514.75 against a measured 514.5 and the rest within 17 px; `Player' is
+ *    LEFT-aligned instead, because the skin swatch is in front of it -- which is
+ *    what `koefDrawSkin', `shiftDrawSkinX' and `sizeDrawSkinY' are for, and the
+ *    swatch measures x 92..107, i.e. tableX0 + shiftDrawSkinX exactly.
+ */
+
+/* THE SKIN SWATCH in the table's first column, and all three of the keys the
+ * dialog ships for it are used.
+ *
+ * `skin_ik_vse' is Interface.sb's own skin-icon sheet: 128x128, a 4 x 4 GRID of
+ * 32x32 cells -- twelve paint swatches and a camera icon in the thirteenth. Cell
+ * (car, skin) is row `car', column `skin', which the game's own lobby
+ * screenshot settles: its one row is the Overkill on skin 0 and the patch on
+ * screen reads (77, 80, 153) blue over (251, 70, 28) orange, which is the
+ * TOP-LEFT cell -- the blue body with the orange flames.
+ *
+ * AND IT IS A SQUARE OF `sizeDrawSkinY / koefDrawSkin'. Measured on that shot
+ * at x 89..106 and y 203..220, i.e. 18 x 18 centred in its row; the two keys
+ * are 9 and 0.50, and 9 / 0.5 is 18. That is a reading rather than a proof --
+ * two numbers whose quotient is the answer could be a coincidence -- but it is
+ * the only reading under which both keys mean anything, and the square is
+ * measured either way. `shiftDrawSkinX' is 6 and tableX0 + 6 is 92 against a
+ * measured 89..91. */
+#define MM_L_SWATCH (DLG_WAITPLAYERS_RACESUM_sizeDrawSkinY \
+                     / DLG_WAITPLAYERS_RACESUM_koefDrawSkin)
+#define MM_L_SWATCH_CELL 0.25f      /* 4 x 4 cells of a 128 px sheet */
+#define MM_L_TEXT_GAP   5.f
+
+/* Where the first column's TEXT starts: past the swatch. Both the header and
+   every name line up on it on the game's own shot, at x 113. */
+#define MM_L_NAME_X (DLG_WAITPLAYERS_RACESUM_tableX0 \
+                     + DLG_WAITPLAYERS_RACESUM_shiftDrawSkinX \
+                     + MM_L_SWATCH + MM_L_TEXT_GAP)
+
+/* A cell's text, centred on `cx' -- which is what the table's columns 1..5 are
+   and what makes its last one land on the measured 514.5. */
+static void mm_l_text_c(const mainmenu_t *m, const mmframe *f, float cx,
+                        float y, float alpha, const char *s)
+{
+    const sfont sf = sf_small(m->tex.font_small);
+    const float sc = f->us * MM_TS_INFO;
+    const float w = sf.tex ? sf_w(&sf, sc, s) : ui_text_w(sc, s);
+    if (sf.tex)
+        sf_text_shadowed(&sf, px(f, cx) - w * 0.5f, py(f, y), sc,
+                         1.f, 1.f, 1.f, alpha, s);
+    else
+        ui_text(px(f, cx) - w * 0.5f, py(f, y), sc, 1.f, 1.f, 1.f, alpha, s);
+}
+
+/* The lobby's own line pitch, which is the car pages' -- the small font's. */
+#define MM_L_LINE_H (SF_SMALL_SIZE_Y + SF_SMALL_LINE)
+
+const int MM_L_NCTRL[MM_L_N_VIEW] = { 2, 2, 4, 3 };
+
+/* The four tabs' own words: 10015, 10016, 42900, 42902. */
+static const char *const MM_L_TAB_NAME[MM_L_N_VIEW] = {
+    STR_UI_RACE_SUMMARY, STR_UI_MAP_AND_INFO, STR_UI_CAR_SETUP,
+    STR_UI_CAR_RESTR
+};
+
+/* dlgWAITPLAYERS_CARRESTR's own five values: 43206 and 43207..43210. Index 0 is
+   `Disable' -- the car is not allowed -- and 1..4 name the highest upgrade level
+   it may wear. NET_RESTR_* is the same numbering. */
+static const char *const MM_L_RESTR_NAME[NET_RESTR_N] = {
+    STR_UI_RESTR_DISABLE, STR_UI_PART_DEFAULT,
+    STR_UI_LEVEL_1, STR_UI_LEVEL_2, STR_UI_LEVEL_3
+};
+
+/* ------------------------------------------------------ the front page */
+
+/* Which of the eight rows a front-page stop is; -1 for the two that are not
+   bars. THE ROW `Two players' WOULD BE IS LEFT EMPTY -- see mainmenu.h. */
+static int mm_m_bar_row(int stop)
+{
+    switch (stop) {
+    case MM_M_CREATE: return 0;
+    case MM_M_JOIN:   return 1;
+    default:          return -1;
+    }
+}
+
+int mainmenu_m_live(const mainmenu_t *m, int stop)
+{
+    if (!m)
+        return 0;
+    /* THE GREEN BUTTON IS DEAD ON THIS PAGE and the game's own screenshot of it
+       says so: there is no game to race in until Create or Join has made one,
+       so Race is grey exactly the way the main menu's five unbuilt rows are. */
+    if (stop == MM_M_RACE)
+        return 0;
+    return 1;
+}
+
+int mainmenu_m_row_at(const mainmenu_t *m, int screen_w, int screen_h,
+                      float x, float y)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float bx, by, bw, bh;
+    int i;
+
+    if (!m || m->page != MM_PAGE_MULTI)
+        return -1;
+    for (i = 0; i < MM_M_N_FOCUS; i++) {
+        const int row = mm_m_bar_row(i);
+        if (row < 0) continue;
+        mm_bar_rect(&f, row, &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return i;
+    }
+    mm_race_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_M_RACE;
+    mm_quit_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_M_BACK;
+    return -1;
+}
+
+void mainmenu_open_multi(mainmenu_t *m)
+{
+    if (!m)
+        return;
+    m->page = MM_PAGE_MULTI;
+    m->mfocus_multi = MM_M_CREATE;
+    m->marmed_multi = -1;
+}
+
+/* ------------------------------------------------------------ the lobby */
+
+/* One of the lobby's own controls, per view: the rectangle and the SE split
+   straight out of its dialog's `.ini', with the label the exe's own record
+   names. An empty label is a control whose value is all there is. */
+static const mm_enum *mm_l_ctrl(int view, int i)
+{
+    static const mm_enum V[MM_L_N_VIEW][4] = {
+        /* MM_L_RACESUM -- Map over N laps, both labelled, both the HOST's */
+        { { DLG_WAITPLAYERS_RACESUM_enumTrackX0,
+            DLG_WAITPLAYERS_RACESUM_enumTrackY0,
+            DLG_WAITPLAYERS_RACESUM_enumTrackSX,
+            DLG_WAITPLAYERS_RACESUM_enumTrackSY,
+            DLG_WAITPLAYERS_RACESUM_enumTrackSE, STR_UI_MAP },
+          { DLG_WAITPLAYERS_RACESUM_enumNLapsX0,
+            DLG_WAITPLAYERS_RACESUM_enumNLapsY0,
+            DLG_WAITPLAYERS_RACESUM_enumNLapsSX,
+            DLG_WAITPLAYERS_RACESUM_enumNLapsSY,
+            DLG_WAITPLAYERS_RACESUM_enumNLapsSE, STR_UI_N_LAPS_SHORT } },
+        /* MM_L_MAPINFO -- dlgMAPINFO's own two, which the quick-race page
+           already draws. The track picker is the host's; the screenshot picker
+           is anybody's. */
+        { { DLG_MAPINFO_shotTrackEnumX0, DLG_MAPINFO_shotTrackEnumY0,
+            DLG_MAPINFO_shotTrackEnumSX, DLG_MAPINFO_shotTrackEnumSY, 0.f, "" },
+          { DLG_MAPINFO_enumShotX0, DLG_MAPINFO_enumShotY0,
+            DLG_MAPINFO_enumShotSX, DLG_MAPINFO_enumShotSY, 0.f, "" } },
+        /* MM_L_CARSETUP -- your own car and its three parts */
+        { { DLG_WAITPLAYERS_CARSETUP_enumCarX0,
+            DLG_WAITPLAYERS_CARSETUP_enumCarY0,
+            DLG_WAITPLAYERS_CARSETUP_enumCarSX,
+            DLG_WAITPLAYERS_CARSETUP_enumCarSY,
+            DLG_WAITPLAYERS_CARSETUP_enumCarSE, "" },
+          { DLG_WAITPLAYERS_CARSETUP_enumBoostX0,
+            DLG_WAITPLAYERS_CARSETUP_enumBoostY0,
+            DLG_WAITPLAYERS_CARSETUP_enumBoostSX,
+            DLG_WAITPLAYERS_CARSETUP_enumBoostSY,
+            DLG_WAITPLAYERS_CARSETUP_enumBoostSE, STR_UI_BOOSTER_LBL },
+          { DLG_WAITPLAYERS_CARSETUP_enumResonX0,
+            DLG_WAITPLAYERS_CARSETUP_enumResonY0,
+            DLG_WAITPLAYERS_CARSETUP_enumResonSX,
+            DLG_WAITPLAYERS_CARSETUP_enumResonSY,
+            DLG_WAITPLAYERS_CARSETUP_enumResonSE, STR_UI_ENGINE_LBL },
+          { DLG_WAITPLAYERS_CARSETUP_enumTiresX0,
+            DLG_WAITPLAYERS_CARSETUP_enumTiresY0,
+            DLG_WAITPLAYERS_CARSETUP_enumTiresSX,
+            DLG_WAITPLAYERS_CARSETUP_enumTiresSY,
+            DLG_WAITPLAYERS_CARSETUP_enumTiresSE, STR_UI_TIRES_LBL } },
+        /* MM_L_CARRESTR -- the host's three, labelled with the car names the
+           exe's own records point at */
+        { { DLG_WAITPLAYERS_CARRESTR_enumCar1X0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar1Y0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar1SX,
+            DLG_WAITPLAYERS_CARRESTR_enumCar1SY,
+            DLG_WAITPLAYERS_CARRESTR_enumCar1SE, "" },
+          { DLG_WAITPLAYERS_CARRESTR_enumCar2X0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar2Y0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar2SX,
+            DLG_WAITPLAYERS_CARRESTR_enumCar2SY,
+            DLG_WAITPLAYERS_CARRESTR_enumCar2SE, "" },
+          { DLG_WAITPLAYERS_CARRESTR_enumCar3X0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar3Y0,
+            DLG_WAITPLAYERS_CARRESTR_enumCar3SX,
+            DLG_WAITPLAYERS_CARRESTR_enumCar3SY,
+            DLG_WAITPLAYERS_CARRESTR_enumCar3SE, "" } }
+    };
+    if (view < 0 || view >= MM_L_N_VIEW || i < 0 || i >= MM_L_NCTRL[view])
+        return 0;
+    return &V[view][i];
+}
+
+/* Which of the eight rows a lobby stop's bar is, and whether it is orange. */
+static int mm_l_bar_row(const mainmenu_t *m, int stop, int *orange)
+{
+    if (orange) *orange = 0;
+    if (stop >= MM_LB_TAB && stop < MM_LB_TAB + MM_L_N_VIEW)
+        return stop - MM_LB_TAB;            /* rows 0..3 */
+    if (stop == MM_LB_ROW) {
+        /* ROW 7, and what it does depends on the view: Kick player off on Race
+           summary (grey on the game's own shot of it, because the only row in
+           the table was the player's own) and Next skin on Car setup (orange).
+           The other two views have no row-7 button at all. */
+        if (m->lview == MM_L_RACESUM) return 7;
+        if (m->lview == MM_L_CARSETUP) { if (orange) *orange = 1; return 7; }
+        return -1;
+    }
+    return -1;
+}
+
+static const char *mm_l_row_name(const mainmenu_t *m)
+{
+    if (m->lview == MM_L_RACESUM)  return STR_UI_KICK_PLAYER;
+    if (m->lview == MM_L_CARSETUP) return STR_UI_NEXT_SKIN;
+    return "";
+}
+
+static int mm_l_ring(int view, int *out)
+{
+    int n = 0, i;
+    if (view < 0 || view >= MM_L_N_VIEW)
+        return 0;
+    for (i = 0; i < MM_L_NCTRL[view]; i++)
+        out[n++] = MM_LB_C0 + i;
+    for (i = 0; i < MM_L_N_VIEW; i++)
+        out[n++] = MM_LB_TAB + i;
+    if (view == MM_L_RACESUM || view == MM_L_CARSETUP)
+        out[n++] = MM_LB_ROW;
+    out[n++] = MM_LB_RACE;
+    out[n++] = MM_LB_BACK;
+    return n;
+}
+
+int mainmenu_l_nfocus(int view)
+{
+    int ring[MM_LB_N_FOCUS];
+    return mm_l_ring(view, ring);
+}
+
+int mainmenu_l_stop(int view, int i)
+{
+    int ring[MM_LB_N_FOCUS];
+    const int n = mm_l_ring(view, ring);
+    if (n <= 0)
+        return -1;
+    while (i < 0) i += n;
+    return ring[i % n];
+}
+
+static int mm_l_index(int view, int stop)
+{
+    int ring[MM_LB_N_FOCUS];
+    const int n = mm_l_ring(view, ring);
+    int i;
+    for (i = 0; i < n; i++)
+        if (ring[i] == stop) return i;
+    return 0;
+}
+
+/* WHETHER A LOBBY STOP CAN ACT, and on this screen that is mostly the question
+   "are we the host". The two settings enums and the three restrictions are the
+   host's alone -- a client that could change the map would be a client whose
+   screen disagrees with the race it is about to load -- and Kick is the host's
+   too. Everything about YOUR OWN car is yours either way. */
+int mainmenu_l_live(const mainmenu_t *m, int stop)
+{
+    if (!m || m->page != MM_PAGE_LOBBY)
+        return 0;
+    switch (stop) {
+    case MM_LB_C0:
+    case MM_LB_C1:
+    case MM_LB_C2:
+    case MM_LB_C3: {
+        const int i = stop - MM_LB_C0;
+        if (i >= MM_L_NCTRL[m->lview])
+            return 0;
+        if (m->lview == MM_L_RACESUM)  return net_is_host();
+        if (m->lview == MM_L_CARRESTR) return net_is_host();
+        /* Map and info: the track picker is the host's, the screenshot picker
+           is anybody's. Car setup: all four are your own car. */
+        if (m->lview == MM_L_MAPINFO)  return i == MM_Q_MI_SHOT || net_is_host();
+        return 1;
+    }
+    case MM_LB_ROW:
+        if (m->lview == MM_L_RACESUM)
+            return net_is_host() && net_n_peers() > 1;
+        if (m->lview == MM_L_CARSETUP)
+            return m->gskins > 1;
+        return 0;
+    /* THE GREEN BUTTON MEANS TWO DIFFERENT THINGS and is live for both: on the
+       host it starts the race and waits for everyone to be ready; on a client
+       it is the ready flag, which is the only thing a client has to say. */
+    case MM_LB_RACE:
+        return net_is_host() ? net_can_start() : 1;
+    default:
+        return 1;
+    }
+}
+
+/* The table's own geometry, in design pixels. `row' -1 is the header. */
+static void mm_l_table(const mmframe *f, int row, float *y, float *h)
+{
+    const float head = DLG_WAITPLAYERS_RACESUM_tableSY
+                       * DLG_WAITPLAYERS_RACESUM_tableHeaderHeight;
+    const float item = DLG_WAITPLAYERS_RACESUM_tableSY
+                       * DLG_WAITPLAYERS_RACESUM_tableItemHeight;
+    (void)f;
+    if (row < 0) {
+        *y = DLG_WAITPLAYERS_RACESUM_tableY0;
+        *h = head;
+    } else {
+        *y = DLG_WAITPLAYERS_RACESUM_tableY0 + head + item * (float)row;
+        *h = item;
+    }
+}
+
+/* Column `c' (0..5) in design pixels: its left edge and its width. The five
+   shipped widths, and the last column takes the remainder the file never
+   names -- dlgFINISH's own rule. */
+static void mm_l_col(int c, float *x, float *w)
+{
+    static const float W[6] = {
+        DLG_WAITPLAYERS_RACESUM_tableWidth1, DLG_WAITPLAYERS_RACESUM_tableWidth2,
+        DLG_WAITPLAYERS_RACESUM_tableWidth3, DLG_WAITPLAYERS_RACESUM_tableWidth4,
+        DLG_WAITPLAYERS_RACESUM_tableWidth5, 0.f
+    };
+    float used = 0.f, i;
+    int k;
+    for (k = 0; k < 5; k++) used += W[k];
+    *x = DLG_WAITPLAYERS_RACESUM_tableX0;
+    for (k = 0; k < c && k < 6; k++)
+        *x += DLG_WAITPLAYERS_RACESUM_tableSX * W[k];
+    i = (c == 5) ? (1.f - used) : W[c];
+    *w = DLG_WAITPLAYERS_RACESUM_tableSX * i;
+}
+
+static void mm_l_arrows(const mainmenu_t *m, const mmframe *f, int i,
+                        float *bx, float *fx, float *ay, float *sz)
+{
+    const mm_enum *e = mm_l_ctrl(m->lview, i);
+    *sz = MM_Q_ARROW * f->us;
+    if (!e) { *bx = *fx = *ay = 0.f; return; }
+    *ay = py(f, e->y0 + e->sy * 0.5f) - *sz * 0.5f;
+    *bx = px(f, e->x0 + e->sx * e->se);
+    *fx = px(f, e->x0 + e->sx) - *sz;
+}
+
+int mainmenu_l_row_at(const mainmenu_t *m, int screen_w, int screen_h,
+                      float x, float y, int *left, int *row)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float bx, by, bw, bh;
+    int i;
+
+    if (left) *left = 0;
+    if (row) *row = -1;
+    if (!m || m->page != MM_PAGE_LOBBY)
+        return -1;
+    for (i = 0; i < MM_L_NCTRL[m->lview]; i++) {
+        float ax, fx, ay, sz;
+        mm_l_arrows(m, &f, i, &ax, &fx, &ay, &sz);
+        if (touch_in(x, y, ax - sz * 0.25f, ay - sz * 0.25f,
+                     sz * 1.5f, sz * 1.5f)) {
+            if (left) *left = 1;
+            return MM_LB_C0 + i;
+        }
+        if (touch_in(x, y, fx - sz * 0.25f, ay - sz * 0.25f,
+                     sz * 1.5f, sz * 1.5f))
+            return MM_LB_C0 + i;
+    }
+    for (i = 0; i < MM_LB_N_FOCUS; i++) {
+        const int r = mm_l_bar_row(m, i, NULL);
+        if (r < 0) continue;
+        mm_bar_rect(&f, r, &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return i;
+    }
+    mm_race_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_LB_RACE;
+    mm_quit_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return MM_LB_BACK;
+    /* AND THE TABLE'S ROWS, which are the Kick button's aim. Only on Race
+       summary, and only over a row the roster really has. */
+    if (m->lview == MM_L_RACESUM && row) {
+        for (i = 0; i < NET_MAX; i++) {
+            float ty, th, rx, ry, rw, rh;
+            const net_peer *q = net_peer_at(i);
+            if (!q || !q->used) continue;
+            mm_l_table(&f, i, &ty, &th);
+            rx = px(&f, DLG_WAITPLAYERS_RACESUM_tableX0);
+            ry = py(&f, ty);
+            rw = px(&f, DLG_WAITPLAYERS_RACESUM_tableX0
+                        + DLG_WAITPLAYERS_RACESUM_tableSX) - rx;
+            rh = py(&f, ty + th) - ry;
+            if (touch_in(x, y, rx, ry, rw, rh)) {
+                *row = i;
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
+void mainmenu_open_lobby(mainmenu_t *m, int view)
+{
+    if (!m)
+        return;
+    m->page = MM_PAGE_LOBBY;
+    m->lview = (view >= 0 && view < MM_L_N_VIEW) ? view : MM_L_RACESUM;
+    m->lfocus = MM_LB_TAB + m->lview;
+    m->larmed = -1;
+    if (m->lsel < 0 || m->lsel >= NET_MAX)
+        m->lsel = 0;
+    /* THE LOBBY'S TRACK AND LAPS ARE THE HOST'S, so the page comes up on what
+       the network says rather than on what this machine last chose -- otherwise
+       a client's first frame shows its own carousel's track under the host's
+       name for it. */
+    {
+        const net_settings *s = net_settings_now();
+        if (s->track < N_TRACKS) m->track = s->track;
+        if (s->laps > 0) m->laps = s->laps;
+    }
+}
+
+/* ------------------------------------------------------------- the step */
+
+/* Our own car and parts, as the network wants them. */
+static void mm_l_push_me(mainmenu_t *m)
+{
+    unsigned char up[3];
+    const player_t *p = player_cur();
+    const int c = (m->car >= 0 && m->car < MM_N_CARS) ? m->car : 0;
+    up[0] = (unsigned char)garage_level(p, GAR_BOOSTER, c);
+    up[1] = (unsigned char)garage_level(p, GAR_ENGINE, c);
+    up[2] = (unsigned char)garage_level(p, GAR_TIRES, c);
+    /* CLAMPED BY THE HOST'S RESTRICTIONS. A car the host has disabled cannot be
+       raced and a part above the ceiling cannot be worn, so the page shows what
+       will actually turn up on the grid rather than what the profile owns. */
+    {
+        const int mx = net_max_upgrade(c);
+        int i;
+        if (mx >= 0)
+            for (i = 0; i < 3; i++)
+                if (up[i] > (unsigned char)mx) up[i] = (unsigned char)mx;
+    }
+    net_set_me(c, up, garage_skin(p, c));
+}
+
+/* One step of a lobby control. */
+static void mm_l_move(mainmenu_t *m, int stop, int d)
+{
+    const int i = stop - MM_LB_C0;
+    if (i < 0 || i >= MM_L_NCTRL[m->lview])
+        return;
+    if (!mainmenu_l_live(m, stop)) {
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    switch (m->lview) {
+    case MM_L_RACESUM:
+        if (i == 0) {
+            m->track = (m->track + d + N_TRACKS) % N_TRACKS;
+            net_set_track(m->track);
+        } else {
+            int k, at = 0;
+            for (k = 0; k < MM_N_LAPS; k++)
+                if (MM_LAPS[k] == m->laps) { at = k; break; }
+            m->laps = MM_LAPS[(at + d + MM_N_LAPS) % MM_N_LAPS];
+            net_set_laps(m->laps);
+        }
+        break;
+    case MM_L_MAPINFO:
+        if (i == MM_Q_MI_TRACK) {
+            m->track = (m->track + d + N_TRACKS) % N_TRACKS;
+            net_set_track(m->track);
+        } else {
+            m->shot = (m->shot + d + MM_N_SHOTS) % MM_N_SHOTS;
+        }
+        break;
+    case MM_L_CARSETUP:
+        if (i == 0) {
+            /* THE CAR PICKER SKIPS WHAT THE HOST HAS DISABLED. Walking onto a
+               car you cannot race and being told so on the Race button is a
+               worse screen than a picker that only offers what is allowed. */
+            int k = m->car;
+            int tries;
+            for (tries = 0; tries < MM_N_CARS; tries++) {
+                k = (k + d + MM_N_CARS) % MM_N_CARS;
+                if (net_car_allowed(k)) break;
+            }
+            m->car = k;
+        } else {
+            const int kind = i - 1;         /* 0 booster, 1 engine, 2 tyres */
+            player_t *p = player_cur();
+            const int mx = net_max_upgrade(m->car);
+            int lv = garage_level(p, kind, m->car) + d;
+            if (mx < 0) { m->cue = MM_CUE_DENY; return; }
+            if (lv < 0) lv = 0;
+            if (lv > mx) lv = mx;
+            /* THE PARTS ARE THE PROFILE'S, and this page does not BUY them: the
+               enum walks what the profile already owns, capped by the host's
+               ceiling. A lobby that could fit a level 3 booster for nothing
+               would be a shop with no prices. */
+            if (p && lv > garage_level(p, kind, m->car))
+                lv = garage_level(p, kind, m->car);
+            if (p) p->car[m->car].up[kind] = (unsigned char)lv;
+        }
+        break;
+    case MM_L_CARRESTR: {
+        const net_settings *s = net_settings_now();
+        int v = (int)s->restr[i] + d;
+        if (v < 0) v = NET_RESTR_N - 1;
+        if (v >= NET_RESTR_N) v = 0;
+        net_set_restr(i, v);
+        break;
+    }
+    default:
+        return;
+    }
+    mm_l_push_me(m);
+    m->cue = MM_CUE_ARROW;
+}
+
+static void mm_l_fire(mainmenu_t *m, int stop)
+{
+    if (stop >= MM_LB_TAB && stop < MM_LB_TAB + MM_L_N_VIEW) {
+        const int v = stop - MM_LB_TAB;
+        if (v != m->lview) {
+            m->lview = v;
+            m->lfocus = stop;
+        }
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    switch (stop) {
+    case MM_LB_C0: case MM_LB_C1: case MM_LB_C2: case MM_LB_C3:
+        mm_l_move(m, stop, +1);
+        return;
+    case MM_LB_ROW:
+        if (!mainmenu_l_live(m, stop)) { m->cue = MM_CUE_DENY; return; }
+        if (m->lview == MM_L_RACESUM) {
+            const int r = net_kick(m->lsel);
+            if (r == -2)
+                mg_say(m, STR_UI_CANT_KICK_SELF);   /* 42907 */
+            m->cue = r == 0 ? MM_CUE_PRESS : MM_CUE_DENY;
+        } else {
+            player_t *p = player_cur();
+            garage_set_skin(p, m->car,
+                            garage_next_skin(garage_skin(p, m->car),
+                                             m->gskins));
+            mm_l_push_me(m);
+            m->action = MM_ACT_GARAGE;
+            m->cue = MM_CUE_PRESS;
+        }
+        return;
+    case MM_LB_RACE:
+        if (net_is_host()) {
+            if (!net_can_start()) { m->cue = MM_CUE_DENY; return; }
+            net_start();
+            m->action = MM_ACT_NET_RACE;
+        } else {
+            /* READY, and it TOGGLES: a player who is not ready any more has to
+               be able to say so, and the table's Status column is what shows
+               which they are. */
+            const net_peer *me = net_peer_at(net_slot());
+            net_set_ready(!(me && me->ready));
+        }
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_LB_BACK:
+        /* 42930, "Do you really want to disconnect?" -- leaving a game is not
+           something to do by brushing a button, and the engine asks. */
+        mg_ask(m, MG_ASK_DISCONNECT, STR_UI_DISCONNECT_ASK);
+        m->cue = MM_CUE_PRESS;
+        return;
+    default:
+        return;
+    }
+}
+
+static void mm_step_lobby(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h)
+{
+    const int view = m->lview;
+    const int n = mainmenu_l_nfocus(view);
+
+    /* THE OTHER END CAN END THIS. A host that went away, a kick, or the game
+       filling up while we asked -- all of them come back through net_error, and
+       the page says so in the engine's own words and goes home. */
+    if (net_mode_now() == NET_OFF) {
+        const net_err e = net_error();
+        mainmenu_open_multi(m);
+        if (e == NET_ERR_KICKED)      mg_say(m, STR_UI_KICKED_OFF);
+        else if (e == NET_ERR_TIMEOUT) mg_say(m, STR_UI_CONN_LOST);
+        net_clear_error();
+        return;
+    }
+    /* THE HOST PRESSED RACE. Everyone else finds out here. */
+    if (net_take_start()) {
+        const net_settings *s = net_settings_now();
+        if (s->track < N_TRACKS) m->track = s->track;
+        if (s->laps > 0) m->laps = s->laps;
+        m->action = MM_ACT_NET_RACE;
+        return;
+    }
+    /* AND THE HOST'S SETTINGS FOLLOW THE NETWORK on a client, every frame: the
+       two enums are read-only there, so what they show has to be what arrived
+       rather than what this machine last had. */
+    if (!net_is_host()) {
+        const net_settings *s = net_settings_now();
+        if (s->track < N_TRACKS) m->track = s->track;
+        if (s->laps > 0) m->laps = s->laps;
+    }
+
+    if (n <= 0)
+        return;
+    if (down & SCE_CTRL_DOWN) {
+        m->lfocus = mainmenu_l_stop(view, mm_l_index(view, m->lfocus) + 1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & SCE_CTRL_UP) {
+        m->lfocus = mainmenu_l_stop(view, mm_l_index(view, m->lfocus) - 1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & SCE_CTRL_LEFT)  mm_l_move(m, m->lfocus, -1);
+    if (down & SCE_CTRL_RIGHT) mm_l_move(m, m->lfocus, +1);
+    /* SQUARE walks the table, which is what the Kick button aims with. Its own
+       stop would be a sixth thing in a ring the pad already has to walk. */
+    if ((down & SCE_CTRL_SQUARE) && m->lview == MM_L_RACESUM) {
+        int i;
+        for (i = 1; i <= NET_MAX; i++) {
+            const int k = (m->lsel + i) % NET_MAX;
+            const net_peer *q = net_peer_at(k);
+            if (q && q->used) { m->lsel = k; break; }
+        }
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mm_l_fire(m, m->lfocus);
+    if (down & SCE_CTRL_CIRCLE) {
+        mm_l_fire(m, MM_LB_BACK);
+        return;
+    }
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        int left, row;
+        m->larmed = mainmenu_l_row_at(m, screen_w, screen_h, tp->x, tp->y,
+                                     &left, &row);
+        if (row >= 0 && row != m->lsel) {
+            m->lsel = row;
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (m->larmed >= 0 && m->lfocus != m->larmed) {
+            m->lfocus = m->larmed;
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    if (tp->released) {
+        int left, row;
+        const int at = mainmenu_l_row_at(m, screen_w, screen_h, tp->x, tp->y,
+                                        &left, &row);
+        if (at >= 0 && at == m->larmed) {
+            if (at <= MM_LB_C3)
+                mm_l_move(m, at, left ? -1 : +1);
+            else
+                mm_l_fire(m, at);
+        }
+        m->larmed = -1;
+    }
+}
+
+/* --------------------------------------------------- the front page's step */
+
+static void mm_m_fire(mainmenu_t *m, int stop)
+{
+    const player_t *p = player_cur();
+    unsigned char up[3];
+    const int c = (m->car >= 0 && m->car < MM_N_CARS) ? m->car : 0;
+
+    up[0] = (unsigned char)garage_level(p, GAR_BOOSTER, c);
+    up[1] = (unsigned char)garage_level(p, GAR_ENGINE, c);
+    up[2] = (unsigned char)garage_level(p, GAR_TIRES, c);
+
+    switch (stop) {
+    case MM_M_CREATE:
+        if (!net_host(p ? p->name : STR_UI_DEFAULT_NAME, c, up,
+                      garage_skin(p, c), p ? p->face : 0)) {
+            mg_say(m, STR_UI_CONNECT_ERR);
+            m->cue = MM_CUE_DENY;
+            return;
+        }
+        /* THE HOST'S OWN CAROUSEL TRACK is the game's, which is why the page
+           has a carousel at all. */
+        net_set_track(m->track);
+        net_set_laps(m->laps);
+        mainmenu_open_lobby(m, MM_L_RACESUM);
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_M_JOIN:
+        if (!net_browse()) {
+            mg_say(m, STR_UI_CONNECT_ERR);
+            m->cue = MM_CUE_DENY;
+            return;
+        }
+        m->modal = MM_MODAL_SERVERS;
+        m->srvsel = 0;
+        m->marmed = -1;
+        m->cue = MM_CUE_PRESS;
+        return;
+    case MM_M_RACE:
+        m->cue = MM_CUE_DENY;               /* no game yet -- see mainmenu_m_live */
+        return;
+    case MM_M_BACK:
+        net_leave();
+        m->page = MM_PAGE_MAIN;
+        m->focus = MM_MULTIPLAYER;
+        m->cue = MM_CUE_PRESS;
+        return;
+    default:
+        return;
+    }
+}
+
+static void mm_step_multi(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h)
+{
+    /* A JOIN THAT SUCCEEDED lands us in somebody's lobby, from whichever page
+       we were looking at. */
+    if (net_mode_now() == NET_JOINED) {
+        m->modal = MM_MODAL_NONE;
+        mainmenu_open_lobby(m, MM_L_RACESUM);
+        return;
+    }
+    if (net_error() != NET_ERR_NONE && m->modal != MM_MODAL_SAY) {
+        const net_err e = net_error();
+        mg_say(m, e == NET_ERR_FULL ? STR_UI_CONNECT_ERR
+               : (e == NET_ERR_KICKED ? STR_UI_KICKED_OFF
+                                      : STR_UI_CONNECT_ERR));
+        net_clear_error();
+    }
+
+    if (down & SCE_CTRL_DOWN) {
+        m->mfocus_multi = (m->mfocus_multi + 1) % MM_M_N_FOCUS;
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & SCE_CTRL_UP) {
+        m->mfocus_multi = (m->mfocus_multi + MM_M_N_FOCUS - 1) % MM_M_N_FOCUS;
+        m->cue = MM_CUE_FOCUS;
+    }
+    /* LEFT and RIGHT walk the carousel, exactly as on the main menu: the track
+       is what this page is choosing, and a host takes it into the game. */
+    if (down & SCE_CTRL_LEFT)  mm_move_track(m, -1);
+    if (down & SCE_CTRL_RIGHT) mm_move_track(m, +1);
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mm_m_fire(m, m->mfocus_multi);
+    if (down & SCE_CTRL_CIRCLE) {
+        mm_m_fire(m, MM_M_BACK);
+        return;
+    }
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        int slot;
+        m->marmed_multi = mainmenu_m_row_at(m, screen_w, screen_h,
+                                            tp->x, tp->y);
+        if (m->marmed_multi >= 0 && m->mfocus_multi != m->marmed_multi) {
+            m->mfocus_multi = m->marmed_multi;
+            m->cue = MM_CUE_FOCUS;
+        }
+        slot = mainmenu_slot_at(m, screen_w, screen_h, tp->x, tp->y);
+        if (slot >= 0 && slot != 2) {
+            m->track = mm_slot_track(m, slot);
+            m->cue = MM_CUE_ARROW;
+        }
+    }
+    if (tp->released) {
+        const int at = mainmenu_m_row_at(m, screen_w, screen_h, tp->x, tp->y);
+        if (at >= 0 && at == m->marmed_multi)
+            mm_m_fire(m, at);
+        m->marmed_multi = -1;
+    }
+}
+
+/* -------------------------------------------------------------- the draw */
+
+static void mm_m_draw_bars(const mainmenu_t *m, const mmframe *f)
+{
+    static const char *const NAME[MM_M_N_FOCUS] = {
+        STR_UI_CREATE_GAME, STR_UI_JOIN_GAME, "", ""
+    };
+    int i;
+    for (i = 0; i < MM_M_N_FOCUS; i++) {
+        float bx, by, bw, bh;
+        const int row = mm_m_bar_row(i);
+        const int lit = m->mfocus_multi == i;
+        if (row < 0) continue;
+        mm_draw_wedge(m, f, row);
+        mm_bar_draw_rect(m, f, row, lit ? MM_SLIDE * MM_SETTLED : 0.f,
+                         &bx, &by, &bw, &bh);
+        if (m->tex.buttons) {
+            const float v = lit ? MM_V_RED_F : MM_V_RED;
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else {
+            ui_rect(bx, by, bw, bh, 0.72f, 0.09f, 0.11f, 1.f);
+        }
+        mm_label(m, f, bx, by, bw, bh, NAME[i], 1.f, 1.f, 1.f);
+    }
+    /* AND THE ROW `Two players' WOULD BE IS LEFT COMPLETELY EMPTY -- no bar and
+       NO TRAY. The tray was drawn there first, on the reasoning that the
+       original's page has one; on screen it is a silver sliver with nothing on
+       it, which reads as a bar that failed to draw rather than as a gap. The
+       main menu's own wedges are only drawn under rows that exist. */
+}
+
+static void mm_draw_multi(const mainmenu_t *m, const mmframe *f)
+{
+    mm_m_draw_bars(m, f);
+    /* THE CARD IS dlgPLRSCOMM's, and `scores_only' is the one difference --
+       this page's Scores line is left-aligned and has no Cash beside it. */
+    mp_draw_card_at(m, f, 1);
+    mm_draw_carousel_at(m, f, 0);
+    /* staticInfoHeader: the track's name over its own box's bottom edge, and
+       then staticInfo's three lines at the small font's own pitch. */
+    mm_q_text(m, f, 1, DLG_MULTIPLAYER_staticInfoHeaderX0,
+              DLG_MULTIPLAYER_staticInfoHeaderY0, MM_TS_TRACK, 0, 1.f,
+              STR_TRACK_NAME[m->track]);
+    mg_rule(f, DLG_MULTIPLAYER_staticInfoHeaderX0,
+            DLG_MULTIPLAYER_staticInfoHeaderY0,
+            DLG_MULTIPLAYER_staticInfoHeaderSX,
+            DLG_MULTIPLAYER_staticInfoHeaderSY);
+    mg_lines(m, f, DLG_MULTIPLAYER_staticInfoX0, DLG_MULTIPLAYER_staticInfoY0,
+             0, 1.f, STR_TRACK_MENU[m->track]);
+}
+
+/* THE MESSAGE PANEL -- the `chat' control, carrying net.c's own log. Every line
+ * in it is one of the engine's 20200..20216.
+ *
+ * THE PANEL AND ITS TEXT ARE ONE GROUP, mapped ONCE. The first version put the
+ * plate through `mm_box' and then the lines through `mm_q_text', which maps with
+ * px()/py() -- two different rules for one box, so on a 960x544 panel the text
+ * started above the plate and ran out of the bottom of it. Everything here is
+ * placed off the plate's own screen rectangle instead.
+ *
+ * AND IT DRAWS AS MANY LINES AS FIT AND NO MORE, newest at the bottom. The log
+ * holds NET_LOG_LINES (six) because a history is useful in the app log; the
+ * panel is 90 design pixels, which is three of the small font's 23 -- and six
+ * were drawn into it, so half of them fell outside the frame. The count comes
+ * off the panel's own height rather than being a second constant to keep in
+ * step with it.
+ */
+#define MM_L_LOG_PAD 8.f
+
+static void mm_l_draw_log(const mainmenu_t *m, const mmframe *f)
+{
+    const sfont sf = sf_small(m->tex.font_small);
+    const float sc = f->us * MM_TS_INFO;
+    const float pad = MM_L_LOG_PAD * f->us;
+    const float lh = MM_L_LINE_H * f->us;
+    float x, y, w, h;
+    int i, fit, first, n = net_n_log();
+
+    mm_box(f, DLG_WAITPLAYERS_RACESUM_chatX0, DLG_WAITPLAYERS_RACESUM_chatY0,
+           DLG_WAITPLAYERS_RACESUM_chatSX, DLG_WAITPLAYERS_RACESUM_chatSY,
+           &x, &y, &w, &h);
+    /* The dark plate and the silver rim the game's own panel has: the rim is
+       messagebox_empty nine-sliced, which is what dlgMAPINFO's map window and
+       every modal in this file already use. */
+    ui_rect(x, y, w, h, 0.10f, 0.07f, 0.05f, 0.55f);
+    if (m->tex.panel)
+        mm_frame9(f, x, y, w, h, m->tex.panel);
+
+    fit = (int)((h - pad * 2.f) / lh);
+    if (fit < 1) fit = 1;
+    first = n > fit ? n - fit : 0;
+    for (i = first; i < n; i++) {
+        const char *line = net_log_at(i);
+        const float ty = y + pad + (float)(i - first) * lh;
+        if (sf.tex)
+            sf_text_shadowed(&sf, x + pad, ty, sc, 1.f, 1.f, 1.f, 1.f, line);
+        else
+            ui_text(x + pad, ty, sc, 1.f, 1.f, 1.f, 1.f, line);
+    }
+}
+
+/* The roster table. */
+static void mm_l_draw_table(const mainmenu_t *m, const mmframe *f)
+{
+    static const char *const HEAD[6] = {
+        STR_UI_COL_PLAYER, STR_UI_COL_CAR, STR_UI_COL_BOOST,
+        STR_UI_COL_ENGINE, STR_UI_COL_TIRES, STR_UI_COL_STATUS
+    };
+    float ty, th;
+    int c, i;
+
+    /* the header, and its rule at the header band's own bottom */
+    mm_l_table(f, -1, &ty, &th);
+    for (c = 0; c < 6; c++) {
+        float cx, cw;
+        mm_l_col(c, &cx, &cw);
+        if (c == 0)
+            mm_q_text(m, f, 0, MM_L_NAME_X, ty + 6.f, MM_TS_INFO, 0, 1.f,
+                      HEAD[c]);
+        else
+            mm_l_text_c(m, f, cx + cw * 0.5f, ty + 6.f, 1.f, HEAD[c]);
+    }
+    /* the header's rule, from the name column to the table's right edge --
+       measured at y 196 running x 114..551 against tableY0 + header = 199 and
+       tableX0 + SX = 552 */
+    mm_rule_at(f, px(f, MM_L_NAME_X), py(f, ty + th),
+               (DLG_WAITPLAYERS_RACESUM_tableX0
+                + DLG_WAITPLAYERS_RACESUM_tableSX - MM_L_NAME_X) * f->us);
+
+    for (i = 0; i < NET_MAX; i++) {
+        const net_peer *q = net_peer_at(i);
+        char line[32];
+        float alpha = 1.f;
+        if (!q || !q->used)
+            continue;
+        mm_l_table(f, i, &ty, &th);
+        /* THE ROW THE KICK BUTTON IS AIMED AT stands out, which is the only way
+           a table with no cursor of its own can say which row a button will
+           take. It is also what the game's own shot has: its one row is drawn
+           lit, with a rule under the name. */
+        if (i == m->lsel && net_is_host()) {
+            float rx = px(f, DLG_WAITPLAYERS_RACESUM_tableX0);
+            float rw = px(f, DLG_WAITPLAYERS_RACESUM_tableX0
+                             + DLG_WAITPLAYERS_RACESUM_tableSX) - rx;
+            ui_rect(rx, py(f, ty), rw, py(f, ty + th) - py(f, ty),
+                    1.f, 1.f, 1.f, 0.10f);
+        }
+        if (i != net_slot())
+            alpha = 0.88f;
+        /* THE PAINT SWATCH: cell (car, skin) of skin_ik_vse's 4 x 4 grid. */
+        {
+            float sx, sy, sw, sh;
+            const float u0 = (float)(q->skin & 3) * MM_L_SWATCH_CELL;
+            const float v0 = (float)(q->car % 3) * MM_L_SWATCH_CELL;
+            mm_box(f, DLG_WAITPLAYERS_RACESUM_tableX0
+                      + DLG_WAITPLAYERS_RACESUM_shiftDrawSkinX,
+                   ty + (th - MM_L_SWATCH) * 0.5f,
+                   MM_L_SWATCH, MM_L_SWATCH, &sx, &sy, &sw, &sh);
+            if (m->tex.skinicons)
+                ui_image(sx, sy, sw, sh, m->tex.skinicons,
+                         u0, v0, u0 + MM_L_SWATCH_CELL,
+                         v0 + MM_L_SWATCH_CELL, 1.f, 1.f, 1.f, 1.f);
+            else
+                ui_rect(sx, sy, sw, sh, 0.8f, 0.7f, 0.2f, 1.f);
+        }
+        mm_q_text(m, f, 0, MM_L_NAME_X, ty + 6.f, MM_TS_INFO, 0, alpha,
+                  q->name);
+        for (c = 1; c < 6; c++) {
+            float cx, cw;
+            mm_l_col(c, &cx, &cw);
+            switch (c) {
+            case 1:
+                snprintf(line, sizeof line, "%s",
+                         STR_CAR_NAME[q->car < STR_N_CARS ? q->car : 0]);
+                break;
+            case 2: case 3: case 4:
+                snprintf(line, sizeof line, "%d", (int)q->up[c - 2]);
+                break;
+            default:
+                snprintf(line, sizeof line, "%s",
+                         q->ready ? STR_UI_READY : STR_UI_NOT_READY);
+                break;
+            }
+            mm_l_text_c(m, f, cx + cw * 0.5f, ty + 6.f, alpha, line);
+        }
+    }
+}
+
+static void mm_l_draw_tabs(const mainmenu_t *m, const mmframe *f)
+{
+    int i;
+    for (i = 0; i < MM_LB_N_FOCUS; i++) {
+        float bx, by, bw, bh, slide = 0.f;
+        int orange = 0;
+        const int row = mm_l_bar_row(m, i, &orange);
+        const int tab = i >= MM_LB_TAB && i < MM_LB_TAB + MM_L_N_VIEW;
+        const int here = tab && (i - MM_LB_TAB) == m->lview;
+        const int lit = m->lfocus == i;
+        const int live = tab ? 1 : mainmenu_l_live(m, i);
+
+        if (row < 0) continue;
+        if (here || lit) slide = MM_SLIDE * MM_SETTLED;
+        mm_draw_wedge(m, f, row);
+        mm_bar_draw_rect(m, f, row, slide, &bx, &by, &bw, &bh);
+        if (tab && m->tex.radio) {
+            const float v = here ? MM_V_RAD_ON : MM_V_RAD;
+            ui_image(bx, by, bw, bh, m->tex.radio,
+                     0.f, v, 1.f, v + MM_V_RAD_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else if (m->tex.buttons) {
+            const float v = !live ? MM_V_GREY_DOT
+                                  : (orange ? (lit ? MM_V_ORANGE_F : MM_V_ORANGE)
+                                            : (lit ? MM_V_RED_F : MM_V_RED));
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else {
+            ui_rect(bx, by, bw, bh, live ? 0.72f : 0.45f,
+                    live ? 0.09f : 0.45f, live ? 0.11f : 0.47f, 1.f);
+        }
+        mm_label(m, f, bx, by, bw, bh,
+                 tab ? MM_L_TAB_NAME[i - MM_LB_TAB] : mm_l_row_name(m),
+                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
+    }
+}
+
+/* The value a lobby control shows between its arrows. */
+static void mm_l_value(const mainmenu_t *m, int i, char *out, int n)
+{
+    const net_settings *s = net_settings_now();
+    const player_t *p = player_cur();
+    out[0] = 0;
+    switch (m->lview) {
+    case MM_L_RACESUM:
+        if (i == 0) snprintf(out, n, "%s", STR_TRACK_NAME[m->track]);
+        else        snprintf(out, n, "%d", m->laps);
+        return;
+    case MM_L_MAPINFO:
+        if (i == MM_Q_MI_TRACK) snprintf(out, n, "%s", STR_TRACK_NAME[m->track]);
+        return;
+    case MM_L_CARSETUP:
+        if (i == 0)
+            snprintf(out, n, "%s", STR_CAR_NAME[m->car]);
+        else
+            snprintf(out, n, "%s",
+                     garage_part_name(i - 1, m->car,
+                                      garage_level(p, i - 1, m->car)));
+        return;
+    case MM_L_CARRESTR:
+        if (i >= 0 && i < 3)
+            snprintf(out, n, "%s", MM_L_RESTR_NAME[s->restr[i] < NET_RESTR_N
+                                                   ? s->restr[i] : 0]);
+        return;
+    default:
+        return;
+    }
+}
+
+static void mm_l_draw_ctrls(const mainmenu_t *m, const mmframe *f)
+{
+    char line[64];
+    int i;
+    for (i = 0; i < MM_L_NCTRL[m->lview]; i++) {
+        const mm_enum *e = mm_l_ctrl(m->lview, i);
+        const int live = mainmenu_l_live(m, MM_LB_C0 + i);
+        const int lit = m->lfocus == MM_LB_C0 + i;
+        float ax, fx, ay, sz;
+        const char *lbl = e->label;
+        if (!e) continue;
+        mm_l_arrows(m, f, i, &ax, &fx, &ay, &sz);
+        /* THE CAR RESTRICTIONS' LABELS ARE THE CAR NAMES, which the exe's own
+           records carry as string ids (40100/40104/40108) rather than as text
+           in the dialog. */
+        if (m->lview == MM_L_CARRESTR)
+            lbl = STR_CAR_NAME[i];
+        if (lbl && lbl[0]) {
+            mm_arrow(m, px(f, e->x0 - MM_Q_BULLET_GAP),
+                     py(f, e->y0 + e->sy * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
+                     MM_Q_BULLET * f->us, live ? (lit ? 1 : 0) : 2, 0);
+            mm_q_text(m, f, 0, e->x0, e->y0, MM_TS_LABEL, 0,
+                      live ? 1.f : 0.82f, lbl);
+            mm_rule_at(f, px(f, e->x0), py(f, e->y0 + 24.f),
+                       (e->sx * e->se - 30.f) * f->us);
+        }
+        /* A CONTROL THE HOST OWNS IS GREY ON A CLIENT, in the artists' own
+           disabled arrow cell -- which is what the read-only enum on the
+           Garage's part page already does. */
+        mm_arrow(m, ax, ay, sz, live ? (lit ? 1 : 0) : 2, 0);
+        mm_arrow(m, fx, ay, sz, live ? (lit ? 1 : 0) : 2, 1);
+        mm_l_value(m, i, line, sizeof line);
+        if (line[0])
+            mg_value(m, f, ax, sz, fx, py(f, e->y0 + e->sy * 0.5f),
+                     live ? 1.f : 0.82f, line);
+    }
+}
+
+static void mm_draw_lobby(const mainmenu_t *m, const mmframe *f)
+{
+    mm_l_draw_tabs(m, f);
+    switch (m->lview) {
+    case MM_L_RACESUM:
+        mm_l_draw_table(m, f);
+        break;
+    case MM_L_MAPINFO:
+        /* dlgMAPINFO ITSELF, which the exe says is this tab: its own control
+           table carries `chat' and `editChat'. One page, two screens. */
+        mm_draw_mapinfo(m, f);
+        break;
+    case MM_L_CARSETUP:
+        /* staticCarName -- dlgCARSCOMM's `Car' heading with its own rule, which
+           is on the game's own shot of this page at x 115 even though
+           dlgWAITPLAYERS_CARSETUP's `enumCar' has SE 0 and carries no label of
+           its own. The furniture is CARSCOMM's on this page too. */
+        mm_q_text(m, f, 0, DLG_CARSCOMM_staticCarNameX0,
+                  DLG_CARSCOMM_staticCarNameY0, MM_TS_LABEL, 0, 1.f,
+                  STR_UI_CAR);
+        mg_rule(f, DLG_CARSCOMM_staticCarNameX0,
+                DLG_CARSCOMM_staticCarNameY0,
+                DLG_CARSCOMM_staticCarNameSX,
+                DLG_CARSCOMM_staticCarNameSY);
+        /* animCarPreview -- dlgCARSCOMM's, the same viewport the Garage uses. */
+        {
+            float x, y, w, h;
+            mm_box(f, DLG_CARSCOMM_animCarPreviewX0,
+                   DLG_CARSCOMM_animCarPreviewY0,
+                   DLG_CARSCOMM_animCarPreviewSX,
+                   DLG_CARSCOMM_animCarPreviewSY, &x, &y, &w, &h);
+            if (m->car_draw) {
+                ui_end();
+                m->car_draw(m->car_ctx, x, y, w, h);
+                ui_begin((int)f->w, (int)f->h);
+            }
+        }
+        break;
+    case MM_L_CARRESTR:
+        /* staticHeader1 and staticHeader2, each with its own rule. */
+        mm_q_text(m, f, 0, DLG_WAITPLAYERS_CARRESTR_staticHeader1X0,
+                  DLG_WAITPLAYERS_CARRESTR_staticHeader1Y0, MM_TS_LABEL, 0,
+                  1.f, STR_UI_CAR_TYPE);
+        mg_rule(f, DLG_WAITPLAYERS_CARRESTR_staticHeader1X0,
+                DLG_WAITPLAYERS_CARRESTR_staticHeader1Y0,
+                DLG_WAITPLAYERS_CARRESTR_staticHeader1SX,
+                DLG_WAITPLAYERS_CARRESTR_staticHeader1SY);
+        mm_q_text(m, f, 0, DLG_WAITPLAYERS_CARRESTR_staticHeader2X0,
+                  DLG_WAITPLAYERS_CARRESTR_staticHeader2Y0, MM_TS_LABEL, 0,
+                  1.f, STR_UI_CAR_ENABLED);
+        break;
+    default:
+        break;
+    }
+    /* THE MESSAGE PANEL IS ON EVERY VIEW, which is what all four of the game's
+       own lobby screenshots have -- and on Map and info the panel is that
+       dialog's own `chat' control at the same rectangle. */
+    mm_l_draw_log(m, f);
+    mm_l_draw_ctrls(m, f);
+}
+
+/* ============================================ dlgPLRSCOMM -- Select player
+ *
+ * See mainmenu.h for what is on this page and where each rectangle came from.
+ * The four in `Settings/dlgPLRSCOMM.ini` are used as the artists authored them;
+ * everything else is read off the game's own 800x600 screenshot of this screen,
+ * the same way the main menu's own constants were:
+ *
+ *   the portrait's two arrows   x 79..100 and 231..252, y 194..214
+ *   the name's ink              y 89..108, with its rule at 110
+ *   Rank / Current car / Play time   y 119, 142, 165 -- a flat 23 pitch
+ *   the second rule             y 184, and Scores/Cash under it at 191
+ *   the table's rules           x 90..478, at y 263 and 509
+ *   the column headers' ink     y 239..255
+ *   row 0's ink                 y 274, its underline at 292, and the second
+ *                               row's underline at 322 -- so the pitch is 30
+ *                               and seven rows fit between the two rules
+ *   the scroll bar              x 518..541, y 280..508
+ *   the four bars               rows 0, 1, 6 and 7 of the eight the main menu
+ *                               already measures: Create player's centre lands
+ *                               on MM_CY[0] and Remove player's on MM_CY[1],
+ *                               and the two orange ones on MM_CY[6] and [7]
+ */
+#define MP_FACE_X    99.f      /* dlgPLRSCOMM.ini shotFaceX0/Y0/SX/SY */
+#define MP_FACE_Y    79.f
+#define MP_FACE_W   130.f
+#define MP_FACE_H   157.f
+#define MP_ARROW_LX  79.f
+#define MP_ARROW_RX 231.f
+#define MP_ARROW_Y  194.f
+#define MP_ARROW_SZ  22.f
+#define MP_TEXT_X   240.f      /* staticName/Info/CashX0, all three */
+#define MP_NAME_Y    89.f
+#define MP_RULE1_Y  110.f
+#define MP_INFO_Y   119.f
+#define MP_INFO_LH   23.f
+#define MP_RULE2_Y  184.f
+#define MP_CASH_Y   191.f
+#define MP_RULE_W   280.f      /* staticNameSX */
+
+#define MP_LIST_L    90.f
+#define MP_LIST_R   478.f
+#define MP_HEAD_Y   239.f
+#define MP_HEAD_RULE 263.f
+#define MP_ROW_Y    274.f
+#define MP_ROW_H     30.f
+#define MP_ROW_RULE  18.f      /* the underline, below the row's ink top */
+#define MP_FOOT_Y   509.f
+#define MP_N_VIS      7
+#define MP_MARK_X    91.f
+#define MP_MARK_SZ   12.f
+#define MP_COL_NAME 110.f
+#define MP_BAR_X    518.f
+#define MP_BAR_Y    280.f
+#define MP_BAR_W     24.f
+#define MP_BAR_H    228.f
+
+/* Score, Cash and Time are CENTRED on their headings -- measured: the heading
+   "Score" runs 251..290 and the value "0" 268..274, both about 270.5, and the
+   same holds for the other two. */
+static const float MP_COL_CX[3] = { 270.5f, 371.5f, 473.f };
+
+/* Which of the eight bars each of the page's four is. */
+#define MP_ROW_CREATE 0
+#define MP_ROW_REMOVE 1
+#define MP_ROW_SORT   6
+#define MP_ROW_FACE   7
+
+/* THE MODALS. The two-button panel is measured off the game's own "Do you want
+   to remove current player?" shot -- the frame x 216..584, y 232..365, its Yes
+   at x 254..387 and No at 414..546, both y 312..333, so the pair is 133 x 22 on
+   centres 80 either side of 400 and the single Ok of "Can't remove last player"
+   is one of them on the centre line.
+
+   THE CREATE PANEL IS TALLER BECAUSE IT CARRIES A KEYBOARD, which the original
+   does not need. Same width, same centre, and the same button bar 168 below its
+   own top. */
+#define MP_DLG_X    216.f
+#define MP_DLG_W    368.f
+#define MP_DLG_Y    232.f
+#define MP_DLG_H    133.f
+#define MP_BTN_W    133.f
+#define MP_BTN_H     22.f
+#define MP_BTN_DX    80.f
+#define MP_DLG_CX   400.f
+#define MP_SAY_BTN_DY 80.f
+#define MP_CDLG_Y   196.f
+#define MP_CDLG_H   208.f
+#define MP_CBTN_DY  168.f
+#define MP_KB_X     250.f
+#define MP_KB_Y     248.f
+#define MP_KEY_W     30.f
+#define MP_KEY_H     26.f
+#define MP_FIELD_Y  214.f      /* the prompt and the field, one line */
+#define MP_FIELD_PAD 24.f      /* inside the panel's own left edge */
+#define MP_FIELD_X  140.f      /* where the name starts, panel-relative */
+
+/* The caret. A trailing underscore, because the atlas has one and a blinking
+   bar would need a clock this drawer does not take. */
+#define STR_UI_CARET "_"
+
+/* The grid, row by row. 0..36 type themselves, 37 is a space, 38 rubs out and
+   39 is the case toggle -- and that is the whole layout, so nothing else in
+   this file has to know where a letter is. */
+static const char MP_KB_CHARS[] = "abcdefghijklmnopqrstuvwxyz0123456789_";
+#define MP_KEY_SPACE 37
+#define MP_KEY_BACK  38
+#define MP_KEY_SHIFT 39
+
+char mainmenu_kb_char(const mainmenu_t *m, int k)
+{
+    char c;
+    if (k < 0 || k >= MM_KB_KEYS)
+        return 0;
+    if (k == MP_KEY_SPACE)
+        return ' ';
+    if (k >= MP_KEY_BACK)
+        return 0;
+    c = MP_KB_CHARS[k];
+    if (m && m->mshift && c >= 'a' && c <= 'z')
+        c = (char)(c - 32);
+    return c;
+}
+
+static const char *mp_key_label(const mainmenu_t *m, int k, char *buf)
+{
+    if (k == MP_KEY_BACK)  return "<-";
+    if (k == MP_KEY_SHIFT) return m->mshift ? "AB" : "ab";
+    if (k == MP_KEY_SPACE) return "__";
+    buf[0] = mainmenu_kb_char(m, k);
+    buf[1] = 0;
+    return buf;
+}
+
+/* --------------------------------------------------------------- the view */
+
+static int mp_name_cmp(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb)
+            return ca - cb;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+/* Best first for the three numeric keys, A to Z for the fourth, and the name is
+   the tie-break everywhere -- so the order is total and a redraw never shuffles
+   two profiles that compare equal. */
+static int mp_cmp(int ia, int ib, int sort)
+{
+    const player_t *a = player_at(ia), *b = player_at(ib);
+    if (!a || !b)
+        return 0;
+    switch (sort) {
+    case MM_SORT_SCORE:
+        if (a->scores != b->scores) return b->scores - a->scores;
+        break;
+    case MM_SORT_CASH:
+        if (a->cash != b->cash) return b->cash - a->cash;
+        break;
+    case MM_SORT_TIME:
+        if (a->play_time != b->play_time)
+            return a->play_time < b->play_time ? 1 : -1;
+        break;
+    default:
+        break;
+    }
+    return mp_name_cmp(a->name, b->name);
+}
+
+void mainmenu_players_sync(mainmenu_t *m)
+{
+    const int n = player_count();
+    const int cur = player_cur_index();
+    int i, j;
+
+    if (!m)
+        return;
+    m->pnview = n < PL_MAX ? n : PL_MAX;
+    for (i = 0; i < m->pnview; i++)
+        m->pview[i] = i;
+    /* Insertion sort: twenty rows at most, and it is stable, so equal rows keep
+       the order the directory handed them. */
+    for (i = 1; i < m->pnview; i++) {
+        const int v = m->pview[i];
+        for (j = i; j > 0 && mp_cmp(m->pview[j - 1], v, m->psort) > 0; j--)
+            m->pview[j] = m->pview[j - 1];
+        m->pview[j] = v;
+    }
+    m->psel = 0;
+    for (i = 0; i < m->pnview; i++)
+        if (m->pview[i] == cur)
+            m->psel = i;
+    if (m->ptop > m->psel)
+        m->ptop = m->psel;
+    if (m->psel >= m->ptop + MP_N_VIS)
+        m->ptop = m->psel - MP_N_VIS + 1;
+    if (m->ptop < 0)
+        m->ptop = 0;
+}
+
+/* The profile the cursor is on, or NULL when there is none at all. */
+static player_t *mp_sel(const mainmenu_t *m)
+{
+    if (m->psel < 0 || m->psel >= m->pnview)
+        return NULL;
+    return player_at(m->pview[m->psel]);
+}
+
+/* Defined with the rest of the step half below; the page's opener needs it. */
+static void mp_open_name(mainmenu_t *m);
+
+void mainmenu_open_players(mainmenu_t *m, int with_create)
+{
+    if (!m)
+        return;
+    m->page = MM_PAGE_PLAYERS;
+    m->pfocus = MM_P_LIST;
+    m->parmed = -1;
+    m->marmed = -1;
+    mainmenu_players_sync(m);
+    if (with_create)
+        mp_open_name(m);
+    else
+        m->modal = MM_MODAL_NONE;
+}
+
+int mainmenu_p_live(const mainmenu_t *m, int stop)
+{
+    switch (stop) {
+    case MM_P_LIST:
+        return m->pnview > 0;
+    case MM_P_FACE_L:
+    case MM_P_FACE_R:
+        return m->pnview > 0;
+    case MM_P_REMOVE:
+        /* Focusable with one profile in the roster, because pressing it is how
+           the game says "Can't remove last player" -- a button that refuses out
+           loud is not the same as a button that is not there. */
+        return m->pnview > 0;
+    case MM_P_FACE:
+        return 0;               /* the chooser over Faces/, not built */
+    case MM_P_CREATE:
+    case MM_P_SORT:
+    case MM_P_CONTINUE:
+        return 1;
+    case MM_P_RACE:
+        return m->pnview > 0;
+    default:
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------- geometry */
+
+static void mp_bar_row(int stop, int *row, int *orange)
+{
+    switch (stop) {
+    case MM_P_CREATE: *row = MP_ROW_CREATE; *orange = 0; return;
+    case MM_P_REMOVE: *row = MP_ROW_REMOVE; *orange = 0; return;
+    case MM_P_SORT:   *row = MP_ROW_SORT;   *orange = 1; return;
+    case MM_P_FACE:   *row = MP_ROW_FACE;   *orange = 1; return;
+    default:          *row = -1;            *orange = 0; return;
+    }
+}
+
+static void mp_arrow_rect(const mmframe *f, int right,
+                          float *x, float *y, float *w, float *h)
+{
+    mm_gbox(f, MP_TEXT_X, right ? MP_ARROW_RX : MP_ARROW_LX, MP_ARROW_Y,
+            MP_ARROW_SZ, MP_ARROW_SZ, x, y, w, h);
+}
+
+static void mp_list_rect(const mmframe *f, int row,
+                         float *x, float *y, float *w, float *h)
+{
+    const float top = MP_ROW_Y + MP_ROW_H * row - 4.f;
+    *x = px(f, MP_LIST_L);
+    *y = py(f, top);
+    *w = px(f, MP_LIST_R) - *x;
+    *h = py(f, top + MP_ROW_H) - *y;
+}
+
+static void mp_modal_rect(const mainmenu_t *m, const mmframe *f,
+                          float *x, float *y, float *w, float *h)
+{
+    const int big = m->modal == MM_MODAL_CREATE;
+    mm_gbox(f, MP_DLG_CX, MP_DLG_X, big ? MP_CDLG_Y : MP_DLG_Y,
+            MP_DLG_W, big ? MP_CDLG_H : MP_DLG_H, x, y, w, h);
+}
+
+/* One modal button. `i` is 0 for the left of a pair, 1 for the right; a modal
+   with ONE button puts it on the centre line, which is where the game's own
+   "Can't remove last player" has it. */
+static void mp_btn_rect(const mainmenu_t *m, const mmframe *f, int i, int pair,
+                        float *x, float *y, float *w, float *h)
+{
+    const int big = m->modal == MM_MODAL_CREATE;
+    const float cx = pair ? MP_DLG_CX + (i ? MP_BTN_DX : -MP_BTN_DX)
+                          : MP_DLG_CX;
+    const float ty = (big ? MP_CDLG_Y + MP_CBTN_DY : MP_DLG_Y + MP_SAY_BTN_DY);
+    mm_gbox(f, MP_DLG_CX, cx - MP_BTN_W * 0.5f, ty, MP_BTN_W, MP_BTN_H,
+            x, y, w, h);
+}
+
+static void mp_key_rect(const mmframe *f, int k,
+                        float *x, float *y, float *w, float *h)
+{
+    const int c = k % MM_KB_COLS, r = k / MM_KB_COLS;
+    mm_gbox(f, MP_DLG_CX, MP_KB_X + MP_KEY_W * c, MP_KB_Y + MP_KEY_H * r,
+            MP_KEY_W - 2.f, MP_KEY_H - 2.f, x, y, w, h);
+}
+
+static int mp_in(float px_, float py_, float x, float y, float w, float h)
+{
+    return px_ >= x && px_ < x + w && py_ >= y && py_ < y + h;
+}
+
+int mainmenu_p_stop_at(const mainmenu_t *m, int screen_w, int screen_h,
+                       float tx, float ty, int *row)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float x, y, w, h;
+    int i;
+
+    if (row)
+        *row = -1;
+    if (!m)
+        return -1;
+    for (i = 0; i < MM_P_N_FOCUS; i++) {
+        int bar, orange;
+        mp_bar_row(i, &bar, &orange);
+        if (bar >= 0) {
+            mm_bar_rect(&f, bar, &x, &y, &w, &h);
+            if (mp_in(tx, ty, x, y, w, h))
+                return i;
+        }
+    }
+    mp_arrow_rect(&f, 0, &x, &y, &w, &h);
+    if (mp_in(tx, ty, x, y, w, h)) return MM_P_FACE_L;
+    mp_arrow_rect(&f, 1, &x, &y, &w, &h);
+    if (mp_in(tx, ty, x, y, w, h)) return MM_P_FACE_R;
+    mm_race_rect(&f, &x, &y, &w, &h);
+    if (mp_in(tx, ty, x, y, w, h)) return MM_P_RACE;
+    mm_quit_rect(&f, &x, &y, &w, &h);
+    if (mp_in(tx, ty, x, y, w, h)) return MM_P_CONTINUE;
+    for (i = 0; i < MP_N_VIS && m->ptop + i < m->pnview; i++) {
+        mp_list_rect(&f, i, &x, &y, &w, &h);
+        if (mp_in(tx, ty, x, y, w, h)) {
+            if (row)
+                *row = m->ptop + i;
+            return MM_P_LIST;
+        }
+    }
+    return -1;
+}
+
+int mainmenu_modal_at(const mainmenu_t *m, int screen_w, int screen_h,
+                      float tx, float ty)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    const int pair = m && m->modal != MM_MODAL_SAY;
+    float x, y, w, h;
+    int i;
+
+    if (!m || !m->modal || m->modal == MM_MODAL_IME)
+        return -1;      /* the system dialog has the panel while it is up */
+    if (m->modal == MM_MODAL_CREATE)
+        for (i = 0; i < MM_KB_KEYS; i++) {
+            mp_key_rect(&f, i, &x, &y, &w, &h);
+            if (mp_in(tx, ty, x, y, w, h))
+                return i;
+        }
+    mp_btn_rect(m, &f, 0, pair, &x, &y, &w, &h);
+    if (mp_in(tx, ty, x, y, w, h)) return MM_MODAL_OK;
+    if (pair) {
+        mp_btn_rect(m, &f, 1, pair, &x, &y, &w, &h);
+        if (mp_in(tx, ty, x, y, w, h)) return MM_MODAL_CANCEL;
+    }
+    return -1;
+}
+
+/* ---------------------------------------------------------------- a step */
+
+/* THE NAME DIALOG. The machine's own keyboard where there is one, and the grid
+   where `ime_open` said no -- which is every host build and any Vita whose
+   common dialog would not configure. Both leave `mname` empty and the same
+   commit runs off it. */
+static void mp_open_name(mainmenu_t *m)
+{
+    m->mfocus = 0;
+    m->mshift = 1;              /* a name starts with a capital */
+    m->marmed = -1;
+    m->mname[0] = 0;
+    m->modal = (ime_available()
+                && ime_open(STR_UI_PLAYER_NAME, "", PL_NAME - 1))
+               ? MM_MODAL_IME : MM_MODAL_CREATE;
+}
+
+static void mp_say(mainmenu_t *m, const char *line)
+{
+    m->modal = MM_MODAL_SAY;
+    m->msay = line;
+    m->mfocus = MM_MODAL_OK;
+    m->marmed = -1;
+}
+
+/* THE PORTRAIT ARROWS walk the nine and mark the profile DIRTY. A face is a
+   property of the profile and not of this screen, so the choice has to survive
+   the launch -- but the write is on the way OUT of the page and not on the
+   press: a `.scp` is 150 KB and a held arrow would put one on the memory card
+   per repeat. One file, on one event, which is settings.c's rule. */
+static void mp_move_face(mainmenu_t *m, int d)
+{
+    player_t *p = mp_sel(m);
+    if (!p)
+        return;
+    p->face = ((p->face < 0 ? 0 : p->face) + d + PL_N_FACES) % PL_N_FACES;
+    p->dirty = 1;
+    m->cue = MM_CUE_ARROW;
+}
+
+/* Leaving the page: whatever it changed goes down now. */
+static void mp_leave(mainmenu_t *m, int page)
+{
+    player_save_cur_if_dirty();
+    m->page = page;
+}
+
+static void mp_set_sel(mainmenu_t *m, int row)
+{
+    if (row < 0 || row >= m->pnview)
+        return;
+    m->psel = row;
+    if (m->ptop > m->psel)
+        m->ptop = m->psel;
+    if (m->psel >= m->ptop + MP_N_VIS)
+        m->ptop = m->psel - MP_N_VIS + 1;
+    /* SELECTING A ROW SELECTS THE PROFILE. There is no separate "use this one"
+       press on the game's own page either -- Continue leaves, it does not
+       choose -- and the card beside the list is already showing whoever the
+       cursor is on. */
+    player_select(m->pview[m->psel]);
+    m->action = MM_ACT_PLAYER;
+}
+
+static void mp_fire(mainmenu_t *m, int stop)
+{
+    int bar, orange;
+    mp_bar_row(stop, &bar, &orange);
+    if (bar >= 0) {
+        m->press_row = bar;
+        m->press_t = 0.f;
+    }
+    if (!mainmenu_p_live(m, stop)) {
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    switch (stop) {
+    case MM_P_CREATE:
+        mp_open_name(m);
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_P_REMOVE:
+        /* The refusal is the game's own, and it is a DIALOG, not a silence. */
+        if (player_count() <= 1) {
+            mp_say(m, STR_UI_LAST_PLAYER);
+            m->cue = MM_CUE_DENY;
+        } else {
+            m->modal = MM_MODAL_REMOVE;
+            m->mfocus = MM_MODAL_CANCEL;   /* No, on a destructive question */
+            m->marmed = -1;
+            m->cue = MM_CUE_PRESS;
+        }
+        break;
+    case MM_P_SORT:
+        m->psort = (m->psort + 1) % MM_N_SORT;
+        mainmenu_players_sync(m);
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_P_FACE_L: mp_move_face(m, -1); break;
+    case MM_P_FACE_R: mp_move_face(m, +1); break;
+    case MM_P_LIST:
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_P_RACE:
+        /* main.c writes the profile at a race start anyway; this is the face,
+           which is not part of the setup it stores. */
+        player_save_cur_if_dirty();
+        m->action = MM_ACT_RACE;
+        m->cue = MM_CUE_PRESS;
+        break;
+    case MM_P_CONTINUE:
+        mp_leave(m, MM_PAGE_MAIN);
+        m->cue = MM_CUE_PRESS;
+        break;
+    default:
+        m->cue = MM_CUE_DENY;
+        break;
+    }
+}
+
+/* The ring skips the dead stops, the way the main menu's does. */
+static int mp_next_focus(const mainmenu_t *m, int from, int d)
+{
+    int i, k = from;
+    for (i = 0; i < MM_P_N_FOCUS; i++) {
+        k = (k + d + MM_P_N_FOCUS) % MM_P_N_FOCUS;
+        if (mainmenu_p_live(m, k))
+            return k;
+    }
+    return from;
+}
+
+/* Returns 1 when the profile was made. A REFUSAL raises the game's own dialog
+   (which replaces the modal) and returns 0; an EMPTY name is refused quietly,
+   because both dialogs carry a Cancel and pressing Ok on nothing is not one --
+   the grid stays open on it and the keyboard has already gone. */
+static int mp_commit_create(mainmenu_t *m)
+{
+    player_t *p = mp_sel(m);
+    const int face = p && p->face >= 0 ? p->face : 0;
+    int r;
+
+    /* Trim: a name that is all spaces is not a name, and a trailing space in a
+       filename is a filename that is hard to type on the other machine. */
+    {
+        int a = 0, b = (int)strlen(m->mname);
+        while (m->mname[a] == ' ') a++;
+        while (b > a && m->mname[b - 1] == ' ') b--;
+        memmove(m->mname, m->mname + a, (size_t)(b - a));
+        m->mname[b - a] = 0;
+    }
+    if (!m->mname[0]) {
+        m->cue = MM_CUE_DENY;
+        return 0;
+    }
+    r = player_create(m->mname, face);
+    if (r == -2) { mp_say(m, STR_UI_PLAYER_EXISTS); m->cue = MM_CUE_DENY; return 0; }
+    if (r == -4) { mp_say(m, STR_UI_SAVE_FAILED);   m->cue = MM_CUE_DENY; return 0; }
+    if (r != 0)  { mp_say(m, STR_UI_CREATE_FAILED); m->cue = MM_CUE_DENY; return 0; }
+    m->modal = MM_MODAL_NONE;
+    m->pfocus = MM_P_LIST;
+    mainmenu_players_sync(m);
+    m->action = MM_ACT_PLAYER;
+    m->cue = MM_CUE_PRESS;
+    return 1;
+}
+
+static void mp_commit_remove(mainmenu_t *m)
+{
+    /* The cursor can only be nowhere if the roster emptied under the dialog,
+       which nothing does -- but pview[-1] is the read it would cost. */
+    const int r = (m->psel >= 0 && m->psel < m->pnview)
+                  ? player_remove(m->pview[m->psel]) : -1;
+    m->modal = MM_MODAL_NONE;
+    if (r == -2) { mp_say(m, STR_UI_LAST_PLAYER); m->cue = MM_CUE_DENY; return; }
+    if (r != 0)  { mp_say(m, STR_UI_SAVE_FAILED); m->cue = MM_CUE_DENY; return; }
+    mainmenu_players_sync(m);
+    m->pfocus = MM_P_LIST;
+    m->action = MM_ACT_PLAYER;
+    m->cue = MM_CUE_PRESS;
+}
+
+static void mp_key(mainmenu_t *m, int k)
+{
+    const int n = (int)strlen(m->mname);
+    if (k == MP_KEY_SHIFT) {
+        m->mshift = !m->mshift;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    if (k == MP_KEY_BACK) {
+        if (n > 0)
+            m->mname[n - 1] = 0;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    if (n >= PL_NAME - 1) {
+        m->cue = MM_CUE_DENY;   /* the engine's own field is sixteen bytes */
+        return;
+    }
+    m->mname[n] = mainmenu_kb_char(m, k);
+    m->mname[n + 1] = 0;
+    /* One capital, then lower case -- which is how a name is spelt and saves a
+       press per letter. */
+    if (m->mshift && n == 0)
+        m->mshift = 0;
+    m->cue = MM_CUE_PRESS;
+}
+
+static void mp_modal_fire(mainmenu_t *m, int stop)
+{
+    if (stop < 0)
+        return;
+    if (stop < MM_KB_KEYS) {
+        mp_key(m, stop);
+        return;
+    }
+    if (stop == MM_MODAL_CANCEL) {
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    switch (m->modal) {
+    case MM_MODAL_CREATE: mp_commit_create(m); break;
+    case MM_MODAL_REMOVE: mp_commit_remove(m); break;
+    case MM_MODAL_ASK:    mg_commit(m); break;
+    default:
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_PRESS;
+        break;
+    }
+}
+
+/* THE MODAL OWNS EVERY INPUT while it is up, which is what a modal is. */
+static void mm_step_modal(mainmenu_t *m, unsigned int down,
+                          const touch_state *tp, int screen_w, int screen_h)
+{
+    const int pair = m->modal != MM_MODAL_SAY;
+    const int keys = m->modal == MM_MODAL_CREATE;
+
+    /* THE MACHINE'S KEYBOARD OWNS THE FRAME while it is up: the compositor has
+       the input and the screen, and all this does is ask whether it is done.
+       Every pad bit is dropped -- the press that opened the dialog is still
+       held on the frame after it, and reading it here would post it twice. */
+    if (m->modal == MM_MODAL_IME) {
+        char got[PL_NAME];
+        const int r = ime_poll(got, (int)sizeof got);
+        if (r == 0)
+            return;
+        m->modal = MM_MODAL_NONE;           /* the keyboard is gone either way */
+        if (r > 0) {
+            snprintf(m->mname, sizeof m->mname, "%s", got);
+            mp_commit_create(m);            /* may raise the refusal dialog */
+        }
+        return;
+    }
+
+    if (down & SCE_CTRL_CIRCLE) {       /* the pad's own "cancel" */
+        if (m->modal == MM_MODAL_SAY)
+            mp_modal_fire(m, MM_MODAL_OK);
+        else
+            mp_modal_fire(m, MM_MODAL_CANCEL);
+        return;
+    }
+    if (down & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) {
+        const int d = (down & SCE_CTRL_RIGHT) ? +1 : -1;
+        if (keys && m->mfocus < MM_KB_KEYS) {
+            const int r = m->mfocus / MM_KB_COLS;
+            const int c = (m->mfocus % MM_KB_COLS + d + MM_KB_COLS)
+                          % MM_KB_COLS;
+            m->mfocus = r * MM_KB_COLS + c;
+        } else if (pair) {
+            m->mfocus = m->mfocus == MM_MODAL_OK ? MM_MODAL_CANCEL
+                                                 : MM_MODAL_OK;
+        }
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & (SCE_CTRL_UP | SCE_CTRL_DOWN)) {
+        const int d = (down & SCE_CTRL_DOWN) ? +1 : -1;
+        if (keys) {
+            /* The grid and the button bar are one column of rows: the row under
+               the bottom key row is Ok/Cancel, and it wraps back to the top. */
+            const int rows = MM_KB_ROWS + 1;
+            int r = m->mfocus < MM_KB_KEYS ? m->mfocus / MM_KB_COLS
+                                           : MM_KB_ROWS;
+            int c = m->mfocus < MM_KB_KEYS ? m->mfocus % MM_KB_COLS
+                                           : (m->mfocus == MM_MODAL_OK ? 2 : 7);
+            r = (r + d + rows) % rows;
+            m->mfocus = r < MM_KB_ROWS ? r * MM_KB_COLS + c
+                                       : (c < MM_KB_COLS / 2 ? MM_MODAL_OK
+                                                             : MM_MODAL_CANCEL);
+        } else if (pair) {
+            m->mfocus = m->mfocus == MM_MODAL_OK ? MM_MODAL_CANCEL
+                                                 : MM_MODAL_OK;
+        }
+        m->cue = MM_CUE_FOCUS;
+    }
+    /* SQUARE rubs out, which is the one shortcut worth having: the key is nine
+       presses away from the far corner of the grid. */
+    if (keys && (down & SCE_CTRL_SQUARE))
+        mp_key(m, MP_KEY_BACK);
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mp_modal_fire(m, m->mfocus);
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        m->marmed = mainmenu_modal_at(m, screen_w, screen_h, tp->x, tp->y);
+        if (m->marmed >= 0 && m->marmed != m->mfocus) {
+            m->mfocus = m->marmed;
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    if (tp->released) {
+        const int at = mainmenu_modal_at(m, screen_w, screen_h, tp->x, tp->y);
+        if (at >= 0 && at == m->marmed)
+            mp_modal_fire(m, at);
+        m->marmed = -1;
+    }
+}
+
+static void mm_step_players(mainmenu_t *m, unsigned int down,
+                            const touch_state *tp, int screen_w, int screen_h)
+{
+    /* No modal gate here: mainmenu_step takes it for every page. */
+    /* THE LIST IS THE ONE STOP THAT EATS UP AND DOWN, because the rows are what
+       those keys mean while the cursor is in a table. Everywhere else on the
+       page they walk the ring, and LEFT/RIGHT step off the list onto it. */
+    if (m->pfocus == MM_P_LIST && m->pnview > 0) {
+        if (down & SCE_CTRL_UP) {
+            if (m->psel > 0) mp_set_sel(m, m->psel - 1);
+            else             m->pfocus = mp_next_focus(m, MM_P_LIST, -1);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_DOWN) {
+            if (m->psel < m->pnview - 1) mp_set_sel(m, m->psel + 1);
+            else                         m->pfocus = mp_next_focus(m, MM_P_LIST, +1);
+            m->cue = MM_CUE_FOCUS;
+        }
+    } else {
+        if (down & SCE_CTRL_UP) {
+            m->pfocus = mp_next_focus(m, m->pfocus, -1);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_DOWN) {
+            m->pfocus = mp_next_focus(m, m->pfocus, +1);
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    /* LEFT and RIGHT are the portrait's, wherever the focus is: they are the
+       only pair of arrows on the page and they do one thing. */
+    if (down & SCE_CTRL_LEFT)  mp_move_face(m, -1);
+    if (down & SCE_CTRL_RIGHT) mp_move_face(m, +1);
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mp_fire(m, m->pfocus);
+    /* CIRCLE leaves, unless there is nobody to leave as: a first launch has to
+       make somebody before the front end has a profile to race with. */
+    if ((down & SCE_CTRL_CIRCLE) && m->pnview > 0) {
+        mp_leave(m, MM_PAGE_MAIN);
+        m->cue = MM_CUE_PRESS;
+    }
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        int row = -1;
+        m->parmed = mainmenu_p_stop_at(m, screen_w, screen_h, tp->x, tp->y,
+                                       &row);
+        if (m->parmed >= 0 && mainmenu_p_live(m, m->parmed)) {
+            if (m->pfocus != m->parmed)
+                m->cue = MM_CUE_FOCUS;
+            m->pfocus = m->parmed;
+        }
+        if (row >= 0 && row != m->psel) {
+            mp_set_sel(m, row);
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    if (tp->released) {
+        int row = -1;
+        const int at = mainmenu_p_stop_at(m, screen_w, screen_h, tp->x, tp->y,
+                                          &row);
+        if (at >= 0 && at == m->parmed)
+            mp_fire(m, at);
+        m->parmed = -1;
+    }
+}
+
+/* ---------------------------------------------------------------- the draw */
+
+/* One string in the engine's own small letters, with the compiled-in font as the
+   fallback every other drawer here uses. `align` 0 left, 1 centred on x,
+   2 right of x. */
+static void mp_text(const mainmenu_t *m, const mmframe *f, int big,
+                    float x, float y, float ts, int align,
+                    float r, float g, float b, const char *s)
+{
+    const sfont sf = big ? sf_big(m->tex.font_big) : sf_small(m->tex.font_small);
+    const float sc = f->us * ts;
+    const float w = sf.tex ? sf_w(&sf, sc, s) : ui_text_w(sc, s);
+    const float tx = align == 1 ? x - w * 0.5f : (align == 2 ? x - w : x);
+    if (sf.tex)
+        sf_text_shadowed(&sf, tx, y, sc, r, g, b, 1.f, s);
+    else
+        ui_text(tx, y, sc, r, g, b, 1.f, s);
+}
+
+/* The four bars this page puts in the eight-row column. */
+static void mp_draw_bars(const mainmenu_t *m, const mmframe *f)
+{
+    static const int STOP[4] = { MM_P_CREATE, MM_P_REMOVE,
+                                 MM_P_SORT, MM_P_FACE };
+    static const char *const SORT_NAME[MM_N_SORT] = {
+        STR_UI_SORT_BY_SCORE, STR_UI_SORT_BY_CASH,
+        STR_UI_SORT_BY_TIME,  STR_UI_SORT_BY_NAME
+    };
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        const int stop = STOP[i];
+        const int live = mainmenu_p_live(m, stop);
+        const int lit = live && m->pfocus == stop;
+        const char *label;
+        float bx, by, bw, bh, v, slide;
+        int row, orange;
+
+        mp_bar_row(stop, &row, &orange);
+        switch (stop) {
+        case MM_P_CREATE: label = STR_UI_CREATE_PLAYER; break;
+        case MM_P_REMOVE: label = STR_UI_REMOVE_PLAYER; break;
+        case MM_P_SORT:   label = SORT_NAME[m->psort];  break;
+        default:          label = STR_UI_FACE;          break;
+        }
+        slide = lit ? MM_SLIDE * MM_SETTLED : 0.f;
+        mm_draw_wedge(m, f, row);
+        mm_bar_draw_rect(m, f, row, slide, &bx, &by, &bw, &bh);
+        v = !live ? MM_V_GREY
+                  : (orange ? (lit ? MM_V_ORANGE_F : MM_V_ORANGE)
+                            : (lit ? MM_V_RED_F : MM_V_RED));
+        if (m->tex.buttons)
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        else
+            ui_rect(bx, by, bw, bh,
+                    live ? (orange ? 0.90f : 0.72f) : 0.45f,
+                    live ? (orange ? 0.55f : 0.09f) : 0.45f,
+                    live ? (orange ? 0.04f : 0.11f) : 0.47f, 1.f);
+        mm_label(m, f, bx, by, bw, bh, label,
+                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
+    }
+}
+
+/* The card: the portrait, its two arrows, and the five facts beside it -- all of
+   them profile fields, which is what this port could not draw until it read the
+   format. */
+/* THE CARD, AND TWO PAGES DRAW IT. `scores_only' is dlgMULTIPLAYER's own
+   difference from the roster page's: that page's `Scores' line is LEFT-aligned
+   at MP_TEXT_X and has no `Cash' beside it, measured on the game's own shot of
+   it at 240..306, where this one right-aligns the pair on 520. Everything above
+   the second rule is identical on both, to the pixel. */
+static void mp_draw_card_at(const mainmenu_t *m, const mmframe *f,
+                            int scores_only)
+{
+    /* WHOSE CARD IT IS depends on the page. On the roster page it is the row
+       the cursor is on -- the point of that screen is to look at a profile
+       before selecting it. Everywhere else it is the profile that IS selected;
+       `mp_sel' reads `pview', which is the roster page's own order and is empty
+       until that page has been opened, so the multiplayer page drew `Create
+       player' over a full roster. */
+    const player_t *p = (m->page == MM_PAGE_PLAYERS) ? mp_sel(m)
+                                                     : player_cur();
+    char line[96], t[24];
+    float x, y, w, h, ty;
+    int face;
+
+    mm_gbox(f, MP_TEXT_X, MP_FACE_X, MP_FACE_Y, MP_FACE_W, MP_FACE_H,
+            &x, &y, &w, &h);
+    face = p && p->face >= 0 && p->face < PL_N_FACES ? p->face : 0;
+    if (m->tex.face[face])
+        ui_image(x, y, w, h, m->tex.face[face],
+                 MM_FACE_U0, MM_FACE_V0, MM_FACE_U1, MM_FACE_V1,
+                 1.f, 1.f, 1.f, 1.f);
+    else
+        ui_rect(x, y, w, h, 0.20f, 0.22f, 0.28f, 1.f);
+
+    if (m->pnview > 0) {
+        mp_arrow_rect(f, 0, &x, &y, &w, &h);
+        mm_arrow(m, x, y, w, m->pfocus == MM_P_FACE_L ? 1 : 0, 0);
+        mp_arrow_rect(f, 1, &x, &y, &w, &h);
+        mm_arrow(m, x, y, w, m->pfocus == MM_P_FACE_R ? 1 : 0, 1);
+    }
+
+    if (!p) {
+        /* An empty roster still draws the card's frame and says what to do,
+           which is the one thing there is to do on this screen. */
+        mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, MP_NAME_Y),
+                MM_TS_INFO, 0, 1.f, 1.f, 1.f, STR_UI_CREATE_PLAYER);
+        return;
+    }
+
+    mp_text(m, f, 1, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, MP_NAME_Y),
+            MM_TS_WELCOME, 0, 1.f, 1.f, 1.f, p->name);
+    mm_rule_at(f, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, MP_RULE1_Y),
+               MP_RULE_W * f->us);
+
+    ty = MP_INFO_Y;
+    snprintf(line, sizeof line, "%s: %s", STR_UI_RANK, player_rank(p));
+    mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, ty),
+            MM_TS_INFO, 0, 1.f, 1.f, 1.f, line);
+    ty += MP_INFO_LH;
+    snprintf(line, sizeof line, "%s: %s", STR_UI_CURRENT_CAR,
+             STR_CAR_NAME[p->sel_car >= 0 && p->sel_car < STR_N_CARS
+                          ? p->sel_car : 0]);
+    mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, ty),
+            MM_TS_INFO, 0, 1.f, 1.f, 1.f, line);
+    ty += MP_INFO_LH;
+    player_time_str(p->play_time, t, sizeof t);
+    snprintf(line, sizeof line, "%s: %s", STR_UI_PLAY_TIME, t);
+    mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, ty),
+            MM_TS_INFO, 0, 1.f, 1.f, 1.f, line);
+
+    mm_rule_at(f, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, MP_RULE2_Y),
+               MP_RULE_W * f->us);
+    /* RIGHT-ALIGNED on the rule's own right end, which is where the game puts
+       it: measured, the pair runs x 357..517 under a rule that ends at 519,
+       while every line above it starts at 240.
+     *
+       AND dlgMULTIPLAYER'S IS NEITHER. On the game's own shot of that page the
+       line is `Scores: 0' alone, LEFT-aligned at 240 and running to 306, with
+       no Cash beside it -- so the same card, one line differently. */
+    if (scores_only) {
+        snprintf(line, sizeof line, "%s: %d", STR_UI_SCORES, p->scores);
+        mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X), py(f, MP_CASH_Y),
+                MM_TS_INFO, 0, 1.f, 1.f, 1.f, line);
+        return;
+    }
+    snprintf(line, sizeof line, "%s: %d    %s: $%d",
+             STR_UI_SCORES, p->scores, STR_UI_CASH, p->cash);
+    mp_text(m, f, 0, gx(f, MP_TEXT_X, MP_TEXT_X + MP_RULE_W), py(f, MP_CASH_Y),
+            MM_TS_INFO, 2, 1.f, 1.f, 1.f, line);
+}
+
+static void mp_draw_card(const mainmenu_t *m, const mmframe *f)
+{
+    mp_draw_card_at(m, f, 0);
+}
+
+/* The table. Four columns, seven rows, the marker on the row the cursor is on,
+   and the engine's own scroll bar beside it when there is more than a page. */
+static void mp_draw_list(const mainmenu_t *m, const mmframe *f)
+{
+    const float l = px(f, MP_LIST_L), r = px(f, MP_LIST_R);
+    char line[64], t[24];
+    int i;
+
+    mp_text(m, f, 0, l + (MP_COL_NAME - MP_LIST_L) * f->us, py(f, MP_HEAD_Y),
+            MM_TS_INFO, 0, 1.f, 1.f, 1.f, STR_UI_COL_PLAYER);
+    mp_text(m, f, 0, px(f, MP_COL_CX[0]), py(f, MP_HEAD_Y),
+            MM_TS_INFO, 1, 1.f, 1.f, 1.f, STR_UI_COL_SCORE);
+    mp_text(m, f, 0, px(f, MP_COL_CX[1]), py(f, MP_HEAD_Y),
+            MM_TS_INFO, 1, 1.f, 1.f, 1.f, STR_UI_COL_CASH);
+    mp_text(m, f, 0, px(f, MP_COL_CX[2]), py(f, MP_HEAD_Y),
+            MM_TS_INFO, 1, 1.f, 1.f, 1.f, STR_UI_COL_TIME);
+    mm_rule_at(f, l, py(f, MP_HEAD_RULE), r - l);
+    mm_rule_at(f, l, py(f, MP_FOOT_Y), r - l);
+
+    for (i = 0; i < MP_N_VIS && m->ptop + i < m->pnview; i++) {
+        const int row = m->ptop + i;
+        const player_t *p = player_at(m->pview[row]);
+        const float y = py(f, MP_ROW_Y + MP_ROW_H * i);
+        const int here = row == m->psel;
+        const float g = here ? 1.f : 0.86f;
+        if (!p)
+            continue;
+        if (here) {
+            /* the red marker the game puts against the chosen row, and the
+               underline under its name */
+            float ax, ay, aw, ah;
+            mm_gbox(f, MP_LIST_L, MP_MARK_X, MP_ROW_Y + MP_ROW_H * i + 3.f,
+                    MP_MARK_SZ, MP_MARK_SZ, &ax, &ay, &aw, &ah);
+            /* state 0 is the RED cell -- see mm_arrow. The game's own row
+               marker is red and the silver is what a focused arrow goes. */
+            mm_arrow(m, ax, ay, aw, 0, 0);
+            mm_rule_at(f, l, py(f, MP_ROW_Y + MP_ROW_H * i + MP_ROW_RULE),
+                       (MP_RULE_W - 158.f) * f->us);
+        }
+        mp_text(m, f, 0, l + (MP_COL_NAME - MP_LIST_L) * f->us, y,
+                MM_TS_INFO, 0, 1.f, g, g, p->name);
+        snprintf(line, sizeof line, "%d", p->scores);
+        mp_text(m, f, 0, px(f, MP_COL_CX[0]), y, MM_TS_INFO, 1,
+                1.f, g, g, line);
+        snprintf(line, sizeof line, "%d", p->cash);
+        mp_text(m, f, 0, px(f, MP_COL_CX[1]), y, MM_TS_INFO, 1,
+                1.f, g, g, line);
+        player_time_str(p->play_time, t, sizeof t);
+        mp_text(m, f, 0, px(f, MP_COL_CX[2]), y, MM_TS_INFO, 1,
+                1.f, g, g, t);
+    }
+
+    /* dlgSTAT's own bar, on the same texture and the same rule: the thumb is
+       the visible window's share of the list and it sits where the window is. */
+    if (m->pnview > MP_N_VIS)
+        mm_draw_scrollbar(m, f, MP_BAR_X, MP_BAR_Y, MP_BAR_Y + MP_BAR_H,
+                          m->ptop, m->pnview, MP_N_VIS);
+}
+
+/* messagebox_empty's own nine slices, in SCREEN pixels rather than design ones.
+ *
+ * mm_frame9 does the same job for dlgMAPINFO's window and takes design
+ * coordinates, which map x through px() -- the stretch. This page's modal is a
+ * GROUP about the screen's centre line and its insides are placed with gx(), so
+ * a rim mapped the other way would sit a dozen pixels off its own contents on a
+ * 960x544 panel. Same texture, same three constants, same corner size in the
+ * uniform scale. */
+/* THERE WAS A SECOND NINE-SLICE DRAWER HERE and it was the correct one. The
+   two have been merged into mm_frame9 -- see its own note on the layout bug
+   that came of having two, which is the second time these two disagreed about
+   the same eight slices. */
+
+/* One modal button, with the game's own red-then-orange pair. */
+static void mp_draw_btn(const mainmenu_t *m, const mmframe *f, int i, int pair,
+                        const char *label, int lit)
+{
+    float x, y, w, h;
+    mp_btn_rect(m, f, i, pair, &x, &y, &w, &h);
+    if (i == 0 && m->tex.buttons) {
+        const float v = lit ? MM_V_RED_F : MM_V_RED;
+        ui_image(x, y, w, h, m->tex.buttons, 0.f, v, 1.f, v + MM_V_CELL,
+                 1.f, 1.f, 1.f, 1.f);
+    } else if (m->tex.back) {
+        ui_image(x, y, w, h, m->tex.back, 0.f, lit ? 32.f / 128.f : 0.f,
+                 1.f, lit ? 64.f / 128.f : 32.f / 128.f, 1.f, 1.f, 1.f, 1.f);
+    } else {
+        ui_rect(x, y, w, h, i ? 0.90f : 0.72f, i ? 0.55f : 0.09f,
+                i ? 0.04f : 0.11f, 1.f);
+    }
+    mp_text(m, f, 0, x + w * 0.5f,
+            y + (h - ui_text_h(f->us * MM_TS_LABEL)) * 0.5f,
+            MM_TS_LABEL, 1, 1.f, 1.f, 1.f, label);
+}
+
+static void mp_draw_modal(const mainmenu_t *m, const mmframe *f)
+{
+    float x, y, w, h;
+
+    /* THE MACHINE'S KEYBOARD DRAWS ITSELF, over everything, and it dims what is
+       under it as well -- so this draws nothing at all while it is up rather
+       than a second dim and an empty panel behind it. */
+    if (m->modal == MM_MODAL_IME)
+        return;
+    char buf[4];
+    int i;
+
+    ui_rect(0.f, 0.f, f->w, f->h, 0.f, 0.f, 0.f, 0.55f);
+    mp_modal_rect(m, f, &x, &y, &w, &h);
+    /* A GROUND UNDER THE RIM, and it is the port's own. messagebox_empty is a
+       RIM -- 32 texels of rounded silver with nothing in the middle -- and on
+       the game's own shot of this dialog the page shows straight through it,
+       because the whole screen behind it is dimmed and there are two buttons and
+       one line to read. The CREATE dialog carries forty keys the original does
+       not, and forty keys over a table of names is neither; so the panel gets a
+       second dim of its own, light enough that the two-button dialogs still read
+       the way the game's do. */
+    ui_rect(x, y, w, h, 0.08f, 0.07f, 0.06f, 0.45f);
+    if (m->tex.panel) {
+        mm_frame9(f, x, y, w, h, m->tex.panel);
+    } else {
+        ui_rect(x, y, w, f->us * 2.f, 0.85f, 0.85f, 0.88f, 0.9f);
+        ui_rect(x, y + h - f->us * 2.f, w, f->us * 2.f,
+                0.85f, 0.85f, 0.88f, 0.9f);
+    }
+
+    if (m->modal == MM_MODAL_CREATE) {
+        /* THE PROMPT AND THE FIELD ARE ONE LINE, which is what the game's own
+           shot of this dialog has: `Player name:' and the caret to its right,
+           over a rule that runs the width of the panel's inside. The field is
+           at a FIXED offset rather than after the label's own width, so the
+           caret does not walk when the label is drawn in the fallback font. */
+        char field[PL_NAME + 2];
+        snprintf(field, sizeof field, "%s%s", m->mname, STR_UI_CARET);
+        mp_text(m, f, 0, gx(f, MP_DLG_CX, MP_DLG_X + MP_FIELD_PAD),
+                py(f, MP_FIELD_Y), MM_TS_INFO, 0,
+                1.f, 1.f, 1.f, STR_UI_PLAYER_NAME ":");
+        mp_text(m, f, 0, gx(f, MP_DLG_CX, MP_DLG_X + MP_FIELD_X),
+                py(f, MP_FIELD_Y), MM_TS_INFO, 0,
+                1.f, 1.f, 0.72f, field);
+        mm_rule_at(f, gx(f, MP_DLG_CX, MP_DLG_X + MP_FIELD_PAD),
+                   py(f, MP_FIELD_Y + 20.f),
+                   (MP_DLG_W - MP_FIELD_PAD * 2.f) * f->us);
+        for (i = 0; i < MM_KB_KEYS; i++) {
+            const int lit = m->mfocus == i;
+            mp_key_rect(f, i, &x, &y, &w, &h);
+            if (m->tex.buttons) {
+                const float v = lit ? MM_V_RED_F : MM_V_GREY;
+                ui_image(x, y, w, h, m->tex.buttons, 0.2f, v, 0.8f,
+                         v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+            } else {
+                ui_rect(x, y, w, h, lit ? 0.72f : 0.28f,
+                        lit ? 0.09f : 0.28f, lit ? 0.11f : 0.30f, 1.f);
+            }
+            mp_text(m, f, 0, x + w * 0.5f,
+                    y + (h - ui_text_h(f->us * MM_TS_LABEL)) * 0.5f,
+                    MM_TS_LABEL, 1, 1.f, 1.f, 1.f,
+                    mp_key_label(m, i, buf));
+        }
+        mp_draw_btn(m, f, 0, 1, STR_UI_OK, m->mfocus == MM_MODAL_OK);
+        mp_draw_btn(m, f, 1, 1, STR_UI_CANCEL, m->mfocus == MM_MODAL_CANCEL);
+        return;
+    }
+
+    /* ONE LINE PER '\n', because the Garage's questions and two of the engine's
+       refusals are written with them -- "Do you want to sell car and
+       upgrades?\ncar: ..." and "You have to sell\nprevious upgrade first!".
+       Centred, at the small font's own pitch, and the block is centred in the
+       panel so a one-line dialog sits exactly where the game's own shot of
+       "Can't remove last player" has it. */
+    {
+        const char *say = m->modal == MM_MODAL_REMOVE ? STR_UI_REMOVE_ASK
+                                                      : (m->msay ? m->msay : "");
+        const char *q = say;
+        int nl = 1;
+        float ty;
+        for (; *q; q++)
+            if (*q == '\n') nl++;
+        ty = MP_DLG_Y + 40.f - (float)(nl - 1) * MM_G_LINE_H * 0.5f;
+        while (*say) {
+            const char *br = strchr(say, '\n');
+            size_t len = br ? (size_t)(br - say) : strlen(say);
+            char one[160];
+            if (len >= sizeof one) len = sizeof one - 1;
+            memcpy(one, say, len);
+            one[len] = 0;
+            mp_text(m, f, 0, px(f, MP_DLG_CX), py(f, ty),
+                    MM_TS_INFO, 1, 1.f, 1.f, 1.f, one);
+            ty += MM_G_LINE_H;
+            if (!br) break;
+            say = br + 1;
+        }
+    }
+    if (m->modal == MM_MODAL_REMOVE || m->modal == MM_MODAL_ASK) {
+        mp_draw_btn(m, f, 0, 1, STR_UI_YES, m->mfocus == MM_MODAL_OK);
+        mp_draw_btn(m, f, 1, 1, STR_UI_NO,  m->mfocus == MM_MODAL_CANCEL);
+    } else {
+        mp_draw_btn(m, f, 0, 0, STR_UI_OK, 1);
+    }
+}
+
+/* ------------------------------------------------ the server list modal
+ *
+ * `Join game' starts a browse and puts this up. The original has a whole dialog
+ * for it -- `dlgNETJOIN_SERVINFO', whose table is `editServerName',
+ * `editNPlayers', `editNMaxPlayers', `editTrack', `editNLaps', `editLag', the
+ * three `enumCar' restrictions and `staticRestr' -- and this port draws a
+ * modal over the page the button was pressed on instead. That is the port's
+ * own: a fifth screen for a list that is usually one row long is a screen to
+ * navigate rather than a thing to read. `known-issues.md'.
+ *
+ * ON THE ROSTER PAGE'S OWN PANEL, which is the create dialog's rectangle -- it
+ * is the taller of the two, and eight rows and a Cancel button need the room. */
+#define MM_S_ROW_H   22.f
+#define MM_S_TOP     (MP_CDLG_Y + 34.f)
+#define MM_S_PAD     20.f
+
+static void mm_s_row_rect(const mmframe *f, int i,
+                          float *x, float *y, float *w, float *h)
+{
+    mm_gbox(f, MP_DLG_CX, MP_DLG_X + MM_S_PAD,
+            MM_S_TOP + MM_S_ROW_H * (float)i,
+            MP_DLG_W - MM_S_PAD * 2.f, MM_S_ROW_H - 2.f, x, y, w, h);
+}
+
+/* Which row is under (x, y), or -1. NET_MAX_SERVERS is the Cancel button. */
+static int mm_s_at(const mainmenu_t *m, int screen_w, int screen_h,
+                   float x, float y)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float bx, by, bw, bh;
+    int i;
+    if (!m || m->modal != MM_MODAL_SERVERS)
+        return -1;
+    for (i = 0; i < net_n_servers(); i++) {
+        mm_s_row_rect(&f, i, &bx, &by, &bw, &bh);
+        if (mp_in(x, y, bx, by, bw, bh))
+            return i;
+    }
+    mp_btn_rect(m, &f, 0, 0, &bx, &by, &bw, &bh);
+    if (mp_in(x, y, bx, by, bw, bh))
+        return NET_MAX_SERVERS;
+    return -1;
+}
+
+/* Join the row the cursor is on, or close. */
+static void mm_s_fire(mainmenu_t *m, int at)
+{
+    const player_t *p = player_cur();
+    unsigned char up[3];
+    const int c = (m->car >= 0 && m->car < MM_N_CARS) ? m->car : 0;
+
+    if (at == NET_MAX_SERVERS || at < 0) {
+        net_leave();
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    up[0] = (unsigned char)garage_level(p, GAR_BOOSTER, c);
+    up[1] = (unsigned char)garage_level(p, GAR_ENGINE, c);
+    up[2] = (unsigned char)garage_level(p, GAR_TIRES, c);
+    if (!net_join(at, p ? p->name : STR_UI_DEFAULT_NAME, c, up,
+                  garage_skin(p, c), p ? p->face : 0)) {
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    /* THE MODAL STAYS UP over `Connecting...' until the welcome arrives -- which
+       is 42451, the engine's own word for the wait, and the step function is
+       what closes it when net_mode_now() says NET_JOINED. */
+    m->cue = MM_CUE_PRESS;
+}
+
+static void mm_s_draw(const mainmenu_t *m, const mmframe *f)
+{
+    float x, y, w, h;
+    int i, n = net_n_servers();
+
+    ui_rect(0.f, 0.f, f->w, f->h, 0.f, 0.f, 0.f, 0.55f);
+    mm_gbox(f, MP_DLG_CX, MP_DLG_X, MP_CDLG_Y, MP_DLG_W, MP_CDLG_H,
+            &x, &y, &w, &h);
+    /* AN OPAQUE PLATE, and this one is not the roster's 0.45. Those dialogs are
+       a line of text and two buttons over a page the player already knows; this
+       is a LIST to read, and at 0.45 the carousel's photographs showed straight
+       through the rows. */
+    ui_rect(x, y, w, h, 0.08f, 0.07f, 0.06f, 0.88f);
+    if (m->tex.panel)
+        mm_frame9(f, x, y, w, h, m->tex.panel);
+    /* 42503, `Server' -- the heading the list is of. */
+    mp_text(m, f, 0, px(f, MP_DLG_CX), py(f, MP_CDLG_Y + 12.f),
+            MM_TS_LABEL, 1, 1.f, 1.f, 1.f, STR_UI_SERVER);
+    if (n == 0) {
+        /* TWO DIFFERENT STATES AND TWO DIFFERENT WORDS. Both branches of this
+           used to be 42451, `Connecting... / Please wait' -- a leftover, and a
+           lie while nothing has been asked yet: a browse is LISTENING, and the
+           announces come twice a second. 10800 is the game's own `Please wait'
+           and is what an empty list says; 42451 is for a join that is actually
+           out.
+         *
+           AND IT IS TWO LINES. 42451 carries its own '\n' and this drew it as
+           one, which put a glyph the atlas has no cell for in the middle of the
+           sentence. */
+        const char *say = net_mode_now() == NET_JOINING ? STR_UI_CONNECTING
+                                                        : STR_UI_PLEASE_WAIT;
+        float ty = MM_S_TOP + MM_S_ROW_H;
+        while (*say) {
+            const char *nl = strchr(say, '\n');
+            size_t len = nl ? (size_t)(nl - say) : strlen(say);
+            char one[64];
+            if (len >= sizeof one) len = sizeof one - 1;
+            memcpy(one, say, len);
+            one[len] = 0;
+            mp_text(m, f, 0, px(f, MP_DLG_CX), py(f, ty),
+                    MM_TS_INFO, 1, 1.f, 1.f, 0.8f, one);
+            ty += MM_L_LINE_H;
+            if (!nl) break;
+            say = nl + 1;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        const net_server *s = net_server_at(i);
+        char line[80];
+        const int lit = m->srvsel == i;
+        if (!s) continue;
+        mm_s_row_rect(f, i, &x, &y, &w, &h);
+        if (lit)
+            ui_rect(x, y, w, h, 1.f, 1.f, 1.f, 0.14f);
+        /* The host's name, the track it is on and how full it is -- which is
+           dlgNETJOIN_SERVINFO's own six fields boiled down to the three a
+           player picking a game needs. */
+        snprintf(line, sizeof line, "%s   %s   %d/%d", s->name,
+                 STR_TRACK_NAME[s->track < STR_N_TRACKS ? s->track : 0],
+                 (int)s->players, (int)s->maxplayers);
+        mp_text(m, f, 0, x + 8.f * f->us,
+                y + (h - ui_text_h(f->us * MM_TS_INFO)) * 0.5f,
+                MM_TS_INFO, 0, 1.f, 1.f, 1.f, line);
+    }
+    mp_draw_btn(m, f, 0, 0, STR_UI_CANCEL, 1);
+}
+
+static void mm_s_step(mainmenu_t *m, unsigned int down, const touch_state *tp,
+                      int screen_w, int screen_h)
+{
+    const int n = net_n_servers();
+
+    if (down & (SCE_CTRL_DOWN | SCE_CTRL_RIGHT)) {
+        if (n > 0) m->srvsel = (m->srvsel + 1) % n;
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & (SCE_CTRL_UP | SCE_CTRL_LEFT)) {
+        if (n > 0) m->srvsel = (m->srvsel + n - 1) % n;
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
+        if (n > 0) mm_s_fire(m, m->srvsel);
+        else       m->cue = MM_CUE_DENY;
+    }
+    if (down & SCE_CTRL_CIRCLE)
+        mm_s_fire(m, NET_MAX_SERVERS);
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        const int at = mm_s_at(m, screen_w, screen_h, tp->x, tp->y);
+        m->marmed = at;
+        if (at >= 0 && at < NET_MAX_SERVERS && at != m->srvsel) {
+            m->srvsel = at;
+            m->cue = MM_CUE_FOCUS;
+        }
+    }
+    if (tp->released) {
+        const int at = mm_s_at(m, screen_w, screen_h, tp->x, tp->y);
+        if (at >= 0 && at == m->marmed)
+            mm_s_fire(m, at);
+        m->marmed = -1;
+    }
+}
+
+static void mm_draw_players(const mainmenu_t *m, const mmframe *f)
+{
+    mp_draw_bars(m, f);
+    mp_draw_card(m, f);
+    mp_draw_list(m, f);
 }
 
 void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
@@ -1408,15 +6098,41 @@ void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
         return;
     mm_draw_frame(m, &f);
     mm_draw_header(m, &f);
-    if (m->page == MM_PAGE_QUICK) {
-        mm_draw_quick(m, &f);
+    if (MM_PAGE_IS_QUICK(m->page)) {
+        /* THE COLUMN FIRST, THEN THE PAGE, THEN THE ENUMS. The bars sit under
+           the oval's right leg and nothing on any of the three pages reaches
+           them; the arrows go last because on Race summary two of them are
+           drawn OVER the car viewport. */
+        mm_draw_qnav(m, &f);
+        if (m->page == MM_PAGE_MAPINFO)
+            mm_draw_mapinfo(m, &f);
+        else if (m->page == MM_PAGE_STATS)
+            mm_draw_stats(m, &f);
+        else
+            mm_draw_quick(m, &f);
+        mm_draw_qenums(m, &f);
+    } else if (m->page == MM_PAGE_PLAYERS) {
+        mm_draw_players(m, &f);
+    } else if (MM_PAGE_IS_CAR(m->page)) {
+        mm_draw_garage(m, &f);
+    } else if (m->page == MM_PAGE_MULTI) {
+        mm_draw_multi(m, &f);
+    } else if (m->page == MM_PAGE_LOBBY) {
+        mm_draw_lobby(m, &f);
     } else {
         mm_draw_card(m, &f);
-        mm_draw_carousel(m, &f);
+        mm_draw_carousel_at(m, &f, 1);
         mm_draw_rows(m, &f);
     }
     mm_draw_race(m, &f);
     mm_draw_quit(m, &f);
+    /* THE MODAL IS LAST AND OVER EVERYTHING, which is what makes it one: it
+       dims the whole page under it, the way the credits panel does. On whichever
+       page raised it -- the roster's three and the Garage's question. */
+    if (m->modal == MM_MODAL_SERVERS)
+        mm_s_draw(m, &f);
+    else if (m->modal)
+        mp_draw_modal(m, &f);
     if (m->credits)
         mm_draw_credits(m, &f);
 }

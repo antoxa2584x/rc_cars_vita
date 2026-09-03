@@ -39,6 +39,7 @@
 #   5b. chars   the 59 people, animals and road cars, per track     (pack_chars.py)
 #   5. props    the 13 knockable props, one file for all tracks    (pack_props.py)
 #   5c. menu    the main menu's art, out of Interface.sb            (pack_vsc.py)
+#   5d. intro   the LAUNCH MOVIE and the LOADING SCREEN     (pack_vid/pack_vsc.py)
 #   6. sound    the sound bank and the music                       (pack_snd.py)
 #   7. tables   tracks.h, the menu font, the bubble and LiveArea   (gen_*.py)
 #   8. ai       ai_data.h and ten .aip opponent paths       (gen_ai_data/pack_ai)
@@ -66,7 +67,7 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 
 JOBS="$(nproc 2>/dev/null || echo 4)"
 FORCE=0
-STAGES="unpack lightmap tracks cars props chars menu sound tables ai check build"
+STAGES="unpack lightmap tracks cars props chars menu faces intro sound tables ai check build"
 WANT=""
 NO_MUSIC=0
 CLEAN=0
@@ -593,10 +594,39 @@ fi
 if wanted menu; then
     step "Packing the front end"
     IFACE=Desktop,Podl_LeftTop,Podl_RightTop,Podl_LeftBottom,Podl_RightBottom
-    IFACE=$IFACE,HeaderSkin,ButtonsTextures,Button_race,Button_back,logoRC_Main
+    IFACE=$IFACE,HeaderSkin,ButtonsTextures,RadioButtonsTextures
+    IFACE=$IFACE,Button_race,Button_back,logoRC_Main
     for i in 1 2 3 4 5 6 7 8 9; do IFACE=$IFACE,ButtonPodl_right_$i; done
+    # ALL FIVE SCREENSHOTS PER TRACK, not one: dlgMAPINFO's `shotList' is a
+    # picker over shot_<track>_0..4 and the port used to load only _0, for the
+    # carousel. Fifty 256x256 photographs, and the strip on that page shows five
+    # of them at once.
     for t in beach1 beach2 beach3 beach4 country1 country2 country3 country4 \
-             urban1 urban2; do IFACE=$IFACE,shot_${t}_0; done
+             urban1 urban2; do
+        for i in 0 1 2 3 4; do IFACE=$IFACE,shot_${t}_$i; done
+    done
+    # AND THE TEN PAINTED MAPS, by the ENGINE's own numbering -- dlgMAPINFO
+    # draws `trackmap_<n>' as its shotTrackView. Each one already rides in its
+    # own track's .vsc for the in-race minimap; the front end has to have all
+    # ten before any track is loaded, which is why they are here as well.
+    for i in 1 2 3 4 5 6 7 8 9 10; do IFACE=$IFACE,trackmap_$i; done
+    # AND THE TWENTY-SEVEN UPGRADE PHOTOGRAPHS, which are Interface.sb's own
+    # `Upgrades' folder and which the Garage's part page (dlgSETDETAIL) draws:
+    # three families by three LEVELS by three cars. `upgr_boost1_2' is level 1
+    # on car 2, not level 2 on car 1 -- the engine builds the name with
+    # sprintf("upgr_boost%i_%i", level, car + 1) -- and the loop below is
+    # deliberately written level-outside so it reads the way the names do.
+    for fam in boost reson tires; do
+        for lv in 1 2 3; do
+            for cc in 1 2 3; do IFACE=$IFACE,upgr_${fam}${lv}_${cc}; done
+        done
+    done
+    # dlgSTAT's scroll bar and the window frame dlgMAPINFO's map sits in.
+    IFACE=$IFACE,scrollbar
+    # AND THE SKIN-ICON SHEET, which the multiplayer lobby's roster table draws
+    # one 32x32 cell of per row -- 4 x 4 cells of a 128x128, three cars by four
+    # paints and a camera icon in the thirteenth.
+    IFACE=$IFACE,skin_ik_vse
     IFACE=$IFACE,Face1,enumarrows,messagebox_empty
     # AND THE DRIVERS' OWN PORTRAITS, for the finish screen's table. ai_data.h
     # names the .tga each of the seven is pictured with (AIPlayer<n>Face in
@@ -605,13 +635,84 @@ if wanted menu; then
     for fc in BabyShark Daisy Dakilla Doc Face2 Johny MCJocker MaxXMad; do
         IFACE=$IFACE,$fc
     done
-    if current "$ASSETS/menu.vsc" "$DB/Interface.sb" "$RE/pack_vsc.py"; then
+    # AND THIS SCRIPT IS A DEPENDENCY: the texture list above is here and not in
+    # Interface.sb, so adding a name to it has to invalidate the pack. It did
+    # not, and RadioButtonsTextures went in without menu.vsc being rebuilt.
+    if current "$ASSETS/menu.vsc" "$DB/Interface.sb" "$RE/pack_vsc.py" "$0"; then
         skip "menu.vsc"
     else
         run python3 "$RE/pack_vsc.py" "$DB/Interface.sb" "$ASSETS/menu.vsc" \
             --extra-tex "$IFACE" \
             --csidir "$EXTRACTED" --embdir "$EMB" \
             --imgdir "$EXTRACTED/FacesSys"
+    fi
+fi
+
+# ----------------------------------------------------- 5c-2. the portraits ---
+# faces.bin: the nine FacesSys portraits as RAW PIXELS, which is what a `.scp`
+# player profile carries. menu.vsc already has all nine as textures -- that is
+# what the card and the finish screen draw -- but a texture is not a file
+# format: the engine puts 128 x 256 BGRA straight into chunk 0x23 of every
+# profile, and a profile this port writes has to hand over those exact bytes or
+# the original opens it with somebody else's face.
+#
+# 1.1 MB, read one 128 KB portrait at a time and never resident. pack_faces.py
+# says why the rows come out reversed; it is measured off the shipped
+# Players/Player.scp rather than reasoned about.
+if wanted faces; then
+    step "Packing the player portraits"
+    if current "$ASSETS/faces.bin" "$EXTRACTED/FacesSys" "$RE/pack_faces.py"; then
+        skip "faces.bin"
+    else
+        run python3 "$RE/pack_faces.py" "$EXTRACTED/FacesSys" "$ASSETS/faces.bin"
+    fi
+fi
+
+# ------------------------------------------------------ 5d. the launch order ---
+# THE THREE LOGO MOVIES AND THE LOADING SCREEN, in the order the game boots in.
+# Both were recovered whole out of the retail exe; intro.h has the addresses.
+#
+# intro.vid: Tracks/Intro.dat's three parts, transcoded. The Vita has no MPEG-1
+# decoder anywhere -- sceAvcdec is H.264 and that is the only video decoder in
+# the OS -- so this is a real conversion and not a copy, and it needs ffmpeg with
+# libx264 and libmp3lame. THE PART RANGES ARE NOT IN THIS SCRIPT: pack_vid.py
+# reads Scripts/intro.ini, which is where the engine reads them from too.
+#
+# boot.vsc: the loading screen's four textures and nothing else. Its own file,
+# not a corner of menu.vsc, because the point of the screen is to be up BEFORE
+# menu.vsc's 29 MB is read -- and that is what the engine does as well
+# (FUN_004a25c0 case 0x13 loads Desktop, logoRC, logo1C and logoCR by name, on
+# demand, rather than out of the interface manifest). 2 MB, released by main.c
+# once the last load is done.
+#
+# ~21 MB on the card. Deleting assets/intro.vid is how this port spells
+# Config.gm's `AutoRunIntro' 0: the launch then goes straight to the loading
+# screen, which is what the engine does with that setting too.
+
+if wanted intro; then
+    step "Packing the launch sequence"
+    # --parts 2,3 drops the 1C logo (ten seconds of a publisher's logo every
+    # launch) and the packer trims the frames it spanned. --crop removes the
+    # FILM's baked-in letterbox: it is a 640x368 picture inside a 640x480 frame,
+    # 56 rows of STUDIO black (Y=16, not 0) top and bottom, which is why
+    # cropdetect's default threshold sees none of it. Both are packaging choices
+    # rather than the game's -- see BUILD.md -- and this script is a dependency
+    # of the output because they are written here rather than in intro.ini.
+    if current "$ASSETS/intro.vid" "$GAME/Tracks/Intro.dat" \
+               "$EXTRACTED/Scripts/intro.ini" "$RE/pack_vid.py" "$0"; then
+        skip "intro.vid"
+    else
+        run python3 "$RE/pack_vid.py" "$EXTRACTED/Scripts" "$GAME/Tracks" \
+            "$ASSETS" --parts 2,3 --crop 640:368:0:56
+    fi
+    # AND THIS SCRIPT IS A DEPENDENCY of boot.vsc, for the same reason menu.vsc
+    # names it: the texture list is here rather than in Interface.sb.
+    if current "$ASSETS/boot.vsc" "$DB/Interface.sb" "$RE/pack_vsc.py" "$0"; then
+        skip "boot.vsc"
+    else
+        run python3 "$RE/pack_vsc.py" "$DB/Interface.sb" "$ASSETS/boot.vsc" \
+            --extra-tex Desktop,logoRC,logo1C,logoCR \
+            --csidir "$EXTRACTED" --embdir "$EMB"
     fi
 fi
 
@@ -682,6 +783,48 @@ if wanted tables; then
     # The characters' placements, markers, volumes and script keys, and the
     # nine behaviour loaders' constants out of the exe. A generated header, not
     # an asset -- the geometry and the recorded paths are the `chars` stage.
+    # The engine's own DIALOG LAYOUTS, out of Settings/dlg*.ini -- every
+    # rectangle on the quick-race pages and the finish screen. Checked in, like
+    # font.h, but regenerated here so a change to the generator (a dialog added
+    # to WANT, the signed-slider bias) reaches the header without being applied
+    # by hand.
+    if current "$VITA/dlg_data.h" "$EXTRACTED/Settings" "$RE/gen_dlg_data.py"; then
+        skip "dlg_data.h"
+    else
+        info "$D\$ python3 $RE/gen_dlg_data.py > $VITA/dlg_data.h$N"
+        python3 "$RE/gen_dlg_data.py" > "$VITA/dlg_data.h" \
+            || die "gen_dlg_data.py failed"
+    fi
+
+    # THE GAME'S OWN AUTHORED TEXT, out of Language/Game/english.tbl: the track
+    # names, their three- and five-line descriptions, the cars' names and spec
+    # blocks, and the front end's own words. The .tbl is XORed against one
+    # arithmetic ramp running across its payloads -- see gen_str_data.py -- and
+    # this port showed substitutes for all of it until that came out.
+    if current "$VITA/str_data.h" "$GAME/Language/Game/english.tbl" \
+               "$RE/gen_str_data.py"; then
+        skip "str_data.h"
+    else
+        info "$D\$ python3 $RE/gen_str_data.py > $VITA/str_data.h$N"
+        python3 "$RE/gen_str_data.py" > "$VITA/str_data.h" \
+            || die "gen_str_data.py failed"
+    fi
+
+    # THE GARAGE'S ECONOMY, out of Scripts/championship.ini -- what a car and
+    # each of the twenty-seven upgrade levels costs, what each fetches back, and
+    # what cash a new profile starts with. The whole shop was in a commented
+    # .ini nobody had opened; gen_champ_data.py's docstring says how its figures
+    # were checked against the game's own four screenshots, including why the
+    # sell prices have to be computed at SINGLE precision.
+    if current "$VITA/champ_data.h" "$EXTRACTED/Scripts/championship.ini" \
+               "$RE/gen_champ_data.py"; then
+        skip "champ_data.h"
+    else
+        info "$D\$ python3 $RE/gen_champ_data.py > $VITA/champ_data.h$N"
+        python3 "$RE/gen_champ_data.py" > "$VITA/champ_data.h" \
+            || die "gen_champ_data.py failed"
+    fi
+
     if current "$VITA/char_data.h" "$DB" "$RE/gen_char_data.py"; then
         skip "char_data.h"
     else

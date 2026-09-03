@@ -207,6 +207,12 @@ typedef struct {
     int   ref;               /* 1..AI_N_PLAYERS */
     int   races;             /* AI_RACE_* mask */
     int   boost, reson, tires;
+    /* THE PAINT, and the recordings do not carry one. A `.aip' profile names
+       three upgrade levels and no skin, so a recorded opponent stays 0 -- which
+       is the skin its model ships wearing, so nothing changes for the shipped
+       field. A REMOTE player's comes off the wire (`ai_remote_look'), because
+       the other machine's driver picked it in the garage. */
+    int   skin;
     int   n;                 /* samples */
     int   cycle_start;       /* where the lap loop rejoins */
     float path_len;          /* the polyline's length, metres */
@@ -339,6 +345,15 @@ typedef struct {
     float steer_cmd;
     int   steer_side;        /* -1 right, 0 undecided, +1 left */
     float steer_hold;        /* seconds left of the commitment */
+
+    /* -- A REMOTE PLAYER. Set by ai_remote_init and read by nothing in this
+     * file's own model: a remote slot is POSED from the network and is never
+     * stepped, never rubber-banded, never bumped and never respawned. The flag
+     * is here rather than in a parallel array in net.c so that `draw_ai',
+     * `ai_matrix', the shadow and the car light all keep working with no idea
+     * that a car is somebody else's -- which is the whole reason a remote car
+     * is an ai_car in the first place. See net.h. */
+    int   remote;
 } ai_car;
 
 typedef struct {
@@ -391,6 +406,105 @@ typedef struct {
     float  player_v[3];
     int    player_seen;
 } ai_t;
+
+/* ---------------------------------------------------- A REMOTE PLAYER'S CAR
+ *
+ * MULTIPLAYER PUTS THE OTHER HUMANS IN THESE SLOTS, and it costs one flag and
+ * two functions because a recorded opponent and a remote player are the same
+ * thing seen from here: a car whose pose arrives from outside and is written
+ * into a real `rb_car' with `rb_car_set_state'. `net.h' says why the wire
+ * format IS `ai_sample'.
+ *
+ * A NETWORK RACE FIELDS NO RECORDINGS. `ai_init' is not called at all; the app
+ * calls `ai_remote_init' with as many slots as there are other peers, so the
+ * recorded-lap machinery -- the rubber band, the spine, the bump offset, the
+ * steering decision -- is not merely skipped but absent, and there is no way
+ * for a replayed car and a remote one to end up in the same array.
+ */
+
+/* Build `n' remote slots on `ai', each on the car model `car[i]' gives, parked
+ * at the origin until the first packet. `w' is the world the bodies collide
+ * against, as ai_init takes it. Clears everything else on the ai_t, so the two
+ * initialisers cannot both have run. -> the number of slots built. */
+int  ai_remote_init(ai_t *ai, int track, const rb_world *w,
+                    const unsigned char *car, int n);
+
+/* Pose slot `i' from `s'. The state goes in exactly as a recorded sample does
+ * -- so the springs sit where the sender's did and the rig animates -- and the
+ * linear velocity is taken from the sample rather than finite-differenced,
+ * because the sender measured it and two consecutive packets are a send
+ * interval apart. THE WHEELS ARE NOT TURNED HERE: their rolling angle is not in
+ * the state and not on the wire. See `ai_remote_spin', which is what turns
+ * them, and call it. */
+void ai_remote_pose(ai_t *ai, int i, const ai_sample *s);
+
+/* THE AUTHORED GRID, without loading a single recording.
+ *
+ * Every `.aip' record holds a sample block, and a recording BEGINS on its car's
+ * grid slot -- that is what the lead-in is (see `cycle_start' above). So the
+ * shipped starting grid for a track is the first sample of each of its profiles,
+ * and the port does not have to invent one. A network race has no recordings and
+ * still wants the grid, which is the whole reason this is separate from
+ * `ai_init': it reads the header, walks the record array and reads TWELVE BYTES
+ * per profile, keeping no blob and building no ai_t.
+ *
+ * Fills `out[i][0..2]` with slot i's position in world metres, in FILE order --
+ * the same order `ai_init' walks, so slot i here is the opponent that would
+ * have been opponent i in a single race. The PLAYER's own start is not in here;
+ * it is that level's own `Players/Player' instance and lives in tracks.h.
+ * Positions only: every car on a start line points the same way, and the yaw is
+ * the track's.
+ *
+ * -> the number of slots filled, 0 if the file is missing or malformed. */
+int  ai_grid(int track, const char *asset_dir, float out[][3], int max);
+
+/* PARK slot `i' on the grid, until its first packet arrives.
+ *
+ * `ai_remote_init' leaves every remote body at the ORIGIN, which is not a
+ * neutral place to leave a solid car: the player's own start is 2.9 m from the
+ * world origin on urban_2, so a peer whose first state packet had not yet
+ * arrived was a car sitting INSIDE the player's during the countdown. And with
+ * no packet ever -- a peer that drops on the line -- it stayed there.
+ *
+ * `yaw' is the rig convention, the one rbcar_init takes. No-op on a slot that is
+ * not remote. */
+void ai_remote_park(ai_t *ai, int i, float x, float y, float z, float yaw);
+
+/* ADVANCE EVERY REMOTE SLOT'S VISUAL RIG BY `dt', which today is its WHEELS.
+ *
+ * A REMOTE CAR'S WHEELS DO NOT COME OFF THE WIRE, and this is the call that was
+ * missing. `rb_wheel.spin' -- the rolling angle carAniProc1 puts on the wheel
+ * node -- is NOT one of the 32 floats (rb.h says so where it is declared: "purely
+ * visual ... NOT in the ODE state"), so it is not in `ai_sample' either and
+ * `ai_remote_pose' cannot write it. It is INTEGRATED, once a frame, by
+ * `rb_wheel_spin_update'. A recorded opponent reaches that through `ai_step';
+ * the player reaches it through `rbcar_step'; a remote player reached it through
+ * NOTHING, because a network race does not call `ai_step' at all (main.c gates
+ * it on `!net_race' and `ai_step' skips remote slots besides). So every remote
+ * car in every multiplayer race slid on four frozen wheels -- on BOTH machines,
+ * because the omission is in the receiver and both ends are receivers.
+ *
+ * It needs no more than the pose does: `ai_fake_contacts' reads the suspension
+ * that arrived to decide which wheels are loaded -- the same signal, and the
+ * same AI_DROOP_TOL, a replayed opponent uses -- and the patch velocity comes
+ * from the body velocity `ai_remote_pose' took off the wire. Nothing is guessed
+ * and nothing is simulated: the wheel turns at the speed the sender said its
+ * car was doing.
+ *
+ * CALL IT AFTER `ai_remote_pose', once per FRAME and on the frame's own dt --
+ * not on the tick loop's. The pose it works from is the interpolated one, which
+ * is a per-frame quantity, and the rate this feeds (`rb_move_towards' at 200
+ * rad/s^2) is a chase toward a target rather than an integration of a force, so
+ * it converges to the same place whatever the step. */
+void ai_remote_spin(ai_t *ai, float dt);
+
+/* WHAT SLOT `i' LOOKS LIKE: the three upgrade levels in garage.h's order
+ * (booster, engine, tyres) and the paint. The MODEL is fixed at
+ * ai_remote_init -- it decides which scene is loaded -- but the exhaust, the
+ * tyres and the skin are retexturings of that scene, so they can be handed over
+ * afterwards, and they have to be: the roster row they come from is the peer's,
+ * not this machine's. No-op on a slot that is not remote. */
+void ai_remote_look(ai_t *ai, int i, const unsigned char up[3], int skin);
 
 /* The rate the commanded speed chases its target, m/s^2. FUN_00503880's third
    argument to moveTowards, an immediate 5.0. */

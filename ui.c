@@ -96,6 +96,18 @@ void ui_end(void)
     glPopMatrix();
 }
 
+/* See ui.h. Left to the caller to turn back off: this is between-draws state,
+   like a bind, and ui_end's restore is of what was true before ui_begin. */
+void ui_alpha_test(float ref)
+{
+    if (ref > 0.f) {
+        glAlphaFunc(GL_GREATER, ref);
+        glEnable(GL_ALPHA_TEST);
+    } else {
+        glDisable(GL_ALPHA_TEST);
+    }
+}
+
 static void flush(int nv, GLuint tex)
 {
     if (nv <= 0)

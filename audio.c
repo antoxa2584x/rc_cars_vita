@@ -43,6 +43,14 @@ static struct {
     volatile int cursor;        /* index into tracks[] of what is playing */
     volatile int want_next;     /* set by audio_music_next / group change */
 
+    /* THE ONE-SHOT FILE -- the launch movie's soundtrack. `seq` is bumped by
+       the game thread and copied by the decoder thread once it has opened the
+       file, which is the whole handshake: the path is written before the bump
+       and never touched after it, so the decoder always reads a settled one. */
+    volatile int oneshot;
+    volatile unsigned oneshot_seq, oneshot_ack;
+    char oneshot_path[256];
+
     /* decoder state, owned by the decoder thread */
     FILE *mf;
     mp3dec_t mp3;
@@ -143,7 +151,11 @@ static int next_in_group(int group, int from)
 void audio_music_group(int group)
 {
     if (!A.ok) return;
-    if (group == A.group) return;
+    /* A one-shot is not a group, so `already playing that group' must not
+       swallow the request that ends it -- the intro's last part is still on the
+       decoder when main.c asks for the menu music. */
+    if (group == A.group && !A.oneshot) return;
+    A.oneshot = 0;
     A.group = group;
     A.cursor = (group < 0) ? -1 : next_in_group(group, 0);
     A.want_next = 1;
@@ -152,8 +164,50 @@ void audio_music_group(int group)
 void audio_music_next(void)
 {
     if (!A.ok || A.group < 0) return;
+    A.oneshot = 0;
     A.cursor = next_in_group(A.group, A.cursor + 1);
     A.want_next = 1;
+}
+
+int audio_music_file(const char *path)
+{
+    FILE *probe;
+
+    if (!A.ok || !path || !*path) return 0;
+    /* OPENED HERE, AND CLOSED AGAIN, only to answer whether it exists. The
+       decoder thread does the real open, so without this a missing file would
+       report success -- and a caller pacing itself off audio_music_frames()
+       would then wait forever for a clock that never starts. */
+    probe = fopen(path, "rb");
+    if (!probe) return 0;
+    fclose(probe);
+
+    A.group = -1;                       /* the playlist is not what is playing */
+    A.want_next = 0;                    /* and the reset below is ours, not its */
+    snprintf(A.oneshot_path, sizeof A.oneshot_path, "%s", path);
+    /* Zeroed HERE rather than on the decoder thread, so audio_music_frames()
+       reads 0 for this stream from the caller's next line -- see audio.h. The
+       lock is what mix_render is called under. */
+    audio_lock();
+    mix_music_reset(&A.mix);
+    audio_unlock();
+    A.oneshot = 1;
+    A.oneshot_seq++;
+    return 1;
+}
+
+void audio_music_stop(void)
+{
+    if (!A.ok) return;
+    A.oneshot = 0;
+    A.group = -1;
+    A.want_next = 1;
+}
+
+unsigned int audio_music_frames(void)
+{
+    if (!A.ok) return 0u;
+    return mix_music_played(&A.mix);
 }
 
 /* -------------------------------------------------------------- decoding */
@@ -164,18 +218,23 @@ static void dec_close(void)
     A.io_len = A.io_pos = 0;
 }
 
-static int dec_open(int idx)
+static int dec_open_path(const char *path)
 {
-    char path[320];
     dec_close();
-    if (idx < 0 || idx >= A.n_tracks) return -1;
-    snprintf(path, sizeof(path), "%s/%s", A.music_dir, A.tracks[idx].name);
     A.mf = fopen(path, "rb");
     if (!A.mf) return -1;
     mp3dec_init(&A.mp3);
     A.mp3_rate = 0;
     A.mp3_ch = 0;
     return 0;
+}
+
+static int dec_open(int idx)
+{
+    char path[320];
+    if (idx < 0 || idx >= A.n_tracks) { dec_close(); return -1; }
+    snprintf(path, sizeof(path), "%s/%s", A.music_dir, A.tracks[idx].name);
+    return dec_open_path(path);
 }
 
 /* Decode one MP3 frame into the ring. -> frames written, 0 at end of file.
@@ -247,6 +306,34 @@ static int dec_frame(void)
 static void dec_step(void)
 {
     int guard;
+
+    /* THE ONE-SHOT FIRST, because it is the thing that is playing when it is
+       set and the playlist below must not also get a turn. Its ring reset was
+       done by audio_music_file on the game thread; all that is owed here is the
+       open, once per request. */
+    if (A.oneshot) {
+        unsigned seq = A.oneshot_seq;
+        if (A.oneshot_ack != seq) {
+            A.oneshot_ack = seq;
+            if (dec_open_path(A.oneshot_path) != 0) {
+                A.oneshot = 0;
+                return;
+            }
+        }
+        if (!A.mf) return;
+        for (guard = 0; guard < 64; guard++) {
+            int n = (int)mix_music_space(&A.mix);
+            if (n < 1152) return;
+            /* End of file STOPS, and does not advance anything: a launch movie
+               that looped its own logo music would be the playlist bug this
+               entry point exists to avoid. */
+            if (dec_frame() == 0) {
+                dec_close();
+                return;
+            }
+        }
+        return;
+    }
 
     if (A.want_next) {
         A.want_next = 0;

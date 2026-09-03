@@ -48,11 +48,40 @@ void audio_unlock(void);
 void audio_master(float sfx, float music);
 
 /* Start a group. Re-selecting the group already playing is a no-op, so this is
-   safe to call every frame. -1 stops the music. */
+   safe to call every frame. -1 stops the music. Cancels a one-shot file. */
 void audio_music_group(int group);
 void audio_music_next(void);
 const char *audio_music_title(void);
 int  audio_music_count(int group);
+
+/* ONE NAMED FILE, ONCE, through the same music channel -- the launch movie's
+   soundtrack, which is not a playlist entry and must not wrap into one. `path`
+   is a whole path, not a name inside music_dir, because the intro's audio does
+   not live there. Returns 1 if the request was taken (the decoder thread opens
+   the file, so a path that does not exist still returns 1 and then plays
+   nothing).
+
+   THE RING IS RESET SYNCHRONOUSLY, before this returns, so audio_music_frames()
+   below reads 0 for the new stream from the caller's very next line. What that
+   costs is up to one MP3 frame -- 26 ms -- of whatever was playing before,
+   already in the ring and written at the new stream's offset; at boot nothing
+   is, and between the intro's parts it is the tail of the part just ended.
+
+   audio_music_group(-1), or audio_music_stop(), ends it. */
+int  audio_music_file(const char *path);
+void audio_music_stop(void);
+
+/* THE AUDIO CLOCK: stereo frames the mixer has actually rendered out of the
+   music ring since the current stream started, at MIX_RATE. Free-running and
+   zeroed whenever a stream starts, so a caller can divide it by MIX_RATE and
+   get seconds of sound the player has heard.
+
+   This, and not a frame timer, is what the launch movie's picture is paced
+   against: a video frame late is invisible and a gap in the music is not, and
+   because the counter only advances on frames the mixer really mixed, an
+   underrun stalls the picture with the sound instead of running past it. 0 when
+   there is no audio at all. */
+unsigned int audio_music_frames(void);
 
 /* On the host build there is no output thread; the test harness calls this to
    pump the decoder by hand. On the Vita it is a no-op. */

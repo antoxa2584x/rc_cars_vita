@@ -1594,6 +1594,171 @@ float ai_coeff(const ai_t *ai, int slot, float lead, int gap)
 
 /* ----------------------------------------------------------------- the tick */
 
+/* ------------------------------------------------------- a remote player
+ *
+ * See ai.h. Nothing here walks a recording, because there is none.
+ */
+int ai_remote_init(ai_t *ai, int track, const rb_world *w,
+                   const unsigned char *car, int n)
+{
+    int i;
+
+    if (!ai)
+        return 0;
+    /* THE WHOLE ai_t, so the recorded-lap machinery cannot be half-present:
+       a slot with a `remote' flag and a stale sample array behind it is
+       exactly the state a later reader would trust. `blob' is NULL after
+       this, so ai_free stays correct. */
+    ai_free(ai);
+    memset(ai, 0, sizeof *ai);
+    ai->track = track;
+    if (n < 0) n = 0;
+    if (n > AI_MAX_OPPONENTS) n = AI_MAX_OPPONENTS;
+    for (i = 0; i < n; i++) {
+        ai_car *a = &ai->car[i];
+        a->car = (car && car[i] <= 2) ? (int)car[i] : 0;
+        a->remote = 1;
+        a->slot = i;
+        snprintf(a->name, sizeof a->name, "P%d", i + 1);
+        /* NULL world to rbcar_init, exactly as a recorded opponent gets: the
+           pose comes from outside and not from a ground probe. */
+        rbcar_init(&a->rb, a->car, NULL, 0.f, 0.f, 0.f, 0.f);
+        a->rb.world = w;
+        rb_boost_reset(&a->rb);
+        ai_bump_derive(a);
+        ai->n++;
+    }
+    rlog("ai: %d remote player(s) on track %d\n", ai->n, track);
+    return ai->n;
+}
+
+int ai_grid(int track, const char *asset_dir, float out[][3], int max)
+{
+    char path[256];
+    unsigned char hdr[12];
+    FILE *f;
+    long size;
+    unsigned int n_file, i;
+    int n = 0;
+
+    if (track < 0 || track >= AI_N_RACES || !out || max <= 0)
+        return 0;
+    snprintf(path, sizeof(path), "%s/%s.aip", asset_dir ? asset_dir : ".",
+             AI_RACES[track].track);
+    f = fopen(path, "rb");
+    if (!f) {
+        rlog("ai: no %s -- no authored grid\n", path);
+        return 0;
+    }
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "AIP1", 4) != 0) {
+        fclose(f);
+        return 0;
+    }
+    memcpy(&n_file, hdr + 4, 4);
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    /* THE SAME BOUND ai_init TAKES, and for the same reason: the opponent count
+       is file data and the record array is indexed on it. Tested before the
+       multiply so it cannot overflow. */
+    if (n_file == 0 || n_file > AI_MAX_OPPONENTS
+        || size < (long)(12 + (long)n_file * AI_RECORD_BYTES)) {
+        fclose(f);
+        return 0;
+    }
+    for (i = 0; i < n_file && n < max; i++) {
+        unsigned int u32[3];
+        float p[3];
+        /* the record's sample-block fields, at +64: count, cycle start, offset */
+        if (fseek(f, 12 + (long)i * AI_RECORD_BYTES + 64, SEEK_SET) != 0
+            || fread(u32, 1, sizeof u32, f) != sizeof u32)
+            break;
+        if (u32[0] < 1
+            || (unsigned long long)u32[2]
+               + (unsigned long long)u32[0] * AI_SAMPLE_BYTES
+               > (unsigned long long)size)
+            continue;
+        /* The first sample's own p[3], which is the first twelve bytes of an
+           ai_sample -- and the field this port has already proved is a position
+           in world metres (ai.h). */
+        if (fseek(f, (long)u32[2], SEEK_SET) != 0
+            || fread(p, 1, sizeof p, f) != sizeof p)
+            break;
+        out[n][0] = p[0];
+        out[n][1] = p[1];
+        out[n][2] = p[2];
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+void ai_remote_park(ai_t *ai, int i, float x, float y, float z, float yaw)
+{
+    ai_car *a;
+    const rb_world *w;
+
+    if (!ai || i < 0 || i >= ai->n)
+        return;
+    a = &ai->car[i];
+    if (!a->remote)
+        return;
+    /* KEPT ACROSS THE RE-INIT, because rbcar_init overwrites the whole rb_car
+       and the world was handed over once, by ai_remote_init. */
+    w = a->rb.world;
+    /* A FULL rbcar_init, not a poke at body.x: the pose is a position AND an
+       orientation AND a suspension state, and half of one is the state a later
+       reader would trust. NULL world, as ai_remote_init hands it -- the caller
+       has already probed the ground, because the world lives over there. */
+    rbcar_init(&a->rb, a->car, NULL, x, y, z, yaw);
+    a->rb.world = w;
+    rb_boost_reset(&a->rb);
+}
+
+void ai_remote_look(ai_t *ai, int i, const unsigned char up[3], int skin)
+{
+    ai_car *a;
+
+    if (!ai || i < 0 || i >= ai->n || !up)
+        return;
+    a = &ai->car[i];
+    if (!a->remote)
+        return;
+    /* CLAMPED HERE, not by the drawer: these three came off the wire and the
+       peer that sent them is not this build. carparts_apply clamps too, but the
+       booster level is also read by fx_pipe_from_rig, which indexes a table. */
+    a->boost = up[0] <= 3 ? (int)up[0] : 3;
+    a->reson = up[1] <= 3 ? (int)up[1] : 3;
+    a->tires = up[2] <= 3 ? (int)up[2] : 3;
+    a->skin  = (skin >= 0 && skin < 4) ? skin : 0;
+}
+
+void ai_remote_pose(ai_t *ai, int i, const ai_sample *s)
+{
+    float y[RB_STATE_N];
+    ai_car *a;
+    int k;
+
+    if (!ai || i < 0 || i >= ai->n || !s)
+        return;
+    a = &ai->car[i];
+    if (!a->remote)
+        return;
+    /* THE RECORDED-LAP UNPACK, verbatim -- one sample in, one rb state out.
+       unpack_state needs the car for its wheel radii (len_extra) and reads
+       nothing else off it, which is why a remote slot needs no recording. */
+    unpack_state(a, s, y);
+    rb_car_set_state(&a->rb, y);
+    /* AND THE VELOCITY IS THE SENDER'S, not a difference of two poses. ai_pose
+       finite-differences a replayed car because a recording's samples are
+       milliseconds apart; these are up to 200 ms apart (net.h) and the sender
+       measured its own velocity, so differencing would be a worse number
+       computed from a longer baseline. The state slot is a MOMENTUM, which is
+       why unpack_state multiplied it back up by the mass. */
+    for (k = 0; k < 3; k++)
+        a->rb.body.v[k] = (float)s->mom[k] / AI_VEL_SCALE;
+    a->rb.body.w[0] = a->rb.body.w[1] = a->rb.body.w[2] = 0.f;
+}
+
 void ai_reset(ai_t *ai)
 {
     int i;
@@ -1626,9 +1791,18 @@ void ai_reset(ai_t *ai)
         a->buried_for = 0.0f;
         a->respawns = 0;
         ai_steer_clear(a);
+        rb_boost_reset(&a->rb);
+        /* AND THAT IS AS FAR AS A REMOTE SLOT GOES. Everything above is state
+           this file owns and can safely zero; everything below reads the
+           RECORDING -- and a remote slot has none, so `ai_pose' unpacked
+           `a->s[0]' through a null pointer and `sample_speed' indexed it. A
+           latent null dereference on every restart of a network race.
+           Where the car goes instead is the app's business: it holds the world,
+           the grid and the wire (`ai_remote_park'). */
+        if (a->remote)
+            continue;
         ai_pose(a);
         a->speed_rec = sample_speed(a, 0);
-        rb_boost_reset(&a->rb);
     }
     ai->player_reach = 0.0f;
     ai->player_dist = 0.0f;
@@ -1708,6 +1882,34 @@ static void ai_fake_contacts(ai_car *a)
             a->rb.hit[i].in_water = a->rb.hit[i].water_gap < radius;
     }
     a->airborne = air;
+}
+
+/* A REMOTE CAR'S WHEELS. See ai.h -- everything about why this exists is there.
+   Placed here rather than beside ai_remote_pose because it is the one caller of
+   ai_fake_contacts outside ai_step and that function is static and above. */
+void ai_remote_spin(ai_t *ai, float dt)
+{
+    int i;
+
+    if (!ai || dt <= 0.f)
+        return;
+    for (i = 0; i < ai->n; i++) {
+        ai_car *a = &ai->car[i];
+        if (!a->remote)
+            continue;
+        /* WHICH WHEELS ARE ON THE GROUND, off the suspension that arrived --
+           the recorded path's own test, unchanged, because the signal is the
+           same one: a strut extended to its free length is hanging. */
+        ai_fake_contacts(a);
+        /* AND THE INPUTS ARE LEFT ALONE. `ai_throttle' has no meaning here --
+           it reads the RECORDING's commanded speed against the car's own, and a
+           remote slot has no recording -- and the only thing in.accel reaches on
+           this path is the wheelspin branch below, whose amplitude is
+           SpeedAngMaxREL, 0 for all three retail cars (rb.h). So a remote car's
+           wheels roll at the patch speed and never spin up, which is what the
+           retail game does for every car including the player's. */
+        rb_wheel_spin_update(&a->rb, dt);
+    }
 }
 
 /*
@@ -1835,6 +2037,16 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
         float target, adist = 0.0f;
         float x0[3], q0[4];
         int acp = 0, gap = 0;
+
+        /* A REMOTE PLAYER IS POSED, NEVER STEPPED. It has no recording to walk,
+           no spine progress of its own worth rubber-banding and nothing this
+           machine is entitled to decide about it -- see ai.h. Belt and braces:
+           a network race builds the field with ai_remote_init and the app does
+           not call this at all, so this is the second of two gates and exists
+           so that adding a third caller cannot start simulating somebody
+           else's car. */
+        if (a->remote)
+            continue;
 
         /* FUN_00503880's order, and it is load-bearing. The pose is written
          * FIRST, so the recorded speed the target is built from is the one at
@@ -2109,6 +2321,17 @@ static void ai_take_impulse(ai_car *a, const float point[3], const float j[3])
     rb_body *bd = &a->rb.body;
     float r[3], rj[3], dw[3];
 
+    /* A REMOTE CAR TAKES NOTHING. It is not simulated here at all: its pose
+       arrives from the machine that owns it and is written straight into the
+       body, so an offset velocity accumulated locally is a number the next
+       packet contradicts -- and `ai_bump_apply' would spend it by moving the
+       body to `rec_x + off', with `rec_x' the origin, because only the recorded
+       path ever fills that. A player nudging an opponent teleported it to the
+       middle of the map. See ai_actor_move, which refuses the positional half
+       for the same reason and by the same rule. */
+    if (a->remote)
+        return;
+
     a->offv[0] = (float)((double)a->offv[0] + (double)j[0] * bd->inv_mass);
     a->offv[1] = (float)((double)a->offv[1] + (double)j[1] * bd->inv_mass);
     a->offv[2] = (float)((double)a->offv[2] + (double)j[2] * bd->inv_mass);
@@ -2159,6 +2382,15 @@ static void ai_actor_move(ai_actor *b, const float dv[3], float taken[3])
             taken[k] = dv[k];
         }
         rb_car_update_matrix(b->car);
+        return;
+    }
+    /* A REMOTE CAR REFUSES THE WHOLE MOVE -- which is not a special case but the
+       strongest form of the refusal this function already reports: it is a car
+       that will not budge, so the caller hands the whole separation to the other
+       body, which is the player and really is simulated here. See
+       ai_take_impulse. */
+    if (a->remote) {
+        taken[0] = taken[1] = taken[2] = 0.f;
         return;
     }
     memcpy(before, a->off, sizeof(before));
@@ -2539,6 +2771,15 @@ static void ai_collide_field(ai_t *ai)
             ai_actor A, B;
             int na, nb;
 
+            /* NOT BETWEEN TWO REMOTE CARS. Each of them is authoritative on
+               its own machine and is posed here from the wire, so a contact
+               solved locally is a nudge the next packet will contradict --
+               and the far side never saw it, so the two machines disagree
+               about where both cars are. The PLAYER against a remote car is a
+               different question and ai_collide_player still asks it: that
+               contact has to move the player, who really is simulated here. */
+            if (ai->car[i].remote && ai->car[j].remote)
+                continue;
             if (!ai_near(&ai->car[i].rb, &ai->car[j].rb))
                 continue;
             na = rb_gather_spheres(&ai->car[i].rb, as);

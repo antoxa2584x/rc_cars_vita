@@ -51,6 +51,7 @@ typedef void GLvoid;
 #define GL_TRIANGLE_FAN          0x0006
 #define GL_BLEND                 0x0BE2
 #define GL_ALPHA_TEST            0x0BC0
+#define GL_GREATER               0x0204
 #define GL_CULL_FACE             0x0B44
 #define GL_DEPTH_TEST            0x0B71
 /* GL_ONE and GL_ZERO: sun.c's flare pass is SRCCOLOR/ONE, which is the
@@ -137,6 +138,7 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride, const void *p);
 void glDrawArrays(GLenum mode, GLint first, GLsizei count);
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx);
 void glEnable(GLenum c);
+void glAlphaFunc(GLenum func, GLfloat ref);
 void glDisable(GLenum c);
 void glEnableClientState(GLenum c);
 void glDisableClientState(GLenum c);

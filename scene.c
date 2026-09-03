@@ -705,7 +705,16 @@ int scene_frame_turntable(const scene_t *s, int aim_skip_part,
     out->aim[0] = out->aim[1] = out->aim[2] = 0.f;
     out->dist = 1.f;
 
-    if (!scene_bounds(s, -1, mn, mx)) {
+    /* THE DISTANCE IS MEASURED OFF THE SAME MODEL THE AIM IS, skip part and all.
+     * It used to be measured off the WHOLE car and that is what kept the preview
+     * small: `need' is the larger of the footprint's half-diagonal over the
+     * aspect and the half-HEIGHT, and on the Overkill the antenna triples the
+     * height (0.674 m against a body ending at 0.293) while adding nothing to
+     * the footprint. So a one-pixel wire -- one that this function's own header
+     * already says is allowed off the frame, and which does go off the top --
+     * was setting how far back the camera stood, and the car came out at 44% of
+     * the viewport where the game's own screen has it at 59%. */
+    if (!scene_bounds(s, aim_skip_part, mn, mx)) {
         mn[0] = mn[1] = mn[2] = -0.2f;
         mx[0] = mx[1] = mx[2] =  0.2f;
     }

@@ -499,10 +499,14 @@ int scene_bounds(const scene_t *s, int skip_part, float mn[3], float mx[3]);
  *
  * TWO QUESTIONS WITH TWO ANSWERS, which is the whole point of the function.
  *
- *   `dist` comes from the WHOLE drawn model, and its horizontal half-extent is
- *   the box's DIAGONAL rather than its width, because at 45 degrees through the
- *   turn that is what the model presents. Anything left out here is something
- *   allowed to leave the frame.
+ *   `dist` comes from the model MINUS `aim_skip_part`, the same one the aim
+ *   does, and its horizontal half-extent is the box's DIAGONAL rather than its
+ *   width, because at 45 degrees through the turn that is what the model
+ *   presents. What is skipped is allowed to leave the frame -- and it must be
+ *   skipped HERE too, or it sets the distance while being allowed off the edge:
+ *   measuring the distance off the whole car let 0.38 m of antenna triple the
+ *   height it was solving for and stood the camera far enough back that the car
+ *   filled 44% of the viewport against the original's 59%.
  *
  *   `aim` comes from the model MINUS `aim_skip_part` -- one rig part, or -1 for
  *   none -- and it is MEASURED, not taken off the box. A box centre and the

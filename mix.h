@@ -161,6 +161,11 @@ void mix_music_gain(mix_t *m, float g);
 unsigned mix_music_space(const mix_t *m);
 void mix_music_write(mix_t *m, const short *stereo, unsigned frames);
 void mix_music_reset(mix_t *m);
+/* Frames mix_render has actually drained out of the ring since the last reset --
+   the AUDIO CLOCK. Only advances on frames that were really mixed, so it stops
+   with an underrun rather than running ahead of what was heard. audio.h's
+   audio_music_frames() is the interface the game should use. */
+unsigned mix_music_played(const mix_t *m);
 
 /* --- rendering --------------------------------------------------------- */
 

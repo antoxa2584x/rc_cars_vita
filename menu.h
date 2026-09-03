@@ -30,6 +30,7 @@
 #define SCE_CTRL_LEFT     0x00000080u
 #define SCE_CTRL_CIRCLE   0x00002000u
 #define SCE_CTRL_CROSS    0x00004000u
+#define SCE_CTRL_SQUARE   0x00008000u
 #endif
 
 /* The rows, in display order. Named rather than counted so a test can aim at

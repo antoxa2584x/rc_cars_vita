@@ -36,7 +36,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -ffast-math -mtune=cortex-a9 -mfpu
 # allstarts) in the two hottest modules in the port.
 set(PHYSICS_C_FLAGS "-Wall -O3 -fno-fast-math -ffp-contract=off -mtune=cortex-a9")
 
-add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c sfont.c dirarrow.c msg.c menu.c mainmenu.c results.c touch.c settings.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
+add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c sfont.c dirarrow.c msg.c menu.c mainmenu.c intro.c avc.c results.c touch.c settings.c records.c player.c garage.c net.c ime.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
   prop.c char.c ai.c mix.c audio.c sfx.c rlog.c)
 
 separate_arguments(PHYSICS_FLAGS_LIST UNIX_COMMAND "${PHYSICS_C_FLAGS}")
@@ -80,11 +80,18 @@ target_link_libraries(${PROJECT_NAME}
   SceDisplay_stub
   SceGxm_stub
   SceCommonDialog_stub
+  SceIme_stub     # sceImeDialog: the system keyboard the Select player page types on
+  SceAppUtil_stub # ...and the language and enter-button assignment it opens with
+  SceVideodec_stub  # sceAvcdec -- the launch movie's H.264 decoder, avc.c
   SceShaccCg_stub
   SceSysmodule_stub
   SceTouch_stub
   ScePower_stub
   SceAudio_stub   # sceAudioOut: the output port audio.c's mixer thread feeds
+  SceNet_stub     # MULTIPLAYER: the UDP socket net.c talks over. Infrastructure
+                  # Wi-Fi and not sceNetAdhoc -- net.h says why, and the short
+                  # version is that it is the one the emulator implements
+  SceNetCtl_stub  # ...and sceNetCtlInetGetInfo, for our own address in the log
   stdc++          # SceShaccCgExt/vitashark are C++; a pure-C link misses these
   m
 )
