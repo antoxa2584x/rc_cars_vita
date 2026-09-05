@@ -49,6 +49,7 @@ enum {
     MENU_TEXQUAL,
     MENU_TEXORDER,
     MENU_CARLIGHT,
+    MENU_INTRO,
     MENU_RESTART,
     MENU_RESUME,
     MENU_QUIT,
@@ -136,6 +137,13 @@ typedef struct {
        rather than the world, and A/B against the flat old appearance is the only
        way to judge it. No reload: it is GL state and a per-frame step. */
     int car_light;
+    /* THE LAUNCH MOVIES, Config.gm's own `AutoRunIntro'. 1 in retail and 1 here.
+       The port used to spell it only by DELETING assets/intro.vid, which a
+       player on a console cannot do -- so 104 seconds of logos had no switch
+       inside the game (docs/known-issues.md). Read once, at boot, before the
+       intro loop runs; changing it takes effect on the next launch, which is
+       what the row says. */
+    int intro;
 
     int vol_sfx;        /* 0..MENU_VOL_STEPS */
     int vol_music;

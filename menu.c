@@ -4,6 +4,7 @@
 
 #include "menu.h"
 #include "ui.h"
+#include "font.h"          /* FONT_CH -- the panel-fits check below */
 #include "tracks.h"
 #include "rb_data.h"
 #include "rbcar.h"
@@ -11,11 +12,28 @@
 #include <stdio.h>
 #include <string.h>
 
+/* THE PANEL HAS TO FIT ON THE SCREEN, and it very nearly does not.
+ *
+ * menu_draw centres a panel of `pad*2 + lh*(MENU_ROWS + 3)` on the display, and
+ * the Vita's is 544 px tall. At the fourteen rows this had before the launch-
+ * movie row it was 503 px; at fifteen it is 530, leaving 7 px above and below;
+ * at sixteen it would be 557 and the top and bottom rows would be off-screen
+ * with nothing to say so.
+ *
+ * So the next row added here needs the layout changed too -- a smaller line
+ * height, a second column, or a scroll -- and this is the line that will say so
+ * at COMPILE time rather than on a device nobody has plugged in. The numbers are
+ * menu_draw's own, kept beside it. */
+#define MENU_PAD_PX   22
+#define MENU_LINE_PX  (FONT_CH + 8)
+#define MENU_PANEL_PX (MENU_PAD_PX * 2 + MENU_LINE_PX * (MENU_ROWS + 3))
+typedef char menu_panel_fits_on_a_vita[MENU_PANEL_PX <= 544 ? 1 : -1];
+
 
 static const char *const ROW_LABEL[MENU_ROWS] = {
     "Track", "Car", "Skin", "Tires", "Resonator", "Booster",
     "Sound volume", "Music volume", "Texture quality", "Texture colours",
-    "Car lighting",
+    "Car lighting", "Intro movies",
     "Restart at race start", "Resume", "Main menu"
 };
 
@@ -29,6 +47,8 @@ static int wrap(int v, int n)
 void menu_init(menu_t *m, int track, int car)
 {
     memset(m, 0, sizeof(*m));
+    /* ON, which is Config.gm's own retail value. */
+    m->intro = 1;
     m->track = wrap(track, N_TRACKS);
     m->car = wrap(car, MENU_N_CARS);
     m->req_track = -1;
@@ -106,6 +126,12 @@ static void adjust(menu_t *m, int d)
        every frame. */
     case MENU_CARLIGHT:
         m->car_light = !m->car_light;
+        break;
+    /* AND THE LAUNCH MOVIES. No reload and no request of any kind: the intro
+       loop has already run by the time this menu can be opened, so the row is
+       read at the NEXT boot and says so. */
+    case MENU_INTRO:
+        m->intro = !m->intro;
         break;
     default: break;
     }
@@ -234,6 +260,12 @@ static void row_value(const menu_t *m, int row, char *out, int n)
                  m->car_light ? "sun + shade (ambient 138, direct 128)"
                               : "off (flat, as before)");
         break;
+    case MENU_INTRO:
+        /* Named by what it costs, because "on" does not tell a player that the
+           thing they are turning off is a hundred seconds long. */
+        snprintf(out, n, "< %s >",
+                 m->intro ? "on (104 s at launch)" : "off (straight to the menu)");
+        break;
     default:
         out[0] = 0;
         break;
@@ -243,10 +275,10 @@ static void row_value(const menu_t *m, int row, char *out, int n)
 void menu_draw(const menu_t *m, int screen_w, int screen_h)
 {
     const float S = 1.0f;                 /* font scale */
-    const float lh = ui_text_h(S) + 8.0f; /* line height */
-    const float pad = 22.0f;
+    const float lh = (float)MENU_LINE_PX; /* line height */
+    const float pad = (float)MENU_PAD_PX;
     const float pw = 620.0f;
-    const float ph = pad * 2.0f + lh * (MENU_ROWS + 3.0f);
+    const float ph = (float)MENU_PANEL_PX;  /* and the check at the top */
     const float px = ((float)screen_w - pw) * 0.5f;
     const float py = ((float)screen_h - ph) * 0.5f;
     const float vx = px + pad + 250.0f;   /* value column */

@@ -338,6 +338,21 @@ int  net_remote_pose(int slot, ai_sample *out);
 /* The race ended for everyone. */
 int  net_race_over(void);
 
+/* HOW LONG THE QUIETEST LIVE PEER HAS BEEN QUIET, seconds; 0 when we are not in
+ * a game or every peer is current.
+ *
+ * WHAT IT IS FOR: the engine's own `msg_low_signal', message slot 0, which has
+ * been packed and addressable since the message layer was read and had nothing
+ * to raise it -- `known-issues.md' said so on the grounds that "this port has no
+ * network", which stopped being true when net.c was written.
+ *
+ * THE THRESHOLD IS NOT A NEW NUMBER: past NET_DR_MAX the newest sample can no
+ * longer be carried forward and a quiet peer FREEZES rather than flying off the
+ * level (see NET_DR_MAX above). That is the moment the player can actually SEE
+ * the link degrade -- a car standing still in the middle of the track -- so it
+ * is the moment to say so, and NET_TIMEOUT takes the slot away 4.5 s later. */
+float net_link_silence(void);
+
 /* ------------------------------------------------------------- the log */
 
 /* The lobby's message panel: the game's own 20200..20216 lines. `net.c' writes

@@ -78,6 +78,15 @@
 
 #define RB_GRAVITY   10.0f  /* m/s^2, applied along -Y */
 
+/* THE REST CLAMP'S OWN SPEED THRESHOLD -- the number rb_car_rest_update compares
+ * against (see rb_car_at_rest). A DOUBLE literal with no suffix, deliberately:
+ * collide.c's test is transcribed and `pick >= RB_REST_SPEED' has to expand to
+ * exactly the token it had, or a float promotion lands in the middle of a
+ * comparison this port is bit-compared on. It is here so a caller that wants to
+ * ask "is this car as good as stopped" does not keep a second copy of it --
+ * main.c's flag hold does. */
+#define RB_REST_SPEED 0.3611111
+
 /* The engine's own float32 constants, as they appear in the disassembly. */
 #define RB_TWO_PI    6.2831855f
 #define RB_RAD2DEG   57.295776f
@@ -366,6 +375,14 @@ struct rb_car {
     int       frozen;       /* phys + 0xa4: held on the line -- no drag, no
                                contacts, and horizontal force / yaw torque are
                                zeroed after summing, so it can only settle */
+    /* THE PORT'S OWN, and it drives the ENGINE's own bit: `in.blocked' is set
+       from this on every tick rbcar_step assembles (rbcar_hold). It exists
+       because the flag hold at the end of a race cannot be a BRAKE -- brake
+       held below 2 m/s is how this model selects REVERSE (rb_engine_accel), so
+       "full brake until it stops" drove the car backwards off the finish line.
+       `blocked' inhibits the drive instead and locks the wheels, which is what
+       the engine's own "drive inhibited by the game" bit is for. */
+    int       hold;
     int       rest_damp;    /* phys + 0x04 == 0 enables the rest damper */
     /* The rest clamp's four timers (0x004f59a0). See rb_car_rest_update. */
     float     rest_slow_t;  /* phys + 0x5c74: time below 0.3611 m/s */

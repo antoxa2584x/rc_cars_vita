@@ -340,6 +340,17 @@ int rbcar_jump(rb_car *c, int held, float dt)
     return rb_car_jump(c, dt);
 }
 
+/* Deliberately not an argument to rbcar_step, for rbcar_jump's two reasons --
+   the seventeen call sites in rccars_re have no hold to pass, and the original
+   keeps the game's own drive inhibit apart from whatever sets the control bits.
+   A LATCH: it stays set until it is cleared, so the caller asserts it once a
+   frame and every tick inside that frame sees it. */
+void rbcar_hold(rb_car *c, int on)
+{
+    if (c)
+        c->hold = on ? 1 : 0;
+}
+
 void rbcar_step(rb_car *c, float throttle, float brake, float steer,
                 int boost, float dt)
 {
@@ -350,7 +361,10 @@ void rbcar_step(rb_car *c, float throttle, float brake, float steer,
     c->in.throttle     = throttle;
     c->in.brake        = (brake > 0.01f);
     c->in.brake_amount = brake;
-    c->in.blocked      = 0;
+    /* THE DRIVE INHIBIT, re-asserted every tick because this is the only place
+       `in.blocked' is written and rbcar_step is called once per tick. See
+       rbcar_hold and rb_car.hold. */
+    c->in.blocked      = c->hold ? 1 : 0;
 
     /* `boost` is the BUTTON, and the button is not what the engine reads. It
        feeds a meter which decides whether a burn is running, and the meter is

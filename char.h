@@ -144,6 +144,22 @@ struct rb_car;
 #define CHR_HIT_COOL 3.0f
 
 /*
+ * THE CAR'S PROXY REACH, until the first one has been measured -- see
+ * chr_t.car_reach. Just over the widest of the three models, MEASURED over the
+ * same gather main.c's net_grid_reach uses: 0.315 m Overkill, 0.326 Buggy,
+ * 0.330 Hummer (`dogstuck` prints all three). It is here for the same reason
+ * that one has a fallback -- a keep-out of zero is the bug it exists to stop --
+ * and a fixture that steps char.c with a bare car POSITION and never calls
+ * char_car_solid runs on it.
+ *
+ * Note it is NOT net_grid_reach's own 0.55f, whose comment claims to be "just
+ * over the widest of the three as measured" and is 67% over it. That number
+ * only reaches a grid SPACING, and only down a branch a real gather never
+ * takes; it is corrected in place there rather than copied here.
+ */
+#define CHR_CAR_REACH 0.35f
+
+/*
  * THE VULTURE IS SCALED AND SHIFTED BY ITS OWN CONFIG, and this is the one
  * placement the .sb does not settle on its own.
  *
@@ -428,6 +444,20 @@ typedef struct {
     float eye2;                     /* to the EYE, for the draw cull */
     int drawn;
     int solid_hit;                  /* the car's proxy overlapped ours this tick */
+
+    /*
+     * HOW FAR THIS INSTANCE'S OWN COLLISION PROXY REACHES from its pivot, in
+     * metres -- the furthest sphere centre plus that sphere's own radius, which
+     * is the same quantity ai_bump_derive and main.c's net_grid_reach measure
+     * off a car. Written by char_proxy every time the proxy is built, so it
+     * follows the pose (the Dog's five spheres are BONES and swing with its
+     * legs), and seeded by char_reset so it is never zero on an instance that
+     * has a proxy at all. 0 for the Seagull and the Vulture, which the engine's
+     * own registries leave unsolid.
+     *
+     * Read by the chase keep-out in step_dog -- see char.c.
+     */
+    float px_reach;
 } chr_inst_t;
 
 typedef struct {
@@ -498,6 +528,16 @@ typedef struct {
 
     unsigned int n_drawn, n_stepped;
     int hide;                       /* CHR_HIDE_*, a diagnostic -- see above */
+
+    /*
+     * HOW FAR THE CAR'S OWN PROXY REACHES, the same quantity as
+     * chr_inst_t.px_reach and by the same rule -- measured off the spheres
+     * char_car_solid has just gathered, every frame, so it is the car that is
+     * actually being driven and it follows a change to the proxy by itself
+     * (ai_bump_derive says the same thing about the same measurement).
+     * CHR_CAR_REACH until the first gather.
+     */
+    float car_reach;
 } chr_t;
 
 /*

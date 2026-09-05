@@ -142,13 +142,42 @@ enum {
     MM_PAGE_QUICK,      /* dlgRACESUM -- Race summary */
     MM_PAGE_MAPINFO,    /* dlgMAPINFO -- Map and info */
     MM_PAGE_STATS,      /* dlgSTAT    -- Track stats  */
+    /* THE AWARD BOOK, and it is the one page in this front end with NO DIALOG
+     * BEHIND IT: the game has no achievements, so the exe carries no table to
+     * read and there is no screenshot to measure (awards.h). It is a fourth
+     * sibling view -- the same frame, the same navigation column, the same
+     * green Race button -- and it borrows dlgSTAT's own rectangles, because it
+     * is the same shape of thing on the same screen: a table with a scroll bar,
+     * a heading over it and one picker under it. Where dlgSTAT gives the table
+     * only 273 px because a photograph and a three-line blurb sit above it,
+     * this page has neither and takes the height back. */
+    MM_PAGE_AWARDS,     /* the port's own -- see awards.h */
     MM_PAGE_PLAYERS,    /* dlgPLRSCOMM -- Select player */
     MM_PAGE_GARAGE,     /* dlgSETCAR   -- the Garage */
     MM_PAGE_DETAIL,     /* dlgSETDETAIL -- one of its three upgrade pages */
     MM_PAGE_MULTI,      /* dlgMULTIPLAYER -- Create game / Join game */
     MM_PAGE_LOBBY,      /* dlgWAITPLAYERS_* -- one of its four views */
+    /* THE CHAMPIONSHIP, and BOTH ITS SCREENS ARE SHIPPED. `Settings/' carries
+     * dlgCHAMP.ini and dlgCHRACE.ini like every other dialog, so neither of
+     * these was measured off anything -- gen_dlg_data.py emits both. See
+     * champ.h for the rules behind them and ui.md for the two pages.
+     *
+     *   dlgCHAMP   the ten-track LADDER: a table of Track / Scores req. /
+     *              Cost / Place / Prize, the chosen track's name under it and
+     *              three lines saying what it takes to enter and what it pays
+     *   dlgCHRACE  the page between the ladder and the flag, and the one that
+     *              TAKES THE ENTRY FEE: what you are to pay, what the prize is,
+     *              what your cash will be afterwards, and the car you are
+     *              taking with its three parts. Race and Back, on the two
+     *              button rectangles that dialog ships of its own
+     */
+    MM_PAGE_CHAMP,
+    MM_PAGE_CHRACE,
     MM_N_PAGES
 };
+
+/* Whether `page' is one of the championship's two. */
+#define MM_PAGE_IS_CHAMP(p) ((p) == MM_PAGE_CHAMP || (p) == MM_PAGE_CHRACE)
 
 /* THE SELECT PLAYER PAGE, which is `dlgPLRSCOMM' and is the screen the game
  * comes up on when there is nobody to race as. It is a fourth view on the same
@@ -285,6 +314,7 @@ enum {
     MM_QB_SUMMARY = 0,
     MM_QB_MAPINFO,
     MM_QB_STATS,
+    MM_QB_AWARDS,
     MM_QB_GARAGE,
     MM_QB_N
 };
@@ -293,7 +323,7 @@ enum {
 extern const int MM_QB_PAGE[MM_QB_N];
 
 /* Whether `page' is one of the three sibling views. */
-#define MM_PAGE_IS_QUICK(p) ((p) >= MM_PAGE_QUICK && (p) <= MM_PAGE_STATS)
+#define MM_PAGE_IS_QUICK(p) ((p) >= MM_PAGE_QUICK && (p) <= MM_PAGE_AWARDS)
 
 /* THE GARAGE AND ITS UPGRADE PAGE -- dlgSETCAR and dlgSETDETAIL, two more views
  * on the same frame, reached from the quick-race page's fourth bar. They are
@@ -357,7 +387,14 @@ enum {
     MM_Q_N_ROWS
 };
 
-/* Map and info's two, and Track stats' one, at the same indices. */
+/* HOW MANY OF THE TWENTY-FIVE AWARDS THE PAGE SHOWS AT ONCE. In the header
+   because the list's bottom stop is AW_N - MM_AW_ROWS and the harness walks the
+   scroller to it -- a copy of this number over there would be a check against
+   itself. The rest of that table's geometry is mainmenu.c's own. */
+#define MM_AW_ROWS 8
+
+/* Map and info's two, Track stats' one and the award page's one, at the same
+   indices. */
 #define MM_Q_MI_TRACK  0        /* shotTrackEnum */
 #define MM_Q_MI_SHOT   1        /* enumShot */
 #define MM_Q_ST_TYPE   0        /* enumStatType, `Sort results by' */
@@ -463,6 +500,61 @@ enum {
 /* How many of the four `C' stops each view has. */
 extern const int MM_L_NCTRL[MM_L_N_VIEW];
 
+/* ================================================ THE CHAMPIONSHIP's two pages
+ *
+ * dlgCHAMP's own focus ring. The LADDER is one stop that UP and DOWN walk, the
+ * way the Select player page's list is -- ten rows in a table is not ten stops
+ * in a ring. The rest are the buttons the original's page has (FUN_004bea70's
+ * switch: 0x76d Race, 0x773 New championship, 0x774 the car setup) drawn in
+ * this port's own right-hand column, plus the Main menu button every page has.
+ */
+/* dlgCHAMP's RIGHT-HAND COLUMN, which is the game's own six bars on the frame's
+   own eight row positions -- read straight off its screenshot, whose bar
+   centres land on MM_CY[0..4] and MM_CY[6] to the pixel. The first three are
+   RADIO cells (this page and the two sibling views), the Garage is an ARROW
+   because it goes to a screen of its own, and the last two are the ORANGE
+   Button_back plate rather than the red one, which is what the picture has. */
+enum {
+    MM_CB_CHAMP = 0,    /* row 0 -- the page you are on */
+    MM_CB_MAPINFO,      /* row 1 -- dlgMAPINFO, on the ladder's own track */
+    MM_CB_STATS,        /* row 2 -- dlgSTAT */
+    MM_CB_GARAGE,       /* row 3 */
+    MM_CB_NEW,          /* row 4 -- New championship, 10053 */
+    MM_CB_TRAINING,     /* row 6 -- 10054. NOT BUILT; drawn in the grey */
+    MM_CB_N
+};
+
+/* Which of the frame's eight rows each bar sits on. Row 5 and row 7 are empty
+   on this page, exactly as they are on the game's own. */
+extern const int MM_CB_ROW[MM_CB_N];
+
+/* dlgCHAMP's own focus ring. The LADDER is one stop that UP and DOWN walk, the
+   way the Select player page's list is -- ten rows in a table is not ten stops
+   in a ring. */
+enum {
+    MM_C_LIST = 0,      /* the ten-track table; UP/DOWN walk it */
+    MM_C_NAV,           /* MM_C_NAV + MM_CB_* -- the six bars */
+    MM_C_RACE = MM_C_NAV + MM_CB_N,   /* the green one: on to dlgCHRACE */
+    MM_C_BACK,          /* the corner, and on this page it says `Main menu' */
+    MM_C_N_FOCUS
+};
+
+/* dlgCHRACE's, and this dialog ships its OWN two buttons -- buttonRace at
+   (257, 530) and buttonBack at (414, 530), both 134x36 -- so unlike every other
+   page in this front end they are not the frame's, and neither is the GREEN
+   plate: the game's own shot of this page has a RED `Race' and an ORANGE
+   `Back', side by side and centred, which is what those two rectangles are.
+ *
+   AND THE PAGE IS AN OVERLAY. That screenshot shows the ladder still there
+   underneath, dimmed -- dlgCHRACE is a panel over dlgCHAMP and not a fifth
+   view of the frame, which is why its own rectFrame is 782x573 and why it
+   carries buttons at all. */
+enum {
+    MM_R_RACE = 0,
+    MM_R_BACK,
+    MM_R_N_FOCUS
+};
+
 /* What mainmenu_step decided this frame. The caller acts and the menu forgets:
    the field is cleared at the top of every step, like menu.c's `cue`. */
 typedef enum {
@@ -481,6 +573,14 @@ typedef enum {
        Distinct from MM_ACT_RACE because the two set up different fields and
        because only one of them can be aborted by the other end going away. */
     MM_ACT_NET_RACE,
+    /* THE CHAMPIONSHIP ROUND IS STARTING, on `track', and the caller's part of
+       it is what the engine's game mode 5 is: FIVE laps whatever the picker
+       says (FUN_004e03b0 refuses anything else) and a finish that is worth
+       money. THE ENTRY FEE HAS ALREADY BEEN TAKEN by the time this is raised --
+       dlgCHRACE's Race button is what pays it, exactly as FUN_004c0300 does,
+       so a caller that ignores this action still leaves the profile paid up.
+       Distinct from MM_ACT_RACE because only one of the two pays out. */
+    MM_ACT_CHAMP_RACE,
     MM_ACT_QUIT
 } mm_action;
 
@@ -514,6 +614,13 @@ typedef struct {
     unsigned int trackmap[10];   /* trackmap_<n> -- the painted top-down map */
     unsigned int scrollbar;      /* the stats table's own bar */
     unsigned int panel;          /* messagebox_empty -- the map's silver frame */
+    /* `messagebox' -- and its RIGHT HALF is THE DIALOG'S OWN BUTTON, which this
+       port spent a long time trying to build out of the row bars. 256x128: the
+       left half is another rounded frame, the right half is FOUR 128x32 pills
+       with BOTH caps rounded and a dot in the left one -- red/dark, red/white,
+       orange/dark, orange/white, which is exactly a Yes/No pair and its focus.
+       See mm_msgbtn. */
+    unsigned int msgbox;
     unsigned int face[PL_N_FACES];  /* the nine portraits, PL_FACE_NAME order */
     unsigned int arrows;         /* enumarrows -- 2x2 of 32x32: silver, red,
                                     grey, in that order across then down */
@@ -552,9 +659,19 @@ typedef struct {
     int   qfocus;       /* MM_Q_* on any of the three sibling pages */
     int   shot;         /* 0..MM_N_SHOTS-1, shared by shotList and dlgSTAT */
     int   stat;         /* REC_STAT_*, `Sort results by' */
+    int   aw_top;       /* the award page's first visible row -- its own picker
+                           scrolls the list, and that is the only thing on that
+                           page there is to hold */
     int   laps;         /* MM_LAPS_MIN .. MM_LAPS_MAX */
     int   skill;        /* 0 .. MM_N_SKILL-1 */
     int   car;          /* 0 .. MM_N_CARS-1 -- the caller's, synced both ways */
+
+    /* THE SCROLL BAR'S ONE BIT: this touch went down in a trough and the thumb
+       is following the finger, so a drag that wanders off the bar sideways --
+       which every drag on a 24 px wide control does -- keeps scrolling instead
+       of stopping. Cleared the frame the finger comes up. One flag for all
+       three pages that have a bar, because only one of them is ever up. */
+    int   sb_drag;
 
     int   focus;        /* MM_* row, MM_FOCUS_RACE or MM_FOCUS_QUIT */
     int   track;        /* 0 .. 9, indexes TRACKS[] */
@@ -611,6 +728,10 @@ typedef struct {
     /* What MM_MODAL_ASK's Yes commits -- one of the four things the Garage
        spends or fetches money for. Private to mainmenu.c. */
     int   gask;
+    /* WHICH PAGE OPENED THE SHOP, so its Back button unwinds one step to the
+       page the thumb came in from. Two pages can now: the quick-race summary's
+       own Garage bar and the championship ladder's. */
+    int   gfrom;
 
     /* ---- the modal over it */
     int   modal;                /* MM_MODAL_* */
@@ -639,6 +760,24 @@ typedef struct {
     int   lview;                /* MM_L_* */
     int   lsel;                 /* the highlighted roster row */
     int   srvsel;               /* the server modal's own cursor */
+
+    /* ---- the championship. `csel' is the row of the ladder the cursor is on,
+       which is a TRACK index (TRACKS[] order) and not a row of a view: the
+       ladder is always all ten in the same order, locked rows included, because
+       a ladder you cannot see the top of is not a ladder. `ctop' scrolls it
+       when the table is shorter than ten rows. */
+    int   cfocus;               /* MM_C_* */
+    /* WHICH PAGE THE THREE SIBLING VIEWS WERE ENTERED FROM. dlgMAPINFO and
+       dlgSTAT are on the championship's navigation column as well as the
+       quick-race page's, so the first nav bar, the header and the green button
+       all have to know which way home is. MM_PAGE_QUICK unless the ladder
+       opened them. */
+    int   qfrom;
+    int   csel;                 /* 0..9 -- the chosen track */
+    int   ctop;                 /* the first visible row */
+    int   carmed;
+    int   rfocus;               /* MM_R_* on dlgCHRACE */
+    int   rarmed;
 } mainmenu_t;
 
 void mainmenu_set_car_draw(mainmenu_t *m, mm_car_draw fn, void *ctx);
@@ -755,6 +894,29 @@ int  mainmenu_l_row_at(const mainmenu_t *m, int screen_w, int screen_h,
 /* The four skill names, and the field each one fields on `track` -- counted off
    ai_data.h's own AI<n>Races masks, which is where the difference comes from.
    See ai_set_skill_field. */
+/* ---------------------------------------------------- the championship's two */
+
+/* Open the ladder on the profile's own current track, or on the first one that
+   is open when that one is not. */
+void mainmenu_open_champ(mainmenu_t *m);
+
+/* Whether a stop on either championship page does anything right now. The Race
+   button on the ladder is dead while the chosen track is locked or the profile
+   cannot pay its fee; the whole page is dead with no profile. */
+int  mainmenu_c_live(const mainmenu_t *m, int stop);
+int  mainmenu_r_live(const mainmenu_t *m, int stop);
+
+/* Which stop of dlgCHAMP is under (x, y), or -1 -- and, when it is the table,
+   `row' comes back as the ladder row (0..9) so a touch can both focus the list
+   and move its cursor in one press. `row' is -1 otherwise. Exposed for the
+   harness, as every other page's hit test is. */
+int  mainmenu_c_stop_at(const mainmenu_t *m, int screen_w, int screen_h,
+                        float x, float y, int *row);
+
+/* Which of dlgCHRACE's own two buttons is under (x, y), or -1. */
+int  mainmenu_r_stop_at(const mainmenu_t *m, int screen_w, int screen_h,
+                        float x, float y);
+
 const char *mainmenu_skill_name(int skill);
 int  mainmenu_field_size(int track, int skill);
 

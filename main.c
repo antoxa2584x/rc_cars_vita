@@ -76,8 +76,10 @@
 #include "menu.h"
 #include "settings.h"
 #include "records.h"
+#include "awards.h"
 #include "player.h"
 #include "garage.h"
+#include "champ.h"
 #include "net.h"
 #include "ime.h"
 #include "ai.h"
@@ -161,6 +163,29 @@ static int         in_main_menu = 1;
 static int race_laps = MM_LAPS_DEF;
 static int ai_skill = 1;
 static int race_over;
+
+/* HOW MANY TIMES THE PLAYER WAS PUT BACK during this race, for the award book's
+   `Not a Scratch' -- awards.h. Counted where the two deaths are raised and
+   cleared by respawn(), which is what starts a race here. */
+static int race_deaths;
+
+/* THIS RACE IS A CHAMPIONSHIP ROUND -- the engine's game mode 5, which is what
+   FUN_004a4c90(5) sets and what FUN_004c56c0 pays prize money on. It is a race
+   like any other in every other respect; what it changes is that the flag is
+   worth money and a placing (champ.h), that the lap count is FIVE whatever the
+   picker says, and that the entry fee has already been taken. */
+static int race_champ;
+
+/* HITS, this race -- the other half of the championship's bonus. The engine
+   keeps this on the car's own physics body (phys+0x5748) and increments it in
+   the SAME branch that raises the two `!HIT!' gates, so one increment is one
+   banner; this counts the port's own !HIT! events for exactly that reason. See
+   champ.h. */
+static int race_hits;
+
+/* The award toast's art: the same plate and the same two fonts the front end
+   uses (mainmenu_tex), bound once beside them. */
+static award_tex award_art;
 
 /* THE RESULTS, and the bookkeeping the finish screen needs. None of it exists
  * anywhere else: the port tracks the PLAYER's clock in race_ui and knows every
@@ -685,7 +710,13 @@ static float net_grid_reach(void)
     }
     /* A proxy that gathered nothing would space the grid at zero, which is the
        bug this exists to fix -- so fall back rather than trust it. 0.55 m is
-       just over the widest of the three as measured. */
+       NOT, as this comment used to say, "just over the widest of the three as
+       measured": the same loop measures 0.315 m on the Overkill, 0.326 on the
+       Buggy and 0.330 on the Hummer (`dogstuck` prints them), so it is 67% over
+       the widest and deliberately generous. Kept, because it only reaches a
+       grid SPACING and only down a branch a real gather never takes -- but it
+       must not be copied anywhere as a measurement, and char.h's
+       CHR_CAR_REACH, which is one, says so. */
     if (cached < 1e-3f)
         cached = 0.55f;
     return cached;
@@ -765,6 +796,16 @@ static void respawn(void)
         sz += net_grid[net_slot()][1];
     }
     place_car(sx, sz, t->y, t->yaw);
+
+    /* A NEW RACE, so nobody has died in it yet -- awards.h's `Not a Scratch'.
+       Here and not at the flag: every path that starts a race in this port ends
+       up in respawn(), which is the same argument countdown_stop's comment
+       makes about the countdown. */
+    race_deaths = 0;
+    /* And the hit counter, for the same reason and on the same event: the bonus
+       is what THIS race knocked over, not what the profile has ever knocked
+       over -- that is the award book's business (awards.h). */
+    race_hits = 0;
 
     /* The spine cursor. cp_restart is what puts the arrow on CHECKPOINT 0 -- the
        start/finish -- which is the first thing a race crosses; it no longer
@@ -883,6 +924,10 @@ static void respawn(void)
  */
 static void respawn_checkpoint(void)
 {
+    /* THE DEATH COUNT, and this is the only place either death path passes
+       through -- see the two callers, the fall out of the world and the
+       drowning. */
+    race_deaths++;
     float p[3], yaw;
 
     if (!cp_respawn_pose(&cps, p, &yaw)) {
@@ -1552,10 +1597,39 @@ static void apply_garage(void)
     menu.skin[c] = garage_skin(p, c);
 }
 
+/* THE PROFILE'S OWN FACTS INTO THE AWARD BOOK. Plain numbers, because awards.h
+   names no other module: the highest part level fitted anywhere in the profile,
+   the paint the chosen car is wearing, and the profile's own clock. Called on
+   the events that can change any of the three -- a shop transaction, a finished
+   race, and the way out of the app -- rather than per frame. */
+static void award_note_profile(void)
+{
+    const player_t *p = player_cur();
+    const int c = (mm.car >= 0 && mm.car < PL_N_CARS) ? mm.car : 0;
+    int car, kind, best = 0;
+
+    if (!p)
+        return;
+    for (car = 0; car < PL_N_CARS; car++)
+        for (kind = 0; kind < GAR_N_KINDS; kind++) {
+            const int lv = garage_level(p, kind, car);
+            if (lv > best)
+                best = lv;
+        }
+    award_shop(best, garage_skin(p, c), p->play_time);
+}
+
 static void apply_player(void)
 {
     const player_t *p = player_cur();
     int i;
+    /* AND ITS AWARD BOOK. This is the one function a profile becoming the
+       current one goes through -- the boot with a roster, and MM_ACT_PLAYER,
+       which is a selection, a creation and a removal -- so it is the one place
+       the book has to follow. With no profile it selects nobody, and every
+       event in awards.c is then dropped rather than credited to the last
+       player who happened to be up. */
+    award_select(p ? p->name : NULL);
     if (!p)
         return;
     for (i = 0; i < MM_N_LAPS; i++)
@@ -1666,6 +1740,10 @@ int main(void)
        nothing to say to each other. Missing is not an error: an empty book is
        an empty table, which is what the original shows on a fresh install. */
     records_load();
+    /* AND THE AWARD BOOK, for the same reason and in the same place -- awards.h.
+       It is keyed by profile name and the roster is not up yet, so nothing is
+       SELECTED here: apply_player does that, below, once there is a profile. */
+    award_load();
     /* AND THE ROSTER. `ux0:data/rccars/Players', in the game's own .scp format,
        so a profile copied off a PC install opens here and one made here opens
        there -- player.h. The nine portraits' pixels come up with it, because a
@@ -1725,10 +1803,17 @@ int main(void)
      * world for the frame loop to step around it, and it ends by giving the
      * decoder's 6 MB of physically contiguous memory back before the first
      * 36 MB scene asks for room. A missing assets/intro.vid is not an error --
-     * it is how this port spells Config.gm's `AutoRunIntro' 0. */
+     * it is one of the two ways this port spells Config.gm's `AutoRunIntro' 0.
+     *
+     * THE OTHER IS THE MENU ROW, and it is the one a player on a console can
+     * actually reach: deleting a file off ux0: is not a setting. `menu.intro'
+     * is read here, after settings_load above and before the loop, so the
+     * switch takes effect on the launch AFTER the one it is thrown on -- which
+     * is what the row's own caption says. */
     {
         intro_t intro;
-        if (intro_open(&intro, "app0:assets/intro.vid", "app0:assets")) {
+        if (menu.intro
+            && intro_open(&intro, "app0:assets/intro.vid", "app0:assets")) {
             SceCtrlData ipad;
             SceRtcTick ia, ib;
             double ihz = (double)sceRtcGetTickResolution();
@@ -1884,6 +1969,11 @@ int main(void)
            roster table draws one cell of per row. */
         mt.skinicons = scene_tex(&menu_scene, "skin_ik_vse");
         mt.panel     = scene_tex(&menu_scene, "messagebox_empty");
+        /* AND `messagebox', whose right half is the dialog's own button pair --
+           mainmenu.h. A menu.vsc packed before it was added leaves this 0 and
+           the dialogs fall back to the row bars, which is what they used to
+           draw. */
+        mt.msgbox    = scene_tex(&menu_scene, "messagebox");
         /* The engine's own letters, which the HUD already loads from the track's
            scene -- but the menu is up before any track has to be, so they come
            from here as well. */
@@ -1891,6 +1981,11 @@ int main(void)
         mt.font_small = scene_tex(&menu_scene, "Smash20");
         if (!mt.font_big)   mt.font_big   = scene_tex(&props_scene, "Smash26");
         if (!mt.font_small) mt.font_small = scene_tex(&props_scene, "Smash20");
+        /* AND THE AWARD TOAST'S TWO FONTS -- one binding, so a toast cannot
+           end up in a different font from the menu that raised it. Its plate is
+           its own; awards.h says why. */
+        award_art.font_big   = mt.font_big;
+        award_art.font_small = mt.font_small;
         mainmenu_init(&mm, &mt);
         mainmenu_set_car_draw(&mm, menu_car_draw, NULL);
         mm.track = menu.track;
@@ -2120,12 +2215,27 @@ unsigned int acc_ticks = 0;
                 settings_save_if_changed(&menu);
             menu_was_open = menu.open;
         }
-        /* THE START MENU'S LAST ROW IS NOW "Main menu", NOT "Quit". A race is
-           something you leave, and where you leave it to is the front end -- so
-           the app can only be quit from the main menu's own Quit button, which
-           is where the original puts it too. Opened FROM the main menu (its
-           Options button) the row just closes itself, since that is already
-           where it would go. */
+        /* AND A SETTLE WRITE WHILE THE MENU IS STILL UP, which is the way out
+           the block above cannot see: the PS button, a crash, or the emulator
+           being closed with the menu open all lose the change otherwise
+           (docs/known-issues.md). One write per burst of edits, a second after
+           the last one -- settings.h has why it is not per keypress and not per
+           frame. On the RAW frame clock, because `dt' is 0 while the menu is
+           open and a settle timer that never advances never settles. */
+        if (menu.open)
+            settings_settle(&menu, frame_dt);
+        /* THE START MENU'S LAST ROW IS "Main menu", NOT "Quit". A race is
+           something you leave, and where you leave it to is the front end.
+           Opened FROM the main menu (its Options button) the row just closes
+           itself, since that is already where it would go.
+         *
+           AND THE FRONT END HAS NO QUIT BUTTON ANY MORE (mainmenu.c): a Vita app
+           is left with the PS button, which the app never sees. So THIS is the
+           last event that can carry a write, and it takes the one the Quit
+           button used to own -- the profile's play time and the award book, both
+           of which move during a race and neither of which a finish has filed if
+           the player walks out mid-race. One file on one event, and abandoning a
+           race is the event. */
         if (menu.req_quit) {
             menu.req_quit = 0;
             menu.open = 0;
@@ -2134,6 +2244,10 @@ unsigned int acc_ticks = 0;
                 mm.track = cur_track;
                 mm.car = cur_car;
                 sfx_ui(SFX_UI_BACK);
+                store_player();
+                player_save_cur_if_dirty();
+                award_note_profile();
+                award_save_if_changed();
             }
         }
 
@@ -2144,6 +2258,13 @@ unsigned int acc_ticks = 0;
            the host and still answer it. A peer that went quiet because its
            owner opened the START menu would be dropped in five seconds. */
         net_step(frame_dt);
+
+        /* THE AWARD TOAST'S CLOCK, once a frame and on the raw frame time for
+           the reason above: a toast is an acknowledgement of something that has
+           already happened, so it has to be able to finish and go. Under `dt'
+           it would freeze mid-life the moment the player opened the START menu
+           -- which msg.c's PAUSE banner wants and this does not. */
+        award_step(frame_dt);
 
         /* THE FRONT END. The panel is read every frame whatever is up, because
            touch.h's edges are differences and a frame that skipped the read
@@ -2160,7 +2281,27 @@ unsigned int acc_ticks = 0;
             if (results.cue == 2) sfx_ui(SFX_UI_ENTER);
             if (results.action == RES_ACT_AGAIN) {
                 results_up = 0;
-                respawn();
+                /* A CHAMPIONSHIP ROUND IS PAID FOR ONCE, so `Race again' does
+                   not silently run a second scored one on one entry fee -- that
+                   is a money printer, and the prize money is the only income in
+                   this build (docs/known-issues.md). It goes back to dlgCHRACE
+                   instead: the same track, the same page that took the fee the
+                   first time, and one press to pay it again and go. Nothing is
+                   charged here and nothing is charged behind the player's back.
+                   A quick race restarts where it stands, as it always has. */
+                if (race_champ) {
+                    race_champ = 0;
+                    in_main_menu = 1;
+                    mm.track = cur_track;
+                    mm.car = cur_car;
+                    mm.csel = cur_track;
+                    mm.page = MM_PAGE_CHRACE;
+                    mm.rfocus = MM_R_RACE;
+                    mm.rarmed = -1;
+                    sfx_ui(SFX_UI_BACK);
+                } else {
+                    respawn();
+                }
             } else if (results.action == RES_ACT_QUIT) {
                 results_up = 0;
                 in_main_menu = 1;
@@ -2238,10 +2379,45 @@ unsigned int acc_ticks = 0;
                 menu.track = mm.track;
                 load_track(mm.track);
                 net_race = 0;
+                race_champ = 0;
                 race_over = 0;
                 in_main_menu = 0;
                 /* AFTER the mode bit, because respawn() is what starts the
                    countdown and the countdown must not tick under the menu. */
+                respawn();
+                break;
+            /* THE CHAMPIONSHIP ROUND, and what makes it one is three lines: the
+             * lap count is FIVE whatever enumNLaps says (FUN_004e03b0 refuses
+             * mode 5 with anything else), the flag is worth money, and the
+             * entry fee has already left the profile -- dlgCHRACE's Race button
+             * paid it, which is where FUN_004c0300 pays it too. Everything else
+             * is MM_ACT_RACE: the same field, the same countdown, the same HUD.
+             *
+             * THE FEE IS WRITTEN OUT BEFORE THE TRACK LOADS. A load is seconds
+             * of I/O and the one moment a player might switch the machine off
+             * having just been charged; the profile has to be on the card by
+             * then. Same rule as every other save in this app, applied to the
+             * event that costs the most. */
+            case MM_ACT_CHAMP_RACE:
+                race_laps = CHAMP_LAPS;
+                store_player();
+                player_save_cur_if_dirty();
+                ai_set_skill_field(1);
+                ai_skill = mm.skill;
+                if (mm.car != cur_car) {
+                    menu.car = mm.car;
+                    load_car(mm.car);
+                }
+                menu.track = mm.track;
+                load_track(mm.track);
+                net_race = 0;
+                race_champ = 1;
+                race_over = 0;
+                in_main_menu = 0;
+                rlog("[rccars] championship: %s, %d laps, fee paid, "
+                     "cash %d, scores %d\n", TRACKS[mm.track].base, race_laps,
+                     player_cur() ? player_cur()->cash : -1,
+                     player_cur() ? player_cur()->scores : -1);
                 respawn();
                 break;
             case MM_ACT_NET_RACE:
@@ -2282,6 +2458,7 @@ unsigned int acc_ticks = 0;
                         cars[n++] = q->car;
                         net_ai_slot[i] = n - 1;
                     }
+                    race_champ = 0;
                     ai_remote_init(&ai, mm.track, col_rb_world(&col),
                                    cars, n);
                     /* AND WHAT EACH OF THEM LOOKS LIKE. A second pass rather
@@ -2346,6 +2523,12 @@ unsigned int acc_ticks = 0;
                    picker, which the mm.car sync above does. */
                 apply_garage();
                 player_save_cur_if_dirty();
+                /* AND THE AWARD BOOK, off the same event: a fitted part and the
+                   paint are two of the three facts it takes off the profile
+                   (awards.h), and this is the only thing in the app that
+                   changes either. */
+                award_note_profile();
+                award_save_if_changed();
                 break;
             case MM_ACT_OPTIONS:
                 menu.open = 1;
@@ -2356,6 +2539,10 @@ unsigned int acc_ticks = 0;
                    Quit button is the only way out of the app. */
                 store_player();
                 player_save_cur_if_dirty();
+                /* AND THE AWARD BOOK -- the play-time award is the one that can
+                   still move in a session that finishes no race. */
+                award_note_profile();
+                award_save_if_changed();
                 /* AND TELL ANYBODY WE ARE IN A GAME WITH. A host that walks out
                    of the app without a NP_BYE leaves three clients on a
                    five-second timeout looking at a lobby that is already
@@ -2368,6 +2555,19 @@ unsigned int acc_ticks = 0;
             }
             if (menu.req_quit)
                 break;
+        }
+        /* THE START MENU CAN RESTART A RACE FOUR WAYS -- another track, another
+           car, a reload and Restart -- and every one of them ends a
+           CHAMPIONSHIP round: the entry fee bought one classified run over one
+           track in one car, and three of these four change what is being
+           raced. So the round carries on as an ordinary race, scoring nothing,
+           rather than either paying twice or paying for a race the player has
+           reset. The ladder is one green button away. */
+        if (race_champ && (menu.req_track >= 0 || menu.req_car >= 0
+                           || menu.req_reload || menu.req_restart)) {
+            race_champ = 0;
+            rlog("[rccars] championship: restarted from the START menu -- "
+                 "this run scores nothing\n");
         }
         if (menu.req_track >= 0) {
             load_track(menu.req_track);
@@ -2580,6 +2780,9 @@ unsigned int acc_ticks = 0;
                 float lead = ai.player_dist;
                 results_up = 1;
                 results.n = 0;
+                /* CLEARED FIRST, so a quick race after a championship round
+                   does not inherit the last one's prize block. */
+                memset(&results.champ, 0, sizeof results.champ);
                 for (k = 0; k <= ai.n && results.n < RES_MAX_ROWS; k++) {
                     const float d = (k == 0) ? ai.player_dist
                                              : ai.car[k - 1].spine_dist;
@@ -2680,11 +2883,113 @@ unsigned int acc_ticks = 0;
                    when the app closes -- loses the result to a PS button. The
                    same ~50 ms a settings save costs, once per race. */
                 records_save_if_changed();
+                /* AND THE AWARD BOOK, off the same table -- awards.h. Every
+                 * field is a number this frame already has:
+                 *
+                 *   place        the player's row after results_finish sorted
+                 *                them, which is the placing the finish screen
+                 *                shows and not a second opinion
+                 *   n_finished   how many rows crossed for the last time before
+                 *                the race ended -- `Home Alone' is a win with
+                 *                that at 1 and a field to beat
+                 *   deaths       race_deaths, counted in respawn_checkpoint
+                 *
+                 * The player's row is found by its own flag rather than by
+                 * index: results_finish SORTS, so row 0 is the winner and not
+                 * necessarily us. */
+                {
+                    aw_race aw;
+                    int fin = 0;
+                    memset(&aw, 0, sizeof aw);
+                    aw.track = menu.track;
+                    aw.car = menu.car;
+                    aw.laps = race_laps;
+                    aw.n_racers = results.n;
+                    aw.net = net_race;
+                    aw.deaths = race_deaths;
+                    aw.best_lap = race_ui.best_lap;
+                    aw.place = 0;
+                    for (k = 0; k < results.n; k++) {
+                        if (results.row[k].finished)
+                            fin++;
+                        if (results.row[k].is_player)
+                            aw.place = results.row[k].place;
+                    }
+                    aw.n_finished = fin;
+                    award_race(&aw);
+                }
+                /* AND THE CHAMPIONSHIP'S OWN BOOKKEEPING -- champ.h, which
+                 * has the whole of FUN_004c56c0's money half.
+                 *
+                 * THE RACE COUNTER IS FILED FOR EVERY RACE, championship or
+                 * not: `pl_track.i45' is what the rank ladder counts
+                 * (FUN_004e85d0 walks the ten and asks "> 0"), and the engine
+                 * bumps it outside its own `mode == 5' branch. The money and
+                 * the best place are inside it, and so they are here.
+                 *
+                 * THE GAP IS TO THE CAR BEHIND, which after results_finish
+                 * sorted the table is simply the next row -- and it is a gap in
+                 * SECONDS only where that car also crossed the line. A racer
+                 * still out there has no time (results.h: the race ends at the
+                 * player's flag and inventing one would be inventing a result),
+                 * so it contributes nothing, which is the same 0 the engine
+                 * arrives at by subtracting the player's own clock from itself.
+                 *
+                 * A player who finished LAST has no row behind and no bonus.
+                 * The original agrees and says so on the finish screen -- 41320,
+                 * "No prize money" -- though by a different route: it leaves its
+                 * bonus global holding the PREVIOUS race's value and pays that.
+                 * This does not reproduce that; docs/known-issues.md says so. */
+                if (!net_race) {
+                    player_t *pp = player_cur();
+                    champ_note_race(pp, menu.track);
+                    if (race_champ && pp) {
+                        float gap = 0.f;
+                        int me = -1, won;
+                        for (k = 0; k < results.n; k++)
+                            if (results.row[k].is_player)
+                                me = k;
+                        if (me >= 0 && me + 1 < results.n
+                            && results.row[me].finished
+                            && results.row[me + 1].finished)
+                            gap = results.row[me + 1].time
+                                  - results.row[me].time;
+                        const int place = me >= 0 ? results.row[me].place - 1
+                                                  : -1;
+                        won = champ_finish(pp, menu.track, place, gap,
+                                           race_hits);
+                        /* AND THE FINISH SCREEN SAYS SO. dlgFINISH has carried
+                           `tableBonus' and its four `staticBonus*' since the
+                           layout was read and this port had nothing to put in
+                           them; it does now, and every figure here is the one
+                           champ.c just paid on rather than a second
+                           calculation of it. */
+                        results.champ.up = 1;
+                        results.champ.hits = race_hits;
+                        results.champ.gap_sec = gap > 0.f
+                                                ? (int)(gap + 0.5f) : 0;
+                        results.champ.allowed = champ_prize(menu.track, 2);
+                        results.champ.paid = won;
+                        rlog("[rccars] championship: %s place %d, gap %.2f s, "
+                             "%d hit(s) -> $%d  (cash %d, scores %d)\n",
+                             TRACKS[menu.track].base,
+                             me >= 0 ? results.row[me].place : 0,
+                             (double)gap, race_hits, won, pp->cash, pp->scores);
+                        if (champ_complete(pp))
+                            rlog("[rccars] championship: every track won\n");
+                    }
+                }
                 /* AND THE PROFILE, for the same reason and in the same frame:
                    `Play time' on the player card is the seconds a race took,
                    and a finish is the one moment there are new ones to file. */
                 store_player();
                 player_save_cur_if_dirty();
+                /* The profile's clock has just moved and its parts may have,
+                   so the three facts the book takes off it are re-read here --
+                   and the book itself is written on the same event as the
+                   record book, for the same reason. */
+                award_note_profile();
+                award_save_if_changed();
             }
         }
         race_ui_step(&race_ui, dt);
@@ -2771,6 +3076,25 @@ unsigned int acc_ticks = 0;
             if (dirarrow_wrong(&dir_arrow))
                 msg_post(&msgs, MSG_WRONG_WAY, ARW_MSG_LIFE, ARW_MSG_HOLD,
                          ARW_MSG_ANIM);
+            /* LOW SIGNAL -- message slot 0, and the last of the eleven that had
+             * nothing to raise it. `known-issues.md' said it was "a network-link
+             * warning and this port has no network", which stopped being true
+             * when net.c was written and nobody went back for the banner.
+             *
+             * WHEN: a peer has been quiet for longer than the newest sample can
+             * be carried forward (NET_DR_MAX, net.h), which is the moment its
+             * car FREEZES on screen instead of dead-reckoning. That is the first
+             * moment the player can see the link fail, so it is the moment to
+             * name it; NET_TIMEOUT takes the slot 4.5 s later if it stays quiet.
+             *
+             * POSTED EVERY FRAME the condition holds, exactly as WRONG WAY above
+             * is and for the same reason: the poster drops a post of the slot
+             * already showing, so this is one flash per life-plus-hold rather
+             * than one a frame. The engine's own slot 0 carries no hold, so this
+             * gives it WRONG WAY's -- the port's choice, and the alternative is a
+             * banner that strobes at 60 Hz through a bad patch. */
+            if (net_race && net_link_silence() > NET_DR_MAX)
+                msg_post(&msgs, MSG_LOW_SIGNAL, ARW_MSG_LIFE, ARW_MSG_HOLD, 0);
             /* cp_beside -- shipped, named, packed, and never loaded until the
                engine's own trigger for it was read. One per checkpoint, as the
                car leaves a marker it actually reached. */
@@ -2827,24 +3151,48 @@ unsigned int acc_ticks = 0;
             brk = 0.f;
             lx = 0.f;
         }
-        /* AND THE RACE IS OVER, so the car is not the player's any more: full
-         * brake, no throttle, no steering, until it is standing still.
+        /* AND THE RACE IS OVER, so the car is not the player's any more: no
+         * throttle, no steering, and the DRIVE INHIBITED until it is standing
+         * still.
          *
-         * BRAKE, NOT A FREEZE. The countdown above holds the car by spending no
-         * physics ticks at all, which is right on the grid -- the car is
-         * stationary and nothing has to settle. At the flag it is doing 20 km/h
-         * and stopping the world under it would leave it hanging mid-corner with
-         * the suspension loaded. Braking is what the car does, through the model
-         * that already exists, so it settles on its springs and the dust and the
-         * tyre marks finish the way they would have.
+         * NOT A FREEZE. The countdown above holds the car by spending no physics
+         * ticks at all, which is right on the grid -- the car is stationary and
+         * nothing has to settle. At the flag it is doing 20 km/h and stopping
+         * the world under it would leave it hanging mid-corner with the
+         * suspension loaded. It has to come to a stop through the model that
+         * already exists, so it settles on its springs and the dust and the tyre
+         * marks finish the way they would have.
+         *
+         * AND NOT A BRAKE EITHER, WHICH IS WHAT THIS USED TO BE. `brk = 1' held
+         * forever reads as the obvious way to stop a car and in this model it is
+         * the way to REVERSE one: rb_drive_forces flips to gear -1 as soon as
+         * the brake is held below 2 m/s and rb_engine_accel then reads the brake
+         * as reverse throttle, so the car braked to a crawl off the finish line
+         * and drove backwards away from it at up to 12 km/h. Reported as "when
+         * race finish, player car start goes backward instead of stop". The
+         * comment above it said "until it is standing still" and nothing made
+         * that true.
+         *
+         * `rbcar_hold' raises the engine's own `in.blocked' instead -- no engine
+         * force in either direction and the wheels locked, so friction takes the
+         * speed out and nothing can put any back in. HELD from there on, not
+         * released: a blocked car is allowed to fall asleep (see collide.c on
+         * the five input bits the rest timers actually test, one of which this
+         * port had wrongly added the block to), so the REST CLAMP takes it after
+         * two seconds under the threshold and parks it the way the engine parks
+         * any settled car -- momenta zeroed, the whole step skipped. The first
+         * version of this fix released the hold at RB_REST_SPEED instead and
+         * three of the ten tracks then traded gravity against friction forever
+         * at 0.37 m/s, which `flaghold' measures.
          *
          * The free camera still flies: it is not part of the race, which is the
          * same rule the countdown follows. */
         if (race_over && !free_cam) {
             thr = 0.f;
-            brk = 1.f;
+            brk = 0.f;
             lx = 0.f;
         }
+        rbcar_hold(&rc, (race_over && !free_cam) ? 1 : 0);
 
         float ex, ey, ez, vyaw, vpitch;
         if (free_cam) {
@@ -3080,7 +3428,13 @@ unsigned int acc_ticks = 0;
                         {
                             int nr = char_car_react(&chars, &rc);
                             unsigned int ri;
-                            for (ri = 0; nr && ri < chars.n_inst; ri++)
+                            for (ri = 0; nr && ri < chars.n_inst; ri++) {
+                                /* THE THROW, which is the one reaction with no
+                                   cue of its own (see the comment below) and is
+                                   therefore the one the award book has to raise
+                                   for itself. An edge, like every imp_kind. */
+                                if (chars.inst[ri].imp_kind == CHR_IMP_THROW)
+                                    award_thrown();
                                 if (chars.inst[ri].imp_kind == CHR_IMP_SHOT)
                                     /* car_cdt_bullet -- NOT positional: it is
                                        the player's own car, which is where the
@@ -3097,6 +3451,7 @@ unsigned int acc_ticks = 0;
                                        what the player gets, which is more
                                        acknowledgement than the props had. */
                                     sfx_bullet_hit();
+                            }
                         }
                         /*
                          * AND WHILE SOMEONE IS HOLDING IT, THE CAR IS NOT
@@ -3147,6 +3502,15 @@ unsigned int acc_ticks = 0;
                                    rather than an invented one, which is the rule
                                    this comment already existed to enforce. */
                                 sfx_char_wav(chr_model_wav(&chars, ci), p, 1.f);
+                                /* AND THE AWARD BOOK, off the same two edges.
+                                   CHR_EV_HURT is anything run over -- a person,
+                                   a dog, a crab -- which is what
+                                   `Pedestrian Crossing' counts, and CHR_EV_SHOOT
+                                   is a guard opening fire. */
+                                if (ev == CHR_EV_HURT)
+                                    award_run_over();
+                                if (ev == CHR_EV_SHOOT)
+                                    award_shot_at();
                                 /* AND A GUARD OPENING FIRE HAS ITS OWN CUE ON
                                    TOP OF ITS VOICE: `bullet`, which snd.dat
                                    names and Sound/bullet.wav ships. One report
@@ -3181,6 +3545,18 @@ unsigned int acc_ticks = 0;
                                cluster of cans in one pass counts up inside a
                                single pop rather than stacking words. */
                             hud_hit(&hud, props.p[pi].hit_speed);
+                            /* AND THE AWARD BOOK COUNTS IT. Every prop, not
+                               every pop: a cluster taken out in one pass is one
+                               banner and three knocks. The speed floor is
+                               hud_hit's, above -- what the player is told about
+                               is what gets counted. */
+                            award_prop();
+                            /* AND SO DOES THE CHAMPIONSHIP'S BONUS, off the
+                               same edge and for the same reason the engine
+                               does: FUN_004f5e50 bumps its counter in the
+                               branch that raises !HIT!, so what the banner
+                               says is what the prize is paid on. champ.h. */
+                            race_hits++;
                         }
                 }
                 if (ticks < 0 && ++phys_clip_log <= 10)
@@ -3283,8 +3659,33 @@ unsigned int acc_ticks = 0;
                     && veh.y < wy - DROWN_DEPTH) {
                     rlog("[rccars] died: drowned (%d cm under)\n",
                                   (int)((wy - veh.y) * 100.f));
+                    award_drowned();
                     respawn_checkpoint();
                 }
+            }
+            /* THE AWARD BOOK'S PER-FRAME WATCH -- awards.h, which takes plain
+             * numbers and keeps the edges itself. Here, at the end of the
+             * frame's physics, because every one of the six is current by this
+             * point: the car has been stepped, the props and the characters
+             * have been resolved, and the two deaths above have been raised.
+             *
+             * `speed_max' IS THE DIAL'S OWN FULL SCALE and the expression is
+             * race_ui's, written out again rather than shared -- the same choice
+             * that file and sfx.c make about it, and for the same reason: this
+             * must still be right on a build where either of those is broken.
+             * `Pegged' is a fraction of it, so it means "your own car flat out"
+             * on all three cars and every resonator level.
+             *
+             * boost_lock is the meter's emptied latch and no_contact_t is the
+             * car's own airborne clock -- rb.h names both. */
+            {
+                float top = rc.tune.speed_boost_max;
+                const int rr = rc.reso_upgrade;
+                if (rr >= 0 && rr < 4)
+                    top *= rc.tune.resonator_speed[rr];
+                award_frame(dt, rbcar_speed(&rc), top / 3.6f,
+                            rc.no_contact_t, rc.boost_lock,
+                            dirarrow_wrong(&dir_arrow), hud_is_great(&hud));
             }
             /* The orbit offsets used to accumulate forever, so any stick nudge
                or drift left the camera permanently off-axis -- very visible now
@@ -3620,6 +4021,11 @@ unsigned int acc_ticks = 0;
             ui_begin(SCR_W, SCR_H);
             mainmenu_draw(&mm, SCR_W, SCR_H);
             ui_end();
+            /* THE AWARD TOAST, over the front end and under the settings
+               overlay -- the band it sits in (awards.c) is the HUD's, so on the
+               menu it is simply over the artwork. Drawn here as well as in the
+               race path because an award can land in the Garage. */
+            award_draw(&award_art, SCR_W, SCR_H);
             if (menu.open)
                 menu_draw(&menu, SCR_W, SCR_H);
             goto frame_end;
@@ -4050,6 +4456,12 @@ unsigned int acc_ticks = 0;
             results_draw(&results, SCR_W, SCR_H);
             ui_end();
         }
+
+        /* THE AWARD TOAST, over the world and the finish screen both -- it is
+           not one of the message layer's slots and overlaps none of them: it
+           lives in the one band of the HUD frame nothing else is in, which is
+           what awards.c's own rect comment enumerates. */
+        award_draw(&award_art, SCR_W, SCR_H);
 
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)

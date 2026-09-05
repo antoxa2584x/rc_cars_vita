@@ -42,6 +42,43 @@ static player_t roster[PL_MAX];
 static int      n_roster;
 static int      cur = -1;
 
+/* WHO THE PLAYER RACED AS LAST TIME, and it is a FILE because nothing else in
+ * the roster remembers. `player_scan' walks the directory and took the first
+ * `.scp' it found, so a launch always came up as whoever the card happened to
+ * list first -- pick a profile, quit, come back and you are somebody else, with
+ * their cash and their championship.
+ *
+ * WHY NOT settings.txt. That file is "the persisted subset of menu_t, and
+ * nothing else" (settings.h), all int so the struct can be memcmp'd against the
+ * last thing written; the current profile is neither in `menu_t` nor an int.
+ * The roster is this file's business, so the marker lives beside it -- one line
+ * naming the profile's own file base, in the directory the profiles are in. The
+ * scan already ignores everything that is not a `.scp', and the game's own
+ * Players/ carries a `descript.txt' next to them, so a stray text file there is
+ * in keeping and a Players/ copied to a PC install is unharmed.
+ *
+ * WRITTEN ON THE SAME EVENT EVERY OTHER SAVE IN THIS APP IS. Selecting a row
+ * only marks it: `player_save_cur_if_dirty' is called from eight places that
+ * already know when it is safe to touch the card, and walking a roster of
+ * twenty with a write per keypress is exactly the memory-card habit audio.md
+ * forbids. */
+#define PL_LAST_FILE "last.txt"
+static char sel_file[PL_NAME + 8];   /* the base name last written, or "" */
+static int  sel_dirty;
+
+/* Every assignment to `cur' goes through this, so the marker cannot fall out of
+   step with the selection -- create and remove move it too. */
+static void set_cur(int i)
+{
+    const char *f;
+    cur = i;
+    f = (i >= 0 && i < n_roster) ? roster[i].file : "";
+    if (strncmp(sel_file, f, sizeof sel_file - 1) != 0) {
+        snprintf(sel_file, sizeof sel_file, "%s", f);
+        sel_dirty = 1;
+    }
+}
+
 /* One FNV-1a per shipped portrait, so an incoming one can be named without the
    1.1 MB of pixels being resident. Filled by player_faces_init; `n_faces` is 0
    until then and every match then answers -1, which writes no portrait chunk. */
@@ -688,6 +725,8 @@ void player_set_dir(const char *dir)
     dir_path = dir ? dir : PL_DIR;
     n_roster = 0;
     cur = -1;
+    sel_file[0] = 0;
+    sel_dirty = 0;
 }
 
 int player_count(void) { return n_roster; }
@@ -703,7 +742,7 @@ int       player_cur_index(void) { return cur; }
 void player_select(int i)
 {
     if (i >= 0 && i < n_roster)
-        cur = i;
+        set_cur(i);
 }
 
 int player_index_of(const char *name)
@@ -780,6 +819,9 @@ static int load_one(const char *path, const char *base, player_t *p)
     return 1;
 }
 
+/* Defined with the other save, below; the scan is what reads it. */
+static int  load_selection(void);
+
 static int has_scp_ext(const char *n)
 {
     const int l = (int)strlen(n);
@@ -836,8 +878,14 @@ int player_scan(void)
     }
 #endif
 
-    if (n_roster > 0)
-        cur = 0;
+    /* THE PROFILE THE LAST LAUNCH ENDED ON, and the first row only when there
+       is no marker or it names somebody who is gone. */
+    if (n_roster > 0) {
+        const int last = load_selection();
+        cur = last >= 0 ? last : 0;
+        if (last < 0)
+            set_cur(cur);       /* nothing on the card yet: write one */
+    }
     for (i = 0; i < n_roster; i++)
         rlog("[rccars] player: %s -- %s, %d scores, $%d, face %d\n",
              roster[i].file, roster[i].name, roster[i].scores,
@@ -917,9 +965,69 @@ int player_save(int i)
     return 1;
 }
 
+/* The marker, if the selection has moved since it was last written. */
+static void save_selection(void)
+{
+    char path[320];
+    FILE *f;
+
+    if (!sel_dirty)
+        return;
+    sel_dirty = 0;              /* one attempt: a card that will not take it
+                                   must not be asked again every save */
+    join(path, sizeof path, dir_path, PL_LAST_FILE);
+    f = fopen(path, "wb");
+    if (!f) {
+        rlog("[rccars] player: could not write %s\n", path);
+        return;
+    }
+    fprintf(f, "%s\n", sel_file);
+    fclose(f);
+}
+
+/* Which profile the last launch ended on, or -1. */
+static int load_selection(void)
+{
+    char path[320], line[PL_NAME + 8];
+    FILE *f;
+    int i, n;
+
+    sel_file[0] = 0;
+    sel_dirty = 0;
+    join(path, sizeof path, dir_path, PL_LAST_FILE);
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    if (!fgets(line, sizeof line, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    n = (int)strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
+                     || line[n - 1] == ' '))
+        line[--n] = 0;
+    if (n == 0)
+        return -1;
+    for (i = 0; i < n_roster; i++)
+        if (ci_eq(roster[i].file, line)) {
+            /* remember what is already on the card, so a launch that changes
+               nothing writes nothing */
+            snprintf(sel_file, sizeof sel_file, "%s", roster[i].file);
+            return i;
+        }
+    rlog("[rccars] player: %s names `%s', which is not in the roster\n",
+         PL_LAST_FILE, line);
+    return -1;
+}
+
 int player_save_cur_if_dirty(void)
 {
     player_t *p = player_cur();
+    /* THE MARKER GOES FIRST AND UNCONDITIONALLY. Choosing a different profile
+       does not make that profile dirty -- nothing about it changed -- so a save
+       gated on `p->dirty' would never write the one thing that did. */
+    save_selection();
     if (!p || !p->dirty)
         return 0;
     return player_save(cur);
@@ -957,7 +1065,7 @@ int player_create(const char *name, int face)
         n_roster--;             /* not kept: a profile with no file is a lie */
         return -4;
     }
-    cur = n_roster - 1;
+    set_cur(n_roster - 1);
     return 0;
 }
 
@@ -984,8 +1092,10 @@ int player_remove(int i)
     /* The selection follows the list rather than the index: removing the row
        above the current one must not move which profile is current. */
     if (cur > i)
-        cur--;
+        set_cur(cur - 1);
     else if (cur == i)
-        cur = i < n_roster ? i : n_roster - 1;
+        set_cur(i < n_roster ? i : n_roster - 1);
+    else
+        set_cur(cur);       /* the row moved under it; re-read its file */
     return 0;
 }

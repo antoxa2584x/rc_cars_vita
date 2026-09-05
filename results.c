@@ -7,6 +7,7 @@
 #include "ui.h"
 #include "hud_data.h"       /* HUD_REF_W/H */
 #include "dlg_data.h"
+#include "str_data.h"   /* the bonus block's own five strings */
 
 #include <stdio.h>
 #include <string.h>
@@ -344,6 +345,68 @@ void results_draw(const results_t *r, int screen_w, int screen_h)
 
         snprintf(buf, sizeof buf, "%.2f km/h", w->av_speed);
         res_text(&small_, rx(&f, res_col_x(5)), ty, sc, ra, buf);
+    }
+
+    /* --- THE CHAMPIONSHIP'S BONUS BLOCK, on dlgFINISH's own tableBonus -----
+     *
+     * Drawn only for a championship round; a quick race leaves `champ.up' at 0
+     * and this screen is the one it has always been. Five lines on the
+     * rectangle the dialog ships for them, in the engine's own words:
+     *
+     *     Hit bonus (n hits):     n*5
+     *     Gap bonus (n sec):      n*5
+     *     Max bonus allowed: $n
+     *     Prize cash              $n
+     *     Race score              n
+     *
+     * TWO COLUMNS, not five: tableBonus ships widths 32/8/13/39/8 and the exe
+     * writes columns 0, 1, 3 and 4 of one row -- a label and a figure, twice.
+     * This puts the label at column 0's left edge and the figure at column 1's,
+     * which is that shape read DOWN the page instead of across it, because the
+     * table is 55 px tall and five lines do not fit inside one row of it.
+     */
+    if (r->champ.up) {
+        const float bx = rx(&f, DLG_FINISH_tableBonusX0);
+        const float vx = rx(&f, DLG_FINISH_tableBonusX0
+                               + DLG_FINISH_tableBonusSX
+                                 * DLG_FINISH_tableBonusWidth0);
+        const float pitch = f.us * 22.f;
+        float by = ry(&f, DLG_FINISH_tableBonusY0);
+        char buf[96];
+
+        snprintf(buf, sizeof buf, STR_UI_HIT_BONUS, r->champ.hits);
+        res_text(&small_, bx, by, sc, a, buf);
+        snprintf(buf, sizeof buf, "%d", r->champ.hits * 5);
+        res_text(&small_, vx, by, sc, a, buf);
+        by += pitch;
+        snprintf(buf, sizeof buf, STR_UI_GAP_BONUS, r->champ.gap_sec);
+        res_text(&small_, bx, by, sc, a, buf);
+        snprintf(buf, sizeof buf, "%d", r->champ.gap_sec * 5);
+        res_text(&small_, vx, by, sc, a, buf);
+        by += pitch;
+        {
+            char money[24];
+            snprintf(money, sizeof money, "$%d", r->champ.allowed);
+            snprintf(buf, sizeof buf, STR_UI_MAX_BONUS, money);
+            res_text(&small_, bx, by, sc, a, buf);
+        }
+        by += pitch;
+        /* AND WHAT IT ACTUALLY PAID. `paid' is one figure and it lands in BOTH
+           the purse and the career total, which is why the same number is on
+           two lines under two labels -- champ.h. Zero off the podium, and the
+           engine has a line for that too: 41320, "No prize money". */
+        if (r->champ.paid > 0) {
+            char money[24];
+            snprintf(money, sizeof money, "$%d", r->champ.paid);
+            res_text(&small_, bx, by, sc, a, STR_UI_PRIZE_CASH);
+            res_text(&small_, vx, by, sc, a, money);
+            by += pitch;
+            snprintf(buf, sizeof buf, "%d", r->champ.paid);
+            res_text(&small_, bx, by, sc, a, STR_UI_RACE_SCORE);
+            res_text(&small_, vx, by, sc, a, buf);
+        } else {
+            res_text(&small_, bx, by, sc, a, STR_UI_NO_PRIZE);
+        }
     }
 
     /* --- buttonAbort and the one the table calls `none' ------------------- */

@@ -400,6 +400,30 @@ int      net_slot(void) { return N.slot; }
 int      net_is_host(void) { return N.mode == NET_HOSTING
                                  || (N.mode == NET_RACING && N.slot == 0); }
 int      net_race_over(void) { return N.race_over; }
+
+/* HOW LONG THE QUIETEST LIVE PEER HAS BEEN QUIET. See net.h. */
+float net_link_silence(void)
+{
+    float worst = 0.f;
+    int i;
+
+    if (N.mode != NET_JOINED && N.mode != NET_RACING && N.mode != NET_HOSTING)
+        return 0.f;
+    for (i = 0; i < NET_MAX; i++) {
+        const net_peer *q = &N.peer[i];
+        float quiet;
+        /* OUR OWN SLOT IS NOT A LINK, and neither is an empty one. A peer that
+           has never been heard from at all is not counted either: `heard' is 0
+           until its first packet, and a slot that has just been filled by a
+           JOIN would otherwise report the whole clock as silence. */
+        if (!q->used || i == N.slot || q->heard <= 0.f)
+            continue;
+        quiet = N.clock - q->heard;
+        if (quiet > worst)
+            worst = quiet;
+    }
+    return worst;
+}
 const net_settings *net_settings_now(void) { return &N.set; }
 
 void net_test_advance(float s) { N.clock += s; }

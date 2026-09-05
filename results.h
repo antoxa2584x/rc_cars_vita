@@ -81,9 +81,30 @@ typedef struct {
     int   is_player;
 } results_row;
 
+/* THE CHAMPIONSHIP'S OWN HALF OF THIS SCREEN, which dlgFINISH has always
+ * carried and this port had nothing to put in: `tableBonus' and the four
+ * `staticBonus*' controls, drawn only when the race that just ended was a
+ * championship round. The engine's own words for them are 41314 "Hit bonus (%i
+ * hits):", 41316 "Gap bonus (%i sec):", 41318 "Max bonus allowed: %s" and
+ * 41308/41309 "Prize cash" / "Race score"; champ.h is the arithmetic.
+ *
+ * `up' is what turns the block on -- a quick race leaves it 0 and the screen is
+ * the one it has always been.
+ */
+typedef struct {
+    int   up;                /* this was a championship round */
+    int   hits;              /* !HIT! events, and hits * 5 points */
+    int   gap_sec;           /* seconds to the car behind, rounded */
+    int   allowed;           /* the cap -- the track's own Place3 */
+    int   paid;              /* prize + bonus, and it lands in BOTH cash and
+                                scores, which is why one figure carries two
+                                labels on the screen */
+} results_champ;
+
 typedef struct {
     results_tex tex;
     results_row row[RES_MAX_ROWS];
+    results_champ champ;
     int   n;
     int   focus;             /* RES_BTN_* */
     int   armed;             /* the button a touch went down on, or -1 */

@@ -803,7 +803,19 @@ void rb_car_rest_update(rb_car *c, float dt)
     /* boost_button, not boost: this asks what the driver is holding, and
        in.boost is now the meter's verdict -- an empty meter must not be able to
        let a car the driver is still leaning on fall asleep. */
-    if (c->in.accel || c->in.brake || c->in.boost_button || c->in.blocked
+    /* AND `blocked' IS NOT ONE OF THEM, which is the original's own list and
+       was this port's own addition to it: the drive inhibit is 0x5784 and the
+       five bits above are 0x575c..0x577c. The distinction is not academic --
+       those five are things the DRIVER is holding, and 0x5784 is the GAME
+       saying this car is not being driven at all, which is the one state a car
+       most needs to be allowed to fall asleep in. With it in this test the flag
+       hold at the end of a race could never reach the rest clamp, so a car
+       parked on a 1 degree slope traded gravity against sliding friction
+       forever at a tenth of a metre a second -- backwards, on three of the ten
+       tracks. See rbcar_hold and `flaghold'. Nothing else in this port has ever
+       set the bit, so removing it from here changes no number anywhere else:
+       `allstarts' is bit-identical across the change. */
+    if (c->in.accel || c->in.brake || c->in.boost_button
         || c->in.jump) {
         c->rest_slow_t   = 0.0f;
         c->rest_spin_t   = 0.0f;
@@ -818,7 +830,7 @@ void rb_car_rest_update(rb_car *c, float dt)
               + (double)c->body.P[1]*c->body.P[1]
               + (double)c->body.P[2]*c->body.P[2]);
     pick = (sv <= sp) ? sp : sv;
-    if (pick >= 0.3611111)
+    if (pick >= RB_REST_SPEED)
         c->rest_slow_t = 0.0f;
     else
         c->rest_slow_t = (float)((double)c->rest_slow_t + dt);

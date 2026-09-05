@@ -45,6 +45,30 @@
 typedef char ai_sample_size_check[(sizeof(ai_sample) == AI_SAMPLE_BYTES)
                                   ? 1 : -1];
 
+/* HOW FAR UP A CONTACT MAY EVER PUT THIS CAR: one car height, off its own
+   proxy, so a Hummer may be lifted further than a Buggy because it IS taller
+   and a change to the proxy carries through by itself. See ai_bump_clamp for
+   why the bound exists and why it is not in ai_pair_resolve. */
+static void ai_bump_up_derive(ai_car *a)
+{
+    float s[RB_MAX_SPHERES][4];
+    double lo = 1e30, hi = -1e30;
+    int n, i;
+
+    n = rb_gather_spheres(&a->rb, s);
+    for (i = 0; i < n; i++) {
+        if ((double)s[i][1] - s[i][3] < lo) lo = (double)s[i][1] - s[i][3];
+        if ((double)s[i][1] + s[i][3] > hi) hi = (double)s[i][1] + s[i][3];
+    }
+    /* A proxy that gathered nothing leaves the bound where it was, which for a
+       car that has never been posed is `bump_reach' -- generous, and the old
+       behaviour, rather than a car that cannot be lifted at all. */
+    if (n > 0 && hi > lo)
+        a->bump_up = (float)(hi - lo);
+    else if (a->bump_up <= 0.0f)
+        a->bump_up = a->bump_reach;
+}
+
 static void ai_bump_derive(ai_car *a);
 static void ai_bump_clamp(ai_car *a);
 static void ai_bump_apply(ai_car *a);
@@ -207,9 +231,11 @@ int ai_init(ai_t *ai, int track, const char *asset_dir, const rb_world *w,
 
         if ((ai->championship || g_skill_field) && !(u16[2] & mask))
             continue;
-        /* The field is AI_MAX_FIELD, not the layout's five -- see ai.h. Capped
-           here rather than at the array bound so the entries that do start keep
-           their own FILE slot, and therefore their own spline. */
+        /* The array bound, and nothing else: the FIELD SIZE is the difficulty
+           mask's, above -- three at easy, five at hard -- and ai.h says why
+           this stopped being a cap of its own. Tested here rather than at the
+           array bound so the entries that do start keep their own FILE slot,
+           and therefore their own spline. */
         if (ai->n >= AI_MAX_FIELD)
             break;
 
@@ -491,6 +517,8 @@ static void ai_bump_derive(ai_car *a)
     a->bump_yaw_limit = (float)(AI_BUMP_YAW_LOCKS * d->steer_max_deg
                                 * (3.14159265358979 / 180.0));
     a->bump_wall      = -1.0f;         /* not measured */
+    a->bump_up        = 0.0f;
+    ai_bump_up_derive(a);
 }
 
 /* HOW FAR THE LEVEL LETS THIS SHOVE GO, along the offset's own horizontal
@@ -850,6 +878,14 @@ static void ai_pose(ai_car *a)
     ai_pose_rec(a);
     memcpy(a->rec_x, a->rb.body.x, sizeof(a->rec_x));
     memcpy(a->rec_q, a->rb.body.q, sizeof(a->rec_q));
+    /* THE LIFT BOUND FOLLOWS THE POSE. `bump_up' is one car height and a car's
+       proxy height is not a constant -- it is thirteen spheres on a rig whose
+       wheels move, and it is measured at whatever attitude the recording has
+       the car in this tick. Derived once at load it was a centimetre or two out
+       of step with the same measurement taken live, which is a bound that is
+       occasionally the wrong side of the invariant it exists to keep. One
+       gather per car per tick, on a rig the contact solve gathers anyway. */
+    ai_bump_up_derive(a);
     ai_bump_apply(a);
 }
 
@@ -876,6 +912,32 @@ static void ai_bump_clamp(ai_car *a)
     if (a->off[1] < -AI_BUMP_MAX_SINK) {
         a->off[1] = -AI_BUMP_MAX_SINK;
         if (a->offv[1] < 0.0f) a->offv[1] = 0.0f;
+    }
+    /* AND UP IS BOUNDED TOO NOW, AT ONE CAR HEIGHT -- which the paragraph above
+     * used to say it was not ("upward it is bounded only by the offset limit
+     * below"). That was true and it was not enough: `bump_limit` is what the
+     * car's GRIP could slide it, 1.4 m on the Overkill, and a lift exists only
+     * to get one car up over another. The most that can ever honestly take is
+     * the height of a car; past it the opponent is simply in the air.
+     *
+     * WHY IT IS HERE and not in ai_pair_resolve, where the lift is applied:
+     * because the lift is not the only thing that raises off[1]. The positional
+     * branch's give-back makes a PAIR zero-sum, and RAISING AI_MAX_FIELD TO THE
+     * LAYOUT'S FIVE (ai.h) showed that a pair is the wrong unit -- with ten
+     * pairs a tick instead of three a car is the upper one in four of them at
+     * once, and what it cannot take positionally it takes through offv[1] out
+     * of the impulse half instead. Capping the positional share alone made the
+     * survey WORSE (0.744 m to 1.195 m), because the pair then stays inside
+     * itself for longer. This is the one place every path -- push, impulse and
+     * relax -- is funnelled through, which is what the function's own header
+     * comment says it is for.
+     *
+     * The outward velocity goes with it, for ai_bump_clamp's own reason: an
+     * offset velocity climbing against a position that cannot move is a car
+     * that reports it is getting out of the way while standing still. */
+    if (a->bump_up > 0.0f && a->off[1] > a->bump_up) {
+        a->off[1] = a->bump_up;
+        if (a->offv[1] > 0.0f) a->offv[1] = 0.0f;
     }
     /* Then ONE budget over all three axes, so `bump_limit` means what it says --
        how far from its line the car can be, full stop. Bounding the horizontal
@@ -1757,6 +1819,22 @@ void ai_remote_pose(ai_t *ai, int i, const ai_sample *s)
     for (k = 0; k < 3; k++)
         a->rb.body.v[k] = (float)s->mom[k] / AI_VEL_SCALE;
     a->rb.body.w[0] = a->rb.body.w[1] = a->rb.body.w[2] = 0.f;
+    /* AND `speed' WITH IT, or the car drives past in silence. That field is
+     * filled by ai_step -- which a remote slot never enters -- so it stayed 0
+     * for the whole race while main.c pitched the opponent's motor voice by
+     * `speed / top'. A car that sounds stopped while it overtakes you was the
+     * report; the number was on the wire the whole time.
+     *
+     * THE SAME EXPRESSION ai_step ENDS ON, all three axes and not the two a
+     * ground speed would use -- so a remote car's `speed' means exactly what a
+     * replayed one's does and the two can be compared. Grepped before writing,
+     * per traps.md: the only other reader that can see a remote slot is
+     * TRIANGLE's inventory dump, which was printing the same 0 and is now
+     * honest too. ai.c's own readers are all inside the step and decide paths,
+     * and neither runs for a remote car. */
+    a->speed = (float)sqrt((double)a->rb.body.v[0] * a->rb.body.v[0]
+                           + (double)a->rb.body.v[1] * a->rb.body.v[1]
+                           + (double)a->rb.body.v[2] * a->rb.body.v[2]);
 }
 
 void ai_reset(ai_t *ai)
@@ -2764,8 +2842,31 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3])
 static void ai_collide_field(ai_t *ai)
 {
     float as[RB_MAX_SPHERES][4], bs[RB_MAX_SPHERES][4];
-    int i, j;
+    int i, j, sweep;
+    /* HOW MANY TIMES THE PAIR LIST IS SWEPT, and it is not a tuning number: the
+     * pairs are solved one at a time, in place, so this is Gauss-Seidel over a
+     * contact GRAPH, and Gauss-Seidel needs about as many sweeps as the graph is
+     * wide. With three opponents the graph is three pairs and one sweep reaches
+     * everything; with five it is ten pairs and a correction made on the first
+     * pair is undone by the last one before the tick ends.
+     *
+     * Raising AI_MAX_FIELD to the layout's five (ai.h) is what showed it: the
+     * ten-track survey's worst overlap went from 0.037 m to 0.061 m, past a
+     * Buggy's own wheel sphere (0.049 m), which is the anchor aitest's five-
+     * centimetre bound is set from.
+     *
+     * `n - 1' is the DIAMETER of the worst graph n cars can form -- a chain --
+     * and therefore how many sweeps it takes a correction at one end to reach
+     * the other. Measured on the ten-track survey at five opponents: one sweep
+     * leaves 0.061 m, three leave 0.037, four (n-1) leave 0.036, and ten leave
+     * 0.042 while distorting the deciding-against-not comparison, so more is
+     * not better. It costs nothing on the field this had before -- three
+     * opponents is two sweeps of a three-pair list. */
+    int sweeps = ai->n - 1;
+    if (sweeps < 1) sweeps = 1;
+    if (sweeps > AI_FIELD_SWEEPS_MAX) sweeps = AI_FIELD_SWEEPS_MAX;
 
+    for (sweep = 0; sweep < sweeps; sweep++)
     for (i = 0; i < ai->n; i++) {
         for (j = i + 1; j < ai->n; j++) {
             ai_actor A, B;

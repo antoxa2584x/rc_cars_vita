@@ -452,6 +452,72 @@
 #define DLG_WAITPLAYERS_CARRESTR_chatSX          425.f
 #define DLG_WAITPLAYERS_CARRESTR_chatSY          90.f
 
+/* dlgCHAMP.ini -- 18 keys */
+#define DLG_CHAMP_staticMapNameX0                115.f
+#define DLG_CHAMP_staticMapNameY0                455.f
+#define DLG_CHAMP_staticMapNameSX                413.f
+#define DLG_CHAMP_staticMapNameSY                40.f
+#define DLG_CHAMP_staticMapInfoX0                114.f
+#define DLG_CHAMP_staticMapInfoY0                497.f
+#define DLG_CHAMP_staticMapInfoSX                413.f
+#define DLG_CHAMP_staticMapInfoSY                91.f
+#define DLG_CHAMP_tableMainX0                    88.f
+#define DLG_CHAMP_tableMainY0                    233.f
+#define DLG_CHAMP_tableMainSX                    440.f
+#define DLG_CHAMP_tableMainSY                    227.f
+#define DLG_CHAMP_tableMainHeadHeight            0.1600f   /* 16% */
+#define DLG_CHAMP_tableMainItemHeight            0.1300f   /* 13% */
+#define DLG_CHAMP_tableMainColWidht0             0.2000f   /* 20% */
+#define DLG_CHAMP_tableMainColWidht1             0.2000f   /* 20% */
+#define DLG_CHAMP_tableMainColWidht2             0.1700f   /* 17% */
+#define DLG_CHAMP_tableMainColWidht3             0.1200f   /* 12% */
+
+/* dlgCHRACE.ini -- 44 keys */
+#define DLG_CHRACE_tableX0                       79.f
+#define DLG_CHRACE_tableY0                       109.f
+#define DLG_CHRACE_tableSX                       604.f
+#define DLG_CHRACE_tableSY                       318.f
+#define DLG_CHRACE_tableHeadHeight               0.1000f   /* 10% */
+#define DLG_CHRACE_tableItemHeight               0.1500f   /* 15% */
+#define DLG_CHRACE_tableColWidht0                0.0900f   /* 9% */
+#define DLG_CHRACE_tableColWidht1                0.1900f   /* 19% */
+#define DLG_CHRACE_tableColWidht2                0.2100f   /* 21% */
+#define DLG_CHRACE_tableColWidht3                0.1700f   /* 17% */
+#define DLG_CHRACE_tableColWidht4                0.1700f   /* 17% */
+#define DLG_CHRACE_staticHeaderX0                66.f
+#define DLG_CHRACE_staticHeaderY0                73.f
+#define DLG_CHRACE_staticHeaderSX                518.f
+#define DLG_CHRACE_staticHeaderSY                30.f
+#define DLG_CHRACE_staticMapInfoX0               140.f
+#define DLG_CHRACE_staticMapInfoY0               44.f
+#define DLG_CHRACE_staticMapInfoSX               520.f
+#define DLG_CHRACE_staticMapInfoSY               60.f
+#define DLG_CHRACE_tableMordaShift               0.0800f   /* 8% */
+#define DLG_CHRACE_buttonRaceX0                  257.f
+#define DLG_CHRACE_buttonRaceY0                  530.f
+#define DLG_CHRACE_buttonRaceSX                  134.f
+#define DLG_CHRACE_buttonRaceSY                  36.f
+#define DLG_CHRACE_buttonBackX0                  414.f
+#define DLG_CHRACE_buttonBackY0                  530.f
+#define DLG_CHRACE_buttonBackSX                  134.f
+#define DLG_CHRACE_buttonBackSY                  36.f
+#define DLG_CHRACE_rectFrameX0                   10.f
+#define DLG_CHRACE_rectFrameY0                   18.f
+#define DLG_CHRACE_rectFrameSX                   782.f
+#define DLG_CHRACE_rectFrameSY                   573.f
+#define DLG_CHRACE_staticPaymentX0               140.f
+#define DLG_CHRACE_staticPaymentY0               416.f
+#define DLG_CHRACE_staticPaymentSX               520.f
+#define DLG_CHRACE_staticPaymentSY               60.f
+#define DLG_CHRACE_staticPrizeX0                 140.f
+#define DLG_CHRACE_staticPrizeY0                 48.f
+#define DLG_CHRACE_staticPrizeSX                 520.f
+#define DLG_CHRACE_staticPrizeSY                 60.f
+#define DLG_CHRACE_staticRemainderX0             140.f
+#define DLG_CHRACE_staticRemainderY0             446.f
+#define DLG_CHRACE_staticRemainderSX             520.f
+#define DLG_CHRACE_staticRemainderSY             60.f
+
 /* network.ini -- the multiplayer state rate. Emitted with its
    own declared RANGE, because the reading is not certain: the
    key is called a `FrameRate' and its slider runs 1..50, which

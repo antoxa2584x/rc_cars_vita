@@ -813,6 +813,8 @@ int char_init(chr_t *c, const char *path, const char *track, const col_t *col)
 void char_reset(chr_t *c)
 {
     unsigned int i;
+    /* Until char_car_solid has gathered a real one -- see char.h. */
+    c->car_reach = CHR_CAR_REACH;
     for (i = 0; i < c->n_inst; i++) {
         chr_inst_t *in = &c->inst[i];
         const chr_place_t *pl = in->place;
@@ -897,6 +899,16 @@ void char_reset(chr_t *c)
         } else if (pl->kind != CHR_KIND_PATH) {
             drop(c, in);
         }
+    }
+
+    /*
+     * AND EVERY PROXY BUILT ONCE, for its reach -- so an instance that has
+     * never been within CHR_SOLID_RANGE of the car still has one, and
+     * dog_keep_out is never reading a zero. One pose each, at a reset.
+     */
+    for (i = 0; i < c->n_inst; i++) {
+        float hs[CHR_PROXY_MAX][4];
+        char_proxy(c, i, hs);
     }
 }
 
@@ -1010,24 +1022,55 @@ static float face(float x, float z, float tx, float tz)
     return atan2f(tx - x, tz - z) / DEG;
 }
 
-/* Walk toward (tx, tz) at `speed`; returns 1 on arrival within `reach`. */
+/*
+ * Walk toward (tx, tz) at `speed`; returns 1 on arrival within `reach`.
+ *
+ * IT STOPS ON THE RING AND NOT ON THE POINT, which is the difference between a
+ * reach and a ratchet. The first version tested arrival AFTER moving and
+ * clamped the step to the whole remaining distance, so every caller that goes
+ * back to CHR_ST_GO with the target still where it was closed a further
+ * `speed * dt` each time it was asked -- and the Dog is exactly that caller:
+ * GO arrives, ACT holds for TimeAttack, GO is entered again, and the target is
+ * the car, which has not moved. At AniSpeed 4.0 that is 0.13 m an attack, so a
+ * dog barking at a parked car walked INTO it a step and a half a second and
+ * ended up with its pivot 0.17 m from the car's origin: five 0.2 m bone
+ * spheres inside the car's thirteen, contact normals pointing both ways, and a
+ * car that could not drive out of it (0.36 m in five seconds at full throttle
+ * against an untouched control's 25.37). See `dogstuck`.
+ *
+ * Nothing else in the file wanted the old behaviour: the burrowers' 0.05 m and
+ * the Seagull's 0.25 m arrival radii are small enough that stopping on the ring
+ * is the same walk, and a target reached is a target reached.
+ */
 static int walk_to(chr_t *c, chr_inst_t *in, float speed, float reach,
                    float turn_rate, float dt)
 {
     float want = face(in->x, in->z, in->tx, in->tz);
     float d2 = dist2_xz(in->x, in->z, in->tx, in->tz);
-    float step;
+    float room, step;
+
     turn_to(in, want, turn_rate, dt);
-    step = speed * dt;
-    if (d2 > 1e-8f) {
-        float d = sqrtf(d2);
-        if (step > d) step = d;
-        in->x += sinf(in->yaw * DEG) * step;
-        in->z += cosf(in->yaw * DEG) * step;
+    if (d2 <= reach * reach) {
+        /* Already there: turn onto it, stand still. The speed is what the
+           caller's stride rate is computed from, so it has to be the truth. */
+        in->speed = 0.0f;
+        drop(c, in);
+        return 1;
     }
+    room = sqrtf(d2) - reach;
+    step = speed * dt;
+    if (step > room) step = room;
+    in->x += sinf(in->yaw * DEG) * step;
+    in->z += cosf(in->yaw * DEG) * step;
     drop(c, in);
     in->speed = speed;
-    return d2 <= reach * reach;
+    /* Measured AFTER the move, and not as `step reached room`: the step goes
+       along the heading, which is only turning toward the target, so a step
+       clamped to the straight-line remainder is a step that closes LESS than
+       that -- reporting arrival off the clamp alone stops a turning walker
+       short of its own ring. Clamped that way it can never cross the ring
+       either, so this only ever becomes true on it. */
+    return dist2_xz(in->x, in->z, in->tx, in->tz) <= reach * reach + 1e-4f;
 }
 
 /*
@@ -1396,6 +1439,40 @@ static int watch_step(chr_inst_t *in, const chr_watch_t *w, const float car[3],
  * What is not invented is any threshold in it: every number below is a
  * recovered constant or a point out of the instance's brief.
  */
+/*
+ * HOW CLOSE A DOG MAY BRING ITS PIVOT TO THE CAR'S ORIGIN. THE PORT'S, and it
+ * is a keep-out rather than a threshold.
+ *
+ * RadReach 0.30 m is a recovered constant and it is a distance to the TARGET
+ * POINT, which for the chase is the car's own origin (step_dog below writes
+ * in->tx = car[0], as the engine's own machine would). That works for the
+ * markers everything else here walks to and it cannot work for the car: this is
+ * a full-scale dog against a 0.42 m RC car (see char.h, "Everything here is
+ * FULL SCALE"), so a pivot 0.30 m from the car's centre is a pivot INSIDE the
+ * car, with the animal's own proxy spheres inside the car's. char_car_solid has
+ * no depenetration in it -- that is the engine's shape, not a shortcut
+ * (char_data.h, CHR_SOLID_RANGE) -- so a car with a character's sphere inside
+ * its own sphere set has contacts pointing in opposite directions and is
+ * WEDGED: it cannot be pushed out and it cannot drive out. Reported as "player
+ * car stuck in dog".
+ *
+ * So the arrival distance is the two proxies' own reaches instead: the dog
+ * stops where its spheres meet the car's, which is where a dog barking at a toy
+ * car belongs and is the tangency the solve can always separate. Both numbers
+ * are MEASURED off the same gathers everything else uses (chr_inst_t.px_reach,
+ * chr_t.car_reach), so a change to either proxy carries through by itself, and
+ * the recovered RadReach is kept as the FLOOR -- if a model has no proxy at all
+ * the engine's own number is what is left.
+ *
+ * The walk HOME is not this question and keeps RadReach: a resetPlace is a
+ * marker, and markers are what that constant measures to.
+ */
+static float dog_keep_out(const chr_t *c, const chr_inst_t *in)
+{
+    float k = c->car_reach + in->px_reach;
+    return k < CHR_DOG_RADREACH ? CHR_DOG_RADREACH : k;
+}
+
 static void step_dog(chr_t *c, chr_inst_t *in, const chr_model_t *m,
                      const float car[3], float dt)
 {
@@ -1433,7 +1510,8 @@ static void step_dog(chr_t *c, chr_inst_t *in, const chr_model_t *m,
     case CHR_ST_GO:
         in->tx = car[0];
         in->tz = car[2];
-        if (walk_to(c, in, CHR_DOG_ANISPEED, CHR_DOG_RADREACH, 240.0f, dt)) {
+        if (walk_to(c, in, CHR_DOG_ANISPEED, dog_keep_out(c, in), 240.0f,
+                    dt)) {
             in->state = CHR_ST_ACT;
             in->timer = CHR_DOG_TIMEATTACK;
             in->event = CHR_EV_BARK;
@@ -2323,6 +2401,26 @@ int char_proxy(chr_t *c, unsigned int idx, float out[][4])
     default:
         break;
     }
+    /*
+     * AND WHAT IT REACHES, kept on the instance -- the furthest sphere centre
+     * from the pivot plus that sphere's own radius, which is what
+     * ai_bump_derive measures off a car and what dog_keep_out needs. Here
+     * rather than in a table because the Dog's five are BONES: they move with
+     * its legs, so the only place the number is right is where the spheres have
+     * just been built.
+     */
+    {
+        float far = 0.0f;
+        int q;
+        for (q = 0; q < n; q++) {
+            float dx = out[q][0] - in->x;
+            float dy = out[q][1] - in->y;
+            float dz = out[q][2] - in->z;
+            float r = sqrtf(dx * dx + dy * dy + dz * dz) + out[q][3];
+            if (r > far) far = r;
+        }
+        c->inst[idx].px_reach = far;
+    }
     return n;
 }
 
@@ -2377,6 +2475,26 @@ int char_car_solid(chr_t *c, rb_car *car, float *impact)
     nc = rb_gather_spheres(car, cs);
     if (nc <= 0)
         return 0;
+
+    /*
+     * THE CAR'S OWN REACH, off the gather that is already here -- see
+     * chr_t.car_reach. char_step runs immediately before this every frame
+     * (main.c, and char.h says so), so the Dog's keep-out reads the car it is
+     * actually being driven at, one frame old at worst.
+     */
+    {
+        float far = 0.0f;
+        int q;
+        for (q = 0; q < nc; q++) {
+            float dx = cs[q][0] - car->body.x[0];
+            float dy = cs[q][1] - car->body.x[1];
+            float dz = cs[q][2] - car->body.x[2];
+            float r = sqrtf(dx * dx + dy * dy + dz * dz) + cs[q][3];
+            if (r > far) far = r;
+        }
+        if (far > 1e-3f)
+            c->car_reach = far;
+    }
 
     for (i = 0; i < c->n_inst; i++) {
         chr_inst_t *in = &c->inst[i];

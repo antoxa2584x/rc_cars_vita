@@ -357,15 +357,48 @@ for an RC car against a 107 x 228 unit track. No scaling needed. Forward is +Z
     # exactly what mainmenu.c wants. --imgdir is for the player portrait: the
     # FacesSys images are TARGA, not .csi, so the .csi index cannot see them.
     #
+    # `messagebox' IS on this list and `messagebox_empty' is not, which looks
+    # backwards: the manifest's own folders carry the empty one and the packer
+    # takes it, and the FULL one -- whose right half is the four dialog buttons
+    # (mainmenu.h) -- is not reachable from any node, so it has to be named. If
+    # a build predates this line the dialogs come up with the row bars on them.
+    #
+    # EVERY TEXTURE THE FRONT END DRAWS HAS TO BE NAMED HERE, and this list was
+    # STALE: it named 32 and menu.vsc ships 121, because the pages added since
+    # (the roster's nine portraits, the five shots per track, the map panel, the
+    # Garage's twenty-seven photographs, the lobby's skin sheet) each grew the
+    # scene without the line that packs it being written down. Running the
+    # command as it stood rebuilt a 7 MB menu.vsc with most of the interface
+    # missing. The whole list is below, and a page that adds art adds its name.
+    #
+    # `messagebox' is the newest of them: `messagebox_empty' is reachable from
+    # the manifest and this one is not, and its right half is the four DIALOG
+    # BUTTONS (mainmenu.h). A menu.vsc packed without it leaves the Yes/No pair
+    # falling back to the menu's own row bars.
+    #
     # Smash20/Smash26 are deliberately NOT on this list. They live in
     # game_data/Language/, outside the pack, and ride in props.vsc instead;
     # main.c falls back to that scene for both.
     IF=Desktop,Podl_LeftTop,Podl_RightTop,Podl_LeftBottom,Podl_RightBottom
-    IF=$IF,HeaderSkin,ButtonsTextures,Button_race,Button_back,logoRC_Main
-    IF=$IF,Face1,enumarrows
+    IF=$IF,HeaderSkin,ButtonsTextures,RadioButtonsTextures
+    IF=$IF,Button_race,Button_back,logoRC_Main
+    IF=$IF,enumarrows,scrollbar,messagebox_empty,messagebox,skin_ik_vse
+    # the nine portraits, in player.c's own PL_FACE_NAME order
+    IF=$IF,Face1,Face2,MaxXMad,Daisy,Doc,BabyShark,Dakilla,Johny,MCJocker
     for i in 1 2 3 4 5 6 7 8 9; do IF=$IF,ButtonPodl_right_$i; done
+    # FIVE shots per track, not one -- the wrapping strip on Map and info
     for t in beach1 beach2 beach3 beach4 country1 country2 country3 country4 \
-             urban1 urban2; do IF=$IF,shot_${t}_0; done
+             urban1 urban2; do
+        for j in 0 1 2 3 4; do IF=$IF,shot_${t}_$j; done
+    done
+    # the painted maps, by the ENGINE's number (gen_hud_data.py --print-maps)
+    for n in 1 2 3 4 5 6 7 8 9 10; do IF=$IF,trackmap_$n; done
+    # the Garage's twenty-seven part photographs: kind, then car, then level
+    for k in boost reson tires; do
+        for c in 1 2 3; do
+            for l in 1 2 3; do IF=$IF,upgr_${k}${l}_${c}; done
+        done
+    done
     python3 $RE/pack_vsc.py "$DB/Interface.sb" assets/menu.vsc \
         --extra-tex "$IF" --csidir .cache/extracted \
         --embdir .cache/lightmaps/embedded --imgdir .cache/extracted/FacesSys
@@ -515,9 +548,9 @@ leaves the previous binary sitting there to answer for it:
 
     rm -f rb_test vis_test carparts_test menuframe menu_test settings_test ui_test meshalign \
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
-          colprof flipped antheight aitest chrfloat curb hudshot wideline \
+          colprof flipped antheight aitest chrfloat dogstuck curb hudshot wideline \
           mainmenu_test menushot results_test finishshot introtest player_test \
-          garage_test net_test
+          garage_test champ_test net_test
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rb_test.c rb.c contact.c collide.c rbcar.c carani.c cam.c \
@@ -597,8 +630,23 @@ leaves the previous binary sitting there to answer for it:
                             # model tags along behind menu.c as it does for
                             # menu_test. Runs on files in the current directory
                             # through settings_set_path and removes them again.
-                            # 64 checks; 21 of 23 mutants die, and the two that
+                            # 74 checks; 21 of 23 mutants die, and the two that
                             # live are named in the file's own header.
+                            #
+                            # THE SETTLE WRITE is the last nine of those checks:
+                            # settings_settle() writes once per BURST of edits,
+                            # a delay after the player stops moving a row, which
+                            # is what covers the PS button, a crash, or the
+                            # emulator closed with the menu still up. It has to
+                            # not write on the frame a value moves, not write
+                            # while it keeps moving, write exactly once when it
+                            # stops, never write the same still value twice, and
+                            # never settle on a zero dt -- which is why main.c
+                            # hands it the RAW frame clock and not `dt'. 2 of 3
+                            # mutants die there; the survivor is the "already
+                            # written this burst" guard, which only bites when a
+                            # write FAILED and is shown equivalent at the point
+                            # of use.
     gcc -I. -O2 rccars_re/player_test.c player.c rlog.c -lm -o player_test
                             # THE PLAYER PROFILE and the game's own `.scp` format.
                             # Its first part is the one that matters and it needs
@@ -616,7 +664,7 @@ leaves the previous binary sitting there to answer for it:
                             # through assets/faces.bin, and what a malformed file
                             # costs. 81 checks; 13 of 13 mutants die.
     gcc -I. -Itestgl -O2 rccars_re/ui_test.c ui.c hud.c countdown.c \
-        race_ui.c dirarrow.c msg.c -lm -o ui_test
+        race_ui.c sfont.c dirarrow.c msg.c -lm -o ui_test
                             # menu drawing, the !HIT! banner, the 3-2-1-GO race
                             # start, the IN-RACE HUD -- the minimap, the place
                             # badge, the two clocks and the two gauges -- and the
@@ -629,7 +677,7 @@ leaves the previous binary sitting there to answer for it:
                             # 414 checks; 38 of 38 mutants die on part 17 and
                             # 27 of 27 on part 18.
     gcc -I. -Itestgl -O2 rccars_re/hudshot.c rccars_re/glrec.c ui.c \
-        race_ui.c sfont.c dirarrow.c msg.c -lm -o hudshot
+        race_ui.c sfont.c dirarrow.c msg.c awards.c rlog.c -lm -o hudshot
                             # NOT a test: it PRINTS the HUD's triangles, and
                             # rccars_re/hudshot.py composites them over the game's
                             # real .csi art into a 960x544 PNG. ui_test asserts
@@ -645,6 +693,15 @@ leaves the previous binary sitting there to answer for it:
                             # projection of two chevrons cut into a grid of quads,
                             # and "does that look like an arrow pointing left" is
                             # not a question ui_test can answer.
+                            #
+                            # AND THE AWARD TOAST, for the same reason: awards.c
+                            # picked the band it sits in by enumerating what else
+                            # is in this frame (the badge, the clocks, the lap
+                            # counter, the map, both dials, the arrow), and the
+                            # picture is what shows it actually clears all seven.
+                            # It is driven through the real book -- an award is
+                            # EARNED and the queue stepped -- so nothing about it
+                            # is posed by hand.
                             #
                             #   ./hudshot 4 | python3 rccars_re/hudshot.py \
                             #       /tmp/hud.png --track 4
@@ -697,9 +754,9 @@ leaves the previous binary sitting there to answer for it:
                             # placing's two rulers about the SAME CAR, with the
                             # odometer (still the fallback) run on the same
                             # frames as its control. Exits non-zero.
-    gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c touch.c \
-        ui.c sfont.c records.c rlog.c player.c garage.c net.c ime.c \
-        -lm -o mainmenu_test
+    gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c champ.c \
+        touch.c ui.c sfont.c records.c awards.c rlog.c player.c garage.c \
+        net.c ime.c -lm -o mainmenu_test
                             # THE MAIN MENU's input and its HIT BOXES -- the half
                             # a picture cannot answer. The focus ring skipping the
                             # five unbuilt rows, a drag off a button cancelling it,
@@ -711,6 +768,18 @@ leaves the previous binary sitting there to answer for it:
                             # line, every row reaching the right edge -- not
                             # against a copy of its own table, and the QUICK
                             # RACE page's four enums walked a full lap each.
+                            #
+                            # AND THE SCROLL BAR AS A CONTROL, on the ladder --
+                            # ten rungs, six shown, and a cursor that is NOT the
+                            # scroll position, so a bar that merely moved the
+                            # cursor would pass a weaker check. It is found BY
+                            # PRESSING: the sweep keeps every point where a press
+                            # moved `ctop' without moving the page or the cursor,
+                            # then walks in from each end for as long as the
+                            # answer is the cap's own +-1 to find the trough. No
+                            # DLG_CHAMP_* arithmetic anywhere in the block -- a
+                            # test handed the drawer's own numbers passes
+                            # whatever the drawer does with them.
                             #
                             # AND THE THREE SIBLING PAGES: the navigation column,
                             # the per-page focus ring (every live stop visited
@@ -724,9 +793,34 @@ leaves the previous binary sitting there to answer for it:
                             # `Track stats' -- the merge, the sort with `n/a'
                             # last, and a round trip through its own file.
                             # Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/awards_test.c awards.c rlog.c \
+        -lm -o awards_test
+                            # THE AWARD BOOK -- the port's own achievements
+                            # (awards.h), which are all RULE and no picture, so
+                            # this is where they are checked. Twelve parts: the
+                            # table (a key and a name each, both unique, and a
+                            # goal that fits its own shape), that nothing is
+                            # credited with no profile selected, that a bitmask
+                            # award cannot be satisfied by doing one track twenty
+                            # times, the win rules (a reset, an empty grid, the
+                            # wire), the per-frame rules (the peg's hold and its
+                            # reset, the air threshold, the CARRIED METRE
+                            # remainder -- 6000 frames at 8.4 m/s is 840 m and an
+                            # int tally alone rounds it to nothing -- and the
+                            # three flag EDGES), the tallies, the toast QUEUE
+                            # (three awards in one frame is three toasts, one at
+                            # a time), what the toast draws (the plate inside the
+                            # free band, measured against hud_data.h's own
+                            # numbers, and the fade at both ends), the file's
+                            # round trip with a name that holds a space, an
+                            # unknown key, a later version and a hand-edited
+                            # value, the save-only-on-change, and one book per
+                            # profile. ui.c and sfont.c are STUBBED in the
+                            # harness as recorders, so it needs no GL tree.
+                            # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/menushot.c rccars_re/glrec.c \
-        mainmenu.c touch.c ui.c sfont.c records.c rlog.c player.c garage.c \
-        net.c ime.c -lm -o menushot
+        mainmenu.c champ.c touch.c ui.c sfont.c records.c awards.c rlog.c \
+        player.c garage.c net.c ime.c -lm -o menushot
                             # and hudshot's twin for the menu: it PRINTS the
                             # front end's triangles and rccars_re/hudshot.py
                             # composites them over the real .csi and .tga art.
@@ -747,6 +841,8 @@ leaves the previous binary sitting there to answer for it:
                             #   ./menushot 800 600 n | ...      # ...its name modal
                             #   ./menushot 800 600 y | ...      # ...Remove player?
                             #   ./menushot 800 600 e | ...      # ...the refusal
+                            #   ./menushot 800 600 a | ...      # THE AWARD PAGE
+                            #   ./menushot 800 600 arrr | ...   # ...scrolled 3
                             #   ./menushot 800 600 g | ...      # THE GARAGE
                             #   ./menushot 800 600 B | ...      # ...its booster
                             #   ./menushot 800 600 E | ...      # ...engine
@@ -807,6 +903,35 @@ leaves the previous binary sitting there to answer for it:
                             # tyres are charged the RESONATOR's column, because
                             # that is what the retail exe does. 53 checks,
                             # 10 of 10 mutants dead, exits non-zero.
+    gcc -I. -O2 -Wall rccars_re/champ_test.c champ.c player.c rlog.c \
+        -lm -o champ_test
+                            # THE CHAMPIONSHIP behind dlgCHAMP and dlgCHRACE:
+                            # which rung is open, what an entry costs, what a
+                            # finish pays and what a race writes back. Every
+                            # threshold is asserted against championship.ini's
+                            # own tables rather than a second copy, and the one
+                            # thing a name would get wrong is asserted from BOTH
+                            # sides: a track's `AccessCash' is measured against
+                            # the profile's SCORES and not its cash, so a
+                            # millionaire with no scores unlocks nothing and a
+                            # pauper with scores unlocks everything and cannot
+                            # pay to enter. Plus War path's SECOND lock (5000
+                            # scores AND all nine others won, neither alone),
+                            # the bonus capped at Place3 and rounded to nearest,
+                            # the prize landing in cash AND scores, both
+                            # thresholds at their exact boundary, and the one
+                            # check about the DESIGN rather than the code: a
+                            # fresh profile winning its way up reaches the top
+                            # (11 races), and one clean sweep of the nine is
+                            # 4500 -- short of War path's 5000, which is the
+                            # ladder working as authored. And the rule the
+                            # game's own screenshot of dlgCHAMP corrected:
+                            # ONLY SURF is open to a new profile, because the
+                            # championship ignores IsOpened (FUN_004e84a0's
+                            # branch is gated on a bit entering the mode sets)
+                            # -- asserted beside champ_open_from_start still
+                            # reporting what the file says. 68 checks, 17 of 17
+                            # mutants dead, exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/results_test.c results.c touch.c \
         ui.c sfont.c -lm -o results_test
                             # THE FINISH SCREEN's ordering and its hit boxes.
@@ -883,6 +1008,21 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/allstarts.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o allstarts        # all ten REAL starts on the REAL .col
+    gcc -I. -O2 -Wall -fno-fast-math -ffp-contract=off \
+        rccars_re/flaghold.c col.c rb.c rbcar.c contact.c collide.c \
+        carani.c -lm -o flaghold        # the END of a race: does the car stop?
+                            # Three seconds of throttle at each of the ten real
+                            # starts, then ten seconds of the flag hold -- and
+                            # the RULE IT REPLACED on the same frames as its own
+                            # control, which is progchk's argument. `brake = 1'
+                            # held from the flag is how this model selects
+                            # REVERSE, so the car used to drive backwards off the
+                            # finish line on all ten tracks at up to 4.06 m/s.
+                            # Scored on the new rule only: ends under
+                            # RB_REST_SPEED, never reverses past 0.1 m/s, runs on
+                            # under 25 m -- and the CONTROL has to go on failing,
+                            # or the fixture has stopped reaching the case.
+                            # Exits non-zero.
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/track.c col.c rb.c rbcar.c contact.c collide.c carani.c \
         cam.c -lm -o track                 # one hand-picked spawn, with tracing
@@ -923,9 +1063,19 @@ header carried a build line that omitted the stub and had stopped linking when
 `scene.c` gained its VBO calls; it is here now so that cannot happen quietly
 again.
 
-`chrfloat` and `antheight` are the two probes: they print numbers and assert nothing, so
-read them, do not run them for a pass. Everything either one found is asserted in
-`chartest` or `proptest`.
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
+        rccars_re/dogstuck.c char.c scene.c col.c carani.c rb.c contact.c \
+        collide.c rbcar.c rlog.c carlight.c rccars_re/glstub_host.c \
+        -lm -o dogstuck        # a Dog CHASING a real car, and the car trying
+                               # to leave -- the one state neither chartest
+                               # part 6 (a bare car position) nor part 12 (a
+                               # PINNED character) can build. A probe: it
+                               # prints the drive tick by tick, and part 20 is
+                               # the assertions.
+
+`chrfloat`, `dogstuck` and `antheight` are the three probes: they print numbers and assert
+nothing, so read them, do not run them for a pass. Everything any of them found is asserted
+in `chartest` or `proptest`.
 
 `allstarts` is the one to run after any change to the physics. It parks the car at
 each track's own race start for 15 s and then drives it for 2 s, on that track's

@@ -108,6 +108,18 @@ void rbcar_clock_reset(rbcar_clock *k);
  * (FUN_00508b50 calls camUpdate with a 2e6 dt). */
 int rbcar_jump(rb_car *c, int held, float dt);
 
+/* THE GAME'S OWN DRIVE INHIBIT -- `in.blocked', which rb_drive_forces turns into
+ * "no engine force at all and the wheels locked", so the car slides to a stop on
+ * friction and cannot be driven in either direction.
+ *
+ * IT IS NOT A BRAKE, and that distinction is the whole reason this exists: in
+ * this model the brake IS reverse (rb_engine_accel selects gear -1 once the
+ * brake is held below 2 m/s), so holding the brake to stop a car ends with the
+ * car reversing. main.c holds the player's car this way at the flag.
+ *
+ * A latch -- set it once a frame; every tick of that frame sees it. */
+void rbcar_hold(rb_car *c, int on);
+
 const char *rbcar_name(int car);
 float rbcar_speed(const rb_car *c);
 

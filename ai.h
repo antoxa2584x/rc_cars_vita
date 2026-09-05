@@ -103,19 +103,35 @@
  *     is the recording's own, to the metre it was driven.
  */
 
-/* HOW MANY OPPONENTS ACTUALLY START.
+/* HOW MANY OPPONENTS ACTUALLY START -- AND IT IS THE DIFFICULTY'S NUMBER, NOT A
+ * CONSTANT. This said THREE for a long time, "for a grid of four", on two
+ * arguments that both turned out to be wrong:
  *
- * The layout carries five per track (AI_MAX_OPPONENTS, out of ai_data.h) and the
- * retail game fields THREE, for a grid of four. Two things agree on that: the
- * game itself, and championship.ini, which pays `Place1`, `Place2` and `Place3`
- * per track and has no `Place4` -- with four cars the podium is the whole field
- * bar last, and with six it would leave two places unpaid.
+ *   - "the game itself". The game's own screenshot of dlgCHRACE, the
+ *     championship's pre-race table, has SIX rows -- the player and five
+ *     opponents, named Doc, BabyShark, Rosy, Da killa and Johny, which is
+ *     exactly AI_RACES[beach_1]'s five entries in order, with Doc's engine at
+ *     level 1 and BabyShark's tyres at level 1 as ai_data.h has them. Every
+ *     cell of that picture is this port's own table.
+ *   - "championship.ini has no Place4, so with six cars two places go unpaid".
+ *     True, and it is not evidence: two places DO go unpaid, and the engine has
+ *     words for them. FUN_004bf150's switch runs 1st..6th over strings
+ *     40912..40914 and 40922..40924 -- a table that only makes sense for a
+ *     six-car grid.
  *
- * The five entries are still all READ, so the roster, the upgrade levels and the
- * spline slots are the layout's own; this is the number that start. Raising it to
- * AI_MAX_OPPONENTS is a one-line change and everything downstream already sizes
- * to five. */
-#define AI_MAX_FIELD 3
+ * And dlgCHRACE.ini settles it arithmetically: tableSY is 318, tableHeadHeight
+ * 10% and tableItemHeight 15%, so the table is 31.8 + 6 x 47.7 = 318.0 exactly.
+ * The layout file is sized for six rows and no others.
+ *
+ * WHAT DECIDES IT is the AI<n>Races mask, which is a DIFFICULTY mask
+ * (ailayouts.ini `#define EASY 1 / NORMAL 2 / HARD 4') -- so the field grows
+ * with the skill the player picked. On beach_1: three at easy, four at normal,
+ * five at hard. That is the rule; this constant was a cap on top of it and is
+ * now the array bound, which is what it should always have been.
+ * mainmenu_field_size() has computed the same number off the same mask with NO
+ * cap since it was written, so the menu has been promising five at hard while
+ * this fielded three. */
+#define AI_MAX_FIELD AI_MAX_OPPONENTS
 
 #define AI_SAMPLE_BYTES 36
 #define AI_RECORD_BYTES 100
@@ -304,6 +320,8 @@ typedef struct {
     float bump_reach;        /* the proxy's own reach, metres -- the car's size */
     float bump_ref;          /* the spring's reference displacement (bump_w) */
     float bump_limit;        /* metres the offset may reach */
+    float bump_up;           /* metres it may be LIFTED -- one car height, off
+                                its own proxy. See ai_bump_clamp. */
     float bump_yaw_limit;    /* radians it may turn */
     float bump_accel;        /* the return's acceleration budget, m/s^2 */
     float bump_w;            /* the return spring's natural frequency, rad/s */
@@ -1003,6 +1021,13 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  * return spring is two orders of magnitude weaker than the push -- so a
  * sustained graze walks a car into the air. See ai_pair_resolve. */
 #define AI_TOP_COS  0.694658f
+
+/* A CEILING ON THE FIELD SOLVE'S SWEEPS, so a bigger field can never turn into
+   a bigger frame cost without somebody choosing it. The layout carries five
+   opponents, which asks for three sweeps of a ten-pair list; this is that, and
+   it is a bound rather than the number itself (ai_collide_field derives the
+   number from how many cars are actually racing). */
+#define AI_FIELD_SWEEPS_MAX 4
 
 /* ------------------------------------------------------------------ DYING
  *

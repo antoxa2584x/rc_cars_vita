@@ -71,6 +71,7 @@ void settings_from_menu(const menu_t *m, settings_t *s)
     s->tex_quality = m->tex_quality;
     s->tex_swap_rb = m->tex_swap_rb;
     s->car_light = m->car_light;
+    s->intro      = m->intro;
 }
 
 void settings_to_menu(const settings_t *s, menu_t *m)
@@ -89,6 +90,7 @@ void settings_to_menu(const settings_t *s, menu_t *m)
     m->tex_quality = s->tex_quality;
     m->tex_swap_rb = s->tex_swap_rb;
     m->car_light = s->car_light;
+    m->intro     = s->intro;
     /* DELIBERATELY NOT TOUCHED: req_track, req_car, req_reload, open, row, cue
        and skins. The caller does the first load itself off m->track and m->car,
        and raising a request here would load the track twice; `skins` is counted
@@ -114,6 +116,7 @@ void settings_clamp(settings_t *s)
     s->tex_quality = clampi(s->tex_quality, 0, MENU_TEXQUAL_LEVELS - 1);
     s->tex_swap_rb = !!s->tex_swap_rb;
     s->car_light = !!s->car_light;
+    s->intro     = !!s->intro;
 }
 
 /*
@@ -207,6 +210,7 @@ int settings_parse(const char *text, settings_t *s)
                table to get out of step with the struct. */
             if ((v = match(q, "track")) != NULL)       { read_int(v, &s->track); continue; }
             if ((v = match(q, "car_light")) != NULL)   { read_int(v, &s->car_light); continue; }
+            if ((v = match(q, "intro")) != NULL)       { read_int(v, &s->intro); continue; }
             if ((v = match(q, "car")) != NULL)         { read_int(v, &s->car); continue; }
             if ((v = match(q, "skin")) != NULL)        { read_ints(v, s->skin, MENU_N_CARS); continue; }
             if ((v = match(q, "tires")) != NULL)       { read_int(v, &s->tires); continue; }
@@ -257,6 +261,7 @@ void settings_format(const settings_t *s, char *out, int n)
     P("tex_quality %d     # 0 high, 1 medium, 2 low\n", s->tex_quality);
     P("tex_swap_rb %d     # 0 real hardware, 1 Vita3K\n", s->tex_swap_rb);
     P("car_light %d       # 1 sun + shade on the car, 0 flat\n", s->car_light);
+    P("intro %d           # 1 play the launch movies, 0 straight to the menu\n", s->intro);
 #undef P
 
     if (n > 0)
@@ -393,4 +398,46 @@ int settings_save_if_changed(const menu_t *m)
     if (have_saved && memcmp(&s, &saved, sizeof(s)) == 0)
         return 0;
     return settings_save(m);
+}
+
+/* See settings.h. Two pieces of state and no allocation: the settings the last
+   call saw, and how long they have been still. */
+int settings_settle(const menu_t *m, float dt)
+{
+    static settings_t last;
+    static int have_last;
+    static float still;
+    settings_t s;
+
+    if (!m)
+        return 0;
+    settings_from_menu(m, &s);
+    settings_clamp(&s);
+    if (!have_last || memcmp(&s, &last, sizeof(s)) != 0) {
+        /* Something moved. Start the clock again -- a burst of presses keeps
+           resetting this, which is the whole point: one write per burst. */
+        last = s;
+        have_last = 1;
+        still = 0.f;
+        return 0;
+    }
+    /* NOTHING MOVED. If it already matches what is on the card there is nothing
+       to do and no clock to run; `settings_save_if_changed' answers that in a
+       memcmp and this leaves `still` where it is so the next real edit starts
+       from zero. */
+    if (have_saved && memcmp(&s, &saved, sizeof(s)) == 0)
+        return 0;
+    /* ALREADY WRITTEN THIS BURST. On the ordinary path the memcmp above has
+       already returned -- a successful write makes `saved' match -- so what
+       this guard is really for is the write that FAILED: a full card, a card
+       pulled mid-game. Without it a failing save would be retried every frame
+       for as long as the menu stayed open. `settings_test' cannot see the
+       difference (both readings return 0 and leave no file), so it survives as
+       an equivalent mutant there and is documented here instead. */
+    if (still >= SETTINGS_SETTLE_DELAY)
+        return 0;
+    still += dt > 0.f ? dt : 0.f;
+    if (still < SETTINGS_SETTLE_DELAY)
+        return 0;
+    return settings_save_if_changed(m);
 }

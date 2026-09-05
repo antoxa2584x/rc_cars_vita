@@ -69,6 +69,7 @@ typedef struct {
     int tex_quality;
     int tex_swap_rb;
     int car_light;
+    int intro;          /* AutoRunIntro -- the launch movies */
 } settings_t;
 
 /* Read the file and apply it to `m`, which must already have been through
@@ -85,6 +86,29 @@ int settings_load(menu_t *m);
    so opening the menu to look at the map costs no I/O. */
 int settings_save(const menu_t *m);
 int settings_save_if_changed(const menu_t *m);
+
+/* THE SETTLE WRITE, and it is what covers the way out this module could not see.
+ *
+ * The two writes above happen on the frame the menu CLOSES and on the Quit row,
+ * which is every ordinary way out -- and `known-issues.md' recorded what that
+ * leaves uncovered: the PS button, a crash, or the emulator being shut with the
+ * menu still up. All three lose the change.
+ *
+ * Ruled out there, and still ruled out: a write per keypress (a memory-card
+ * write on the game thread, per press) and a write per frame while the menu is
+ * open (the same thing, sixty times a second). This is the third option --
+ * write once the player STOPS changing things. Call it every frame with the
+ * frame's own clock; it writes at most once per burst of edits, SETTLE_DELAY
+ * after the last one, and never while a key is still moving. A player who nudges
+ * the volume eight times pays one write, at the end, and a player who then
+ * PS-buttons out has already paid it.
+ *
+ * -> 1 on the frame it actually wrote. `settings_save_if_changed' is what it
+ * calls, so a settle that finds nothing different still costs no I/O, and the
+ * menu-close write is unaffected: whichever comes first makes the other a
+ * no-op. */
+#define SETTINGS_SETTLE_DELAY 1.0f
+int settings_settle(const menu_t *m, float dt);
 
 /* Where the file is, for the log line that says so. */
 const char *settings_path(void);
