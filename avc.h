@@ -49,13 +49,19 @@ int avc_open(int w, int h, int max_au);
 
 void avc_close(void);
 
-/* Feed one access unit. -> 1 if a picture came out and avc_tex() now names it,
- * 0 if the decoder swallowed the unit without producing one, negative on error.
+/* Feed one access unit. -> 1 if a picture came out, 0 if the decoder swallowed
+ * the unit without producing one, negative on error.
+ *
+ * `present` says whether that picture is the one that will be DRAWN. With it 0
+ * the unit is still decoded -- it has to be, later frames reference it -- but
+ * nothing is converted and nothing is uploaded, so a tick that feeds four units
+ * to catch up pays for one picture instead of four. avc_tex() therefore names
+ * the last picture fed with `present' 1, not simply the last one fed.
  *
  * `size` must be <= the max_au avc_open was given; a larger unit is refused
  * rather than truncated, because half an access unit is not a decodable thing
  * and the decoder's own error would be about the wrong subject. */
-int avc_decode(const void *au, int size);
+int avc_decode(const void *au, int size, int present);
 
 /* The texture holding the most recent picture, 0 before there is one. Its
  * dimensions are avc_open's w and h; sample it over the whole [0,1] range. */

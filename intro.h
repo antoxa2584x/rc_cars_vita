@@ -100,6 +100,16 @@ typedef struct {
     unsigned int logo_cr;       /* `logoCR',  top right  -- 128x128 */
 } intro_tex;
 
+/* THE CAPTION'S FONT, and it is the engine's own where there is one.
+ *
+ * This screen is up before anything is loaded, so it has to come up with no
+ * assets at all -- which is why the line below falls back to ui.c's compiled-in
+ * Consolas. `Smash20' rides in props.vsc and props.vsc is the FIRST thing the
+ * boot reads, so from the second seam onward there is a real atlas and the
+ * caption is in the same letters as the rest of the game. Hand the handle over
+ * as soon as it resolves; 0 puts the fallback back. */
+void intro_set_font(unsigned int smash20_tex);
+
 /* Draw the loading screen. `caption` is the line in the engine's own bottom
  * band, or NULL for none; `progress` in [0,1] draws a bar under it, and a
  * negative value leaves it out -- a load with no measure should not draw a bar

@@ -53,6 +53,7 @@ rb_test
 results_test
 rockroll
 settings_test
+track
 ui_test
 vis_test
 wading

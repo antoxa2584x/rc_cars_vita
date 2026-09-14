@@ -80,6 +80,13 @@ void rlog(const char *fmt, ...)
    gives up rather than hanging, the way audio_shutdown's waits do. */
 void rlog_flush(void);
 
+/* A MONOTONIC MILLISECOND CLOCK, for the one thing this log could not say: how
+ * long something took. The port's loads are tens of megabytes off a card and the
+ * emulator reads them off an SSD, so "slow on hardware" was a report with no
+ * number in it -- every load in the app now prints its own. Wall time, not CPU
+ * time, because the answer is nearly all I/O. */
+double rlog_now_ms(void);
+
 void rlog_shutdown(void);
 
 /* Where the file went, for the one line that says so on screen. "" if none. */

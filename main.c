@@ -39,8 +39,11 @@
  */
 
 #include <psp2/ctrl.h>
+#include <psp2/display.h>          /* the frame pacer: vcount and vblank wait */
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/clib.h>
+#include <limits.h>            /* INT_MAX, the phycont threshold below */
+#include <psp2/kernel/sysmem.h>   /* sceKernelGetFreeMemorySize: see mem_report */
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <vitaGL.h>
@@ -70,13 +73,13 @@
 #include "dirarrow.h"
 #include "msg.h"
 #include "mainmenu.h"
+#include "sfont.h"
 #include "intro.h"
 #include "touch.h"
 #include "results.h"
 #include "menu.h"
 #include "settings.h"
 #include "records.h"
-#include "awards.h"
 #include "player.h"
 #include "garage.h"
 #include "champ.h"
@@ -116,7 +119,31 @@
 
 unsigned int _newlib_heap_size_user = 192 * 1024 * 1024;
 
-static scene_t track, car;
+static scene_t track;
+
+/* THE PLAYER'S CAR IS A POOL OF THREE, AND `carp' IS WHICHEVER ONE IS FITTED.
+ *
+ * Changing car in the front end used to be a HANG -- reported as one -- because
+ * every step of the picker read the whole model off the card again: 5.8 to
+ * 8.3 MB at 11 MB/s is 500 to 780 ms of nothing on screen, and stepping the
+ * three cars round the ring paid it three times. Nothing about the model had
+ * changed in between; it had simply been thrown away.
+ *
+ * So the three scenes each get a slot and a slot is read at most once. `carp'
+ * points at the fitted one and everything downstream of it -- the shadow decal,
+ * the whip, the parts, the dust, the marks, the turntable framing -- is REBOUND
+ * rather than rebuilt, which is what those five calls already were: a memset and
+ * some pointer setup apiece, no allocation and no I/O (see each header).
+ *
+ * WHAT KEEPS THIS INSIDE THE MEMORY BUDGET is that `race_load' drops the two
+ * slots the race is not driving. In a race the resident set is exactly what it
+ * always was -- one player car beside the track and the opponents' own up-to-
+ * three models -- and the front end, which holds no track at all, is where the
+ * other two live. Coming back from a race the first look at each of the other
+ * two pays one read again, and that is the trade: bounded in the place that is
+ * tight, cached in the place that is not. */
+static scene_t car_pool[MENU_N_CARS];
+static scene_t *carp = &car_pool[0];
 /* props.vsc holds all 13 knockable props and is shared by every track, so it
    loads ONCE at init and is never released with the track. See prop.h. */
 static scene_t props_scene;
@@ -164,11 +191,6 @@ static int race_laps = MM_LAPS_DEF;
 static int ai_skill = 1;
 static int race_over;
 
-/* HOW MANY TIMES THE PLAYER WAS PUT BACK during this race, for the award book's
-   `Not a Scratch' -- awards.h. Counted where the two deaths are raised and
-   cleared by respawn(), which is what starts a race here. */
-static int race_deaths;
-
 /* THIS RACE IS A CHAMPIONSHIP ROUND -- the engine's game mode 5, which is what
    FUN_004a4c90(5) sets and what FUN_004c56c0 pays prize money on. It is a race
    like any other in every other respect; what it changes is that the flag is
@@ -182,10 +204,6 @@ static int race_champ;
    banner; this counts the port's own !HIT! events for exactly that reason. See
    champ.h. */
 static int race_hits;
-
-/* The award toast's art: the same plate and the same two fonts the front end
-   uses (mainmenu_tex), bound once beside them. */
-static award_tex award_art;
 
 /* THE RESULTS, and the bookkeeping the finish screen needs. None of it exists
  * anywhere else: the port tracks the PLAYER's clock in race_ui and knows every
@@ -230,8 +248,37 @@ static const char *const DBG_ISOLATE[] = {
 };
 #define DBG_ISOLATE_N 5
 
+/* THE PER-VERTEX RELIGHT'S OWN SHARE OF `draw'. `scene_shade' walks every batch
+ * of a car, dots the sun against every normal and pushes the result up as a
+ * colour buffer -- ONCE PER CAR PER FRAME, because the light is in MODEL space
+ * and a car that turns changes it. With a field of four that is ~140 batches
+ * and ~12,000 vertices of CPU arithmetic plus ~140 glBufferSubData inside the
+ * draw span, and the hardware log put `draw' at 21-25 ms against a 16.7 ms
+ * vblank with the GPU idle. This says how much of that it is; nothing was going
+ * to say so from the outside, because it is submission time either way. */
+static double acc_relight = 0.0;
+/* AND THE FIELD'S SHARE OF `draw'. The hardware log has 272 batches submitted in
+   22-25 ms with the GPU idle, of which roughly 190 are the opponents -- 32 to 40
+   per car plus the environment-mapped glance pass -- so whether the answer is
+   "fewer cars", "fewer passes per car" or "the track's own batches" turns on one
+   number, and it was not being taken. */
+static double acc_draw_ai = 0.0;
+
+/* THE FRAME AFTER A BLOCKING LOAD IS NOT A FRAME, and it was drowning the worst-
+   frame report: the hardware log's first race window read "worst frame of the
+   60: 20819216 us", which is the 20.8 s the track took to read off the card
+   wearing a frame's clothes. race_load raises this and the accumulator spends
+   it. */
+static int pacing_skip;
+
 /* What is loaded right now. The menu changes these; load_track/load_car act. */
 static int cur_track = 0, cur_car = 0;
+
+/* IS THERE A TRACK AT ALL. The boot does not load one -- see the guard in the
+   frame loop and race_load below -- so between the launch and the first race
+   there is no world to step, no collision grid to query and no checkpoint set.
+   Set by race_load and never cleared: once a track is in, one is always in. */
+static int world_ready = 0;
 static sun_t sun;
 static menu_t menu;
 
@@ -432,12 +479,32 @@ static rb_car rc;
  * FRAME with dt (0x4fc685) and that is transcribed, not convenient. */
 static struct { float bump; } tick_world;
 
+/* WHAT A PHYSICS TICK ACTUALLY COSTS, broken into its four. The hardware log
+   has a tick at 1.9 ms in one place on beach_1 and 8.7 ms in another -- 4.5x,
+   by location -- and `phys' is the whole of rbcar_step_frame_cb, which is the
+   CAR plus everything below. Which of the five it is decides whether the answer
+   is the collision grid, the field, or the props. */
+static double acc_t_prop, acc_t_ai, acc_t_hit;
+
+/* AND THE OTHER HALF OF `sim' -- the once-a-FRAME work, which the log had only
+   as "everything else" and which reached 31 ms on one frame of the hardware
+   run. The three named here are the three this file's own budget note already
+   suspected ("the water, fx and trace vertex updates, not the collision grid")
+   plus the characters, which step once per frame with the ticks they were
+   given. Whatever is left after these is the checkpoint/HUD/message/camera
+   layer, and if it turns out to be the big one that is worth knowing too. */
+static double acc_f_water, acc_f_char, acc_f_fx;
+
 static void tick_world_step(void *ctx)
 {
     float h;
+    double t0;
 
     (void)ctx;
+    t0 = rlog_now_ms();
     prop_step(&props, &rc, RBCAR_TICK_DT);
+    acc_t_prop += rlog_now_ms() - t0;
+    t0 = rlog_now_ms();
     /* ONE TICK AT A TIME and never ticks*dt in one go: ai_step's acceleration
        limit and cursor walk are written for a 1/60 tick, and handing it 2/60
        would quietly halve the resolution of both.
@@ -450,9 +517,12 @@ static void tick_world_step(void *ctx)
     if (!net_race)
         ai_step(&ai, cps.enabled ? &ai_tr : NULL, rc.body.x[0], rc.body.x[1],
                 rc.body.x[2], cps.lap, RBCAR_TICK_DT);
+    acc_t_ai += rlog_now_ms() - t0;
     /* Solid opponents, immediately after the step so the contact sees the pose
        it just wrote. */
+    t0 = rlog_now_ms();
     h = ai_collide_player(&ai, &rc, RBCAR_TICK_DT);
+    acc_t_hit += rlog_now_ms() - t0;
     if (h > tick_world.bump)
         tick_world.bump = h;
 }
@@ -632,8 +702,8 @@ static void place_car(float x, float z, float ref_y, float yaw)
     /* the pose mirror the HUD and the free-fly camera read */
     vehicle_init(&veh, cur_car, x, gy + 0.06f, z, yaw);
 
-    if (car.has_rig)
-        carani_bind(&car.rig, &rc);
+    if (carp->has_rig)
+        carani_bind(&carp->rig, &rc);
 
     /* The engine's own reset cue. Also the one place the loops are guaranteed
        to be re-evaluated against a car that has just teleported.
@@ -797,14 +867,11 @@ static void respawn(void)
     }
     place_car(sx, sz, t->y, t->yaw);
 
-    /* A NEW RACE, so nobody has died in it yet -- awards.h's `Not a Scratch'.
-       Here and not at the flag: every path that starts a race in this port ends
-       up in respawn(), which is the same argument countdown_stop's comment
-       makes about the countdown. */
-    race_deaths = 0;
-    /* And the hit counter, for the same reason and on the same event: the bonus
-       is what THIS race knocked over, not what the profile has ever knocked
-       over -- that is the award book's business (awards.h). */
+    /* The hit counter: the championship's bonus is what THIS race knocked
+       over, not what the profile has ever knocked over. Here and not at the
+       flag, because every path that starts a race in this port ends up in
+       respawn() -- the same argument countdown_stop's comment makes about the
+       countdown. */
     race_hits = 0;
 
     /* The spine cursor. cp_restart is what puts the arrow on CHECKPOINT 0 -- the
@@ -924,10 +991,6 @@ static void respawn(void)
  */
 static void respawn_checkpoint(void)
 {
-    /* THE DEATH COUNT, and this is the only place either death path passes
-       through -- see the two callers, the fall out of the world and the
-       drowning. */
-    race_deaths++;
     float p[3], yaw;
 
     if (!cp_respawn_pose(&cps, p, &yaw)) {
@@ -995,6 +1058,12 @@ static void respawn_checkpoint(void)
  * taken once already, above, and the body is what the player is choosing. */
 #define MENU_CAR_MARGIN 0.84f
 
+/* THE STUDIO LIGHT'S TWO TERMS -- see menu_car_draw, which is the only caller.
+   Not the engine's 0.541/0.502: there is no track under this car to bounce
+   anything back at it. */
+#define MENU_CAR_AMBIENT 0.72f
+#define MENU_CAR_DIRECT  0.45f
+
 /* THE FRAME, SOLVED ONCE PER CAR. scene_frame_turntable projects every drawn
  * vertex at twelve spin angles, six times over, which is a few hundred thousand
  * transforms -- fine at a car change and not fine at 60 Hz. So it is cached on
@@ -1024,21 +1093,32 @@ static void respawn_checkpoint(void)
  * which frames exactly as before. */
 static const scene_frame_t *menu_car_frame(float aspect)
 {
-    static scene_frame_t fr;
-    static int   for_car = -2;
+    /* ONE SOLUTION PER SLOT, not one for whichever car is fitted: the pool means
+       a car comes back without being read again, and re-solving the turntable
+       for it would put a few hundred thousand transforms back into the frame the
+       picker steps on -- the same cost this cache exists to keep out of 60 Hz,
+       moved from the load to the switch. */
+    static scene_frame_t fr[MENU_N_CARS];
+    static int   solved[MENU_N_CARS];
     static float for_aspect = 0.f;
+    const int c = (cur_car >= 0 && cur_car < MENU_N_CARS) ? cur_car : 0;
+    int k;
 
-    if (for_car != cur_car || aspect != for_aspect) {
-        scene_frame_turntable(&car, antenna.part, MENU_CAR_FOV,
-                              MENU_CAR_PITCH, aspect, MENU_CAR_MARGIN, &fr);
-        for_car = cur_car;
+    if (aspect != for_aspect) {
+        for (k = 0; k < MENU_N_CARS; k++)
+            solved[k] = 0;
         for_aspect = aspect;
-        rlog("[rccars] menu car frame: %s  aim (%d,%d,%d) mm  %d cm back\n",
-             rbcar_name(cur_car), (int)(fr.aim[0] * 1000.f),
-             (int)(fr.aim[1] * 1000.f), (int)(fr.aim[2] * 1000.f),
-             (int)(fr.dist * 100.f));
     }
-    return &fr;
+    if (!solved[c]) {
+        scene_frame_turntable(carp, antenna.part, MENU_CAR_FOV,
+                              MENU_CAR_PITCH, aspect, MENU_CAR_MARGIN, &fr[c]);
+        solved[c] = 1;
+        rlog("[rccars] menu car frame: %s  aim (%d,%d,%d) mm  %d cm back\n",
+             rbcar_name(c), (int)(fr[c].aim[0] * 1000.f),
+             (int)(fr[c].aim[1] * 1000.f), (int)(fr[c].aim[2] * 1000.f),
+             (int)(fr[c].dist * 100.f));
+    }
+    return &fr[c];
 }
 
 static void menu_car_draw(void *ctx, float x, float y, float w, float h)
@@ -1050,7 +1130,7 @@ static void menu_car_draw(void *ctx, float x, float y, float w, float h)
     const int vy = SCR_H - (int)(y + 0.5f) - vh;
 
     (void)ctx;
-    if (!car.n_batches || vw <= 0 || vh <= 0)
+    if (!carp->n_batches || vw <= 0 || vh <= 0)
         return;
 
     glViewport(vx, vy, vw, vh);
@@ -1094,16 +1174,26 @@ static void menu_car_draw(void *ctx, float x, float y, float w, float h)
        the lightmap under the wheels (carlight.h), which in a menu is wherever the
        car happens to be parked -- a car previewed under a bridge would come up
        black. Model space, because scene_shade works there. */
+    /* AND BRIGHTER THAN THE TRACK'S. The pair used to be the engine's own
+       138/128 -- carlight.h's `AmbientI * level' and the directional's diffuse
+       -- which is right for a car sitting on a lit track under a sky, and dark
+       for a car in a black box: on this page nothing bounces, so a panel turned
+       away from the one light gets the ambient and nothing else, and 0.55 of
+       white is what "too dark" was. The ambient goes up and the direct comes
+       down by less than half of it, so a lit panel still saturates (0.72 + 0.45
+       is over 1) and the shading still reads -- it is the SHADOW side that
+       lifts, from 55% grey to 72%. Nothing in a race changes: the in-race pair
+       is carlight's own, two thousand lines down, and is untouched. */
     {
         static const float Lm[3] = { 0.42f, 0.80f, 0.43f };
-        scene_shade(&car, Lm, 0.55f, 0.55f);
+        scene_shade(carp, Lm, MENU_CAR_AMBIENT, MENU_CAR_DIRECT);
         scene_set_lighting(1);
     }
-    scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+    scene_draw(carp, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
     /* The exhaust, opaque with the reference dropped -- the same pass and the
        same reason as the in-race draw. */
     glAlphaFunc(GL_GREATER, 0.f);
-    scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
+    scene_draw(carp, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
     glAlphaFunc(GL_GREATER, 0.5f);
     scene_set_lighting(0);
 
@@ -1113,6 +1203,41 @@ static void menu_car_draw(void *ctx, float x, float y, float w, float h)
     glPopMatrix();
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, SCR_W, SCR_H);
+}
+
+/* SOMETHING ON THE SCREEN BEFORE A BLOCKING READ, in the front end.
+ *
+ * A cold car slot is half a second of memory card and the menu cannot be stepped
+ * while it is read, so without this the front end simply stopped -- which is
+ * what "when switch cars, game hangs for a bit" was. The pool (car_pool) means
+ * it now happens at most once per car per visit to the front end; this is for
+ * the once.
+ *
+ * The menu is drawn as it stands and the line goes over it, in the engine's own
+ * letters where they are loaded and in the compiled-in font where they are not
+ * -- the same fallback every page in this app has. Draws AND PRESENTS, like the
+ * loading screens: the caller is about to block, so the frame has to be on the
+ * display before it does. */
+static void menu_wait_frame(const char *what)
+{
+    const sfont sf = sf_small(mm.tex.font_small);
+    const float sc = (float)SCR_H / 600.f * 1.25f;
+    const float tw = sf.tex ? sf_w(&sf, sc, what) : ui_text_w(sc, what);
+    const float th = sf.tex ? sf_h(&sf, sc) : ui_text_h(sc);
+    const float x = ((float)SCR_W - tw) * 0.5f;
+    const float y = (float)SCR_H - th * 2.6f;
+
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    ui_begin(SCR_W, SCR_H);
+    mainmenu_draw(&mm, SCR_W, SCR_H);
+    ui_rect(x - th * 0.6f, y - th * 0.35f, tw + th * 1.2f, th * 1.7f,
+            0.f, 0.f, 0.f, 0.55f);
+    if (sf.tex)
+        sf_text_shadowed(&sf, x, y, sc, 1.f, 1.f, 1.f, 1.f, what);
+    else
+        ui_text(x, y, sc, 1.f, 1.f, 1.f, 1.f, what);
+    ui_end();
+    vglSwapBuffers(GL_FALSE);
 }
 
 /* ai_track.spine, bound to checkpoint.c's own spine. The original asks the same
@@ -1353,35 +1478,56 @@ static int load_track(int idx)
     return 1;
 }
 
-static int load_car(int idx)
+/* Is slot `idx' already read? -- so a caller can put something on the screen
+   before a cold one blocks for half a second. */
+static int car_resident(int idx)
+{
+    return idx >= 0 && idx < MENU_N_CARS && car_pool[idx].n_batches != 0;
+}
+
+/* FIT CAR `idx'. `for_race' is whether the MOTOR comes with it.
+ *
+ * The model is read at most once per slot (see car_pool); everything after it
+ * is a rebind and costs nothing measurable, so this is the same call whether the
+ * scene was already there or not.
+ *
+ * THE MOTOR IS NOT THE MENU'S. sfx_set_car pages several megabytes of engine
+ * loops off the card, and the front end plays none of them -- `sfx_race_active'
+ * is false the whole time it is up (sfx.h). It used to ride along with every
+ * step of the car picker, which is a memory-card read for a sound nothing was
+ * going to make. race_load asks for it; the picker does not. */
+static int load_car(int idx, int for_race)
 {
     char path[128];
 
-    if (idx < 0 || idx > 2)
+    if (idx < 0 || idx >= MENU_N_CARS)
         return 0;
 
-    snprintf(path, sizeof(path), "app0:assets/car%d.vsc", idx + 1);
-    scene_release(&car);
-    scene_set_build_normals(1);           /* see the AI loader above */
-    if (!scene_load(path, &car))
-        rlog("[rccars] cannot load %s\n", path);
-    scene_set_build_normals(0);
+    carp = &car_pool[idx];
+    if (!carp->n_batches) {
+        snprintf(path, sizeof(path), "app0:assets/car%d.vsc", idx + 1);
+        scene_set_build_normals(1);       /* see the AI loader above */
+        if (!scene_load(path, carp))
+            rlog("[rccars] cannot load %s\n", path);
+        scene_set_build_normals(0);
+    }
 
     cur_car = idx;
     /* The motor family is per-car -- three channels' worth of loops, and the
-       biggest thing in the bank -- so it is paged in and out with the model. */
-    sfx_set_car(idx);
+       biggest thing in the bank. */
+    if (for_race)
+        sfx_set_car(idx);
     /* ShadowSize and ShadowShift are per-car, so the decal is rebuilt too. */
-    shadow_init(&shadow, &car, idx);
+    shadow_init(&shadow, carp, idx);
     /* the whip is per-car too: Antenna_Car<n>.crs differs (0.25 m for the
        Overkill, 0.35 for the Buggy) and it binds to this scene's own batch */
-    antenna_init(&antenna, &car, idx);
+    antenna_init(&antenna, carp, idx);
 
     /* Resolve this car's exhaust groups and wheel batches, then show the picked
        levels. Without this every car draws ALL FOUR of its UPGRADES groups on
        top of each other -- 662 overlapping triangles of exhaust on the Overkill.
        See carparts.h. */
-    carparts_bind(&parts, &car);
+    carparts_bind(&parts, carp);
     /* How many skins THIS model has. The menu cannot work it out -- it is a
        property of the packed scene, and a car packed without the three extra
        atlases has exactly one -- so it is handed over here, before the apply, and
@@ -1394,13 +1540,13 @@ static int load_car(int idx)
     mm.gskins = menu.skins;
     if (menu.skin[idx] >= menu.skins)
         menu.skin[idx] = 0;
-    carparts_apply(&parts, &car, menu.tires, menu.boost, menu.skin[idx]);
+    carparts_apply(&parts, carp, menu.tires, menu.boost, menu.skin[idx]);
 
     /* The dust sprite and the four tyre marks are packed into the CAR, so both
        follow it. The pipe is the fitted booster's own node. */
-    fx_init(&fx, &car);
-    fx_pipe_from_rig(&fx.em, &car.rig, menu.boost, rbcar_com_oy(idx));
-    trace_init(&traces, &car);
+    fx_init(&fx, carp);
+    fx_pipe_from_rig(&fx.em, &carp->rig, menu.boost, rbcar_com_oy(idx));
+    trace_init(&traces, carp);
     trace_clear(&traces);
     rlog("[rccars] parts: %d exhausts  %d wheel batches  "
                   "tyres '%s' %d/4 levels packed  "
@@ -1505,9 +1651,11 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
         lit_ai = ai_cam_dist[i] < LIGHT_FADE_FAR && carlight_enabled();
         if (lit_ai) {
             float La, Ld, Lm[3];
+            const double rl0 = rlog_now_ms();
             carlight_terms(&ai_lit[i], ai_cam_dist[i], &La, &Ld);
             carlight_model_dir(ai_matrix(&ai, i), Lm);
             scene_shade(sc, Lm, La, Ld);
+            acc_relight += (rlog_now_ms() - rl0) / 1000.0;
             scene_set_lighting(1);
         }
         scene_draw(sc, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
@@ -1580,7 +1728,10 @@ static void draw_ai(const float eye[3], float vpitch, float vyaw)
 static void apply_garage(void)
 {
     const player_t *p = player_cur();
-    const int c = (mm.car >= 0 && mm.car < MENU_N_CARS) ? mm.car : 0;
+    /* THE CAR THE PAGE IS ABOUT, which since the quick race got a pick of its
+       own is not always the profile's -- and the parts pushed here are what the
+       model about to be fitted will WEAR, so they have to be that car's. */
+    const int c = mainmenu_view_car(&mm);
     if (!p)
         return;
     menu.boost = garage_level(p, GAR_BOOSTER, c);
@@ -1597,41 +1748,19 @@ static void apply_garage(void)
     menu.skin[c] = garage_skin(p, c);
 }
 
-/* THE PROFILE'S OWN FACTS INTO THE AWARD BOOK. Plain numbers, because awards.h
-   names no other module: the highest part level fitted anywhere in the profile,
-   the paint the chosen car is wearing, and the profile's own clock. Called on
-   the events that can change any of the three -- a shop transaction, a finished
-   race, and the way out of the app -- rather than per frame. */
-static void award_note_profile(void)
-{
-    const player_t *p = player_cur();
-    const int c = (mm.car >= 0 && mm.car < PL_N_CARS) ? mm.car : 0;
-    int car, kind, best = 0;
-
-    if (!p)
-        return;
-    for (car = 0; car < PL_N_CARS; car++)
-        for (kind = 0; kind < GAR_N_KINDS; kind++) {
-            const int lv = garage_level(p, kind, car);
-            if (lv > best)
-                best = lv;
-        }
-    award_shop(best, garage_skin(p, c), p->play_time);
-}
-
 static void apply_player(void)
 {
     const player_t *p = player_cur();
     int i;
-    /* AND ITS AWARD BOOK. This is the one function a profile becoming the
-       current one goes through -- the boot with a roster, and MM_ACT_PLAYER,
-       which is a selection, a creation and a removal -- so it is the one place
-       the book has to follow. With no profile it selects nobody, and every
-       event in awards.c is then dropped rather than credited to the last
-       player who happened to be up. */
-    award_select(p ? p->name : NULL);
     if (!p)
         return;
+    /* AND ITS CAR. `sel_car' is the engine's own 0x51 and the port has written
+       it since the profile was decoded, but nothing read it back -- so the
+       Garage and the championship came up on whatever the last profile had been
+       looking at. Before apply_garage, which fits the parts of whichever car
+       this is. A quick race is not this car (mainmenu.h): it has `qcar'. */
+    if (p->sel_car >= 0 && p->sel_car < MM_N_CARS)
+        mm.car = p->sel_car;
     for (i = 0; i < MM_N_LAPS; i++)
         if (MM_LAPS[i] == p->laps) {
             mm.laps = p->laps;
@@ -1658,11 +1787,137 @@ static void store_player(void)
     p->skill = mm.skill;
 }
 
+/* WHAT IS LEFT, PER PARTITION, AND WHY THIS EXISTS.
+ *
+ * The launch movie was black on hardware and correct in Vita3K, and the reason
+ * was one line the log did not have: `sceVideodecInitLibrary' answering
+ * 0x80024302, `SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE'. The hardware H.264
+ * decoder allocates its own PHYSICALLY CONTIGUOUS memory internally, and
+ * vitaGL had already taken the whole phycont partition for its own
+ * `VGL_MEM_SLOW' texture heap at `vglInit' -- which the emulator does not
+ * enforce a budget for, so the same call succeeds there.
+ *
+ * Three numbers, at every point where something large is claimed or given
+ * back. `size_user' is what newlib's heap and vitaGL's RAM heap come out of,
+ * `size_cdram' is the 128 MB of video memory, and `size_phycont' is the one
+ * this port learnt to care about. */
+static void mem_report(const char *when)
+{
+    SceKernelFreeMemorySizeInfo mi;
+    memset(&mi, 0, sizeof mi);
+    mi.size = sizeof mi;
+    if (sceKernelGetFreeMemorySize(&mi) < 0) {
+        rlog("[rccars] mem (%s): sceKernelGetFreeMemorySize failed\n", when);
+        return;
+    }
+    rlog("[rccars] mem (%s): user %d KB, cdram %d KB, PHYCONT %d KB\n",
+         when, mi.size_user / 1024, mi.size_cdram / 1024,
+         mi.size_phycont / 1024);
+}
+
+/* -> the free phycont right now, or 0. The threshold vglInit is given and the
+   size the intro hands back are both this number, so neither is a guess. */
+static unsigned int mem_phycont_free(void)
+{
+    SceKernelFreeMemorySizeInfo mi;
+    memset(&mi, 0, sizeof mi);
+    mi.size = sizeof mi;
+    if (sceKernelGetFreeMemorySize(&mi) < 0 || mi.size_phycont < 0)
+        return 0u;
+    return (unsigned int)mi.size_phycont;
+}
+
 static void boot_screen(const char *what, float progress)
 {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     intro_load_screen(&boot_tex, SCR_W, SCR_H, what, progress);
     vglSwapBuffers(GL_FALSE);
+}
+
+/* THE RACE'S OWN LOADING SCREEN, and it is the ENGINE'S OWN PAGE.
+ *
+ * The boot screen above is the engine's four rects at 0x56b8a0 (intro.h), and it
+ * is gone by the time the front end is up -- `boot_scene' is released to get its
+ * 2 MB back. The green button then spends five to twelve seconds reading a track
+ * off the card, and it used to do it with the last menu frame still on the
+ * display, which is a hang with no other name.
+ *
+ * This used to be a page of the port's own invention -- the painted map, big and
+ * centred, with a caption band under it. It is not any more: the engine has a
+ * SECOND table of the same shape as the boot screen's, at 0x570888, and it is
+ * this page. Four screenshots of the track in the corners, the map panel between
+ * them, two silver rules, the track's name, the step, and the game's own
+ * `Progressor' bar across the foot. mainmenu.h has the table, row for row;
+ * mainmenu_draw_loading draws it, because every texture on it is the front end's
+ * and so is the 800x600 frame it is laid out in.
+ *
+ * Draws AND PRESENTS, like boot_screen: on this port a load is a blocking call
+ * between two swaps, not a state machine stepped once a frame. */
+static void race_load_screen(int track, const char *what, float progress)
+{
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    mainmenu_draw_loading(&mm, track, what, progress, SCR_W, SCR_H);
+    vglSwapBuffers(GL_FALSE);
+}
+
+/* EVERYTHING A RACE NEEDS THAT THE FRONT END DOES NOT, under that screen.
+ *
+ * One place, because all three race entries -- quick, championship and network
+ * -- want exactly the same two loads in the same order, and because this is the
+ * only path that can set `world_ready'. -> 0 if there is no world at the end of
+ * it, and the caller then stays in the front end rather than starting a race on
+ * an empty grid.
+ *
+ * The car goes first: it is the smaller of the two and the front end has usually
+ * read it already for its own turning model, in which case fitting it is free.
+ * It is also where the MOTOR comes in -- the one caller that passes `for_race'.
+ *
+ * AND THIS IS WHERE THE CAR POOL GIVES ITS OTHER TWO SLOTS BACK. The front end
+ * holds all three so that stepping the picker costs nothing; a race holds a
+ * track, its collision grid, its characters and up to three OPPONENT models, and
+ * two spare player cars on top of that is 14 MB of video memory nothing is going
+ * to draw. Released before load_track rather than after, so the track is read
+ * into the space they were in. */
+static int race_load(int track, int car)
+{
+    const double t0 = rlog_now_ms();
+    int k;
+
+    if (track < 0 || track >= N_TRACKS)
+        track = 0;
+    race_load_screen(track, "Loading car", 0.10f);
+    load_car(car, 1);
+    for (k = 0; k < MENU_N_CARS; k++)
+        if (k != cur_car && car_pool[k].n_batches)
+            scene_release(&car_pool[k]);
+    race_load_screen(track, "Loading track", 0.30f);
+    if (!load_track(track)) {
+        /* The boot used to make this check and exit the process on it. It is a
+           race entry now, and refusing one is not a reason to take the app
+           down: fall back to the first track the way the boot did, and if THAT
+           is missing too, say so and go back to the menu. */
+        if (track == 0 || !load_track(0)) {
+            rlog("[rccars] race: %s will not load, and nor will the first "
+                 "track -- staying in the front end\n", TRACKS[track].base);
+            race_load_screen(track, "This track will not load", -1.f);
+            return 0;
+        }
+        rlog("[rccars] race: track %d would not load -- fell back to 0\n",
+             track);
+        track = 0;
+        menu.track = 0;
+        mm.track = 0;
+    }
+    world_ready = 1;
+    pacing_skip = 1;            /* the next frame is the load, not a frame */
+    race_load_screen(track, "Ready", 1.00f);
+    rlog("[rccars] world: %s ready -- shadow %s, water %d spawn points, "
+         "checkpoints %d, ambient '%s'  [%.0f ms all in]\n",
+         TRACKS[track].base, shadow.enabled ? "on" : "OFF",
+         water.n_spawn, cps.n,
+         TRACKS[track].ambient[0] ? TRACKS[track].ambient : "-",
+         rlog_now_ms() - t0);
+    return 1;
 }
 
 int main(void)
@@ -1695,7 +1950,46 @@ int main(void)
                   scePowerGetGpuXbarClockFrequency());
 
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
-    vglInitExtended(0, SCR_W, SCR_H, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
+
+    /* THE PHYCONT PARTITION IS NOT vitaGL'S TO TAKE YET, and that one word is
+     * why the launch movies were black on a real Vita while playing perfectly
+     * in the emulator.
+     *
+     * `vglInitExtended' is `vglInitWithCustomThreshold' with every threshold
+     * but the RAM one at zero, and a threshold is how much of a partition to
+     * LEAVE. Zero therefore means "take all of it" -- so vitaGL claimed the
+     * whole physically contiguous pool for `VGL_MEM_SLOW', the fallback heap it
+     * puts textures in when VRAM is full. The hardware H.264 decoder allocates
+     * ITS work memory out of that same pool, from inside
+     * `sceVideodecInitLibrary', which answered `SCE_KERNEL_ERROR_NO_FREE_
+     * PHYSICAL_PAGE' (0x80024302) on the machine and succeeded on the emulator,
+     * which enforces no budget. `avc_open' returned -4, `intro.c' logged "no
+     * decoder", and the mp3s played on over a black screen for 100 seconds.
+     *
+     * So the threshold is the WHOLE of the free phycont, measured rather than
+     * guessed: vitaGL takes none of it, the intro gets it, and
+     * `vglPhycontMemLazyInit' hands it over the moment the movies are done.
+     * vitaGL's own header names that function for exactly this case. Nothing
+     * else about the init changes -- the RAM threshold is the 16 MB it was.
+     *
+     * The port does not actually need `VGL_MEM_SLOW': the biggest texture set
+     * it ever holds is a track's 25 MB and the menu's 36 MB against 128 MB of
+     * CDRAM. Giving it back anyway keeps this a change to the ORDER of one
+     * allocation and not to how much memory the renderer has. */
+    mem_report("boot");
+    /* THE OTHER THREE THRESHOLDS ARE vglInitExtended's OWN, and the last one is
+       not zero: `vglInitExtended' passes `SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE'
+       for the common-dialog partition, which is how it takes NONE of it
+       (vgl.c: `MAX > threshold ? MAX - threshold : 0'). Passing 0 there would
+       hand vitaGL the 9.2 MB `sceImeDialog' and every other system dialog runs
+       in -- a second memory bug of exactly the shape of the one being fixed.
+       The constant is vitaGL's own internal header's and is not exported, so it
+       is repeated here with its provenance. */
+#define VGL_CDLG_ALL 0x8C6000       /* SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE */
+    vglInitWithCustomThreshold(0, SCR_W, SCR_H, 0x1000000, 0,
+                               INT_MAX, VGL_CDLG_ALL,
+                               SCE_GXM_MULTISAMPLE_NONE);
+    mem_report("after vglInit");
 
     /* THE RENDERER'S INITIAL STATE, and it used to be set immediately before the
        frame loop -- i.e. after every load. It is up here now because the LAUNCH
@@ -1740,10 +2034,6 @@ int main(void)
        nothing to say to each other. Missing is not an error: an empty book is
        an empty table, which is what the original shows on a fresh install. */
     records_load();
-    /* AND THE AWARD BOOK, for the same reason and in the same place -- awards.h.
-       It is keyed by profile name and the roster is not up yet, so nothing is
-       SELECTED here: apply_player does that, below, once there is a profile. */
-    award_load();
     /* AND THE ROSTER. `ux0:data/rccars/Players', in the game's own .scp format,
        so a profile copied off a PC install opens here and one made here opens
        there -- player.h. The nine portraits' pixels come up with it, because a
@@ -1810,8 +2100,17 @@ int main(void)
      * is read here, after settings_load above and before the loop, so the
      * switch takes effect on the launch AFTER the one it is thrown on -- which
      * is what the row's own caption says. */
+    mem_report("before the intro");
     {
+        /* ZEROED FIRST. `intro_close' is called unconditionally below and
+           `intro_open' is not -- `menu.intro' short-circuits it -- so with the
+           launch movies switched off in the menu this used to hand an
+           uninitialised stack struct to a function that reads `decoder', `fp',
+           `ftab' and `win' out of it and frees three of them. */
         intro_t intro;
+        memset(&intro, 0, sizeof intro);
+        intro.state = INTRO_ST_DONE;
+        intro.cur = -1;
         if (menu.intro
             && intro_open(&intro, "app0:assets/intro.vid", "app0:assets")) {
             SceCtrlData ipad;
@@ -1842,6 +2141,28 @@ int main(void)
             }
         }
         intro_close(&intro);
+    }
+
+    /* AND NOW vitaGL MAY HAVE IT. The decoder's own allocation went back inside
+       intro_close, so this is the first moment the phycont partition is both
+       free and no longer wanted by anything else -- which is what makes the
+       whole of it the right size to hand over. See vglInitWithCustomThreshold
+       above for why it was withheld. */
+    mem_report("intro done");
+    {
+        /* ROUNDED DOWN TO A MEGABYTE. vgl_mem_provide_phycont aligns the size
+           UP to 1 MB before asking the kernel for it, so handing it exactly
+           what is free is the one value guaranteed to ask for more than there
+           is. */
+        unsigned int phy = mem_phycont_free() & ~0xFFFFFu;
+        if (phy) {
+            vglPhycontMemLazyInit((size_t)phy);
+            rlog("[rccars] mem: %u KB of phycont handed to vitaGL "
+                 "(VGL_MEM_SLOW)\n", phy / 1024u);
+        } else {
+            rlog("[rccars] mem: no phycont to hand vitaGL -- textures will "
+                 "use VRAM and RAM only\n");
+        }
     }
 
     /* AND FROM HERE THE LOADING SCREEN COVERS EVERY LOAD, one presented frame at
@@ -1969,6 +2290,12 @@ int main(void)
            roster table draws one cell of per row. */
         mt.skinicons = scene_tex(&menu_scene, "skin_ik_vse");
         mt.panel     = scene_tex(&menu_scene, "messagebox_empty");
+        /* AND THE LOADING PAGE'S BAR. `Progressor' is 64x128 and its four bands
+           are the trough, the fill, a stud and a cursor -- mainmenu.h. Absent
+           from a pack built before it was on build.sh's list, which
+           mainmenu_draw_loading answers with a plain bar rather than with
+           nothing. */
+        mt.progressor = scene_tex(&menu_scene, "Progressor");
         /* AND `messagebox', whose right half is the dialog's own button pair --
            mainmenu.h. A menu.vsc packed before it was added leaves this 0 and
            the dialogs fall back to the row bars, which is what they used to
@@ -1981,14 +2308,17 @@ int main(void)
         mt.font_small = scene_tex(&menu_scene, "Smash20");
         if (!mt.font_big)   mt.font_big   = scene_tex(&props_scene, "Smash26");
         if (!mt.font_small) mt.font_small = scene_tex(&props_scene, "Smash20");
-        /* AND THE AWARD TOAST'S TWO FONTS -- one binding, so a toast cannot
-           end up in a different font from the menu that raised it. Its plate is
-           its own; awards.h says why. */
-        award_art.font_big   = mt.font_big;
-        award_art.font_small = mt.font_small;
+        /* AND THE BOOT SCREEN GETS THE SAME ONE. It is still up -- the car
+           below loads under it -- and it has been drawing its caption in the
+           compiled-in Consolas because nothing had handed it an atlas.
+           intro.h. */
+        intro_set_font(mt.font_small);
         mainmenu_init(&mm, &mt);
         mainmenu_set_car_draw(&mm, menu_car_draw, NULL);
         mm.track = menu.track;
+        /* The settings file's car row is the QUICK race's; the profile's own is
+           read by apply_player, below. mainmenu.h has why they are two. */
+        mm.qcar = menu.car;
         mm.car = menu.car;
         /* THE FIRST LAUNCH OPENS ON SELECT PLAYER, with the name modal already
            up: there is nobody to race as, and making somebody is the one thing
@@ -2071,24 +2401,20 @@ int main(void)
              SF_BIG_TEX, !!t.font_big, SF_SMALL_TEX, !!t.font_small);
     }
 
-    /* menu.track, not 0: it is where the saved settings left off, and the menu
-       row has to agree with what is on screen. A track that will not load falls
-       back to the first one rather than taking the app down -- the index is
-       already clamped into range, so a failure here means an asset this build
-       does not have, which is not the settings file's fault to die of. */
-    boot_screen("Loading track", 0.45f);
-    if (!load_track(menu.track)) {
-        if (menu.track == 0 || !load_track(0)) {
-            sceKernelExitProcess(0);
-            return 0;
-        }
-        rlog("[rccars] settings: track %d would not load -- fell back to 0\n",
-             menu.track);
-        menu.track = 0;
-    }
-    boot_screen("Loading car", 0.80f);
-    load_car(menu.car);          /* optional -- the track alone is still useful */
-    respawn();
+    /* NO TRACK HERE, AND THAT IS THE POINT. The boot used to read one -- 36 MB
+       of scene, its collision grid, its characters, its opponents' recordings
+       and up to three more car models -- before the menu it boots into could be
+       drawn, and then MM_ACT_RACE read the whole lot again, because the skill
+       decides the roster and the roster is built by load_track. It was ~55 MB
+       spent on nothing, which on an emulator reading an SSD is a blink and on
+       the machine this port is for is most of the launch. race_load does it on
+       the way into a race, under a loading screen that says which track.
+
+       The CAR does stay: the quick-race page turns it in its own viewport the
+       moment that page opens, and the first frame of the menu would load it
+       anyway (`mm.car != cur_car'). It is 5.7 MB against the track's 55. */
+    boot_screen("Loading car", 0.60f);
+    load_car(menu.car, 0);
     boot_screen("Loading", 1.00f);
     /* AND THE LOADING SCREEN IS DONE WITH. Its 2 MB goes back here rather than
        at exit: the front end is up next and it has its own copy of `Desktop' in
@@ -2140,25 +2466,24 @@ int main(void)
          countdown.tex ? "bound (the game's own 3-2-1-GO!)"
                        : "NOT PACKED -- falling back to the built-in font");
 
-    if (car.has_rig)
+    if (carp->has_rig)
         rlog("[rccars] rig: wheels %d %d %d %d  knuckles %d %d  "
                       "axles %d/%d  springs %d\n",
-                      car.rig.wheel[0], car.rig.wheel[1], car.rig.wheel[2],
-                      car.rig.wheel[3], car.rig.support[0], car.rig.support[1],
-                      car.rig.axle_front, car.rig.axle_rear, car.rig.n_springs);
+                      carp->rig.wheel[0], carp->rig.wheel[1], carp->rig.wheel[2],
+                      carp->rig.wheel[3], carp->rig.support[0], carp->rig.support[1],
+                      carp->rig.axle_front, carp->rig.axle_rear, carp->rig.n_springs);
     rlog("[rccars] car: %s   tracks: %d\n",
                   rbcar_name(cur_car), N_TRACKS);
-    rlog("[rccars] visuals: shadow %s  water %d spawn points  "
-                  "checkpoints %d\n",
-                  shadow.enabled ? "on" : "OFF (no __shadow texture)",
-                  water.n_spawn, cps.n);
-    rlog("[rccars] audio: %s  music %d race / %d menu  "
-                  "resident %u KB  ambient '%s'\n",
+    /* The water, the checkpoints and the ambient bed are all per TRACK and
+       there is no track yet -- race_load prints those four the moment there
+       is one. */
+    rlog("[rccars] visuals: shadow %s\n",
+                  shadow.enabled ? "on" : "OFF (no __shadow texture)");
+    rlog("[rccars] audio: %s  music %d race / %d menu  resident %u KB\n",
                   audio_ok() ? "on" : "OFF",
                   audio_music_count(AUDIO_MUSIC_RACE),
                   audio_music_count(AUDIO_MUSIC_MENU),
-                  sfx_resident_bytes() / 1024u,
-                  TRACKS[cur_track].ambient[0] ? TRACKS[cur_track].ambient : "-");
+                  sfx_resident_bytes() / 1024u);
 
     SceCtrlData pad;
     unsigned int prev_buttons = 0, frames = 0;
@@ -2166,6 +2491,15 @@ int main(void)
     /* frame budget accounting -- see the report by the fps line */
     SceRtcTick t_draw0, t_swap0, t_swap1;
     double acc_sim = 0.0, acc_draw = 0.0, acc_swap = 0.0;
+    /* AND THE WORST ONE IN THE WINDOW, which the averages above cannot show and
+       which is the only thing a report of "periodic stuttering" can be held
+       against: sixty frames averaging 28 ms and sixty frames of 20 ms with one
+       of 500 ms in them read the same on the line below and look nothing alike
+       on the screen. Kept with its own split, so a spike is attributable. */
+    double worst = 0.0, worst_sim = 0.0, worst_draw = 0.0, worst_swap = 0.0;
+    double worst_phys = 0.0;
+    int worst_ticks = 0;
+    unsigned int pace_next = (unsigned int)sceDisplayGetVcount();
 /* rbcar_step_frame's own share of `sim`, and the ticks it was spent on -- so the
    collision queries, which is where a hardware log put 111 ms of a 118 ms frame
    while `draw` never moved off 5.7 ms. The draw side has had this split since the
@@ -2186,6 +2520,32 @@ unsigned int acc_ticks = 0;
         float dt = (float)((double)(t1.tick - tf.tick) / hz);
         tf = t1;
         if (dt > 0.1f) dt = 0.1f;      /* don't integrate through a hitch */
+        /* AND WHEN THE PACER IS ON, IT OWNS THE CLOCK.
+         *
+         * The pacer holds a frame for a whole number of vblanks, so a frame that
+         * FITS hands the world exactly that much time and the physics bank takes
+         * exactly that many 1/60 ticks -- which is the whole point of it. A frame
+         * that OVERRUNS used to hand over the overrun as well, and that is the
+         * spike coming back through the other door: 50 ms of real time is three
+         * ticks, a tick on this track costs up to 8.7 ms, so the frame that was
+         * already too long got 26 ms of physics put on top of it and the one
+         * after it got four ticks and was CLIPPED. The hardware log has both.
+         *
+         * Clamped to the pacer's own period, the world advances at most `pace'
+         * vblanks per frame however long the frame took. What that costs is
+         * honest and small: on a frame the machine could not deliver, the world
+         * runs slightly slow -- which is what the catch-up cap was already doing
+         * at four ticks, less evenly and only at the extreme. What it buys is
+         * that the tick count stops moving, so a slow frame cannot make the next
+         * one slower.
+         *
+         * Only under the pacer. With pacing off the accumulator behaves exactly
+         * as it did, because then nothing is promising an even frame and running
+         * the world slow would buy nothing. */
+        if (menu.pace > 0) {
+            const float pace_dt = (float)menu.pace / 60.0f;
+            if (dt > pace_dt) dt = pace_dt;
+        }
         /* KEPT before the menu zeroes dt further down. Only the message layer
            reads it, and only so PAUSE can keep its own life topped up while the
            world is frozen -- everything else in the app is meant to stop with
@@ -2232,22 +2592,20 @@ unsigned int acc_ticks = 0;
            AND THE FRONT END HAS NO QUIT BUTTON ANY MORE (mainmenu.c): a Vita app
            is left with the PS button, which the app never sees. So THIS is the
            last event that can carry a write, and it takes the one the Quit
-           button used to own -- the profile's play time and the award book, both
-           of which move during a race and neither of which a finish has filed if
-           the player walks out mid-race. One file on one event, and abandoning a
-           race is the event. */
+           button used to own -- the profile's play time, which moves during a
+           race and which a finish has not filed if the player walks out
+           mid-race. One file on one event, and abandoning a race is the
+           event. */
         if (menu.req_quit) {
             menu.req_quit = 0;
             menu.open = 0;
             if (!in_main_menu) {
                 in_main_menu = 1;
                 mm.track = cur_track;
-                mm.car = cur_car;
+                mm.qcar = cur_car;
                 sfx_ui(SFX_UI_BACK);
                 store_player();
                 player_save_cur_if_dirty();
-                award_note_profile();
-                award_save_if_changed();
             }
         }
 
@@ -2258,13 +2616,6 @@ unsigned int acc_ticks = 0;
            the host and still answer it. A peer that went quiet because its
            owner opened the START menu would be dropped in five seconds. */
         net_step(frame_dt);
-
-        /* THE AWARD TOAST'S CLOCK, once a frame and on the raw frame time for
-           the reason above: a toast is an acknowledgement of something that has
-           already happened, so it has to be able to finish and go. Under `dt'
-           it would freeze mid-life the moment the player opened the START menu
-           -- which msg.c's PAUSE banner wants and this does not. */
-        award_step(frame_dt);
 
         /* THE FRONT END. The panel is read every frame whatever is up, because
            touch.h's edges are differences and a frame that skipped the read
@@ -2293,7 +2644,7 @@ unsigned int acc_ticks = 0;
                     race_champ = 0;
                     in_main_menu = 1;
                     mm.track = cur_track;
-                    mm.car = cur_car;
+                    mm.qcar = cur_car;
                     mm.csel = cur_track;
                     mm.page = MM_PAGE_CHRACE;
                     mm.rfocus = MM_R_RACE;
@@ -2306,7 +2657,7 @@ unsigned int acc_ticks = 0;
                 results_up = 0;
                 in_main_menu = 1;
                 mm.track = cur_track;
-                mm.car = cur_car;
+                mm.qcar = cur_car;
                 sfx_ui(SFX_UI_BACK);
             }
         }
@@ -2320,24 +2671,37 @@ unsigned int acc_ticks = 0;
             static int settings_was_open;
             if (in_main_menu && settings_was_open && !menu.open) {
                 mm.track = menu.track;
-                mm.car = menu.car;
+                mm.qcar = menu.car;
             }
             settings_was_open = menu.open;
         }
         if (in_main_menu && !menu.open) {
             mainmenu_step(&mm, pad.buttons, &g_touch, SCR_W, SCR_H, frame_dt);
-            /* THE CAR PICKER LOADS THE CAR. animCar draws the scene that is
-               loaded, so without this the quick-race page changed the name and
-               the numbers and went on turning the previous model -- reported as
-               "car model not change if choose other car".
+            /* THE PAGE ON SCREEN DECIDES WHICH CAR IS FITTED. animCar draws
+               the scene that is loaded, so without this the quick-race page
+               changed the name and the numbers and went on turning the previous
+               model -- reported as "car model not change if choose other car".
+               There are two cars now (mainmenu.h) and only one can be fitted, so
+               the question is the PAGE's, and mainmenu_view_car answers it.
              *
-               Straight away rather than at the flag: the picture IS the control's
-               feedback, and it is the same call the START menu's own Car row
-               makes. It costs a scene load, which is what changing a car costs
-               anywhere in this app. */
-            if (mm.car != cur_car && mm.car >= 0 && mm.car < MENU_N_CARS) {
-                menu.car = mm.car;
-                load_car(mm.car);
+               Straight away rather than at the flag: the picture IS the
+               control's feedback. It is nearly free once the pool has the model
+               (see car_pool) -- and where it is not, the frame below says so
+               rather than letting the front end sit still for half a second. */
+            {
+                const int want = mainmenu_view_car(&mm);
+                if (want != cur_car) {
+                    if (!car_resident(want))
+                        menu_wait_frame("Loading car");
+                    /* THE PARTS FIRST, because load_car reads menu.tires /
+                       boost / skin as it binds -- and they are per CAR, so a
+                       car fitted before its own levels were pushed wears the
+                       last one's exhaust. */
+                    apply_garage();
+                    load_car(want, 0);
+                }
+                if (MM_PAGE_IS_QUICK(mm.page))
+                    menu.car = mm.qcar;
             }
             switch (mm.cue) {
             case MM_CUE_FOCUS: sfx_ui(SFX_UI_FOCUS); break;
@@ -2366,18 +2730,20 @@ unsigned int acc_ticks = 0;
                 player_save_cur_if_dirty();
                 ai_set_skill_field(1);
                 ai_skill = mm.skill;
-                if (mm.car != cur_car) {
-                    menu.car = mm.car;
-                    load_car(mm.car);
-                }
+                /* THE QUICK RACE'S OWN CAR, which is what this page picked --
+                   not the profile's, which is the Garage's and the ladder's.
+                   mainmenu.h. */
+                menu.car = mm.qcar;
                 /* The carousel is the authority on the track from here, so the
                    settings row follows it rather than the other way round --
                    otherwise the START menu would open on the old one and the
                    next save would write it back. RELOADED even when it has not
                    changed, because the skill decides the roster and the roster
-                   is built by load_track. */
+                   is built by load_track -- which is also why the boot no
+                   longer loads one at all. */
                 menu.track = mm.track;
-                load_track(mm.track);
+                if (!race_load(mm.track, mm.qcar))
+                    break;      /* no world: stay in the front end */
                 net_race = 0;
                 race_champ = 0;
                 race_over = 0;
@@ -2404,12 +2770,10 @@ unsigned int acc_ticks = 0;
                 player_save_cur_if_dirty();
                 ai_set_skill_field(1);
                 ai_skill = mm.skill;
-                if (mm.car != cur_car) {
-                    menu.car = mm.car;
-                    load_car(mm.car);
-                }
+                menu.car = mm.car;
                 menu.track = mm.track;
-                load_track(mm.track);
+                if (!race_load(mm.track, mm.car))
+                    break;
                 net_race = 0;
                 race_champ = 1;
                 race_over = 0;
@@ -2441,12 +2805,10 @@ unsigned int acc_ticks = 0;
                     race_laps = ns->laps > 0 ? ns->laps : mm.laps;
                     store_player();
                     player_save_cur_if_dirty();
-                    if (mm.car != cur_car) {
-                        menu.car = mm.car;
-                        load_car(mm.car);
-                    }
+                    menu.car = mm.car;
                     menu.track = mm.track;
-                    load_track(mm.track);
+                    if (!race_load(mm.track, mm.car))
+                        break;
                     /* AFTER load_track, which is what builds the world the
                        remote bodies collide against -- and after it has run
                        ai_init for the single-race field, which this then
@@ -2523,12 +2885,6 @@ unsigned int acc_ticks = 0;
                    picker, which the mm.car sync above does. */
                 apply_garage();
                 player_save_cur_if_dirty();
-                /* AND THE AWARD BOOK, off the same event: a fitted part and the
-                   paint are two of the three facts it takes off the profile
-                   (awards.h), and this is the only thing in the app that
-                   changes either. */
-                award_note_profile();
-                award_save_if_changed();
                 break;
             case MM_ACT_OPTIONS:
                 menu.open = 1;
@@ -2539,10 +2895,6 @@ unsigned int acc_ticks = 0;
                    Quit button is the only way out of the app. */
                 store_player();
                 player_save_cur_if_dirty();
-                /* AND THE AWARD BOOK -- the play-time award is the one that can
-                   still move in a session that finishes no race. */
-                award_note_profile();
-                award_save_if_changed();
                 /* AND TELL ANYBODY WE ARE IN A GAME WITH. A host that walks out
                    of the app without a NP_BYE leaves three clients on a
                    five-second timeout looking at a lobby that is already
@@ -2570,14 +2922,25 @@ unsigned int acc_ticks = 0;
                  "this run scores nothing\n");
         }
         if (menu.req_track >= 0) {
-            load_track(menu.req_track);
+            /* NOT WHILE THERE IS NO WORLD. Options opens over the FRONT END as
+               well as over a race, and its Track row there is a choice about
+               the race to come, not a change to one in progress -- the carousel
+               takes it when the overlay closes and race_load is what reads it.
+               Loading 36 MB on the row itself would be the boot-time load this
+               file just stopped making, moved one screen along. */
+            if (world_ready) {
+                race_load_screen(menu.req_track, "Loading track", 0.30f);
+                load_track(menu.req_track);
+                respawn();
+            }
             menu.req_track = -1;
-            respawn();
         }
         if (menu.req_car >= 0) {
-            load_car(menu.req_car);
+            /* The car loads either way: the front end draws it. */
+            load_car(menu.req_car, world_ready);
             menu.req_car = -1;
-            respawn();
+            if (world_ready)
+                respawn();
         }
         /* The car's light needs no reload: the row is GL state and a per-frame
            step, so it is handed over every frame and takes effect on the next
@@ -2590,13 +2953,30 @@ unsigned int acc_ticks = 0;
             menu.req_reload = 0;
             scene_set_tex_quality(menu.tex_quality);
             scene_set_tex_swap_rb(menu.tex_swap_rb);
-            load_track(cur_track);
-            load_car(cur_car);
-            respawn();
+            if (world_ready) {
+                race_load_screen(cur_track, "Reloading", 0.30f);
+                load_track(cur_track);
+            }
+            {
+                /* EVERY RESIDENT SLOT, not just the fitted one: quality is
+                   picked at UPLOAD time, so a car still holding its old levels
+                   would come back at the old quality the moment the picker
+                   reached it. Dropped and re-read through load_car, which reads
+                   an empty slot. */
+                const int was = cur_car;
+                int k;
+                for (k = 0; k < MENU_N_CARS; k++)
+                    if (car_pool[k].n_batches)
+                        scene_release(&car_pool[k]);
+                load_car(was, world_ready);
+            }
+            if (world_ready)
+                respawn();
         }
         if (menu.req_restart) {
             menu.req_restart = 0;
-            respawn();
+            if (world_ready)
+                respawn();
         }
         /* Upgrades are plain indices the model reads each frame, so they apply
            live -- no reload, and the effect is visible while driving. */
@@ -2622,11 +3002,11 @@ unsigned int acc_ticks = 0;
                                       ? cur_car : 0];
             if (shown_tires != menu.tires || shown_boost != menu.boost
                 || shown_skin != want_skin) {
-                carparts_apply(&parts, &car, menu.tires, menu.boost, want_skin);
+                carparts_apply(&parts, carp, menu.tires, menu.boost, want_skin);
                 /* A different exhaust is a different pipe, in a different
                    place -- the four booster_<n>_end nodes are up to 18 cm
                    apart on the Overkill. */
-                fx_pipe_from_rig(&fx.em, &car.rig, menu.boost,
+                fx_pipe_from_rig(&fx.em, &carp->rig, menu.boost,
                                  rbcar_com_oy(cur_car));
                 shown_tires = menu.tires;
                 shown_boost = menu.boost;
@@ -2672,10 +3052,90 @@ unsigned int acc_ticks = 0;
         ai_hidden = (dbg_isolate == 4);
         prev_buttons = pad.buttons;
 
+        /* THE CAMERA, declared HERE rather than beside the branch that sets
+           it, because the `!world_ready' guard below is a forward jump and a
+           jump past a declaration leaves the object uninitialised -- which is
+           what the compiler said, and it was right even though nothing on that
+           path reads them. With no world the frame is always the front end's:
+           it draws and goes straight to frame_end. */
+        float ex = 0.f, ey = 0.f, ez = 0.f, vyaw = 0.f, vpitch = 0.f;
+        /* THIS frame's physics, as against the window's average -- above the
+           guard for the same reason, and because the worst frame's split is the
+           only thing that separates "the tick loop ran four times" from
+           "something else in sim took 30 ms". */
+        double frame_phys = 0.0;
+        int frame_ticks = 0;
+
+        /* ---- what the FRONT END needs out of the audio block ---------------
+           Hoisted out of it, and above the guard below, because these five are
+           the only calls between here and the draw that a frame with NO WORLD
+           still has to make: which bank is playing, whether the race loops are
+           running, and the interface sound the last keypress earned. The rest
+           of that block wants the listener's position, and there is no listener
+           until a track is loaded. */
+        /* The menu freezes the world (dt = 0) but not the sound thread, so
+           the loops are stopped explicitly rather than left droning on a
+           car that is no longer moving.
+         *
+           AND THE FRONT END COUNTS AS A MENU, which it did not at first: the
+           app used to load a track at boot, so with only `menu.open' here the
+           engine and the track's ambient bed came up UNDER the main menu and
+           played the whole time the player was choosing. sfx_pause stops the
+           loops and quiets the bed and leaves the music alone; the group
+           below then puts the MENU music on, which is what the original
+           plays on this screen -- there are eleven of them in the bank
+           against the race's seven. */
+        sfx_race_active(!in_main_menu);
+        sfx_pause(menu.open);
+        audio_music_group((menu.open || in_main_menu) ? AUDIO_MUSIC_MENU
+                                                      : AUDIO_MUSIC_RACE);
+
+        /* The menu raises what the last input DID; turning that into one of
+           the game's own interface sounds is this side's job, so menu.c
+           stays linkable without a mixer. */
+        switch (menu.cue) {
+        case MENU_CUE_MOVE:   sfx_ui(SFX_UI_FOCUS); break;
+        case MENU_CUE_CHANGE: sfx_ui(SFX_UI_PRESS); break;
+        case MENU_CUE_SELECT: sfx_ui(SFX_UI_ENTER); break;
+        case MENU_CUE_CLOSE:  sfx_ui(SFX_UI_BACK);  break;
+        default: break;
+        }
+        menu.cue = MENU_CUE_NONE;
+
+        sfx_volumes((float)menu.vol_sfx / (float)MENU_VOL_STEPS,
+                    (float)menu.vol_music / (float)MENU_VOL_STEPS);
+
+        /* ---- AND NOTHING BELOW THIS RUNS UNTIL THERE IS A WORLD ------------
+         *
+         * The app boots into the front end and the front end does not need a
+         * track: it draws instead of the world (see the `in_main_menu' branch
+         * at the draw), the world is frozen at dt = 0 while it is up, and every
+         * race entry reloads the track anyway because the skill decides the
+         * roster and the roster is built by load_track. So the ~55 MB the boot
+         * used to spend on a track, its collision grid, its characters and its
+         * opponents' car models bought exactly nothing, and on a machine that
+         * reads its card at a tenth of an emulator's disk that was most of the
+         * launch. It is spent on the way INTO a race now, under the loading
+         * screen race_load draws.
+         *
+         * The guard is a jump rather than a flag threaded through the sim,
+         * because "no world" is not a state the 1300 lines below were written
+         * for -- an empty scene, an empty collision grid and a memset checkpoint
+         * set are not a supported input to them, and would not be worth making
+         * one for a case that draws nothing. */
+        if (!world_ready) {
+            want_inventory = 0;     /* TRIANGLE has nothing to inventory yet */
+            goto menu_only;
+        }
+
         /* The water clock and the wave sprites run whether or not the player is
            driving, so they step outside the free-cam branch. */
         if (show_vis)
+        {
+            const double w0 = rlog_now_ms();
             water_step(&water, dt);
+            acc_f_water += rlog_now_ms() - w0;
+        }
         /* NOT on show_vis. That button is for turning the port's own visual
            subsystems off while looking for a rendering bug, and checkpoint
            progression stopped being one of those when the crossing became the
@@ -2883,41 +3343,6 @@ unsigned int acc_ticks = 0;
                    when the app closes -- loses the result to a PS button. The
                    same ~50 ms a settings save costs, once per race. */
                 records_save_if_changed();
-                /* AND THE AWARD BOOK, off the same table -- awards.h. Every
-                 * field is a number this frame already has:
-                 *
-                 *   place        the player's row after results_finish sorted
-                 *                them, which is the placing the finish screen
-                 *                shows and not a second opinion
-                 *   n_finished   how many rows crossed for the last time before
-                 *                the race ended -- `Home Alone' is a win with
-                 *                that at 1 and a field to beat
-                 *   deaths       race_deaths, counted in respawn_checkpoint
-                 *
-                 * The player's row is found by its own flag rather than by
-                 * index: results_finish SORTS, so row 0 is the winner and not
-                 * necessarily us. */
-                {
-                    aw_race aw;
-                    int fin = 0;
-                    memset(&aw, 0, sizeof aw);
-                    aw.track = menu.track;
-                    aw.car = menu.car;
-                    aw.laps = race_laps;
-                    aw.n_racers = results.n;
-                    aw.net = net_race;
-                    aw.deaths = race_deaths;
-                    aw.best_lap = race_ui.best_lap;
-                    aw.place = 0;
-                    for (k = 0; k < results.n; k++) {
-                        if (results.row[k].finished)
-                            fin++;
-                        if (results.row[k].is_player)
-                            aw.place = results.row[k].place;
-                    }
-                    aw.n_finished = fin;
-                    award_race(&aw);
-                }
                 /* AND THE CHAMPIONSHIP'S OWN BOOKKEEPING -- champ.h, which
                  * has the whole of FUN_004c56c0's money half.
                  *
@@ -2984,12 +3409,6 @@ unsigned int acc_ticks = 0;
                    and a finish is the one moment there are new ones to file. */
                 store_player();
                 player_save_cur_if_dirty();
-                /* The profile's clock has just moved and its parts may have,
-                   so the three facts the book takes off it are re-read here --
-                   and the book itself is written on the same event as the
-                   record book, for the same reason. */
-                award_note_profile();
-                award_save_if_changed();
             }
         }
         race_ui_step(&race_ui, dt);
@@ -3194,7 +3613,6 @@ unsigned int acc_ticks = 0;
         }
         rbcar_hold(&rc, (race_over && !free_cam) ? 1 : 0);
 
-        float ex, ey, ez, vyaw, vpitch;
         if (free_cam) {
             fly_yaw += rx * 2.2f;
             fly_pitch -= ry * 1.6f;
@@ -3282,9 +3700,18 @@ unsigned int acc_ticks = 0;
                                                 &tick_world);
                 }
                 sceRtcGetCurrentTick(&t_p1);
-                acc_phys += (double)(t_p1.tick - t_p0.tick) / hz;
-                if (ticks > 0)
-                    acc_ticks += (unsigned)ticks;
+                frame_phys = (double)(t_p1.tick - t_p0.tick) / hz;
+                /* -1 IS THE CATCH-UP CAP, NOT ZERO TICKS. rbcar_step_frame_cb
+                   returns -1 when RBCAR_MAX_CATCHUP clipped the frame, having
+                   run exactly that many ticks -- and reporting it as 0 put
+                   "phys 16923 us over 0 tick(s)" in the log twenty-eight times,
+                   which reads as physics costing 17 ms out of nowhere when it
+                   is four ticks doing what they cost. Negated so the line can
+                   still say which it was. */
+                frame_ticks = ticks < 0 ? -RBCAR_MAX_CATCHUP : ticks;
+                acc_phys += frame_phys;
+                acc_ticks += (unsigned)(frame_ticks < 0 ? -frame_ticks
+                                                        : frame_ticks);
 
                 /* ---------------------------------- THE NETWORK EXCHANGE
                  *
@@ -3400,8 +3827,10 @@ unsigned int acc_ticks = 0;
                         const float *cm = rbcar_matrix(&rc);
                         float cpos[3] = { cm[12], cm[13], cm[14] };
                         float cfwd[3] = { cm[8], cm[9], cm[10] };
+                        const double c0 = rlog_now_ms();
                         char_step(&chars, ticks * RBCAR_TICK_DT, cpos, cfwd,
                                   rbcar_speed(&rc));
+                        acc_f_char += rlog_now_ms() - c0;
                         /* AND THE CHARACTERS ARE SOLID. Immediately after the
                            step, so the contact sees the positions it just wrote,
                            and once per FRAME rather than once per tick because
@@ -3429,12 +3858,6 @@ unsigned int acc_ticks = 0;
                             int nr = char_car_react(&chars, &rc);
                             unsigned int ri;
                             for (ri = 0; nr && ri < chars.n_inst; ri++) {
-                                /* THE THROW, which is the one reaction with no
-                                   cue of its own (see the comment below) and is
-                                   therefore the one the award book has to raise
-                                   for itself. An edge, like every imp_kind. */
-                                if (chars.inst[ri].imp_kind == CHR_IMP_THROW)
-                                    award_thrown();
                                 if (chars.inst[ri].imp_kind == CHR_IMP_SHOT)
                                     /* car_cdt_bullet -- NOT positional: it is
                                        the player's own car, which is where the
@@ -3502,15 +3925,6 @@ unsigned int acc_ticks = 0;
                                    rather than an invented one, which is the rule
                                    this comment already existed to enforce. */
                                 sfx_char_wav(chr_model_wav(&chars, ci), p, 1.f);
-                                /* AND THE AWARD BOOK, off the same two edges.
-                                   CHR_EV_HURT is anything run over -- a person,
-                                   a dog, a crab -- which is what
-                                   `Pedestrian Crossing' counts, and CHR_EV_SHOOT
-                                   is a guard opening fire. */
-                                if (ev == CHR_EV_HURT)
-                                    award_run_over();
-                                if (ev == CHR_EV_SHOOT)
-                                    award_shot_at();
                                 /* AND A GUARD OPENING FIRE HAS ITS OWN CUE ON
                                    TOP OF ITS VOICE: `bullet`, which snd.dat
                                    names and Sound/bullet.wav ships. One report
@@ -3545,12 +3959,6 @@ unsigned int acc_ticks = 0;
                                cluster of cans in one pass counts up inside a
                                single pop rather than stacking words. */
                             hud_hit(&hud, props.p[pi].hit_speed);
-                            /* AND THE AWARD BOOK COUNTS IT. Every prop, not
-                               every pop: a cluster taken out in one pass is one
-                               banner and three knocks. The speed floor is
-                               hud_hit's, above -- what the player is told about
-                               is what gets counted. */
-                            award_prop();
                             /* AND SO DOES THE CHAMPIONSHIP'S BONUS, off the
                                same edge and for the same reason the engine
                                does: FUN_004f5e50 bumps its counter in the
@@ -3591,9 +3999,9 @@ unsigned int acc_ticks = 0;
                The placeholder model has no per-wheel spring length and no steer
                ANGLE (only the stick), so it gets the reduced version: wheels that
                steer and roll, axles at rest. */
-            if (car.has_rig) {
+            if (carp->has_rig) {
                 if (use_rb) {
-                    carani_update(&car.rig, &rc);
+                    carani_update(&carp->rig, &rc);
                     /* The whip antenna. Acceleration is finite-differenced from
                        the body's own linear velocity, which rb.c already keeps
                        (P * 1/m) -- differencing the POSITION instead would be a
@@ -3617,7 +4025,7 @@ unsigned int acc_ticks = 0;
                     flat_spin = fmodf(flat_spin, 2.f * 3.14159265f);
                     /* same sign convention as rb_car.steer: positive points the
                        wheels LEFT, so the stick is negated */
-                    carani_update_flat(&car.rig, -lx * 30.f, flat_spin);
+                    carani_update_flat(&carp->rig, -lx * 30.f, flat_spin);
                     {
                         /* the placeholder has no body matrix; feed the antenna
                            an upright frame and its forward speed */
@@ -3659,33 +4067,8 @@ unsigned int acc_ticks = 0;
                     && veh.y < wy - DROWN_DEPTH) {
                     rlog("[rccars] died: drowned (%d cm under)\n",
                                   (int)((wy - veh.y) * 100.f));
-                    award_drowned();
                     respawn_checkpoint();
                 }
-            }
-            /* THE AWARD BOOK'S PER-FRAME WATCH -- awards.h, which takes plain
-             * numbers and keeps the edges itself. Here, at the end of the
-             * frame's physics, because every one of the six is current by this
-             * point: the car has been stepped, the props and the characters
-             * have been resolved, and the two deaths above have been raised.
-             *
-             * `speed_max' IS THE DIAL'S OWN FULL SCALE and the expression is
-             * race_ui's, written out again rather than shared -- the same choice
-             * that file and sfx.c make about it, and for the same reason: this
-             * must still be right on a build where either of those is broken.
-             * `Pegged' is a fraction of it, so it means "your own car flat out"
-             * on all three cars and every resonator level.
-             *
-             * boost_lock is the meter's emptied latch and no_contact_t is the
-             * car's own airborne clock -- rb.h names both. */
-            {
-                float top = rc.tune.speed_boost_max;
-                const int rr = rc.reso_upgrade;
-                if (rr >= 0 && rr < 4)
-                    top *= rc.tune.resonator_speed[rr];
-                award_frame(dt, rbcar_speed(&rc), top / 3.6f,
-                            rc.no_contact_t, rc.boost_lock,
-                            dirarrow_wrong(&dir_arrow), hud_is_great(&hud));
             }
             /* The orbit offsets used to accumulate forever, so any stick nudge
                or drift left the camera permanently off-axis -- very visible now
@@ -3818,37 +4201,6 @@ unsigned int acc_ticks = 0;
                 rlog("[rccars] ---- end of inventory ----\n");
             }
 
-            /* The menu freezes the world (dt = 0) but not the sound thread, so
-               the loops are stopped explicitly rather than left droning on a
-               car that is no longer moving.
-             *
-               AND THE FRONT END COUNTS AS A MENU, which it did not at first: the
-               app loads a track at boot, so with only `menu.open' here the
-               engine and the track's ambient bed came up UNDER the main menu and
-               played the whole time the player was choosing. sfx_pause stops the
-               loops and quiets the bed and leaves the music alone; the group
-               below then puts the MENU music on, which is what the original
-               plays on this screen -- there are eleven of them in the bank
-               against the race's seven. */
-            sfx_race_active(!in_main_menu);
-            sfx_pause(menu.open);
-            audio_music_group((menu.open || in_main_menu) ? AUDIO_MUSIC_MENU
-                                                          : AUDIO_MUSIC_RACE);
-
-            /* The menu raises what the last input DID; turning that into one of
-               the game's own interface sounds is this side's job, so menu.c
-               stays linkable without a mixer. */
-            switch (menu.cue) {
-            case MENU_CUE_MOVE:   sfx_ui(SFX_UI_FOCUS); break;
-            case MENU_CUE_CHANGE: sfx_ui(SFX_UI_PRESS); break;
-            case MENU_CUE_SELECT: sfx_ui(SFX_UI_ENTER); break;
-            case MENU_CUE_CLOSE:  sfx_ui(SFX_UI_BACK);  break;
-            default: break;
-            }
-            menu.cue = MENU_CUE_NONE;
-
-            sfx_volumes((float)menu.vol_sfx / (float)MENU_VOL_STEPS,
-                        (float)menu.vol_music / (float)MENU_VOL_STEPS);
 
             if (use_rb)
                 sfx_update(&rc, eye3, vyaw, dt);
@@ -4003,12 +4355,17 @@ unsigned int acc_ticks = 0;
                 ai_fx_emitted++;
             }
 
-            fx_step(&fx, &rc, &col, eye, dt);
-            trace_step(&traces, &rc, &col, dt);
+            {
+                const double f0 = rlog_now_ms();
+                fx_step(&fx, &rc, &col, eye, dt);
+                trace_step(&traces, &rc, &col, dt);
+                acc_f_fx += rlog_now_ms() - f0;
+            }
         }
 
         /* Frame budget: mark the boundary between simulation and submission. See
            the report under the fps line for what this is for. */
+menu_only:
         sceRtcGetCurrentTick(&t_draw0);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -4021,11 +4378,6 @@ unsigned int acc_ticks = 0;
             ui_begin(SCR_W, SCR_H);
             mainmenu_draw(&mm, SCR_W, SCR_H);
             ui_end();
-            /* THE AWARD TOAST, over the front end and under the settings
-               overlay -- the band it sits in (awards.c) is the HUD's, so on the
-               menu it is simply over the artwork. Drawn here as well as in the
-               race path because an award can land in the Garage. */
-            award_draw(&award_art, SCR_W, SCR_H);
             if (menu.open)
                 menu_draw(&menu, SCR_W, SCR_H);
             goto frame_end;
@@ -4148,7 +4500,7 @@ unsigned int acc_ticks = 0;
                 shadow_draw_yaw(&shadow, &col, veh.x, veh.y, veh.z, veh.yaw);
         }
 
-        if (car.n_batches) {
+        if (carp->n_batches) {
             /* The car is drawn under its own body matrix, so a model-space box
                tested against the world frustum means nothing. scene_draw already
                declines to cull a scene that has a rig, but a car packed without
@@ -4187,7 +4539,7 @@ unsigned int acc_ticks = 0;
                    original's own version of this line and negates exactly that
                    vector; see rb_data.h.
 
-                   This used to subtract carani_wheel_plane_y(&car.rig) instead,
+                   This used to subtract carani_wheel_plane_y(carp->rig) instead,
                    the mesh's own wheel-centre plane, which was the right number
                    only while gen_rb_data.py parked the com on that plane. It no
                    longer does, and the alignment now falls out of mount_y rather
@@ -4211,12 +4563,14 @@ unsigned int acc_ticks = 0;
                scene_set_lighting is what binds them. */
             if (carlight_enabled()) {
                 float La, Ld, Lm[3];
+                const double rl0 = rlog_now_ms();
                 carlight_terms(&car_lit, car_cam_dist, &La, &Ld);
                 carlight_model_dir(rbcar_matrix(&rc), Lm);
-                scene_shade(&car, Lm, La, Ld);
+                scene_shade(carp, Lm, La, Ld);
+                acc_relight += (rlog_now_ms() - rl0) / 1000.0;
                 scene_set_lighting(1);
             }
-            scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
+            scene_draw(carp, BATCH_SKY | BATCH_ALPHA_LOWREF, 0);
             /* The exhaust last, OPAQUE, and with only the ALPHA-TEST REFERENCE
              * moved.
              *
@@ -4242,7 +4596,7 @@ unsigned int acc_ticks = 0;
              * in this fixed-function path and the rest of the car still needs
              * 0.5. Depth writes were never off here and stay on. */
             glAlphaFunc(GL_GREATER, 0.f);
-            scene_draw(&car, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
+            scene_draw(carp, BATCH_SKY | BATCH_ALPHA_LOWREF, BATCH_ALPHA_LOWREF);
             glAlphaFunc(GL_GREATER, 0.5f);
             scene_set_lighting(0);   /* harmless when it was never turned on */
             /* The glance goes on last, over the paint and the exhaust both --
@@ -4252,7 +4606,7 @@ unsigned int acc_ticks = 0;
             if (show_vis && use_rb) {
                 float n3[9];
                 env_normal_matrix(rbcar_matrix(&rc), vpitch, vyaw, n3);
-                envmap_draw(&envmap, &car, n3, car_lit.level);
+                envmap_draw(&envmap, carp, n3, car_lit.level);
                 /* Snapshot: draw_ai runs envmap_draw again per opponent and
                    envmap_draw resets its own counters, so the log would report
                    the last opponent's glance as the player's. */
@@ -4268,7 +4622,11 @@ unsigned int acc_ticks = 0;
         {
             float aeye[3];
             aeye[0] = ex; aeye[1] = ey; aeye[2] = ez;
+            {
+            const double da0 = rlog_now_ms();
             draw_ai(aeye, vpitch, vyaw);
+            acc_draw_ai += (rlog_now_ms() - da0) / 1000.0;
+        }
         }
 
         /* Water last of the world: the sea surface and the stream are opaque,
@@ -4457,12 +4815,6 @@ unsigned int acc_ticks = 0;
             ui_end();
         }
 
-        /* THE AWARD TOAST, over the world and the finish screen both -- it is
-           not one of the message layer's slots and overlaps none of them: it
-           lives in the one band of the HUD frame nothing else is in, which is
-           what awards.c's own rect comment enumerates. */
-        award_draw(&award_art, SCR_W, SCR_H);
-
         /* The menu goes over everything, in its own ortho pass. */
         if (menu.open)
             menu_draw(&menu, SCR_W, SCR_H);
@@ -4474,10 +4826,68 @@ frame_end:
            dialog runs, takes the input and draws NOTHING -- which reads as the
            app having hung on the frame the player asked for a name. See ime.h. */
         vglSwapBuffers(ime_active() ? GL_TRUE : GL_FALSE);
+
+        /* ------------------------------------------------- THE FRAME PACER
+         *
+         * WHAT IT IS FOR, and it is not the frame rate. The hardware log has a
+         * race at 26-38 fps with `draw' a flat 22-25 ms and `swap' 0.19 ms --
+         * the GPU finishes long before the CPU stops submitting, and
+         * vglSwapBuffers does not block, so the main loop runs free and each
+         * frame is shown at the next vblank after it happens to finish. A frame
+         * that wanders either side of one vblank is therefore held for two,
+         * then three, then two. THAT ALTERNATION IS THE JUDDER, and it is what
+         * a player calls stuttering; the average frame rate barely moves while
+         * it happens.
+         *
+         * AND IT FIXES THE PHYSICS SPIKE WITH THE SAME LINE, which is the part
+         * that makes this worth doing rather than merely tidy. rbcar banks real
+         * time and spends it in whole 1/60 ticks, so a frame of wandering length
+         * runs one tick, then three, then two; twenty-eight windows of that log
+         * ran the FULL four and were clipped by RBCAR_MAX_CATCHUP -- 10 to 17 ms
+         * of physics landing on top of a 25 ms draw, which is a 3-vblank frame
+         * next to 2-vblank neighbours, and dropped world time on top. Pinned at
+         * exactly two vblanks the bank takes exactly two ticks EVERY frame: no
+         * catch-up, no clip, no spike.
+         *
+         * A FLOOR, NOT A BUDGET. A frame that overruns is not made up for
+         * afterwards -- `pace_next' is re-anchored to the vblank we actually
+         * left on, so a slow patch of track cannot leave the pacer owing time
+         * and stuttering in the other direction while it pays it back.
+         *
+         * Not in the front end: that draws in 1.9 ms and waits 14 ms on the GPU
+         * already, so it is a clean 60 and pacing it would halve it. The wait
+         * sits inside the swap span deliberately, so the budget line reports it
+         * where the menu's vblank wait is reported. */
+        if (!in_main_menu && menu.pace > 0) {
+            unsigned int v = (unsigned int)sceDisplayGetVcount();
+            while ((int)(pace_next - v) > 0) {
+                sceDisplayWaitVblankStart();
+                v = (unsigned int)sceDisplayGetVcount();
+            }
+            pace_next = v + (unsigned int)menu.pace;
+        } else {
+            pace_next = (unsigned int)sceDisplayGetVcount()
+                      + (unsigned int)(menu.pace > 0 ? menu.pace : 2);
+        }
         sceRtcGetCurrentTick(&t_swap1);
-        acc_sim  += (double)(t_draw0.tick - tf.tick) / hz;
-        acc_draw += (double)(t_swap0.tick - t_draw0.tick) / hz;
-        acc_swap += (double)(t_swap1.tick - t_swap0.tick) / hz;
+        {
+            const double f_sim  = (double)(t_draw0.tick - tf.tick) / hz;
+            const double f_draw = (double)(t_swap0.tick - t_draw0.tick) / hz;
+            const double f_swap = (double)(t_swap1.tick - t_swap0.tick) / hz;
+            acc_sim  += f_sim;
+            acc_draw += f_draw;
+            acc_swap += f_swap;
+            if (pacing_skip) {
+                pacing_skip = 0;
+            } else if (f_sim + f_draw + f_swap > worst) {
+                worst       = f_sim + f_draw + f_swap;
+                worst_sim   = f_sim;
+                worst_draw  = f_draw;
+                worst_swap  = f_swap;
+                worst_phys  = frame_phys;
+                worst_ticks = frame_ticks;
+            }
+        }
 
         if (++frames >= 60) {
             sceRtcGetCurrentTick(&t1);
@@ -4520,6 +4930,46 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                           (int)(acc_swap * 1e6 / frames),
                           (int)(100.0 * acc_swap
                                 / (acc_sim + acc_draw + acc_swap + 1e-9)));
+            /* THE WORST FRAME OF THE SIXTY, and the relight's share of the
+               average draw -- the two numbers the averages hide. A frame that
+               takes longer than one vblank is shown after TWO, so a race
+               hovering either side of 16667 us judders however good its mean
+               looks; that is what this line is for. */
+            rlog("[rccars] worst frame of the %u: %d us = sim %d + draw %d + "
+                 "swap %d;  vblanks %d  (of that sim: phys %d us over %d tick(s)"
+                 ", everything else %d us)\n", frames, (int)(worst * 1e6),
+                 (int)(worst_sim * 1e6), (int)(worst_draw * 1e6),
+                 (int)(worst_swap * 1e6), (int)(worst * 60.0 + 0.999),
+                 (int)(worst_phys * 1e6),
+                 worst_ticks < 0 ? -worst_ticks : worst_ticks,
+                 (int)((worst_sim - worst_phys) * 1e6));
+            if (worst_ticks < 0)
+                rlog("[rccars]   ...and that frame was CLIPPED by the %d-tick "
+                     "catch-up cap: the world dropped time (rbcar.h)\n",
+                     RBCAR_MAX_CATCHUP);
+            rlog("[rccars] draw: the FIELD %d us (%d%% of draw, %d opponent(s)"
+                 "), of which per-vertex relight %d us (%d%%); everything else "
+                 "%d us\n",
+                 (int)(acc_draw_ai * 1e6 / frames),
+                 (int)(100.0 * acc_draw_ai / (acc_draw + 1e-9)), ai.n,
+                 (int)(acc_relight * 1e6 / frames),
+                 (int)(100.0 * acc_relight / (acc_draw + 1e-9)),
+                 (int)((acc_draw - acc_draw_ai) * 1e6 / frames));
+            rlog("[rccars] sim: per tick -- props %d us, opponents %d us, "
+                 "car-vs-car %d us; the CAR itself is the rest of us/tick "
+                 "below\n",
+                 (int)(acc_t_prop * 1e6 / (acc_ticks ? acc_ticks : 1u)),
+                 (int)(acc_t_ai   * 1e6 / (acc_ticks ? acc_ticks : 1u)),
+                 (int)(acc_t_hit  * 1e6 / (acc_ticks ? acc_ticks : 1u)));
+            {
+                const double named = acc_f_water + acc_f_char + acc_f_fx;
+                rlog("[rccars] sim: per frame -- water %d us, characters %d us, "
+                     "fx+marks %d us, all the rest %d us\n",
+                     (int)(acc_f_water * 1e6 / frames),
+                     (int)(acc_f_char * 1e6 / frames),
+                     (int)(acc_f_fx * 1e6 / frames),
+                     (int)((acc_sim - acc_phys - named) * 1e6 / frames));
+            }
             rlog("[rccars] sim: phys %d us over %d tick(s) = %d us/tick, "
                  "rest of sim %d us\n",
                  (int)(acc_phys * 1e6 / frames),
@@ -4544,7 +4994,12 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                      (unsigned)(100u * st.tris_culled
                                 / (st.tris + st.tris_culled ? st.tris + st.tris_culled : 1u)));
             }
-            acc_sim = acc_draw = acc_swap = acc_phys = 0.0;
+            acc_sim = acc_draw = acc_swap = acc_phys = acc_relight = 0.0;
+            acc_draw_ai = 0.0;
+            acc_t_prop = acc_t_ai = acc_t_hit = 0.0;
+            acc_f_water = acc_f_char = acc_f_fx = 0.0;
+            worst = worst_sim = worst_draw = worst_swap = worst_phys = 0.0;
+            worst_ticks = 0;
             acc_ticks = 0;
             if (use_rb) {
                 /* Physics telemetry, so a "it still looks wrong" report comes
@@ -4648,7 +5103,7 @@ rlog("[rccars] %u fps  spd=%d cm/s  pos=%d,%d,%d cm  yaw=%d%s\n",
                          (int)(in->speed * 100.f));
                 }
             }
-            if (car.has_rig) {
+            if (carp->has_rig) {
                 /* Rig telemetry, for the same reason: "the wheels look wrong"
                    should never need a guess. steer in degrees (body sense,
                    positive = wheels left), wheel rates in rad/s. */

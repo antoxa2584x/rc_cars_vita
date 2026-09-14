@@ -677,7 +677,7 @@ leaves the previous binary sitting there to answer for it:
                             # 414 checks; 38 of 38 mutants die on part 17 and
                             # 27 of 27 on part 18.
     gcc -I. -Itestgl -O2 rccars_re/hudshot.c rccars_re/glrec.c ui.c \
-        race_ui.c sfont.c dirarrow.c msg.c awards.c rlog.c -lm -o hudshot
+        race_ui.c sfont.c dirarrow.c msg.c rlog.c -lm -o hudshot
                             # NOT a test: it PRINTS the HUD's triangles, and
                             # rccars_re/hudshot.py composites them over the game's
                             # real .csi art into a 960x544 PNG. ui_test asserts
@@ -693,15 +693,6 @@ leaves the previous binary sitting there to answer for it:
                             # projection of two chevrons cut into a grid of quads,
                             # and "does that look like an arrow pointing left" is
                             # not a question ui_test can answer.
-                            #
-                            # AND THE AWARD TOAST, for the same reason: awards.c
-                            # picked the band it sits in by enumerating what else
-                            # is in this frame (the badge, the clocks, the lap
-                            # counter, the map, both dials, the arrow), and the
-                            # picture is what shows it actually clears all seven.
-                            # It is driven through the real book -- an award is
-                            # EARNED and the queue stepped -- so nothing about it
-                            # is posed by hand.
                             #
                             #   ./hudshot 4 | python3 rccars_re/hudshot.py \
                             #       /tmp/hud.png --track 4
@@ -755,7 +746,7 @@ leaves the previous binary sitting there to answer for it:
                             # odometer (still the fallback) run on the same
                             # frames as its control. Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c champ.c \
-        touch.c ui.c sfont.c records.c awards.c rlog.c player.c garage.c \
+        touch.c ui.c sfont.c records.c rlog.c player.c garage.c \
         net.c ime.c -lm -o mainmenu_test
                             # THE MAIN MENU's input and its HIT BOXES -- the half
                             # a picture cannot answer. The focus ring skipping the
@@ -793,33 +784,8 @@ leaves the previous binary sitting there to answer for it:
                             # `Track stats' -- the merge, the sort with `n/a'
                             # last, and a round trip through its own file.
                             # Exits non-zero.
-    gcc -I. -Itestgl -O2 -Wall rccars_re/awards_test.c awards.c rlog.c \
-        -lm -o awards_test
-                            # THE AWARD BOOK -- the port's own achievements
-                            # (awards.h), which are all RULE and no picture, so
-                            # this is where they are checked. Twelve parts: the
-                            # table (a key and a name each, both unique, and a
-                            # goal that fits its own shape), that nothing is
-                            # credited with no profile selected, that a bitmask
-                            # award cannot be satisfied by doing one track twenty
-                            # times, the win rules (a reset, an empty grid, the
-                            # wire), the per-frame rules (the peg's hold and its
-                            # reset, the air threshold, the CARRIED METRE
-                            # remainder -- 6000 frames at 8.4 m/s is 840 m and an
-                            # int tally alone rounds it to nothing -- and the
-                            # three flag EDGES), the tallies, the toast QUEUE
-                            # (three awards in one frame is three toasts, one at
-                            # a time), what the toast draws (the plate inside the
-                            # free band, measured against hud_data.h's own
-                            # numbers, and the fade at both ends), the file's
-                            # round trip with a name that holds a space, an
-                            # unknown key, a later version and a hand-edited
-                            # value, the save-only-on-change, and one book per
-                            # profile. ui.c and sfont.c are STUBBED in the
-                            # harness as recorders, so it needs no GL tree.
-                            # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/menushot.c rccars_re/glrec.c \
-        mainmenu.c champ.c touch.c ui.c sfont.c records.c awards.c rlog.c \
+        mainmenu.c champ.c touch.c ui.c sfont.c records.c rlog.c \
         player.c garage.c net.c ime.c -lm -o menushot
                             # and hudshot's twin for the menu: it PRINTS the
                             # front end's triangles and rccars_re/hudshot.py
@@ -841,8 +807,6 @@ leaves the previous binary sitting there to answer for it:
                             #   ./menushot 800 600 n | ...      # ...its name modal
                             #   ./menushot 800 600 y | ...      # ...Remove player?
                             #   ./menushot 800 600 e | ...      # ...the refusal
-                            #   ./menushot 800 600 a | ...      # THE AWARD PAGE
-                            #   ./menushot 800 600 arrr | ...   # ...scrolled 3
                             #   ./menushot 800 600 g | ...      # THE GARAGE
                             #   ./menushot 800 600 B | ...      # ...its booster
                             #   ./menushot 800 600 E | ...      # ...engine
@@ -954,7 +918,7 @@ leaves the previous binary sitting there to answer for it:
                             # distance for its gap. It is what caught the column
                             # indexing being one out.
     gcc -I. -Itestgl -O2 -Wall rccars_re/introtest.c intro.c avc.c audio.c \
-        mix.c ui.c touch.c rlog.c -lm -o introtest
+        mix.c ui.c sfont.c touch.c rlog.c -lm -o introtest
                             # THE LAUNCH SEQUENCE. No H.264 decoder on the host,
                             # so NO CHECK IN IT IS ABOUT A PICTURE -- it says so
                             # out loud, and asserts that avc_open really did
@@ -1040,6 +1004,10 @@ leaves the previous binary sitting there to answer for it:
         rccars_re/aitest.c ai.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c scene.c rlog.c carlight.c rccars_re/glstub_host.c \
         -lm -o aitest        # the AI opponents, on the real .aip and .col files
+                            # part 12 is the LAP SEAM and runs one lap of every
+                            # profile on every track, so it costs ~9 s of the
+                            # suite's ~17 s. All three of its cases fail on the
+                            # pre-fix ai.c -- see docs/harnesses.md.
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
         contact.c collide.c rlog.c carlight.c rccars_re/glstub_host.c \

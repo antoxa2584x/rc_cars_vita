@@ -6,6 +6,7 @@
  */
 
 #include "mix.h"
+#include "scene.h"      /* ASSET_IOBUF */
 
 #include <math.h>
 #include <stdio.h>
@@ -41,6 +42,8 @@ int mix_init(mix_t *m, const char *bank_path)
 
     f = fopen(bank_path, "rb");
     if (!f) return -1;
+    /* See ASSET_IOBUF in scene.h. The bank is 9.5 MB resident. */
+    setvbuf(f, NULL, _IOFBF, ASSET_IOBUF);
     if (fread(hdr, 4, 4, f) != 4 || memcmp(hdr, "SBK1", 4) != 0) {
         fclose(f);
         return -2;

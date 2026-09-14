@@ -14,6 +14,7 @@
  */
 
 #include "col.h"
+#include "scene.h"      /* ASSET_IOBUF */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,9 @@ static int rd(FILE *f, void *p, size_t n)
 int col_load(const char *path, col_t *c)
 {
     FILE *f = fopen(path, "rb");
+    /* See ASSET_IOBUF in scene.h: without this newlib reads the whole file in
+       1 KB syscalls and the load runs at a third of the card's speed. */
+    if (f) setvbuf(f, NULL, _IOFBF, ASSET_IOBUF);
     char magic[4];
     unsigned int ncell, nref;
     int v2, v3, v4, v5;

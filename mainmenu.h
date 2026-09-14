@@ -142,16 +142,6 @@ enum {
     MM_PAGE_QUICK,      /* dlgRACESUM -- Race summary */
     MM_PAGE_MAPINFO,    /* dlgMAPINFO -- Map and info */
     MM_PAGE_STATS,      /* dlgSTAT    -- Track stats  */
-    /* THE AWARD BOOK, and it is the one page in this front end with NO DIALOG
-     * BEHIND IT: the game has no achievements, so the exe carries no table to
-     * read and there is no screenshot to measure (awards.h). It is a fourth
-     * sibling view -- the same frame, the same navigation column, the same
-     * green Race button -- and it borrows dlgSTAT's own rectangles, because it
-     * is the same shape of thing on the same screen: a table with a scroll bar,
-     * a heading over it and one picker under it. Where dlgSTAT gives the table
-     * only 273 px because a photograph and a three-line blurb sit above it,
-     * this page has neither and takes the height back. */
-    MM_PAGE_AWARDS,     /* the port's own -- see awards.h */
     MM_PAGE_PLAYERS,    /* dlgPLRSCOMM -- Select player */
     MM_PAGE_GARAGE,     /* dlgSETCAR   -- the Garage */
     MM_PAGE_DETAIL,     /* dlgSETDETAIL -- one of its three upgrade pages */
@@ -314,7 +304,6 @@ enum {
     MM_QB_SUMMARY = 0,
     MM_QB_MAPINFO,
     MM_QB_STATS,
-    MM_QB_AWARDS,
     MM_QB_GARAGE,
     MM_QB_N
 };
@@ -322,8 +311,9 @@ enum {
 /* Which page each bar opens; -1 for the one that is not built. */
 extern const int MM_QB_PAGE[MM_QB_N];
 
+
 /* Whether `page' is one of the three sibling views. */
-#define MM_PAGE_IS_QUICK(p) ((p) >= MM_PAGE_QUICK && (p) <= MM_PAGE_AWARDS)
+#define MM_PAGE_IS_QUICK(p) ((p) >= MM_PAGE_QUICK && (p) <= MM_PAGE_STATS)
 
 /* THE GARAGE AND ITS UPGRADE PAGE -- dlgSETCAR and dlgSETDETAIL, two more views
  * on the same frame, reached from the quick-race page's fourth bar. They are
@@ -387,14 +377,7 @@ enum {
     MM_Q_N_ROWS
 };
 
-/* HOW MANY OF THE TWENTY-FIVE AWARDS THE PAGE SHOWS AT ONCE. In the header
-   because the list's bottom stop is AW_N - MM_AW_ROWS and the harness walks the
-   scroller to it -- a copy of this number over there would be a check against
-   itself. The rest of that table's geometry is mainmenu.c's own. */
-#define MM_AW_ROWS 8
-
-/* Map and info's two, Track stats' one and the award page's one, at the same
-   indices. */
+/* Map and info's two and Track stats' one, at the same indices. */
 #define MM_Q_MI_TRACK  0        /* shotTrackEnum */
 #define MM_Q_MI_SHOT   1        /* enumShot */
 #define MM_Q_ST_TYPE   0        /* enumStatType, `Sort results by' */
@@ -614,6 +597,12 @@ typedef struct {
     unsigned int trackmap[10];   /* trackmap_<n> -- the painted top-down map */
     unsigned int scrollbar;      /* the stats table's own bar */
     unsigned int panel;          /* messagebox_empty -- the map's silver frame */
+    /* `Progressor' -- the LOADING SCREEN'S BAR, 64x128 and four elements down
+       it: the silver trough (rows 0..32), the red fill (32..64), a stud
+       (64..96) and a cursor (96..128). The engine draws the bar as five quads
+       out of the first two, at the UV rects at 0x56dc38..0x56dc78 -- see
+       mainmenu_draw_loading. */
+    unsigned int progressor;
     /* `messagebox' -- and its RIGHT HALF is THE DIALOG'S OWN BUTTON, which this
        port spent a long time trying to build out of the row bars. 256x128: the
        left half is another rounded frame, the right half is FOUR 128x32 pills
@@ -659,12 +648,26 @@ typedef struct {
     int   qfocus;       /* MM_Q_* on any of the three sibling pages */
     int   shot;         /* 0..MM_N_SHOTS-1, shared by shotList and dlgSTAT */
     int   stat;         /* REC_STAT_*, `Sort results by' */
-    int   aw_top;       /* the award page's first visible row -- its own picker
-                           scrolls the list, and that is the only thing on that
-                           page there is to hold */
     int   laps;         /* MM_LAPS_MIN .. MM_LAPS_MAX */
     int   skill;        /* 0 .. MM_N_SKILL-1 */
-    int   car;          /* 0 .. MM_N_CARS-1 -- the caller's, synced both ways */
+    /* TWO CARS, AND THEY ARE DIFFERENT QUESTIONS.
+     *
+     * `car' is the PROFILE'S car: the one the Garage buys, sells, upgrades and
+     * paints, the one dlgCHRACE takes onto the ladder, and the one written to
+     * the .scp's own `sel_car'. Nothing but the Garage moves it.
+     *
+     * `qcar' is what a QUICK RACE is driving, which is a throwaway pick over all
+     * three whether or not the profile owns them -- the same freedom the
+     * original's dlgRACESUM picker has. It rides in the port's settings file
+     * beside the track, not in the profile.
+     *
+     * They used to be one field, so stepping the quick-race picker re-armed the
+     * championship with a car the player had not chosen for it -- and, if that
+     * car was not owned, with one the ladder then refused. Reported as exactly
+     * that. mainmenu_view_car says which of the two the page on screen is
+     * about, since the app can only have one car model fitted at a time. */
+    int   car;          /* 0 .. MM_N_CARS-1 -- the profile's, synced both ways */
+    int   qcar;         /* 0 .. MM_N_CARS-1 -- the quick race's own pick */
 
     /* THE SCROLL BAR'S ONE BIT: this touch went down in a trough and the thumb
        is following the finger, so a drag that wanders off the bar sideways --
@@ -780,6 +783,11 @@ typedef struct {
     int   rarmed;
 } mainmenu_t;
 
+/* WHICH CAR THE PAGE ON SCREEN IS ABOUT -- `qcar' on the quick-race siblings,
+   `car' everywhere else. One car model is fitted at a time, so the caller needs
+   one answer per frame rather than two fields to choose between. */
+int mainmenu_view_car(const mainmenu_t *m);
+
 void mainmenu_set_car_draw(mainmenu_t *m, mm_car_draw fn, void *ctx);
 
 /* `tex` is copied. Leaves the focus on Quick race, which is the one live mode. */
@@ -824,6 +832,39 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
 /* Draws between ui_begin/ui_end -- the caller brackets it, because main.c draws
    the menu and the settings overlay in one pass. */
 void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h);
+
+/* THE RACE'S LOADING PAGE -- the engine's own, out of the table at 0x570888.
+ *
+ * Twelve rows of `{ int kind; float x0, y0, x1, y1; void *tex; }', stride 0x18,
+ * terminated by kind 7 -- the same shape as the boot screen's table at 0x56b8a0
+ * (intro.h), and the rects are normalised the same way. `FUN_004dfcc0' walks it
+ * to load the textures and `FUN_004e01aa' to draw them:
+ *
+ *   kind 0  `Desktop', OPAQUE, over the whole screen
+ *   kind 1  `shot_<Track>_L' -- the 512x512 pre-composited MAP PANEL, blended
+ *   kind 2  a rule: a line along the rect's BOTTOM edge (FUN_004ac6e0, 0x400000)
+ *   kind 3  `shot_<Track>_<n>', blended -- four of them, n in TABLE order
+ *   kind 4  the progress bar, a control of its own on `Progressor'
+ *   kind 5  the TRACK'S NAME, centred, bottom-aligned on y1
+ *   kind 6  string 0xa3c0 -- "Loading...", the same string the BOOT screen puts
+ *           in its band, which intro.h had down as "not recovered"
+ *   kind 7  the terminator
+ *
+ * `caption' replaces kind 6's string, because the port's loads are blocking
+ * calls at named seams and "Loading track" says more than "Loading..." does;
+ * `progress' in [0,1] fills kind 4's bar, or negative to leave it empty.
+ *
+ * WHAT THE PORT DOES NOT SHIP is `shot_<Track>_L': it is ten more 512x512
+ * textures, 7 MB of them, for a picture the front end can already assemble --
+ * that art IS `trackmap_<n>' inside `messagebox_empty''s frame with the route
+ * alpha-keyed over the top, which is exactly what dlgMAPINFO draws. So kind 1's
+ * rectangle is honoured and its CONTENT is composited. See mm_draw_mapinfo.
+ *
+ * Brackets its own ui_begin/ui_end and paints its own ground: it is a whole
+ * page. It does not clear and does not swap -- the caller owns the frame, the
+ * same contract intro_load_screen has. */
+void mainmenu_draw_loading(const mainmenu_t *m, int track, const char *caption,
+                           float progress, int screen_w, int screen_h);
 
 /* THE CURRENT SIBLING PAGE's row under (x, y): one of the page's own enums,
    MM_Q_RACE, MM_Q_BACK, MM_Q_NAV + MM_QB_*, or -1. `left` comes back 1 when the

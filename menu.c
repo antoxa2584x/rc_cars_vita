@@ -16,16 +16,19 @@
  *
  * menu_draw centres a panel of `pad*2 + lh*(MENU_ROWS + 3)` on the display, and
  * the Vita's is 544 px tall. At the fourteen rows this had before the launch-
- * movie row it was 503 px; at fifteen it is 530, leaving 7 px above and below;
- * at sixteen it would be 557 and the top and bottom rows would be off-screen
- * with nothing to say so.
+ * movie row it was 503 px; at fifteen, with the 22 px pad and the 8 px line gap
+ * it had then, it was 530.
  *
- * So the next row added here needs the layout changed too -- a smaller line
- * height, a second column, or a scroll -- and this is the line that will say so
- * at COMPILE time rather than on a device nobody has plugged in. The numbers are
- * menu_draw's own, kept beside it. */
-#define MENU_PAD_PX   22
-#define MENU_LINE_PX  (FONT_CH + 8)
+ * THE SIXTEENTH ROW IS THE ONE THIS PREDICTED. Frame pacing took it to 557 and
+ * the assert below refused the build, which is what it is for -- the failure it
+ * replaced was the top and bottom rows off-screen with nothing to say so, on a
+ * device nobody has plugged in. The layout paid for it the cheapest way the note
+ * offered: one pixel off the line gap and two off the pad, which is 534 and
+ * invisible at this size. That is 10 px of headroom, so the SEVENTEENTH row
+ * needs a real answer -- a second column, or a scroll -- and not another pixel.
+ * The numbers are menu_draw's own, kept beside it. */
+#define MENU_PAD_PX   20
+#define MENU_LINE_PX  (FONT_CH + 7)
 #define MENU_PANEL_PX (MENU_PAD_PX * 2 + MENU_LINE_PX * (MENU_ROWS + 3))
 typedef char menu_panel_fits_on_a_vita[MENU_PANEL_PX <= 544 ? 1 : -1];
 
@@ -33,7 +36,7 @@ typedef char menu_panel_fits_on_a_vita[MENU_PANEL_PX <= 544 ? 1 : -1];
 static const char *const ROW_LABEL[MENU_ROWS] = {
     "Track", "Car", "Skin", "Tires", "Resonator", "Booster",
     "Sound volume", "Music volume", "Texture quality", "Texture colours",
-    "Car lighting", "Intro movies",
+    "Car lighting", "Intro movies", "Frame pacing",
     "Restart at race start", "Resume", "Main menu"
 };
 
@@ -64,6 +67,12 @@ void menu_init(menu_t *m, int track, int car)
     m->vol_music = 7;
     /* On: it is what the original does. See carlight.h. */
     m->car_light = 1;
+    /* EVEN 30 BY DEFAULT, because the hardware measurement says the race cannot
+       hold 60: `draw' alone is 22-25 ms with the GPU already idle, so every
+       frame is shown for two vblanks or three depending on where it lands, and
+       that alternation is the judder. Holding it to two is even. A build that
+       gets under one vblank should ship 0 here and nothing else changes. */
+    m->pace = 2;
 }
 
 static int clampi(int v, int lo, int hi)
@@ -132,6 +141,12 @@ static void adjust(menu_t *m, int d)
        read at the NEXT boot and says so. */
     case MENU_INTRO:
         m->intro = !m->intro;
+        break;
+    /* THREE VALUES, and they are vblank counts and not frame rates on purpose:
+       the display has one clock and every frame is shown for a whole number of
+       its ticks whatever this row says. Off, 2 (30 Hz) and 3 (20 Hz). */
+    case MENU_PACE:
+        m->pace = m->pace == 0 ? 2 : (m->pace == 2 ? 3 : 0);
         break;
     default: break;
     }
@@ -265,6 +280,14 @@ static void row_value(const menu_t *m, int row, char *out, int n)
            thing they are turning off is a hundred seconds long. */
         snprintf(out, n, "< %s >",
                  m->intro ? "on (104 s at launch)" : "off (straight to the menu)");
+        break;
+    case MENU_PACE:
+        /* Named by the rate a player can feel, with the reason after it: `even'
+           is the whole point, and it is what `off' does not give. */
+        snprintf(out, n, "< %s >",
+                 m->pace == 2 ? "even 30 (hold each frame 2 vblanks)"
+               : m->pace == 3 ? "even 20 (hold each frame 3 vblanks)"
+                              : "off (as fast as it comes, uneven)");
         break;
     default:
         out[0] = 0;

@@ -72,6 +72,7 @@ void settings_from_menu(const menu_t *m, settings_t *s)
     s->tex_swap_rb = m->tex_swap_rb;
     s->car_light = m->car_light;
     s->intro      = m->intro;
+    s->pace       = m->pace;
 }
 
 void settings_to_menu(const settings_t *s, menu_t *m)
@@ -91,6 +92,7 @@ void settings_to_menu(const settings_t *s, menu_t *m)
     m->tex_swap_rb = s->tex_swap_rb;
     m->car_light = s->car_light;
     m->intro     = s->intro;
+    m->pace      = s->pace;
     /* DELIBERATELY NOT TOUCHED: req_track, req_car, req_reload, open, row, cue
        and skins. The caller does the first load itself off m->track and m->car,
        and raising a request here would load the track twice; `skins` is counted
@@ -117,6 +119,10 @@ void settings_clamp(settings_t *s)
     s->tex_swap_rb = !!s->tex_swap_rb;
     s->car_light = !!s->car_light;
     s->intro     = !!s->intro;
+    /* Only the three the row offers; anything else in the file is somebody's
+       hand edit and 2 is the value this port ships. */
+    if (s->pace != 0 && s->pace != 2 && s->pace != 3)
+        s->pace = 2;
 }
 
 /*
@@ -211,6 +217,7 @@ int settings_parse(const char *text, settings_t *s)
             if ((v = match(q, "track")) != NULL)       { read_int(v, &s->track); continue; }
             if ((v = match(q, "car_light")) != NULL)   { read_int(v, &s->car_light); continue; }
             if ((v = match(q, "intro")) != NULL)       { read_int(v, &s->intro); continue; }
+    if ((v = match(q, "pace")) != NULL)        { read_int(v, &s->pace); continue; }
             if ((v = match(q, "car")) != NULL)         { read_int(v, &s->car); continue; }
             if ((v = match(q, "skin")) != NULL)        { read_ints(v, s->skin, MENU_N_CARS); continue; }
             if ((v = match(q, "tires")) != NULL)       { read_int(v, &s->tires); continue; }
@@ -261,6 +268,8 @@ void settings_format(const settings_t *s, char *out, int n)
     P("tex_quality %d     # 0 high, 1 medium, 2 low\n", s->tex_quality);
     P("tex_swap_rb %d     # 0 real hardware, 1 Vita3K\n", s->tex_swap_rb);
     P("car_light %d       # 1 sun + shade on the car, 0 flat\n", s->car_light);
+    P("pace %d             # vblanks a race frame is held for: 0 off, 2 = even "
+      "30, 3 = even 20\n", s->pace);
     P("intro %d           # 1 play the launch movies, 0 straight to the menu\n", s->intro);
 #undef P
 

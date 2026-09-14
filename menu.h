@@ -50,6 +50,7 @@ enum {
     MENU_TEXORDER,
     MENU_CARLIGHT,
     MENU_INTRO,
+    MENU_PACE,
     MENU_RESTART,
     MENU_RESUME,
     MENU_QUIT,
@@ -144,6 +145,11 @@ typedef struct {
        intro loop runs; changing it takes effect on the next launch, which is
        what the row says. */
     int intro;
+    /* THE FRAME PACER, in vblanks per frame -- 0 off, 2 is 30 Hz. See main.c;
+       the short version is that a race whose frame time wanders either side of
+       one vblank is shown at 2 vblanks then 3 then 2, which is the judder, and
+       holding it to a whole number is what makes it even. */
+    int pace;
 
     int vol_sfx;        /* 0..MENU_VOL_STEPS */
     int vol_music;

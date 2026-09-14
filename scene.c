@@ -17,7 +17,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int rd(FILE *f, void *p, size_t n) { return fread(p, 1, n, f) == n; }
+/* EVERY BYTE THIS FILE READS GOES THROUGH HERE, so this is where the question
+   "is a load I/O or is it the GPU upload?" gets answered. The hardware log had
+   a whole track at 36 MB in 12.5 s and the loading-screen scene at 2 MB in
+   0.69 s -- 2.9 MB/s BOTH TIMES, which is either a card at 2.9 MB/s or work
+   that scales with bytes and is not the card at all. vitaGL generates the whole
+   mip chain on the CPU (docs/vita-port.md: it keeps only level 0 out of the
+   file), which scales with bytes exactly the same way, so the two are
+   indistinguishable from the outside. They are not indistinguishable from in
+   here. */
+static double rd_ms;
+static size_t rd_bytes;
+
+static int rd(FILE *f, void *p, size_t n)
+{
+    const double t0 = rlog_now_ms();
+    const int ok = fread(p, 1, n, f) == n;
+    rd_ms += rlog_now_ms() - t0;
+    rd_bytes += n;
+    return ok;
+}
 
 /* How many mip levels to drop off the top of every texture -- see scene.h. */
 static int tex_skip;
@@ -183,8 +202,35 @@ void scene_read_texture(FILE *f, GLuint id, char *name_out, size_t cap,
 
 int scene_load(const char *path, scene_t *s)
 {
-    FILE *f = fopen(path, "rb");
+    /* WHAT THIS COST, in wall-clock milliseconds. A .vsc is 2 to 41 MB and the
+       whole of a load is reading it, so this one number is the port's load-time
+       measurement -- and it is the number that separates a card from an SSD.
+       See rlog.h. */
+    const double t_open = rlog_now_ms();
+    FILE *f;
+    rd_ms = 0.0;
+    rd_bytes = 0;
+    f = fopen(path, "rb");
     if (!f) { rlog("[rccars] cannot open %s\n", path); return 0; }
+    /* HALF A MEGABYTE OF STDIO BUFFER, AND IT IS THE PORT'S LOAD TIME.
+     *
+     * The hardware log read every scene at 3.2 MB/s -- boot.vsc's 2 MB and
+     * beach_1's 36 MB alike, with only 15 and 201 ms of the two loads spent on
+     * the GPU upload. A flat rate across files with completely different read
+     * patterns says the limit is per-CALL, not per-byte, and it is:
+     * NEWLIB'S `fread' NEVER READS PAST THE FILE BUFFER. Its object calls
+     * exactly `__srefill' and `memcpy' and nothing else -- unlike glibc's,
+     * which hands a large request straight to `read' -- so every byte of a
+     * 36 MB file arrives in `BUFSIZ' pieces. BUFSIZ is 1024. That is ~36,000
+     * `sceIoRead's at ~300 us of syscall and filesystem apiece, which is
+     * exactly 3.2 MB/s, and it is not the card's speed at all.
+     *
+     * This project ruled that out once, on the argument that `scene_load's
+     * reads are large and would bypass the buffer. They are large. Nothing in
+     * newlib bypasses the buffer. See traps.md.
+     *
+     * 512 KB makes a 36 MB scene 72 reads. It is freed by fclose. */
+    setvbuf(f, NULL, _IOFBF, ASSET_IOBUF);
 
     char magic[4];
     unsigned int n_parts = 0;
@@ -520,8 +566,18 @@ int scene_load(const char *path, scene_t *s)
         if (s->batches[i].env)
             n_env++;
     rlog("[rccars] %s: VSC%d  %u textures, %u batches, %u rig parts, "
-                  "%u markers, %u glance\n", path, ver, s->n_tex, s->n_batches,
-                  s->has_rig ? (unsigned)s->rig.n : 0u, s->n_markers, n_env);
+                  "%u markers, %u glance  [%.0f ms]\n", path, ver, s->n_tex,
+                  s->n_batches,
+                  s->has_rig ? (unsigned)s->rig.n : 0u, s->n_markers, n_env,
+                  rlog_now_ms() - t_open);
+    {
+        const double total = rlog_now_ms() - t_open;
+        rlog("[rccars]   of which %.0f ms read %u KB off the card (%.1f MB/s) "
+             "and %.0f ms was upload and setup\n",
+             rd_ms, (unsigned)(rd_bytes / 1024u),
+             rd_ms > 0.0 ? (double)rd_bytes / 1048.576 / rd_ms : 0.0,
+             total - rd_ms);
+    }
     /* up_bytes is the base levels only; the generated chain adds about a third
        on top of that. It is the number that moves with the quality setting,
        which is what this line is for. */

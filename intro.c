@@ -21,6 +21,7 @@
 #include "menu.h"           /* the SCE_CTRL_ bits, on both targets */
 #include "mix.h"            /* MIX_RATE */
 #include "rlog.h"
+#include "sfont.h"
 #include "ui.h"
 
 #include <stdio.h>
@@ -55,6 +56,19 @@ static const struct { float x0, y0, x1, y1; } LS_RECT[INTRO_N_ELEMENTS] = {
 /* The authored aspect. Every rect above is square at 640x480, so the logos are
    placed in a 4:3 box fitted to the screen height -- see intro.h. */
 #define LS_ASPECT (4.0f / 3.0f)
+
+/* The engine's own letters for the caption, once something has loaded them --
+   0 until then, which is what makes ui_text the fallback. See intro.h. */
+static unsigned int ls_font;
+
+void intro_set_font(unsigned int smash20_tex) { ls_font = smash20_tex; }
+
+/* How big the caption is drawn, as a multiplier on Smash20's own letSizeY.
+   Those metrics are written in the 800x600 frame (HUD_REF_H), NOT in the 640x480
+   the four rects above are square at, so the scale is taken against that frame
+   and not against LS_REF_H. 0.80 puts the ink at about the height ui_text's 2.0
+   was, so nothing about the band's layout moves; only the letters change. */
+#define LS_TEXT_SCALE 0.80f
 
 void intro_element_rect(int i, int screen_w, int screen_h,
                         float *x, float *y, float *w, float *h)
@@ -115,10 +129,22 @@ void intro_load_screen(const intro_tex *t, int screen_w, int screen_h,
     band = LS_TEXT_BAND * (float)screen_h / LS_REF_H;
     y = (float)screen_h - band;
     if (caption && *caption) {
-        const float sc = 2.0f;
-        float tw = ui_text_w(sc, caption);
-        ui_text(((float)screen_w - tw) * 0.5f, y + band * 0.20f, sc,
-                1.f, 1.f, 1.f, 1.f, caption);
+        /* THE GAME'S OWN FONT where it is loaded and ui.c's compiled-in one
+           where it is not -- the fallback every page in this app has, and here
+           it is not hypothetical: the first seam of the boot is drawn before
+           anything has been read. intro.h. */
+        const sfont sf = sf_small(ls_font);
+        if (sf.tex) {
+            const float sc = (float)screen_h / HUD_REF_H * LS_TEXT_SCALE;
+            const float tw = sf_w(&sf, sc, caption);
+            sf_text_shadowed(&sf, ((float)screen_w - tw) * 0.5f,
+                             y + band * 0.20f, sc, 1.f, 1.f, 1.f, 1.f, caption);
+        } else {
+            const float sc = 2.0f;
+            const float tw = ui_text_w(sc, caption);
+            ui_text(((float)screen_w - tw) * 0.5f, y + band * 0.20f, sc,
+                    1.f, 1.f, 1.f, 1.f, caption);
+        }
     }
     if (progress >= 0.f) {
         /* One bar, in the same band, at the desktop's own width. The engine
@@ -257,8 +283,11 @@ static const unsigned char *au_at(intro_t *in, unsigned int f,
     return in->win + (off - in->win_off);
 }
 
-/* Feed one frame of the current part. -> 1 fed, 0 nothing left, <0 on error. */
-static int feed_one(intro_t *in)
+/* Feed one frame of the current part. -> 1 fed, 0 nothing left, <0 on error.
+   `present' is passed through to avc_decode: only the last unit of a tick is
+   the one that will be drawn, and the other three cost a decode and nothing
+   else. See avc.h. */
+static int feed_one(intro_t *in, int present)
 {
     const unsigned char *au;
     unsigned int size = 0, abs_f;
@@ -273,7 +302,7 @@ static int feed_one(intro_t *in)
     in->fed++;
     if (!in->decoder)
         return 1;                   /* no decoder: the clock still runs */
-    if (avc_decode(au, (int)size) < 0)
+    if (avc_decode(au, (int)size, present) < 0)
         return -1;
     return 1;
 }
@@ -299,6 +328,13 @@ int intro_open(intro_t *in, const char *vid_path, const char *audio_dir)
     if (!vid_path)
         return 0;
     fp = fopen(vid_path, "rb");
+    if (fp) {
+        /* See ASSET_IOBUF in scene.h. This file also has its OWN read-ahead
+           window over the access units (WIN_BYTES), so the stdio buffer under
+           it is deliberately smaller: the window is what does the work, and
+           two 512 KB buffers over one stream is one of them wasted. */
+        setvbuf(fp, NULL, _IOFBF, 64u * 1024u);
+    }
     if (!fp) {
         rlog("[rccars] intro: no %s -- straight to the loading screen\n",
              vid_path);
@@ -494,8 +530,15 @@ int intro_step(intro_t *in, unsigned int buttons, unsigned int prev,
             in->fed = k;
         }
 
-        for (n = 0; n < FEED_PER_TICK && in->fed < want; n++) {
-            int r = feed_one(in);
+        /* HOW MANY THIS TICK WILL FEED, decided before the loop so the last
+           one can be told that it is the last -- which is what makes a
+           catch-up cost one conversion instead of four. */
+        {
+            unsigned int todo = want > in->fed ? want - in->fed : 0u;
+            if (todo > FEED_PER_TICK)
+                todo = FEED_PER_TICK;
+        for (n = 0; n < (int)todo && in->fed < want; n++) {
+            int r = feed_one(in, n == (int)todo - 1);
             if (r < 0) {
                 rlog("[rccars] intro: part %d failed at frame %u\n",
                      in->cur + 1, in->fed);
@@ -504,6 +547,7 @@ int intro_step(intro_t *in, unsigned int buttons, unsigned int prev,
             }
             if (r == 0)
                 break;
+        }
         }
 
         /* The part ends when its frames are spent AND its time is up: with the

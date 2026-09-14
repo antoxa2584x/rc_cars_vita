@@ -7,12 +7,28 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+/* ---------------------------------------------------------------- TEMPORARY
+   NO LOG FILE. Asked for explicitly: this build must not touch
+   ux0:data/rccars/rccars.log at all -- not open it, not truncate it, not
+   remove the one already on the card. Every line still goes out on the debug
+   channel (sceClibPrintf, or stdout on the host), which is where Vita3K and a
+   devkit read it from anyway.
+
+   `L` stays NULL, and that is the whole mechanism: rlog() returns after the
+   printf, drain() returns at its first line, the drain thread is never
+   created, and rlog_flush/rlog_shutdown become no-ops. Delete this define
+   (and nothing else) to restore file logging.
+   ------------------------------------------------------------------------- */
+#define RLOG_NO_FILE 1
 
 #ifdef __vita__
 #include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/cpu.h>            /* SCE_KERNEL_CPU_MASK_USER_* */
+#include <psp2/kernel/processmgr.h>   /* sceKernelGetProcessTimeWide */
 #include <psp2/kernel/threadmgr.h>
 #define RLOG_DIR  "ux0:data/rccars"
 #define RLOG_FILE "ux0:data/rccars/rccars.log"
@@ -122,6 +138,15 @@ void rlog_init(void)
     if (inited)
         return;
     inited = 1;
+
+#ifdef RLOG_NO_FILE
+    /* See the note at the top of this file: no mkdir, no remove, no fopen, no
+       drain thread. The host build would normally drain inline; there is
+       nothing to drain into, so leave that alone too. */
+    snprintf(path_shown, sizeof(path_shown), "%s", "(file logging disabled)");
+    rlog("[rccars] log: FILE WRITES DISABLED in this build; debug channel only\n");
+    return;
+#endif
 
 #ifdef __vita__
     /* ux0:data exists on every machine; the app's own subdirectory may not, and
@@ -290,3 +315,15 @@ void rlog_shutdown(void)
 
 const char *rlog_path(void) { return path_shown; }
 unsigned rlog_bytes(void) { return written; }
+
+/* See rlog.h. sceKernelGetProcessTimeWide is microseconds since the process
+   started and needs no resolution query; the host build has no such clock and
+   uses clock(), which is close enough for a harness that never measures I/O. */
+double rlog_now_ms(void)
+{
+#ifdef __vita__
+    return (double)sceKernelGetProcessTimeWide() / 1000.0;
+#else
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+#endif
+}

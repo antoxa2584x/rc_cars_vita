@@ -3,6 +3,7 @@
  */
 
 #include "player.h"
+#include "scene.h"      /* ASSET_IOBUF */
 #include "champ_data.h"   /* DefaultCash and IsEnabled, which is what a
                                 fresh profile is built out of */
 #include "rlog.h"
@@ -611,6 +612,8 @@ static int faces_open(FILE **f, int *count)
     FILE *fp = fopen(faces_path, "rb");
     if (!fp)
         return 0;
+    /* See ASSET_IOBUF in scene.h. faces.bin is 1.1 MB of portraits. */
+    setvbuf(fp, NULL, _IOFBF, ASSET_IOBUF);
     if (fread(h, 1, PL_FACES_HDR, fp) != PL_FACES_HDR
         || rd32(h) != PL_FACES_MAGIC
         || rd32(h + 12) != PL_FACE_W || rd32(h + 16) != PL_FACE_H

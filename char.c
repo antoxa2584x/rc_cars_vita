@@ -313,6 +313,9 @@ void char_free(chr_t *c)
 static int load_file(chr_t *c, const char *path)
 {
     FILE *f = fopen(path, "rb");
+    /* See ASSET_IOBUF in scene.h: without this newlib reads the whole file in
+       1 KB syscalls and the load runs at a third of the card's speed. */
+    if (f) setvbuf(f, NULL, _IOFBF, ASSET_IOBUF);
     char magic[4];
     unsigned int i, j, k;
 

@@ -623,6 +623,11 @@ if wanted menu; then
     done
     # dlgSTAT's scroll bar and the window frame dlgMAPINFO's map sits in.
     IFACE=$IFACE,scrollbar
+    # AND THE RACE LOADING PAGE'S BAR. `Progressor' is 64x128 -- the silver
+    # trough, the red fill, a stud and a cursor, one 64x32 band each -- and the
+    # engine assembles the bar out of the first two as five quads. The page
+    # itself is the table at 0x570888; mainmenu.h has it row for row. 16 KB.
+    IFACE=$IFACE,Progressor
     # AND THE SKIN-ICON SHEET, which the multiplayer lobby's roster table draws
     # one 32x32 cell of per row -- 4 x 4 cells of a 128x128, three cars by four
     # paints and a camera icon in the thirteenth.

@@ -94,7 +94,7 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.073500f,0.087879f,0.075758f}, 0.051010f, 0.000000f },  /* X clamped */
+        { {0.000000f,0.087879f,0.075758f}, 0.051010f, 0.000000f },  /* X->centre clamped */
         { {0.000000f,0.185240f,-0.160040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 28 mm proud */
         { {0.000000f,0.185240f,0.181040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 28 mm proud */
       },
@@ -148,7 +148,7 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.108000f,0.041448f,0.184848f}, 0.051010f, 0.000000f },  /* X Y>floor clamped */
+        { {0.000000f,0.041448f,0.184848f}, 0.051010f, 0.000000f },  /* X->centre Y>floor clamped */
         { {0.000000f,0.110167f,-0.246890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft */
         { {0.000000f,0.110167f,0.183890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore */
       },
@@ -202,7 +202,7 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
       /* cdt_side_x    */ 0.050000f,
       /* body_sphere   */ {
-        { {-0.097110f,0.073737f,0.015152f}, 0.051010f, 0.000000f },  /* X clamped */
+        { {0.000000f,0.073737f,0.015152f}, 0.051010f, 0.000000f },  /* X->centre clamped */
         { {0.000000f,0.177577f,-0.209900f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 4 mm proud */
         { {0.000000f,0.177577f,0.195860f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 4 mm proud */
       },

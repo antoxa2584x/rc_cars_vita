@@ -10,7 +10,6 @@
 #include "dlg_data.h"
 #include "str_data.h"       /* the game's own authored text, decoded */
 #include "records.h"
-#include "awards.h"        /* the record book behind Track stats */
 #include "player.h"         /* the roster dlgPLRSCOMM is a view of */
 #include "garage.h"
 #include "champ.h"         /* the shop behind dlgSETCAR/dlgSETDETAIL */
@@ -579,21 +578,13 @@ static void mm_gbox(const mmframe *f, float ax, float x, float y,
    row positions, so its bars and wedges land on the oval with nothing new to
    get wrong -- the one thing here that is the port's and not the .ini's. The
    four words are the string table's own, 10015..10017 and 10052. */
-/* AND THE FIFTH BAR IS THE PORT'S OWN WORD. The other four are the string
-   table's -- 10015..10017 and 10052 -- and there is no shipped string for a
-   thing the game does not have, so `Awards' is written here rather than in
-   str_data.h, which is generated out of english.tbl and holds the original's
-   text and nothing else. See awards.h. */
-#define MM_UI_AWARDS "Awards"
-
 static const char *const MM_QB_NAME[MM_QB_N] = {
     STR_UI_RACE_SUMMARY, STR_UI_MAP_AND_INFO, STR_UI_TRACK_STATS,
-    MM_UI_AWARDS, STR_UI_GARAGE
+    STR_UI_GARAGE
 };
 
 const int MM_QB_PAGE[MM_QB_N] = {
     MM_PAGE_QUICK, MM_PAGE_MAPINFO, MM_PAGE_STATS,
-    MM_PAGE_AWARDS,             /* the port's own page -- awards.h */
     MM_PAGE_GARAGE              /* dlgSETCAR -- and it is built now */
 };
 
@@ -636,15 +627,8 @@ static const mm_enum MM_Q_ENUM[MM_N_PAGES][MM_Q_N_ROWS] = {
        therefore also not the enum's own. */
     { { DLG_STAT_enumStatTypeX0, DLG_STAT_enumStatTypeY0,
         DLG_STAT_enumStatTypeSX, DLG_STAT_enumStatTypeSY, 0.f, "" } },
-    /* MM_PAGE_AWARDS -- the list's own SCROLLER, in dlgSTAT's enum rectangle
-       (mainmenu.h says why this page borrows that dialog's boxes). Its value is
-       which rows are on screen, so it is the one control on the page and the
-       one thing a touch-only player needs: the arrows either side of it are hit
-       boxes already, through mainmenu_q_at's enum pass. */
-    { { DLG_STAT_enumStatTypeX0, DLG_STAT_enumStatTypeY0,
-        DLG_STAT_enumStatTypeSX, DLG_STAT_enumStatTypeSY, 0.f, "" } },
 };
-static const int MM_Q_NENUM[MM_N_PAGES] = { 0, 4, 2, 1, 1 };
+static const int MM_Q_NENUM[MM_N_PAGES] = { 0, 4, 2, 1 };
 
 /* ------------------------------------------------- dlgMAPINFO's shot list
  *
@@ -693,23 +677,6 @@ static const int MM_Q_NENUM[MM_N_PAGES] = { 0, 4, 2, 1, 1 };
 #define MM_ST_COL2     0.828f   /* the car column's centre */
 #define MM_ST_RULE0    0.378f   /* where the per-name rule stops */
 #define MM_ST_MARK     7.f      /* the row marker, design px right of X0 */
-
-/* THE AWARD PAGE'S TABLE. dlgSTAT's own left edge and width -- 88 and 434 --
-   with the HEIGHT taken back: that dialog gives its table 273 px starting at
-   210 because a photograph and a three-line blurb sit above it, and this page
-   has neither. So the box runs from under the heading (130) to just above the
-   scroller's own row (480), which is 350, and eight rows of 43.75 px is a row
-   deep enough for the award's name AND the line saying how it is earned.
-   Nothing here is measured off anything -- see mainmenu.h on this page. */
-#define MM_AW_Y0     130.f
-#define MM_AW_SY     350.f
-/* MM_AW_ROWS is in mainmenu.h: the harness walks the scroller to its stop and
-   the stop is AW_N - MM_AW_ROWS, so a second copy of the row count there would
-   be a check against itself. */
-#define MM_AW_NAME_TS 0.78f     /* the name */
-#define MM_AW_WHAT_TS 0.60f     /* the line under it */
-#define MM_AW_STATE_TS 0.62f    /* the tally on the right */
-#define MM_AW_STATE_W 92.f      /* how much of the row the tally may take */
 
 /* THE SCROLLBAR, `scrollbar.csi': 256x64, eight 32-wide cells with 26 px of ink
  * in each -- the TOP cap with an up-arrow in grey, red and hollow, the BOTTOM
@@ -1245,6 +1212,15 @@ void mainmenu_init(mainmenu_t *m, const mainmenu_tex *tex)
     mainmenu_players_sync(m);
 }
 
+int mainmenu_view_car(const mainmenu_t *m)
+{
+    int c;
+    if (!m)
+        return 0;
+    c = MM_PAGE_IS_QUICK(m->page) ? m->qcar : m->car;
+    return (c >= 0 && c < MM_N_CARS) ? c : 0;
+}
+
 /* The focus moves, and both rows start animating: the one arriving on the focus
    curve, the one leaving on the unfocus curve. One clock drives the pair. */
 static void mm_set_focus(mainmenu_t *m, int row)
@@ -1304,8 +1280,8 @@ static void mm_fire(mainmenu_t *m, int focus)
         break;
     /* NO `case MM_FOCUS_QUIT' -- the front page has no Quit button, so the ring
        never lands there and a touch in that corner answers -1. `MM_ACT_QUIT'
-       itself is kept: it is the app's one ORDERLY shutdown (the profile and the
-       award book written, the network told) and nothing raises it today, which
+       itself is kept: it is the app's one ORDERLY shutdown (the profile
+       written, the network told) and nothing raises it today, which
        is a fact worth stating rather than a leftover. Give any row this line and
        it works. */
     default:
@@ -1347,19 +1323,6 @@ static void mm_q_move(mainmenu_t *m, int row, int d)
         m->cue = MM_CUE_ARROW;
         return;
     }
-    if (m->page == MM_PAGE_AWARDS) {
-        /* ONE ROW AT A TIME AND IT DOES NOT WRAP, which is the difference
-           between this picker and every other one on these pages: those pick a
-           VALUE out of a ring and this one moves a VIEW over a list, where
-           running off the end and reappearing at the top is not a step, it is a
-           jump. The last full page is the bottom stop. */
-        const int last = AW_N - MM_AW_ROWS;
-        m->aw_top += d;
-        if (m->aw_top > last) m->aw_top = last;
-        if (m->aw_top < 0) m->aw_top = 0;
-        m->cue = MM_CUE_ARROW;
-        return;
-    }
     switch (row) {
     case MM_Q_TRACK:
         m->track += d;
@@ -1377,7 +1340,10 @@ static void mm_q_move(mainmenu_t *m, int row, int d)
         m->skill = (m->skill + d + MM_N_SKILL) % MM_N_SKILL;
         break;
     case MM_Q_CAR:
-        m->car = (m->car + d + MM_N_CARS) % MM_N_CARS;
+        /* THE QUICK RACE'S OWN, and not the profile's: this picker used to be
+           the only way to change the car anywhere in the app, so it wrote the
+           field the Garage and the championship read. mainmenu.h. */
+        m->qcar = (m->qcar + d + MM_N_CARS) % MM_N_CARS;
         break;
     default:
         return;
@@ -1499,21 +1465,7 @@ static void mm_step_quick(mainmenu_t *m, unsigned int down,
 
     if (!tp)
         return;
-    if (m->page == MM_PAGE_AWARDS) {
-        const mmframe f = mm_frame(screen_w, screen_h);
-        const int was = m->aw_top;
-        if (mm_sb_drive(&f, tp,
-                        DLG_STAT_tableStatX0 + DLG_STAT_tableStatSX + MM_SB_GAP,
-                        MM_AW_Y0, MM_AW_Y0 + MM_AW_SY,
-                        &m->aw_top, AW_N, MM_AW_ROWS, &m->sb_drag)) {
-            if (m->aw_top != was)
-                m->cue = MM_CUE_FOCUS;
-            m->armed = -1;
-            return;
-        }
-    } else {
-        m->sb_drag = 0;
-    }
+    m->sb_drag = 0;
     if (tp->pressed) {
         int left;
         m->armed = mainmenu_q_row_at(m, screen_w, screen_h,
@@ -1950,12 +1902,11 @@ static void mm_draw_header(const mainmenu_t *m, const mmframe *f)
                                 && m->qfrom == MM_PAGE_CHAMP)
                           ? STR_UI_CHAMPIONSHIP
                           : (m->page == MM_PAGE_PLAYERS ? STR_UI_SELECT_PLAYER
-                          : (m->page == MM_PAGE_AWARDS ? MM_UI_AWARDS
                           : (MM_PAGE_IS_QUICK(m->page) ? STR_UI_QUICK_RACE
                           : (MM_PAGE_IS_CAR(m->page) ? STR_UI_GARAGE
                           : (m->page == MM_PAGE_MULTI ? STR_UI_MULTIPLAYER
                           : (m->page == MM_PAGE_LOBBY ? STR_UI_WAIT_PLAYERS
-                                                      : STR_UI_MAIN_MENU))))));
+                                                      : STR_UI_MAIN_MENU)))));
         /* right-aligned against the triangle the cell already carries */
         const float tr = px(f, MM_HDR_X + MM_HDR_TEXT_R);
         const float tw = sf.tex ? sf_w(&sf, sc, title) : ui_text_w(sc, title);
@@ -2214,19 +2165,6 @@ static const char *const MM_ST_NAME[REC_N_STAT] = {
    of one list is how a 5-lap time ends up in the "3 laps" column. */
 typedef char mm_laps_agree[(MM_N_LAPS == REC_N_LAPS) ? 1 : -1];
 
-/* THE AWARD LIST'S SCROLL POSITION, clamped. Its own function because three
-   places need the same answer -- the picker, the enum's value and the draw --
-   and a list whose scroller and whose rows disagree about where it starts shows
-   the wrong rows under the right label. */
-static int mm_aw_top(const mainmenu_t *m)
-{
-    const int last = AW_N - MM_AW_ROWS;
-    int t = m ? m->aw_top : 0;
-    if (t > last) t = last;
-    if (t < 0) t = 0;
-    return t;
-}
-
 /* The value a row shows BETWEEN ITS TWO ARROWS, or "" for the three enums whose
    value is a picture -- the track photograph and the car viewport on Race
    summary, the screenshot strip on Map and info. Every one is shipped data or a
@@ -2242,13 +2180,6 @@ static void mm_q_value(const mainmenu_t *m, int row, char *out, int n)
     if (m->page == MM_PAGE_STATS) {
         const int k = (m->stat < 0 || m->stat >= REC_N_STAT) ? 0 : m->stat;
         snprintf(out, n, "%s", MM_ST_NAME[k]);
-        return;
-    }
-    if (m->page == MM_PAGE_AWARDS) {
-        /* WHICH ROWS ARE ON SCREEN, which is a scroller's own value -- and it
-           is also the only place the page says how long the list is. */
-        const int top = mm_aw_top(m);
-        snprintf(out, n, "%d-%d of %d", top + 1, top + MM_AW_ROWS, AW_N);
         return;
     }
     switch (row) {
@@ -2434,7 +2365,7 @@ static void mm_draw_qenums(const mainmenu_t *m, const mmframe *f)
 
 static void mm_draw_quick(const mainmenu_t *m, const mmframe *f)
 {
-    const int c = (m->car < 0 || m->car >= MM_N_CARS) ? 0 : m->car;
+    const int c = (m->qcar < 0 || m->qcar >= MM_N_CARS) ? 0 : m->qcar;
     const rb_car_data *cd = &RB_CARS[c];
     char line[96];
 
@@ -2780,8 +2711,8 @@ static void mm_draw_scrollbar(const mainmenu_t *m, const mmframe *f,
 /* ---------------------------------------------- and the bar as a CONTROL
  *
  * It was drawn and nothing read it: three pages put a scroller beside a list
- * that really does scroll -- the ladder (ten rungs, six shown), the award book
- * (twenty-five, eight) and the roster (twenty, seven) -- and a thumb that walks
+ * that really does scroll -- the ladder (ten rungs, six shown) and the roster
+ * (twenty, seven) -- and a thumb that walks
  * when the cursor walks but cannot be pushed is a control that does not work.
  *
  * WHAT A PRESS MEANS is the caps' own arrows: the top cap is one row back, the
@@ -3002,136 +2933,6 @@ static void mm_draw_stats(const mainmenu_t *m, const mmframe *f)
     /* staticShowResult -- the label enumStatType does not carry itself */
     mm_q_text(m, f, 0, DLG_STAT_staticShowResultX0,
               DLG_STAT_staticShowResultY0, MM_TS_LABEL, 0, 1.f, STR_UI_SORT_BY);
-    mm_rule_at(f, px(f, DLG_STAT_staticShowResultX0),
-               py(f, DLG_STAT_staticShowResultY0 + 24.f),
-               DLG_STAT_staticShowResultSX * f->us);
-}
-
-/* ============================================== THE AWARD PAGE -- no dialog
- *
- * The port's own, on the port's own list (awards.h). Eight rows of the
- * twenty-five, each one a name over the line that says how it is earned, with
- * the marker beside it RED when the award is held and silver when it is not --
- * which is the same cell of the same `enumarrows' atlas dlgSTAT puts beside the
- * signed-in player, used for the same reason: it is the game's own way of
- * saying "this row is yours".
- *
- * A row that is not held shows its TALLY where a held one shows nothing: the
- * numbers are the award's own progress and goal, and for the by-track and
- * by-car awards they are how many of the ten (or three) have been done, which
- * is what a bitmask means. An award with a goal of one has no tally to show --
- * "0/1" tells nobody anything they cannot see from the marker.
- *
- * BOTH STRINGS ARE SHRUNK TO FIT and neither is clipped. The names and the
- * lines are written in awards.c and the column is 434 design px wide, so a
- * table that clipped would silently reward whoever wrote the shortest line --
- * see the toast in awards.c, which does the same for the same reason.
- */
-static void mm_draw_awards(const mainmenu_t *m, const mmframe *f)
-{
-    const float tx0 = DLG_STAT_tableStatX0, ty0 = MM_AW_Y0;
-    const float tsx = DLG_STAT_tableStatSX, tsy = MM_AW_SY;
-    const float item = tsy / (float)MM_AW_ROWS;
-    const float col0 = tx0 + tsx * MM_ST_COL0;
-    const int top = mm_aw_top(m);
-    const sfont big = sf_big(m->tex.font_big);
-    const sfont small_ = sf_small(m->tex.font_small);
-    char line[96];
-    int i;
-
-    /* WHOSE BOOK THIS IS, where dlgSTAT puts the track's name -- and with its
-       rule, which is that control's own bottom edge run its full width. With no
-       profile selected there is nobody to have earned anything, and the page
-       says so rather than showing an empty book as if it were somebody's. */
-    if (*award_player())
-        snprintf(line, sizeof line, "%s", award_player());
-    else
-        snprintf(line, sizeof line, "%s", STR_UI_SELECT_PLAYER);
-    mm_q_text(m, f, 1, DLG_STAT_staticTrackNameX0, DLG_STAT_staticTrackNameY0,
-              MM_TS_TRACK, 0, 1.f, line);
-    mm_rule_at(f, px(f, DLG_STAT_staticTrackNameX0),
-               py(f, DLG_STAT_staticTrackNameY0 + 24.f),
-               DLG_STAT_staticTrackNameSX * f->us);
-
-    for (i = 0; i < MM_AW_ROWS && top + i < AW_N; i++) {
-        const int id = top + i;
-        const aw_def *d = award_def(id);
-        const int got = award_have(id);
-        const float ry = ty0 + item * (float)i;
-        const float sc_n = f->us * MM_AW_NAME_TS;
-        const float sc_w = f->us * MM_AW_WHAT_TS;
-        float avail, wid;
-
-        if (!d)
-            continue;
-
-        /* the marker: dlgSTAT's own two cells, red for held and silver for not */
-        mm_arrow(m, px(f, tx0 + MM_ST_MARK),
-                 py(f, ry + item * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
-                 MM_Q_BULLET * f->us, got ? 0 : 2, 0);
-
-        /* THE NAME, and a held award is white while one still to come is the
-           0.82 grey the front end's own dead rows use -- so the book reads at a
-           glance, which is the whole point of a page like this. */
-        avail = (tsx - tsx * MM_ST_COL0 - MM_AW_STATE_W) * f->us;
-        {
-            float r = got ? 1.f : 0.82f, g = got ? 1.f : 0.82f;
-            float b = got ? 1.f : 0.84f;
-            const float x = px(f, col0);
-            float ns = sc_n;
-            wid = big.tex ? sf_w(&big, ns, d->name) : ui_text_w(ns, d->name);
-            if (wid > avail && wid > 0.f)
-                ns *= avail / wid;
-            if (big.tex)
-                sf_text_shadowed(&big, x, py(f, ry + 3.f), ns, r, g, b, 1.f,
-                                 d->name);
-            else
-                ui_text(x, py(f, ry + 3.f), ns, r, g, b, 1.f, d->name);
-
-            ns = sc_w;
-            wid = small_.tex ? sf_w(&small_, ns, d->what)
-                             : ui_text_w(ns, d->what);
-            if (wid > avail && wid > 0.f)
-                ns *= avail / wid;
-            if (small_.tex)
-                sf_text_shadowed(&small_, x, py(f, ry + 24.f), ns,
-                                 0.72f, 0.74f, 0.76f, 1.f, d->what);
-            else
-                ui_text(x, py(f, ry + 24.f), ns, 0.72f, 0.74f, 0.76f, 1.f,
-                        d->what);
-        }
-
-        /* THE TALLY, right-aligned against the table's own right edge. Only on
-           an award that is neither held nor a one-shot. */
-        if (!got && d->goal > 1) {
-            int have = award_progress(id);
-            if (d->kind == AW_K_BITS) {
-                unsigned int v = (unsigned int)have;
-                int c = 0;
-                while (v) { c += (int)(v & 1u); v >>= 1; }
-                have = c;
-            }
-            snprintf(line, sizeof line, "%d/%d", have, d->goal);
-            mm_q_text(m, f, 0, tx0 + tsx, ry + 8.f, MM_AW_STATE_TS, 1, 0.9f,
-                      line);
-        }
-        /* the per-row rule, the stats table's own, run the table's full width */
-        if (i + 1 < MM_AW_ROWS)
-            mm_rule_at(f, px(f, col0), py(f, ry + item - 3.f),
-                       (tx0 + tsx - col0) * f->us);
-    }
-    mm_rule_at(f, px(f, col0), py(f, ty0 + tsy), (tx0 + tsx - col0) * f->us);
-
-    mm_draw_scrollbar(m, f, tx0 + tsx + MM_SB_GAP, ty0, ty0 + tsy,
-                      top, AW_N, MM_AW_ROWS);
-
-    /* AND THE COUNT, where dlgSTAT puts `Sort results by' -- the label of the
-       picker below, in the same place, with the same rule under it. It says how
-       many are held; the picker's own value says which rows are on screen. */
-    snprintf(line, sizeof line, "%s: %d of %d", MM_UI_AWARDS,
-             award_n_have(), AW_N);
-    mm_q_text(m, f, 0, DLG_STAT_staticShowResultX0,
-              DLG_STAT_staticShowResultY0, MM_TS_LABEL, 0, 1.f, line);
     mm_rule_at(f, px(f, DLG_STAT_staticShowResultX0),
                py(f, DLG_STAT_staticShowResultY0 + 24.f),
                DLG_STAT_staticShowResultSX * f->us);
@@ -7727,6 +7528,236 @@ static void mm_draw_players(const mainmenu_t *m, const mmframe *f)
     mp_draw_list(m, f);
 }
 
+/* ============================== THE RACE'S LOADING PAGE -- 0x570888
+ *
+ * mainmenu.h has the table and the eight kinds. Every number below is that
+ * table's, multiplied into the 800x600 frame the rest of this file is written
+ * in: the rects are normalised against a 640x480 screen, so x * 800 and y * 600
+ * is the same rectangle expressed in design pixels, and the elements that are
+ * SQUARE at 640x480 stay square here (the map's is 512 x 512, each screenshot's
+ * 256 x 256).
+ *
+ *   row  kind  x0        y0        x1        y1          design px
+ *    0    0    0.00000   0.00000   1.00000   1.00000     the whole screen
+ *    1    1    0.20000   0.00000   0.84000   0.85333     160,  0  512x512
+ *    2    2    0.05375   0.00000   0.93375   0.09000     43..747  at y 54
+ *    3    2    0.05375   0.00000   0.93375   0.75833     43..747  at y 455
+ *    4    3    0.00250   0.05000   0.32250   0.47667       2, 30  256x256
+ *    5    3    0.67750   0.05000   0.99750   0.47667     542, 30  256x256
+ *    6    3    0.00250   0.36500   0.32250   0.79167       2,219  256x256
+ *    7    3    0.67750   0.36500   0.99750   0.79167     542,219  256x256
+ *    8    4    0.04125   0.91167   0.95875   0.95500      33..767  y 547..573
+ *    9    5    0            --        --     0.74667     the name, bottom 448
+ *   10    6    0            --        --     0.90333     the step, bottom 542
+ *   11    7    the terminator
+ *
+ * A KIND 2 IS A LINE ALONG THE RECT'S BOTTOM EDGE and not a filled rectangle:
+ * FUN_004ac6e0 is passed 0x400000, and that case takes (x0, y1) to (x1, y1).
+ * Which is why both rules have y0 = 0 and differ only in y1.
+ *
+ * A KIND 5 OR 6 IS TEXT in a rect that spans the page, so what the row carries
+ * is a BASELINE and a centring -- flags 0x210001 through FUN_00470e30 -- and the
+ * two are placed by their bottom edge here for the same reason.
+ *
+ * WHAT IS INSIDE A ROW'S RECTANGLE IS NOT THE ROW'S RECTANGLE. A screenshot's
+ * art is a 256x256 with its ink at x 28..227 and y 53..202 (MM_SHOT_U0..V1), so
+ * the picture the player sees is inset from the 256 the table names -- and since
+ * the element is exactly 256 design px wide, a texel of the art IS a design
+ * pixel of the page and the ink lands at 2+27 .. 2+229. The same is true of the
+ * map: `shot_<Track>_L' paints its silver panel at texel 113..369 of its 512, so
+ * the panel is 256 design px at (273, 113), with the route's black outline
+ * running outside it as far as texel 87 and 397.
+ */
+#define LP_MAP_X      273.f     /* the PANEL inside kind 1's element */
+#define LP_MAP_Y      113.f
+#define LP_MAP_W      256.f
+#define LP_MAP_H      256.f
+#define LP_SHOT_W     202.f     /* the INK of a kind 3, not its 256 element */
+#define LP_SHOT_H     152.f
+#define LP_SHOT_XL     29.f
+#define LP_SHOT_XR    569.f
+#define LP_SHOT_Y0     82.f
+#define LP_SHOT_Y1    271.f
+#define LP_RULE_X0     43.f
+#define LP_RULE_X1    747.f
+#define LP_RULE_Y0     54.f
+#define LP_RULE_Y1    455.f
+#define LP_BAR_X0      33.f
+#define LP_BAR_X1     767.f
+#define LP_BAR_Y0     547.f
+#define LP_BAR_Y1     573.f
+#define LP_NAME_Y     448.f     /* the track's name, by its bottom edge */
+#define LP_STEP_Y     542.f     /* and the step under it */
+#define LP_NAME_TS      0.72f   /* on Smash20's own letSizeY -- see below */
+#define LP_STEP_TS      0.80f
+
+/* THE BAR'S END CAP, 64 texels of `Progressor' drawn against the engine's own
+   640-pixel reference width -- `fild [0x5647f0]' is 640 and `fdivr [0x55484c]'
+   is 64.0, so the cap is a tenth of the screen and 80 design pixels here. The
+   art is a capsule whose rounded nose is the first quarter of that; the rest of
+   the cell is the flat run that the middle quad then stretches. */
+#define LP_BAR_CAP     80.f
+
+/* Its four UV rects, at 0x56dc38, 0x56dc48, 0x56dc58, 0x56dc68 and 0x56dc78 --
+   the 64x128 sheet is four 64x32 bands and the bar uses the first two. The
+   RIGHT cap is the trough's own cell with u REVERSED, which is the engine's own
+   (1, 0, 0, 0.25): one end cap of art, mirrored, rather than two. */
+#define LP_BAR_TROUGH_V0  0.00f
+#define LP_BAR_TROUGH_V1  0.25f
+#define LP_BAR_FILL_V0    0.25f
+#define LP_BAR_FILL_V1    0.50f
+#define LP_BAR_MID_U0     0.50f     /* the repeatable half of either band */
+
+/* One line of the page's own text, centred on the frame and sitting ON `by'.
+   The engine's font where it is loaded and ui.c's where it is not, which is the
+   fallback every other drawer in this file has. */
+static void lp_text(const mainmenu_t *m, const mmframe *f, float by, float ts,
+                    const char *s)
+{
+    const sfont sf = sf_small(m->tex.font_small);
+    const float sc = f->us * ts;
+    const float tw = sf.tex ? sf_w(&sf, sc, s) : ui_text_w(sc, s);
+    const float th = sf.tex ? sf_h(&sf, sc) : ui_text_h(sc);
+    const float x = px(f, 400.f) - tw * 0.5f;
+    const float y = py(f, by) - th;
+
+    if (sf.tex)
+        sf_text_shadowed(&sf, x, y, sc, 1.f, 1.f, 1.f, 1.f, s);
+    else
+        ui_text(x, y, sc, 1.f, 1.f, 1.f, 1.f, s);
+}
+
+/* One quad of the bar, in design pixels, out of `Progressor'. */
+static void lp_bar_quad(const mainmenu_t *m, const mmframe *f,
+                        float x0, float x1, float u0, float u1,
+                        float v0, float v1)
+{
+    const float y = py(f, LP_BAR_Y0);
+    const float h = (LP_BAR_Y1 - LP_BAR_Y0) * f->us;
+    if (x1 <= x0)
+        return;
+    ui_image(px(f, x0), y, px(f, x1) - px(f, x0), h,
+             m->tex.progressor, u0, v0, u1, v1, 1.f, 1.f, 1.f, 1.f);
+}
+
+void mainmenu_draw_loading(const mainmenu_t *m, int track, const char *caption,
+                           float progress, int screen_w, int screen_h)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    float x, y, w, h;
+    int t, i;
+
+    if (!m)
+        return;
+    t = (track >= 0 && track < N_TRACKS) ? track : 0;
+
+    ui_begin(screen_w, screen_h);
+    /* ROW 0. The ground first and NOT conditional on the texture -- the rule
+       every page in this app follows: a missing Desktop reads as the same page
+       in flat paint rather than as a hole. */
+    ui_rect(0.f, 0.f, (float)screen_w, (float)screen_h,
+            0.93f, 0.65f, 0.09f, 1.f);
+    if (m->tex.desktop)
+        ui_image(0.f, 0.f, (float)screen_w, (float)screen_h, m->tex.desktop,
+                 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
+
+    /* ROWS 4..7 -- the four screenshots, in the table's own order: top left,
+       top right, bottom left, bottom right. */
+    for (i = 0; i < 4; i++) {
+        const float sx = (i & 1) ? LP_SHOT_XR : LP_SHOT_XL;
+        const float sy = (i & 2) ? LP_SHOT_Y1 : LP_SHOT_Y0;
+        const unsigned int tx = m->tex.shot[t][i];
+        mm_box(&f, sx, sy, LP_SHOT_W, LP_SHOT_H, &x, &y, &w, &h);
+        if (tx)
+            ui_image(x, y, w, h, tx, MM_SHOT_U0, MM_SHOT_V0,
+                     MM_SHOT_U1, MM_SHOT_V1, 1.f, 1.f, 1.f, 1.f);
+        else
+            ui_rect(x, y, w, h, 0.25f, 0.28f, 0.34f, 1.f);
+    }
+
+    /* ROW 1 -- the map panel, COMPOSITED rather than read out of
+       `shot_<Track>_L': the painting inside `messagebox_empty''s frame, then
+       the route alpha-keyed over the whole page. Both passes are
+       mm_draw_mapinfo's, and the second derives its rectangle from the first
+       for the reason that drawer states at length -- two mappings of the same
+       texture disagree by a few pixels and the route ghosts. */
+    if (m->tex.trackmap[t]) {
+        const unsigned int tm = m->tex.trackmap[t];
+        const float mx = DLG_MAPINFO_shotTrackViewX0;
+        const float my = DLG_MAPINFO_shotTrackViewY0;
+        const float ms = DLG_MAPINFO_shotTrackViewSX;
+        const float mt = DLG_MAPINFO_shotTrackViewSY;
+        const float u0 = (MM_MAP_X - mx) / ms;
+        const float v0 = (MM_MAP_Y - my) / mt;
+        const float u1 = (MM_MAP_X + MM_MAP_W - mx) / ms;
+        const float v1 = (MM_MAP_Y + MM_MAP_H - my) / mt;
+
+        mm_box(&f, LP_MAP_X, LP_MAP_Y, LP_MAP_W, LP_MAP_H, &x, &y, &w, &h);
+        ui_rect(x, y, w, h, 0.f, 0.f, 0.f, MM_MAP_PLATE);
+        ui_image(x, y, w, h, tm, u0, v0, u1, v1, 1.f, 1.f, 1.f, 1.f);
+        mm_frame9(&f, x, y, w, h, m->tex.panel);
+
+        w /= (u1 - u0);
+        h /= (v1 - v0);
+        x -= u0 * w;
+        y -= v0 * h;
+        ui_alpha_test(MM_MAP_KEY);
+        ui_image(x, y, w, h, tm, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
+        ui_alpha_test(0.f);
+    }
+
+    /* ROWS 2 AND 3 -- the two rules, over everything: they run the width of the
+       page and the screenshots' own frames stop short of them. */
+    mm_rule_at(&f, px(&f, LP_RULE_X0), py(&f, LP_RULE_Y0),
+               px(&f, LP_RULE_X1) - px(&f, LP_RULE_X0));
+    mm_rule_at(&f, px(&f, LP_RULE_X0), py(&f, LP_RULE_Y1),
+               px(&f, LP_RULE_X1) - px(&f, LP_RULE_X0));
+
+    /* ROW 9 -- the track's name, and ROW 10 -- what the load is doing. */
+    lp_text(m, &f, LP_NAME_Y, LP_NAME_TS, STR_TRACK_NAME[t]);
+    if (caption && *caption)
+        lp_text(m, &f, LP_STEP_Y, LP_STEP_TS, caption);
+
+    /* ROW 8 -- the bar. Five quads, the engine's own: the trough's cap, its
+       stretched middle and its cap again mirrored, then the fill's cap and the
+       fill's middle over them. The STUDS the art also carries are not drawn --
+       they are stepped off the progress control's own scale, which on this port
+       is a count of load seams and not a range. */
+    if (m->tex.progressor) {
+        const float x0 = LP_BAR_X0, x1 = LP_BAR_X1;
+        const float mid0 = x0 + LP_BAR_CAP, mid1 = x1 - LP_BAR_CAP;
+        float p = progress;
+        lp_bar_quad(m, &f, x0, mid0, 0.f, 1.f,
+                    LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+        lp_bar_quad(m, &f, mid0, mid1, LP_BAR_MID_U0, 1.f,
+                    LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+        lp_bar_quad(m, &f, mid1, x1, 1.f, 0.f,
+                    LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+        if (p > 1.f) p = 1.f;
+        if (p > 0.f) {
+            const float end = x0 + (x1 - x0) * p;
+            lp_bar_quad(m, &f, x0, mid0 < end ? mid0 : end, 0.f, 1.f,
+                        LP_BAR_FILL_V0, LP_BAR_FILL_V1);
+            if (end > mid0)
+                lp_bar_quad(m, &f, mid0, end < mid1 ? end : mid1,
+                            LP_BAR_MID_U0, 1.f,
+                            LP_BAR_FILL_V0, LP_BAR_FILL_V1);
+        }
+    } else if (progress >= 0.f) {
+        /* No `Progressor' in the pack: the port's own plain bar, so a build
+           packed before that name was on the list still says how far along it
+           is rather than showing nothing. */
+        const float bx = px(&f, LP_BAR_X0);
+        const float bw = px(&f, LP_BAR_X1) - bx;
+        const float by = py(&f, LP_BAR_Y0);
+        const float bh = (LP_BAR_Y1 - LP_BAR_Y0) * f.us;
+        float p = progress > 1.f ? 1.f : progress;
+        ui_rect(bx - 1.f, by - 1.f, bw + 2.f, bh + 2.f, 0.f, 0.f, 0.f, 0.5f);
+        ui_rect(bx, by, bw * p, bh, 0.85f, 0.09f, 0.13f, 1.f);
+    }
+    ui_end();
+}
+
 void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
 {
     const mmframe f = mm_frame(screen_w, screen_h);
@@ -7745,8 +7776,6 @@ void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
             mm_draw_mapinfo(m, &f);
         else if (m->page == MM_PAGE_STATS)
             mm_draw_stats(m, &f);
-        else if (m->page == MM_PAGE_AWARDS)
-            mm_draw_awards(m, &f);
         else
             mm_draw_quick(m, &f);
         mm_draw_qenums(m, &f);

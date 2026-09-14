@@ -23,6 +23,12 @@
 #ifndef SCENE_H
 #define SCENE_H
 
+/* THE STDIO BUFFER EVERY ASSET READER SETS, and why there is one at all is
+   written out at the setvbuf in scene_load: newlib's fread never reads past the
+   FILE buffer, so an unset one turns every load into BUFSIZ-sized syscalls and
+   caps the port at 3.2 MB/s off the card. Freed by fclose. */
+#define ASSET_IOBUF (512u * 1024u)
+
 #include <stdio.h>
 
 #include <vitaGL.h>

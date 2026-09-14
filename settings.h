@@ -70,6 +70,7 @@ typedef struct {
     int tex_swap_rb;
     int car_light;
     int intro;          /* AutoRunIntro -- the launch movies */
+    int pace;           /* vblanks a race frame is held for: 0 off, 2, or 3 */
 } settings_t;
 
 /* Read the file and apply it to `m`, which must already have been through
