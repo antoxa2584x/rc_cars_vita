@@ -25,14 +25,23 @@
  *
  *   Place      the placing, off the same progress the HUD's badge uses
  *   Time       the race clock at the moment that racer crossed for the last
- *              time. A racer who had NOT finished when the player did shows
- *              `---': the race ends at the player's flag, which is what this
- *              port does, and inventing a time for a car still driving would be
- *              inventing a result
+ *              time -- INCLUDING THE ONES THAT CROSS AFTER THE PLAYER DOES.
+ *              The race does not end at the player's flag: the opponents go on
+ *              being stepped behind the finish screen, the engine agrees they
+ *              should be (`ai-opponents.md` -- the post-race stop is armed by
+ *              each car's OWN race state), and a car half a second back really
+ *              does come home. This table used to be filled once, at the flag,
+ *              so every one of them was written down as a DNF with no time for
+ *              ever; the caller refills it as they arrive and the rows re-sort.
+ *              `---' now means what it says: still out there when the field was
+ *              called. Nothing is extrapolated -- a time appears only when a
+ *              car that is really driving really crosses
  *   Gap        behind the winner. Seconds for a finisher; for a racer still out
- *              there, the DISTANCE it was behind, in metres, which is the true
- *              answer to the same question and says plainly that it did not
- *              finish
+ *              there, the DISTANCE it was behind AT THE PLAYER'S FLAG, in
+ *              metres, which is the true answer to the same question and says
+ *              plainly that it did not finish. Latched there rather than read
+ *              live, because a number that crept while the player read it would
+ *              be a live scoreboard pretending to be a result
  *   Best lap   the quickest lap that racer turned, watched off its own lap
  *              counter -- the player's is race_ui's, which already tracks it
  *   Av. speed  the road actually driven over the time it took, km/h
@@ -72,10 +81,11 @@ typedef struct {
 typedef struct {
     char  name[RES_NAME];
     int   place;             /* 1-based */
-    int   finished;          /* crossed the last line before the race ended */
+    int   finished;          /* crossed the last line, whenever it did */
     float time;              /* seconds; only meaningful when `finished' */
     float gap;               /* seconds behind the winner, when both finished */
-    float behind_m;          /* metres behind the winner, when it did not */
+    float behind_m;          /* metres behind the winner at the PLAYER's flag,
+                                when it did not */
     float best_lap;          /* seconds, 0 for none turned */
     float av_speed;          /* km/h over the road it drove */
     int   is_player;

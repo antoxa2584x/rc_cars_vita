@@ -1082,6 +1082,85 @@ static void settle(rb_car *c, int car)
         rbcar_step(c, 0.0f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
 }
 
+/* ---- part 5c: HOW EACH OF THE THREE CARS SITS ON LEVEL GROUND ------------
+ *
+ * ALL THREE, because part 5b is the only thing in this file that has ever run
+ * cars 1 and 2 and this is the cheapest question there is.
+ *
+ * `known-issues.md` carried "the Buggy settles 2.9 degrees nose-down on level
+ * ground, with all four mounts, free lengths and sags identical -- not
+ * explained" for a long time. It is explained and it is not a fault: the
+ * mounts, lengths and sags ARE identical and the WHEELS are not.
+ * `coeffRadBackWheels` is 1.3737 on the Buggy and 1.0 on the other two, so its
+ * rear tyres are 37% taller than its fronts -- which is what a buggy looks
+ * like -- and a car whose rear axle is taller than its front sits nose-down by
+ * atan(dr / wheelbase) whatever its springs do.
+ *
+ * Checked as a DERIVATION and not against 2.9, so the number has a reason:
+ *
+ *   geometry alone   atan(0.067438 - 0.049091, 0.36450) = 2.882 deg
+ *   measured settle                                       2.802 deg
+ *
+ * and the 0.080 deg between them is the springs, which is also derived rather
+ * than tolerated -- the nose-down attitude moves load onto the rear, the rear
+ * legs end 0.47 mm shorter than the fronts, and atan(0.00047 / 0.36450) is
+ * 0.074 deg. The residual is checked against THAT, so a build that got the
+ * right total for the wrong reason fails. */
+static void part5c(void)
+{
+    int car;
+
+    puts("\n-- part 5c: how each car sits on level ground --");
+
+    for (car = 0; car < 3; car++) {
+        const rb_car_data *d = &RB_CARS[car];
+        rb_car c;
+        double dr = (double)d->tune.cdt_rad_back - d->tune.cdt_rad_wheel;
+        double base = 2.0 * (double)d->half_base;
+        double geom = atan2(dr, base) * RB_RAD2DEG;
+        double dlen, spring, pitch;
+        int i;
+        char what[160];
+
+        rbcar_init(&c, car, &FLAT_WORLD, 0.0f, 0.0f, 0.0f, 0.0f);
+        for (i = 0; i < 600; i++)
+            rbcar_step(&c, 0.0f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
+
+        /* m[9] is the y of the body's forward (+Z) axis, so its arcsine is the
+           pitch: positive is nose-UP. */
+        pitch = asin((double)c.m[9]) * RB_RAD2DEG;
+        /* Front leg longer than rear = the front end is carried higher by the
+           springs, which is nose-up, the same sign as `pitch`. */
+        dlen = (double)c.wheel[0].len - c.wheel[2].len;
+        spring = atan2(dlen, base) * RB_RAD2DEG;
+
+        printf("%-8s rF %.5f rR %.5f base %.5f | geometry %+.3f  springs "
+               "%+.3f  =%+.3f | settled %+.3f deg\n",
+               d->name, d->tune.cdt_rad_wheel, d->tune.cdt_rad_back, base,
+               -geom, spring, spring - geom, pitch);
+
+        snprintf(what, sizeof what,
+                 "%s settles at the pitch its own two wheel radii demand",
+                 d->name);
+        ck(fabs(pitch - (spring - geom)) < 0.02, what);
+
+        /* AND THE TWO CARS WITH EQUAL RADII SIT LEVEL, which is the other half:
+           without it the derivation above is satisfied by any build where the
+           two errors happen to cancel, and a level car has no springs term to
+           cancel with. */
+        if (fabs(dr) < 1e-9) {
+            snprintf(what, sizeof what,
+                     "  and %s, whose axles match, sits dead level", d->name);
+            ck(fabs(pitch) < 0.01, what);
+        } else {
+            snprintf(what, sizeof what,
+                     "  and %s is the one that does not -- nose DOWN, not up",
+                     d->name);
+            ck(pitch < -1.0, what);
+        }
+    }
+}
+
 static float tilt_deg(const rb_car *c)
 {
     double u = c->m[5];
@@ -3125,6 +3204,7 @@ int main(void)
     /* ================= part 5: the car rig ============================ */
     rig_checks();
     rig_checks_23();
+    part5c();
 
     /* ================= part 6: Jump, and water ======================== */
     jump_water_checks();

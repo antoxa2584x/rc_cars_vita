@@ -1464,6 +1464,40 @@ void net_race_begin(void)
     N.peer_at = -1000.f;
 }
 
+/* THE RACE IS OVER AND WE ARE BACK IN THE LOBBY -- net_race_begin's counterpart,
+ * which did not exist and should have from the day it did.
+ *
+ * NOTHING EVER LEFT `NET_RACING`. A session that had raced once stayed in it for
+ * the rest of its life, because the three ways out of a race -- the finish
+ * screen's Quit, the START menu's `Main menu' row and a restart -- all just put
+ * the front end back up. The keep-alive survived that (it runs in NET_RACING
+ * too, deliberately, and net.h says why), so this was not a dropped peer; what
+ * it cost is the ANNOUNCE. `net_step` sends one only while the mode is exactly
+ * NET_HOSTING, so **a host that had run one race was never advertised again**
+ * and no fourth player could ever find the game. The lobby looked perfectly
+ * alive to everyone already in it, which is why it took this long to notice.
+ *
+ * Host-ness is read BEFORE the mode moves, because `net_is_host' is defined in
+ * terms of the mode (`NET_RACING && slot == 0`), and reading it afterwards
+ * would ask the question of the answer.
+ *
+ * Idempotent, and safe to call when there is no game at all: every path out of
+ * a race calls it, and most races are not networked. */
+void net_race_end(void)
+{
+    int host;
+    if (!opened || N.mode != NET_RACING)
+        return;
+    host = net_is_host();
+    N.mode = host ? NET_HOSTING : NET_JOINED;
+    N.race_over = 0;
+    /* So the next race's first state packet is not rate-limited against a
+       timestamp from the last one. net_race_begin does the same on entry; doing
+       it at both ends means neither depends on the other having run. */
+    N.state_at = -1000.f;
+    N.announce_at = -1000.f;
+}
+
 /* THE STATE RATE IS network.ini's OWN, read as sends per second, with a FLOOR
    under it. See gen_dlg_data.py on why the reading is stated rather than
    certain, and net.h at NET_STATE_FLOOR for why 5 is not enough here. */

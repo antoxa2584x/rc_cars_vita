@@ -47,6 +47,7 @@ meshalign
 net_test
 placechk
 player_test
+cpwide
 progchk
 proptest
 rb_test

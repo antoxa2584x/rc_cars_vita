@@ -265,14 +265,26 @@ void race_ui_set_track(race_ui_t *r, int track, unsigned int map_tex);
    its binding. */
 void race_ui_start(race_ui_t *r);
 
-/* A lap line was crossed. The lap clock's reading is held and blinked for
-   HUD_LAP_BLINK seconds and the clock restarts.
+/* THE START/FINISH LINE WAS CROSSED. `completes_lap' is whether that crossing
+   ended a lap, and it is the CALLER'S to answer -- `cps.lap' is the authority
+   (checkpoints_t.started) and a second copy of that state kept in here would be
+   one more pair of counters nothing compares.
 
-   -> 1 when the lap just finished is the BEST so far, which is what posts
-   message slot 10. The very first completed lap counts as a best: it is, and the
-   alternative is a banner that can never appear on a two-lap run. -> 0 when the
-   clock was not running, so nothing is claimed for a lap that was not timed. */
-int race_ui_lap(race_ui_t *r);
+   With it set the lap clock's reading is held and blinked for HUD_LAP_BLINK
+   seconds and the clock restarts; -> 1 when the lap just finished is the BEST so
+   far, which is what posts message slot 10. The very first COMPLETED lap counts
+   as a best: it is, and the alternative is a banner that can never appear on a
+   two-lap run. -> 0 when the clock was not running, so nothing is claimed for a
+   lap that was not timed.
+
+   WITH IT CLEAR the clock restarts and NOTHING ELSE HAPPENS -- no hold, no
+   blink, no best. That is the OPENING crossing, the run up from the grid, which
+   every race makes within a second or two of GO and which completes no lap: it
+   used to arrive here as an ordinary one, so `BEST LAP' was posted on the line
+   at the start of every race (there being no best to beat yet) and the HUD
+   blinked the grid-to-line time as though it were a lap. The clock still has to
+   be restarted, because the line is where lap 1 begins. */
+int race_ui_lap(race_ui_t *r, int completes_lap);
 
 /* The race is over: the clocks stop where they are. */
 void race_ui_stop(race_ui_t *r);

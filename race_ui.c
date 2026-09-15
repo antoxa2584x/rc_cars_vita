@@ -142,11 +142,17 @@ void race_ui_start(race_ui_t *r)
     r->running = 1;
 }
 
-int race_ui_lap(race_ui_t *r)
+int race_ui_lap(race_ui_t *r, int completes_lap)
 {
     int best;
     if (!r || !r->running)
         return 0;
+    /* THE OPENING CROSSING COMPLETES NO LAP, so there is nothing to time, hold
+       or beat -- only a clock to start. See race_ui.h. */
+    if (!completes_lap) {
+        r->t_lap = 0.f;
+        return 0;
+    }
     /* The best lap, decided BEFORE the clock is reset and off the reading the
        line is being crossed with -- which is the same number the lap-time line
        is about to hold and blink, so the banner and the clock can never disagree

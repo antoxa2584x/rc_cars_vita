@@ -1999,7 +1999,8 @@ static void part2_checkpoints(void)
      *   inside cp_1's radius already, so firing on entry would sound the cue
      *   before GO on all five -- which is what CP_PASS_EPS is for.
      *
-     * Then every checkpoint, once per lap, in order, over all 30 recordings.
+     * Then every checkpoint, once per lap, in order, over every shipped
+     * recording -- which is the ROSTER's count and not a literal; see want_runs.
      */
     {
         static const char *const TRK2[10] = {
@@ -2008,6 +2009,24 @@ static void part2_checkpoints(void)
         };
         int t, loaded = 0, first_wrong = 0, held_fired = 0;
         int miss = 0, ooo = 0, runs = 0;
+        /* NOT a literal. The field is the ROSTER, and the roster is per track:
+           this used to demand 30 -- "three opponents each" -- and went red the
+           day AI_MAX_FIELD stopped capping at three, reporting 50 of 30 on a
+           build that was right. The count to hold `runs' against is the one
+           ai_data.h's own table authored, summed over the tracks that loaded,
+           which is a different route to the same number than the walk of the
+           .aip that produced `ai.n'. `short_roster' is the half that matters:
+           a track whose recordings went missing loads with a SMALLER ai.n and
+           a total that still adds up if another track is counted twice. */
+        int want_runs = 0, short_roster = 0;
+        /* THE WIDE-LINE RULE'S REFUSAL, counted here because this is the only
+           fixture that drives all fifty shipped laps. The rule steps over a
+           checkpoint the car took wider than CP_TRIGGER_RAD (checkpoint.h); on a
+           RECORDED lap nothing is ever taken wide, so it must never once fire --
+           and country_2, whose road brushes cp_3 within 2.18 m about 130 m
+           before the real pass, is the lap that says so. That fly-by is what
+           took the REVERTED distance hatch on every one of that track's laps. */
+        int forgiven = 0;
         float worst = -1.f;
 
         for (t = 0; t < 10; t++) {
@@ -2039,6 +2058,8 @@ static void part2_checkpoints(void)
                 continue;
             }
             loaded++;
+            want_runs += AI_RACES[t].n;
+            if (ai.n != AI_RACES[t].n) short_roster++;
 
             for (i = 0; i < ai.n; i++) {
                 const ai_car *a = &ai.car[i];
@@ -2071,6 +2092,7 @@ static void part2_checkpoints(void)
                             if (d > worst) worst = d;
                         }
                     }
+                forgiven += rc.skipped;
                 if (first != 0) first_wrong++;
                 /* Two laps of the recording plus the crossing that starts it: the
                    line three times, everything else twice. */
@@ -2089,20 +2111,25 @@ static void part2_checkpoints(void)
             scene_release(&ts);
         }
 
-        ck(loaded == 10 && runs == 30,
-           "all ten tracks' recorded laps load (three opponents each)",
-           "%d tracks, %d recordings", loaded, runs);
-        ck(runs == 30 && first_wrong == 0,
+        ck(loaded == 10 && runs == want_runs && short_roster == 0,
+           "all ten tracks' recorded laps load (every opponent on the roster)",
+           "%d tracks, %d recordings of %d authored, %d short rosters",
+           loaded, runs, want_runs, short_roster);
+        ck(runs == want_runs && first_wrong == 0,
            "the START/FINISH is the first checkpoint to fire, on every track",
            "%d of %d recordings started on the wrong one", first_wrong, runs);
         ck(held_fired == 0,
            "and nothing fires while the car is held on the grid for the countdown",
            "%d cues during 3 s x %d grids", held_fired, runs);
-        ck(runs == 30 && miss == 0,
+        ck(runs == want_runs && miss == 0,
            "every checkpoint fires on every recorded lap, none missed",
            "%d missing over %d recordings", miss, runs);
         ck(ooo == 0, "and always in cp_1, cp_2, ... cp_n order",
            "%d out of order", ooo);
+        ck(runs == want_runs && forgiven == 0,
+           "and the wide-line rule steps over NOTHING on a recorded lap -- "
+           "country_2's fly-by is still refused",
+           "%d skip(s) forgiven over %d recordings", forgiven, runs);
         ck(worst >= 0.f && worst <= CP_TRIGGER_RAD + CP_PASS_EPS,
            "each fires within the trigger radius of its own marker",
            "worst %.2f m of %.1f m (the OLD rule missed 174 of these 300 "
@@ -6462,6 +6489,9 @@ static void part14_aifx(void)
              * The seam wrap is not a jump and is subtracted out. */
             {
                 int t2, tot_back = 0, tot_big = 0, laps = 0;
+                /* Summed off ai_data.h's own rosters, not the literal 30 this
+                   used to carry -- see part 2. */
+                int want_laps = 0;
                 float worst_back = 0.f;
                 for (t2 = 0; t2 < 10; t2++) {
                     char pth[160];
@@ -6481,6 +6511,7 @@ static void part14_aifx(void)
                     cp_init(&k2, &s2, &c2);
                     memset(&a2, 0, sizeof a2);
                     if (ai_init(&a2, t2, "assets", col_rb_world(&c2), 1, 0)) {
+                        want_laps += AI_RACES[t2].n;
                         for (q = 0; q < a2.n; q++) {
                             const ai_car *ac = &a2.car[q];
                             float prev = -1e9f, hint = -1.f;
@@ -6512,9 +6543,9 @@ static void part14_aifx(void)
                     scene_release(&s2);
                     col_free(&c2);
                 }
-                ck(laps == 30,
-                   "all 30 shipped recordings drive the progress query",
-                   "%d of 30", laps);
+                ck(laps > 0 && laps == want_laps,
+                   "every shipped recording drives the progress query",
+                   "%d of %d", laps, want_laps);
                 /* A KNOWN-DEFECT CHECK, and deliberately the wrong way round:
                    the projection DOES jump, that is why neither side of the
                    placing uses it, and if it ever stops jumping this line is the

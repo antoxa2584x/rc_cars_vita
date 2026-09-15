@@ -550,6 +550,7 @@ leaves the previous binary sitting there to answer for it:
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
           colprof flipped antheight aitest chrfloat dogstuck curb hudshot wideline \
           mainmenu_test menushot results_test finishshot introtest player_test \
+          cpwide \
           garage_test champ_test net_test
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
@@ -647,7 +648,7 @@ leaves the previous binary sitting there to answer for it:
                             # written this burst" guard, which only bites when a
                             # write FAILED and is shown equivalent at the point
                             # of use.
-    gcc -I. -O2 rccars_re/player_test.c player.c rlog.c -lm -o player_test
+    gcc -I. -Itestgl -O2 rccars_re/player_test.c player.c rlog.c -lm -o player_test
                             # THE PLAYER PROFILE and the game's own `.scp` format.
                             # Its first part is the one that matters and it needs
                             # a retail install:
@@ -745,6 +746,23 @@ leaves the previous binary sitting there to answer for it:
                             # placing's two rulers about the SAME CAR, with the
                             # odometer (still the fallback) run on the same
                             # frames as its control. Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/cpwide.c scene.c checkpoint.c col.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c carlight.c \
+        rccars_re/glstub_host.c -lm -o cpwide
+                            # and the case none of the four above can build: ONE
+                            # checkpoint taken wider than CP_TRIGGER_RAD, on every
+                            # checkpoint of every track, with the rest of the lap
+                            # on the recorded line. wideline's sinusoid is not
+                            # this -- at 12 m of amplitude it still passes every
+                            # one of the fifty markers inside 2.2 m, because its
+                            # phase is the road's and not theirs. Scores what the
+                            # miss COSTS: 8.81 of the two laps' remaining
+                            # crossings under strict order, 2.00 under
+                            # CP_SKIP_FRAC, and the 21 wide crossings of the
+                            # START/FINISH still stalling, which is the half of
+                            # the rule every other line here is blind to. `-v'
+                            # prints the 200-row table. 4 of 4 mutants die.
+                            # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c champ.c \
         touch.c ui.c sfont.c records.c rlog.c player.c garage.c \
         net.c ime.c -lm -o mainmenu_test
@@ -852,7 +870,7 @@ leaves the previous binary sitting there to answer for it:
                             # interpolation, exits non-zero. It binds UDP 3658
                             # and 3659 on the loopback; nothing leaves the
                             # machine.
-    gcc -I. -O2 -Wall rccars_re/garage_test.c garage.c player.c rlog.c \
+    gcc -I. -Itestgl -O2 -Wall rccars_re/garage_test.c garage.c player.c rlog.c \
         -lm -o garage_test
                             # THE SHOP behind dlgSETCAR and dlgSETDETAIL: what a
                             # part costs, what it fetches back, which of the
@@ -867,7 +885,7 @@ leaves the previous binary sitting there to answer for it:
                             # tyres are charged the RESONATOR's column, because
                             # that is what the retail exe does. 53 checks,
                             # 10 of 10 mutants dead, exits non-zero.
-    gcc -I. -O2 -Wall rccars_re/champ_test.c champ.c player.c rlog.c \
+    gcc -I. -Itestgl -O2 -Wall rccars_re/champ_test.c champ.c player.c rlog.c \
         -lm -o champ_test
                             # THE CHAMPIONSHIP behind dlgCHAMP and dlgCHRACE:
                             # which rung is open, what an entry costs, what a
@@ -955,12 +973,12 @@ leaves the previous binary sitting there to answer for it:
                             # shifted by 30 frames -- which is what the intro.ini
                             # derivation catches, and the reason that check
                             # matches on length rather than on frame number.
-    gcc -I. -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
+    gcc -I. -Itestgl -O2 rccars_re/audio_test.c mix.c audio.c sfx.c col.c \
         rb.c contact.c collide.c -lm -o audio_test                 # sound
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off rccars_re/curb.c \
         col.c rb.c rbcar.c contact.c collide.c carani.c \
         -lm -o curb                    # driving AT a low obstacle / a kerb
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off \
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/wetcheck.c col.c rb.c contact.c collide.c rbcar.c \
         -lm -o wetcheck                         # water, against the real grids
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
@@ -969,10 +987,10 @@ leaves the previous binary sitting there to answer for it:
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/rockroll.c rb.c rbcar.c contact.c collide.c \
         -lm -o rockroll                         # heave/pitch/roll, and inverted
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off \
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/allstarts.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o allstarts        # all ten REAL starts on the REAL .col
-    gcc -I. -O2 -Wall -fno-fast-math -ffp-contract=off \
+    gcc -I. -Itestgl -O2 -Wall -fno-fast-math -ffp-contract=off \
         rccars_re/flaghold.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o flaghold        # the END of a race: does the car stop?
                             # Three seconds of throttle at each of the ten real
@@ -987,10 +1005,10 @@ leaves the previous binary sitting there to answer for it:
                             # under 25 m -- and the CONTROL has to go on failing,
                             # or the fixture has stopped reaching the case.
                             # Exits non-zero.
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off \
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/track.c col.c rb.c rbcar.c contact.c collide.c carani.c \
         cam.c -lm -o track                 # one hand-picked spawn, with tracing
-    gcc -I. -O2 -fno-fast-math -ffp-contract=off \
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/ceiling.c col.c rb.c rbcar.c contact.c collide.c \
         carani.c -lm -o ceiling         # low overhead space: driving under roofs
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off -DCOL_PROFILE \

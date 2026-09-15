@@ -410,6 +410,11 @@ void cp_resync(checkpoints_t *c, float x, float y, float z)
     c->passed = -1;
     c->in_zone = 0;
     c->zone_min = 0.f;
+    /* The skip approach goes with them: a car that has been PUT somewhere is not
+       mid-approach to the checkpoint after the one it is heading for either. */
+    c->skip_zone = 0;
+    c->skip_min = 0.f;
+    c->stretch_hi = 0.f;
     if (c->n <= 0)
         return;
     c->next = (c->last < 0) ? 0 : (c->last + 1) % c->n;
@@ -436,6 +441,7 @@ void cp_restart(checkpoints_t *c, float x, float y, float z)
        what a race start is. */
     c->lap = 0;
     c->last = -1;
+    c->skipped = 0;
     /* And the race is not under way, so the crossing of the line that a race
        start makes within its first second counts no lap. cp_resync deliberately
        does NOT clear this, for the same reason it keeps the lap. */
@@ -539,9 +545,85 @@ int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
    cp_step only so that cp_step can advance the PROGRESS on every call whatever
    this answers -- when the two shared a body, the early returns for "still
    closing" and "nowhere near it" took the progress with them. */
+/* LATCH `k` AS PASSED and aim at the one after it. Shared by the ordinary pass
+   and by the forgiven skip below, because everything about the latch except
+   which index it names is the same either way -- and when the two were written
+   out twice the skip path forgot the odometer re-anchor. */
+static void cp_latch(checkpoints_t *c, int k)
+{
+    c->passed = k;
+    c->last = k;                       /* latched, for the respawn point */
+    /* Checkpoint 0 IS the start/finish line, so passing it is the lap -- from the
+       SECOND time. It is also the first thing a race passes, on every track,
+       because cp_restart aims here and the grid is short of it; that opening
+       crossing completes no lap. See checkpoints_t.started. */
+    if (k == 0) {
+        if (c->started)
+            c->lap++;
+        else
+            c->started = 1;
+    }
+    c->next = (k + 1) % c->n;
+    c->in_zone = 0;
+    c->zone_min = 0.f;
+    c->skip_zone = 0;
+    c->skip_min = 0.f;
+    c->stretch_hi = 0.f;
+    /* AND THE RE-ANCHOR. The odometer measures from the checkpoint last passed,
+       so passing one starts it again -- which is what makes cp_prog_step answer
+       with the new stretch's own station on this very frame, whatever the last
+       stretch had accumulated. See there. */
+    c->prog_odo = 0.f;
+    /* The window is re-anchored the same way and for the same reason: the stretch
+       it is clamped to is the one the latch names, and the car is AT the marker
+       that begins it. -1 says exactly that without needing the arc. */
+    c->line_prev = -1.f;
+}
+
+/* HOW FAR ALONG THE STRETCH TO `next` THE CAR HAS DRIVEN, 0 .. 1 -- the same
+   from/to cp_prog_step laid `prog' out between, read back. It is last frame's
+   answer, because the cursor runs before the progress; at this car's speed that
+   is under 13 cm, which is nothing against CP_SKIP_FRAC. */
+static float cp_stretch_frac(const checkpoints_t *c)
+{
+    int a = (c->last >= 0 && c->last < c->n) ? c->last : -1;
+    int b = (c->next >= 0 && c->next < c->n) ? c->next : 0;
+    float from = (a < 0) ? c->grid_arc : c->station[a];
+    float to = (b == 0) ? c->spine_len : c->station[b];
+    if (!(to - from > 1e-3f))
+        return 0.f;
+    return (c->prog - from) / (to - from);
+}
+
+/* THE APPROACH MACHINERY, for one checkpoint and one pair of state fields.
+   Returns 1 on the frame the car is judged to have passed `k`.
+
+   The event is the MINIMUM of the distance: the pass fires when the distance has
+   climbed CP_PASS_EPS back off that minimum, or when the car leaves the radius
+   having been inside it -- so the cue lands AT the marker, the closest approach,
+   rather than at the edge of the circle, however fast the car is going. */
+static int cp_approach(const checkpoints_t *c, int k, float x, float z,
+                       int *in_zone, float *zone_min)
+{
+    float d = sqrtf(dist2_xz(c->cp[k].p[0], x, z));
+
+    if (d <= CP_TRIGGER_RAD) {
+        if (!*in_zone || d < *zone_min) {
+            *in_zone = 1;
+            *zone_min = d;
+            return 0;                  /* still closing */
+        }
+        if (d < *zone_min + CP_PASS_EPS)
+            return 0;                  /* not yet clear of the minimum */
+    } else if (!*in_zone) {
+        return 0;                      /* nowhere near it */
+    }
+    return 1;
+}
+
 static void cp_cursor_step(checkpoints_t *c, float x, float z)
 {
-    float d;
+    int fwd;
 
     if (c->next < 0 || c->next >= c->n)
         c->next = 0;
@@ -552,48 +634,35 @@ static void cp_cursor_step(checkpoints_t *c, float x, float z)
        is not near the checkpoint above it -- but it is also never within 5 m of it
        in XZ, because CP_TRIGGER_RAD is under half the closest two markers on any
        track. Nothing in the ten needs the third axis to disambiguate. */
-    d = sqrtf(dist2_xz(c->cp[c->next].p[0], x, z));
-
-    if (d <= CP_TRIGGER_RAD) {
-        if (!c->in_zone || d < c->zone_min) {
-            c->in_zone = 1;
-            c->zone_min = d;
-            return;                    /* still closing */
-        }
-        if (d < c->zone_min + CP_PASS_EPS)
-            return;                    /* not yet clear of the minimum */
-    } else if (!c->in_zone) {
-        return;                        /* nowhere near it */
+    if (cp_approach(c, c->next, x, z, &c->in_zone, &c->zone_min)) {
+        cp_latch(c, c->next);
+        return;
     }
 
-    /* PASSED: either the distance has climbed CP_PASS_EPS off its minimum, or the
-       car has left the radius having been inside it. The event is AT the marker --
-       the closest approach -- rather than at the edge of the circle, so the cue
-       lands where the checkpoint is however fast the car is going. */
-    c->passed = c->next;
-    c->last = c->next;                 /* latched, for the respawn point */
-    /* Checkpoint 0 IS the start/finish line, so passing it is the lap -- from the
-       SECOND time. It is also the first thing a race passes, on every track,
-       because cp_restart aims here and the grid is short of it; that opening
-       crossing completes no lap. See checkpoints_t.started. */
-    if (c->next == 0) {
-        if (c->started)
-            c->lap++;
-        else
-            c->started = 1;
+    /* AND THE ONE AFTER IT, which is the wide-line rule -- see CP_SKIP_FRAC.
+       Everything here is a refusal except the last three lines:
+
+         - a one-checkpoint track has no `next + 1' to watch;
+         - checkpoint 0 is never stepped over, whatever the progress says;
+         - and the car has to have driven the stretch, not merely brushed the
+           later marker on its way past something else. */
+    fwd = (c->next + 1) % c->n;
+    if (c->n < 2 || c->next == 0) {
+        c->skip_zone = 0;
+        c->skip_min = 0.f;
+        return;
     }
-    c->next = (c->next + 1) % c->n;
-    c->in_zone = 0;
-    c->zone_min = 0.f;
-    /* AND THE RE-ANCHOR. The odometer measures from the checkpoint last passed,
-       so passing one starts it again -- which is what makes cp_prog_step answer
-       with the new stretch's own station on this very frame, whatever the last
-       stretch had accumulated. See there. */
-    c->prog_odo = 0.f;
-    /* The window is re-anchored the same way and for the same reason: the stretch
-       it is clamped to is the one the latch names, and the car is AT the marker
-       that begins it. -1 says exactly that without needing the arc. */
-    c->line_prev = -1.f;
+    if (!cp_approach(c, fwd, x, z, &c->skip_zone, &c->skip_min))
+        return;
+    if (c->stretch_hi < CP_SKIP_FRAC) {
+        /* Brushed, not passed: drop the approach so a second brush is judged on
+           its own closest point rather than on this one's. */
+        c->skip_zone = 0;
+        c->skip_min = 0.f;
+        return;
+    }
+    c->skipped++;
+    cp_latch(c, fwd);
 }
 
 void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
@@ -609,6 +678,17 @@ void cp_step(checkpoints_t *c, float x, float y, float z, float dt)
        to is the one the latch names, so on the frame a checkpoint is passed the
        progress must see the NEW stretch -- that is what re-anchors it. */
     cp_prog_step(c, x, z);
+    {
+        /* THE HIGH-WATER MARK, and it has to be one. The projection is onto the
+           CURRENT stretch alone, and past the far end of a stretch that turns,
+           the nearest point on it comes BACK: on beach_1's cp_0 -> cp_1 leg a car
+           standing at cp_2 projects to 0.848 of it and falling. So the question
+           the skip rule asks -- has this car driven the road to `next' -- is
+           about the furthest it has got, not about where it projects now.
+           Reset by cp_latch and by every reset, with the rest of the cursor. */
+        float f = cp_stretch_frac(c);
+        if (f > c->stretch_hi) c->stretch_hi = f;
+    }
 }
 
 /* The stitched polyline, as SEGMENTS. `i` walks 0 .. cp_spine_n(c)-1 and the

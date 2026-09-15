@@ -257,11 +257,50 @@
  * narrow to sit a threshold in), and country_2's road also comes back within
  * 1.17 m of cp_6 elsewhere in the same lap.
  *
- * Strict order is therefore what ships: 0 missed and 0 out of order on all 30
- * recorded laps, against 6 silent skips with the hatch in. A stalled arrow points
- * at the thing to go back for, which is what an arrow is for, and the port does not
- * yet enforce a lap limit for it to spoil (see known-issues.md).
+ * WHAT SHIPS NOW IS A THIRD RULE, and it is neither of those two. The port DOES
+ * enforce a lap limit, and the championship pays money on the result, so a lap
+ * that does not count is a lap the player has to drive again -- the stall stopped
+ * being the cheaper side of the trade the day `race_laps' landed.
+ *
+ * The distance hatch could not separate country_2's fly-by from a real pass
+ * because distance is the wrong question. The right one is WHETHER THE CAR HAS
+ * DRIVEN THE ROAD PAST THE CHECKPOINT, and the port already measures that: `prog`
+ * is the car's own progress along the stretch from `last` to `next`, clamped to
+ * that stretch and taken off the fitted road line, so it reaches `station[next]`
+ * exactly when the car reaches the checkpoint's own place on the road, however
+ * wide of the marker it is. So:
+ *
+ *   while `next' is pending, the cursor also watches `next + 1'. If THAT one is
+ *   passed first, `next' is stepped over -- but only when the car has covered
+ *   CP_SKIP_FRAC of the stretch to it.
+ *
+ * Measured on the shipped data (rccars_re/cpwide.c, which takes one checkpoint of
+ * one track wide at a time and leaves the rest of the lap on the recorded line):
+ * missing one checkpoint used to cost 6 to 10 of the remaining crossings of two
+ * laps -- the whole rest of the race, which is the stall -- and now costs the one
+ * that was missed. The fly-by stays rejected: country_2's road is a fifth of the
+ * way along the cp_1 -> cp_2 stretch when it brushes cp_3, nowhere near
+ * CP_SKIP_FRAC, and all 50 shipped recordings still pass all their checkpoints in
+ * order with nothing forgiven (vis_test part 2).
+ *
+ * TWO THINGS IT DELIBERATELY DOES NOT DO. It steps over ONE checkpoint, not a
+ * run of them -- two missed in a row still stalls, and a player who has left the
+ * road for that long has left the race. And CHECKPOINT 0 IS NEVER STEPPED OVER:
+ * it is the start/finish, `station[0]` is 0 so the progress test has no power
+ * over it at all, and the error it would license -- a lap counted or lost -- is
+ * the worst one available here. A wide line across the finish still stalls.
  */
+
+/* HOW MUCH OF THE STRETCH the car has to have driven before a missed checkpoint
+ * may be stepped over: 0.90 of it, measured as `prog' between the stations of
+ * `last' and `next'.
+ *
+ * Not 1.0, because only the FITTED-ROAD path reaches exactly 1: the odometer
+ * fallback divides by `max(seg_road, odo + d)' and `d' is the straight line still
+ * to run, which for a car 10 m wide of a 100 m stretch holds the fraction at
+ * about 0.91 however far it drives. 0.90 clears that and is still four fifths of
+ * a stretch clear of country_2's fly-by at 0.21. */
+#define CP_SKIP_FRAC 0.90f
 
 #define CP_MAX 8
 #define CP_MAX_POINTS 33          /* cp_N plus up to 32 edges, per the loader */
@@ -422,6 +461,25 @@ typedef struct {
        car that has been PUT somewhere is not mid-approach to anything. */
     int   in_zone;
     float zone_min;
+
+    /* THE SAME APPROACH, RUN A CHECKPOINT AHEAD -- `(next + 1) % n` -- so that a
+       checkpoint taken wider than CP_TRIGGER_RAD can be stepped over instead of
+       stalling the cursor on it for the rest of the race. See CP_SKIP_FRAC for
+       the rule and for what it refuses. Cleared wherever in_zone/zone_min are,
+       and on a forgiven skip, for the same reason. */
+    int   skip_zone;
+    float skip_min;
+
+    /* THE FURTHEST ALONG THE CURRENT STRETCH THE CAR HAS BEEN, 0 .. 1, which is
+       what the skip rule is actually asking about. See cp_step for why it cannot
+       be the instantaneous projection. */
+    float stretch_hi;
+
+    /* HOW MANY SKIPS HAVE BEEN FORGIVEN since the last cp_restart. Nothing in the
+       game reads it; it is here because "the rule never fires on the shipped
+       recordings" is the check that country_2's fly-by is still refused, and a
+       harness cannot see a decision that leaves no trace. */
+    int   skipped;
 
     /* THE CAR JUST PASSED A CHECKPOINT: its index, or -1 on every other step.
        An EDGE, the way prop_t.hit is one, and for the same reason -- the host

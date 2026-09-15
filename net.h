@@ -321,6 +321,16 @@ int  net_take_start(void);
 /* The app has finished loading and the race is running. */
 void net_race_begin(void);
 
+/* AND THE RACE IS OVER: back to the lobby, host or client. Call it on every
+   path that leaves a race -- the finish screen, the START menu's `Main menu'
+   row, a restart -- whether or not the race was a networked one; it does
+   nothing unless the mode is NET_RACING.
+ *
+ * It exists because nothing ever left NET_RACING, and `net_step' announces the
+ * game only while the mode is exactly NET_HOSTING: a host that had run one race
+ * was never advertised again, so nobody new could join it. See net.c. */
+void net_race_end(void);
+
 /* Our own car's state, once a frame. `net_step' decides when to send it -- at
    `sendFrameRate' and not per frame. */
 void net_send_state(const ai_sample *s, int lap, int place, float best_lap);
