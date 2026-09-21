@@ -63,7 +63,7 @@ Two packaging gotchas worth remembering:
                                       # because it is the only LOAD-ONCE scene
     mkdir -p build && cd build
     cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake ..
-    make -j8            # -> rc_cars_vita<BUILD_VERSION>.vpk, e.g. rc_cars_vita0.8.vpk
+    make -j8            # -> rc_cars_vita<BUILD_VERSION>.vpk, e.g. rc_cars_vita0.81.vpk
 
 Current `beach_1` payload: 74 textures (3.7 MB of pixels), 75 draw batches,
 57,636 vertices, 52,358 triangles, 5.1 MB scene file, 2.9 MB vpk.
@@ -129,7 +129,7 @@ visible. The files also come out about 3x smaller.
 Two guards, because a stale build directory would look fixed:
 
     python3 rccars_re/gen_sce_sys.py                    # regenerate, verify on disk
-    python3 rccars_re/gen_sce_sys.py --check-vpk build/rc_cars_vita0.8.vpk
+    python3 rccars_re/gen_sce_sys.py --check-vpk build/rc_cars_vita0.81.vpk
 
 `verify()` re-reads each IHDR after writing; `check_vpk` asserts the same of the
 art *inside* the packaged vpk, which is the file that actually gets promoted.
