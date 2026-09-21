@@ -287,6 +287,27 @@ static int cp_line_index(const checkpoints_t *c, float arc)
     return lo;
 }
 
+/* WHERE THE LOOP IS at arc `arc`, wrapping. The inverse of cp_line_arc, and the
+   only thing on this road that has to answer a POSITION rather than a distance:
+   cp_respawn_pose aims a resurrected car along it. Linear inside the segment,
+   which is all the road itself is. */
+static void cp_line_point(const checkpoints_t *c, float arc, float out[2])
+{
+    int i, i2;
+    float ca, seg, t;
+
+    while (arc < 0.f)            arc += c->line_len;
+    while (arc >= c->line_len)   arc -= c->line_len;
+    i = cp_line_index(c, arc);
+    i2 = (i + 1 == c->line_n) ? 0 : i + 1;
+    ca = c->line_cum[i];
+    seg = cp_line_fwd(c, ca, c->line_cum[i2]);
+    t = (seg > 1e-6f) ? (arc - ca) / seg : 0.f;
+    if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+    out[0] = c->line_pt[i][0] + (c->line_pt[i2][0] - c->line_pt[i][0]) * t;
+    out[1] = c->line_pt[i][1] + (c->line_pt[i2][1] - c->line_pt[i][1]) * t;
+}
+
 /* The nearest point on the loop to (x, z), searching arc `lo` forward for `span`
    metres. -> its arc. The projection is onto SEGMENTS and clamped to each, so
    the answer is continuous as the car drives -- the same rule cp_spine_dist_near
@@ -488,6 +509,46 @@ int cp_respawn_pose(const checkpoints_t *c, float pos[3], float *yaw_deg)
     if (k->n <= 0)
         return 0;
     a = k->p[0];
+
+    /* THE HEADING COMES OFF THE ROAD, and the spine below is the fallback.
+     *
+     * This used to aim along the spine alone, and the spine is not the road:
+     * checkpoint.h has said since it was written that the `cp_N_M` refining
+     * points run up to 63 m off the racing line and are OUT OF ORDER, and that
+     * the polyline is 1.6 to 2.1x the length of the lap it describes. The point
+     * stitched after a marker is therefore not reliably up the track, and where
+     * it is not, a car sent back to that checkpoint was pointed at the oncoming
+     * field. Measured on the shipped data by rccars_re/respawn.c: 25 of the 50
+     * checkpoints on the ten tracks aimed more than NINETY degrees away from the
+     * direction the race is driven in, worst 175, and 39 of 50 more than 45.
+     * Exactly half -- which is what "sometimes it spawns facing backwards" is.
+     *
+     * The road is the fitted recording (checkpoints_t.line_pt): a lap somebody
+     * drove, whose tangent at `line_at[last]` IS the race direction by
+     * construction. That is the same second source this project reached for when
+     * the spine could not carry the progress measure either.
+     *
+     * Sampled over CP_RESPAWN_AIM of arc rather than off one sample pair: the
+     * recordings run 0.06 to 0.25 m apart, so a one-pair tangent is mostly the
+     * driver's own wobble, and three metres is about the ground the car covers
+     * as it lands. */
+    if (c->line_ok && c->line_n >= 2 && c->line_len > 1e-3f) {
+        float p0[2], p1[2];
+        cp_line_point(c, c->line_at[c->last], p0);
+        cp_line_point(c, c->line_at[c->last] + CP_RESPAWN_AIM, p1);
+        dx = p1[0] - p0[0];
+        dz = p1[1] - p0[1];
+        if (dx * dx + dz * dz > 1e-6f) {
+            if (pos) {
+                pos[0] = a[0];
+                pos[1] = k->ground;
+                pos[2] = a[2];
+            }
+            if (yaw_deg)
+                *yaw_deg = (float)(atan2((double)dx, (double)dz) * CP_RAD2DEG);
+            return 1;
+        }
+    }
 
     /* Aim along the spine, which means the NEXT point in the loader's own
      * stitching order -- this checkpoint's first refining point if it has one,

@@ -103,6 +103,15 @@ typedef struct {
 
     float master_sfx, master_music;
 
+    /* HOW MANY OF THE VOICES MAY BE USED, 1..MIX_VOICES. The Options screen's
+       `Sound quality' row is what moves it (opts.h) and MIX_VOICES is the
+       default, so a build that never sets it mixes exactly as it always has.
+       A cap that comes DOWN does not stop the voices already playing -- they
+       finish or are stolen; it only narrows what pick_slot may allocate, which
+       is the cheapest honest reading of a quality setting and the only one
+       that cannot click. */
+    int vcap;
+
     /* listener: position and the app's render yaw, in degrees. See cam.c and
        "The renderer's yaw convention is MIRRORED" in CLAUDE.md -- forward is
        (sin yaw, 0, cos yaw) in the rb path, and the right vector follows. */
@@ -151,6 +160,8 @@ int  mix_alive(const mix_t *m, mix_voice h);
 
 void mix_listener(mix_t *m, float x, float y, float z, float yaw_deg);
 void mix_master(mix_t *m, float sfx, float music);
+/* Clamped into 1..MIX_VOICES. */
+void mix_voice_cap(mix_t *m, int n);
 
 /* --- music ------------------------------------------------------------- */
 

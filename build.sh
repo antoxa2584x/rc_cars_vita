@@ -44,7 +44,7 @@
 #   7. tables   tracks.h, the menu font, the bubble and LiveArea   (gen_*.py)
 #   8. ai       ai_data.h and ten .aip opponent paths       (gen_ai_data/pack_ai)
 #   9. check    vsc_check.py over every packed scene
-#  10. build    cmake + make -> build/rccars_viewer.vpk
+#  10. build    cmake + make -> build/rc_cars_vita<BUILD_VERSION>.vpk
 #
 # Every stage is skipped when its output is already newer than its input, so a
 # re-run after editing one .c file goes straight to stage 9. --force redoes
@@ -974,7 +974,12 @@ if wanted build; then
 
     (cd "$VITA/build" && run make -j"$JOBS")
 
-    VPK="$VITA/build/rccars_viewer.vpk"
+    # The package carries BUILD_VERSION in its name. Read it back out of
+    # CMakeLists.txt rather than keeping a second copy here.
+    BUILD_VERSION=$(sed -n 's/^set(BUILD_VERSION "\([^"]*\)").*/\1/p' \
+                    "$VITA/CMakeLists.txt")
+    [ -n "$BUILD_VERSION" ] || die "no BUILD_VERSION in $VITA/CMakeLists.txt"
+    VPK="$VITA/build/rc_cars_vita${BUILD_VERSION}.vpk"
     [ -f "$VPK" ] || die "make finished but $VPK is missing"
 
     # The vpk is what VitaShell promotes, so verify the art INSIDE it: a stale

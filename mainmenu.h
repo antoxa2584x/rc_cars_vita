@@ -93,6 +93,9 @@
 #include "player.h"     /* the roster the Select player page is a view of */
 #include "garage.h"     /* GAR_N_KINDS / GAR_N_LEVELS -- the upgrade art's
                            dimensions, and the shop dlgSETCAR is a view of */
+#include "opts.h"       /* the Options screen's own state -- the sound
+                           switches and the control map the three pages
+                           below are views of */
 
 /* The nine rows down the right, in the game's own order. The first eight are the
    red bars; QUIT is the orange one in the bottom-right corner and is a row only
@@ -163,8 +166,122 @@ enum {
      */
     MM_PAGE_CHAMP,
     MM_PAGE_CHRACE,
+    /* THE OPTIONS SCREEN, which is three dialogs on one frame the way the
+     * quick-race page is three and the Garage two. The Options button opens
+     * the first of them and the right-hand column moves between all three.
+     *
+     *   dlgSOUND          Use sound, Sound quality, Sound volume, Background
+     *                     sound, Background volume, Music style, a rule and
+     *                     Master volume
+     *   dlgCONTROL        Input devices: Use joystick, Joystick sensitivity,
+     *                     Joystick deadzone
+     *   dlgCONTROL_PLAYER Customize controls: the eight-action table and the
+     *                     conflict line
+     */
+    MM_PAGE_OPTIONS,
+    MM_PAGE_INPUT,
+    MM_PAGE_CONTROLS,
     MM_N_PAGES
 };
+
+/* Whether `page' is one of the Options screen's three -- they share the
+   header, the right-hand column, the green Race button and the Main menu
+   corner, exactly as the quick-race siblings do. */
+#define MM_PAGE_IS_OPT(p) ((p) >= MM_PAGE_OPTIONS && (p) <= MM_PAGE_CONTROLS)
+
+/* ================================================ THE OPTIONS SCREEN's column
+ *
+ * The game's own column has seven bars; this port draws FOUR of them, on the
+ * frame's own first four row positions. What went and why:
+ *
+ *   Video options    the PC's resolution, colour depth and gamma. The port's
+ *                    own video rows -- texture quality, texture colours, the
+ *                    car's light, frame pacing and the launch movies -- live in
+ *                    the START menu, which a race opens with START; a second
+ *                    bar leading to the same overlay was a second door and not
+ *                    a second screen. `MM_ACT_OPTIONS' is still the action that
+ *                    opens it and nothing raises it any more, which is the same
+ *                    state MM_ACT_QUIT is in -- give any row that one line and
+ *                    it works again
+ *   Advanced video   the PC driver's page: Z buffer mode, triple buffer, the
+ *                    3D hardware driver. None of it exists on this machine
+ *   Chat messages    dlgOPT_CHATMSG's seven canned lines, behind a lobby chat
+ *                    that is deliberately not built (see MULTIPLAYER above)
+ *
+ * Cockpit options stays and is still drawn in the artists' grey: dlgOPT_COCK is
+ * a chooser over the COCKPIT cameras and this port draws one chase camera.
+ */
+enum {
+    MM_OB_COCKPIT = 0,  /* row 0 -- 10031, not built */
+    MM_OB_SOUND,        /* row 1 -- 10032, dlgSOUND */
+    MM_OB_INPUT,        /* row 2 -- 10034, dlgCONTROL */
+    MM_OB_CUSTOM,       /* row 3 -- 10035, dlgCONTROL_PLAYER */
+    MM_OB_N
+};
+
+/* dlgSOUND's own focus ring: its seven rows, then the two buttons every page
+   has, then the column. MM_O_VOL_* are SLIDERS and the rest are enums; both
+   are walked with LEFT and RIGHT, which is what the original's own arrows and
+   slider do. */
+enum {
+    MM_O_USE = 0,       /* 10201 Use sound          -- Yes / No */
+    MM_O_QUALITY,       /* 10205 Sound quality      -- Low / Medium / High */
+    MM_O_VOL_SFX,       /* 10203 Sound volume       -- slider */
+    MM_O_BG,            /* 10207 Background sound   -- Yes / No */
+    MM_O_VOL_MUSIC,     /* 10208 Background volume  -- slider */
+    MM_O_STYLE,         /* 10209 Music style        -- Rock / Techno / Both */
+    MM_O_VOL_MASTER,    /* 10202 Master volume      -- slider, under the rule */
+    MM_O_N_ROWS,
+    MM_O_RACE = MM_O_N_ROWS,
+    MM_O_BACK,
+    MM_O_NAV,           /* MM_O_NAV + MM_OB_* */
+    MM_O_N_FOCUS = MM_O_NAV + MM_OB_N
+};
+
+/* dlgCONTROL's -- Input devices, and THREE rows rather than four.
+ *
+ * `Control type' is gone. The original picks between a keyboard, a wheel and a
+ * pad; this machine is one of the three and cannot be the others, so the row
+ * could only ever state a fact. The three that remain move UP by the dialog's
+ * own 40 px row pitch into the rectangle it vacated, so the block still starts
+ * where the file puts the page's first control. */
+enum {
+    MM_I_STICK = 0,     /* 10317 Use joystick     -- Yes / No */
+    MM_I_SENS,          /* 10318 Joystick sensitivity -- slider */
+    MM_I_DEAD,          /* 10319 Joystick deadzone    -- slider */
+    MM_I_N_ROWS,
+    MM_I_RACE = MM_I_N_ROWS,
+    MM_I_BACK,
+    MM_I_NAV,
+    MM_I_N_FOCUS = MM_I_NAV + MM_OB_N
+};
+
+/* dlgCONTROL_PLAYER's -- Customize controls, and the page IS the table.
+ *
+ * `Show controls for' and `Layout' are both gone. The first could only ever say
+ * Player 1 -- two players is split screen on one machine and this machine has
+ * one pad -- and the second was a two-value picker whose only live move was
+ * `put the defaults back', on a dialog whose other five values are keyboard and
+ * wheel layouts this machine has not got.
+ *
+ * THE TABLE IS ONE STOP AND SIXTEEN CELLS, the way the ladder is one stop and
+ * ten rungs and the roster one stop and seven rows: UP and DOWN walk the eight
+ * actions, LEFT and RIGHT walk the two slots, and CROSS opens the bind modal on
+ * whichever cell the cursor is in. Eight rows in a table is not eight stops in
+ * a ring -- and with the two enums gone it is the page's ONLY row stop, so L
+ * and R are what step the ring past it. */
+enum {
+    MM_K_TABLE = 0,     /* the eight actions by two slots */
+    MM_K_N_ROWS,
+    MM_K_RACE = MM_K_N_ROWS,
+    MM_K_BACK,
+    MM_K_NAV,
+    MM_K_N_FOCUS = MM_K_NAV + MM_OB_N
+};
+
+/* Which of the frame's eight rows each Options bar sits on -- 0..6, and row 7
+   is empty on all three pages. */
+extern const int MM_OB_ROW[MM_OB_N];
 
 /* Whether `page' is one of the championship's two. */
 #define MM_PAGE_IS_CHAMP(p) ((p) == MM_PAGE_CHAMP || (p) == MM_PAGE_CHRACE)
@@ -263,6 +380,12 @@ enum {
        does not draw); a modal over the page it was pressed on is the port's,
        and it is what makes the page work without a fifth screen. */
     MM_MODAL_SERVERS,
+    /* THE BIND PROMPT. `Customize controls' puts this up on the cell it is
+       about and the NEXT button press is the binding -- which is the only way
+       a control page can work on a machine whose every button is a candidate.
+       START cancels, because START is the one button this page refuses to bind
+       (opts.h says why), so there is always a way out that needs no touch. */
+    MM_MODAL_BIND,
     MM_N_MODAL
 };
 
@@ -781,6 +904,27 @@ typedef struct {
     int   carmed;
     int   rfocus;               /* MM_R_* on dlgCHRACE */
     int   rarmed;
+
+    /* ---- THE OPTIONS SCREEN. `opt' is the state the three pages edit and
+     * `set' the START menu's, because two of dlgSOUND's rows -- Sound volume
+     * and Background volume -- ARE menu_t::vol_sfx and vol_music. There is one
+     * of each in this app and two screens that edit it, exactly as there is
+     * one track picker on two screens; a second copy here is how the front end
+     * and the pause menu end up disagreeing about the volume.
+     *
+     * Both are borrowed pointers, set by mainmenu_set_options and NULL until
+     * then -- a build that never calls it draws the pages inert rather than
+     * dereferencing nothing. */
+    opts_t *opt;
+    menu_t *set;
+    int   ofocus;               /* MM_O_* on dlgSOUND */
+    int   oarmed;
+    int   ifocus;               /* MM_I_* on dlgCONTROL */
+    int   iarmed;
+    int   kfocus;               /* MM_K_* on dlgCONTROL_PLAYER */
+    int   karmed;
+    int   kact;                 /* the table cursor: 0..OPT_N_ACT-1 */
+    int   kslot;                /* ...and which of its two slots */
 } mainmenu_t;
 
 /* WHICH CAR THE PAGE ON SCREEN IS ABOUT -- `qcar' on the quick-race siblings,
@@ -789,6 +933,22 @@ typedef struct {
 int mainmenu_view_car(const mainmenu_t *m);
 
 void mainmenu_set_car_draw(mainmenu_t *m, mm_car_draw fn, void *ctx);
+
+/* Hand the Options screen the two structs it is a view of -- see `opt' and
+   `set' above. Both may be NULL, which leaves those pages drawn and inert. */
+void mainmenu_set_options(mainmenu_t *m, opts_t *o, menu_t *set);
+
+/* Open the Options screen on dlgSOUND, which is what the front page's Options
+   button does. */
+void mainmenu_open_options(mainmenu_t *m);
+
+/* The three pages' rings and hit boxes, exposed for the harness on the same
+   terms the Garage's and the ladder's are. `row' comes back as the table's
+   ACTION row and `slot' as its column when the point is inside the control
+   table; both are -1 otherwise. `left' is 1 in a row's own back-arrow. */
+int  mainmenu_o_live(const mainmenu_t *m, int stop);
+int  mainmenu_o_stop_at(const mainmenu_t *m, int screen_w, int screen_h,
+                        float x, float y, int *left, int *row, int *slot);
 
 /* `tex` is copied. Leaves the focus on Quick race, which is the one live mode. */
 void mainmenu_init(mainmenu_t *m, const mainmenu_tex *tex);

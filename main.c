@@ -74,11 +74,14 @@
 #include "msg.h"
 #include "mainmenu.h"
 #include "sfont.h"
+#include "str_data.h"   /* STR_UI_WAIT_PLAYERS -- the game's own words for the
+                            start barrier, off english.tbl */
 #include "intro.h"
 #include "touch.h"
 #include "results.h"
 #include "menu.h"
 #include "settings.h"
+#include "opts.h"
 #include "records.h"
 #include "player.h"
 #include "garage.h"
@@ -104,6 +107,12 @@
 #endif
 #if MENU_SKINS != CARPARTS_SKINS
 #error "menu.h's MENU_SKINS and carparts.h's CARPARTS_SKINS disagree"
+#endif
+/* opts.h mirrors audio.h's two playlist groups for the same reason menu.h
+   mirrors scene.h: opts.c is kept free of the audio layer so the host
+   harnesses link it without a mixer. This is the one file that sees both. */
+#if OPT_GROUP_MENU != AUDIO_MUSIC_MENU || OPT_GROUP_RACE != AUDIO_MUSIC_RACE
+#error "opts.h's OPT_GROUP_* and audio.h's AUDIO_MUSIC_* disagree"
 #endif
 /* And ai.h mirrors checkpoint.h's checkpoint count for the same shape of reason:
    ai.c must stay clear of checkpoint.h, which pulls in scene.h and therefore GL
@@ -174,6 +183,15 @@ static mainmenu_t  mm;
  * -- and the only things that differ are who fills the other cars and who is
  * allowed to end it. */
 static int         net_race;
+/* THE START BARRIER IS UP: this machine is on the grid and at least one other
+ * is still loading. The countdown does not tick and the 3-2-1 does not sound
+ * until it comes down, which is what makes the two race clocks START TOGETHER
+ * -- see net.h at net_start_hold, and the two Vitas whose totals were 2.78 s
+ * apart on the same race.
+ *
+ * A LOCAL EDGE OVER net.c's OWN LEVEL, for the one thing the level cannot say:
+ * WHEN it came down, which is the frame the beeps have to start on. */
+static int         net_wait_go;
 /* WHICH ai SLOT EACH NETWORK SLOT GOT. The roster has holes in it -- slot 2 can
    be used with slot 1 empty -- and our own slot is not in the field at all, so
    the two indices are not the same number and one table says which. -1 for a
@@ -310,6 +328,11 @@ static int cur_track = 0, cur_car = 0;
 static int world_ready = 0;
 static sun_t sun;
 static menu_t menu;
+/* THE OPTIONS SCREEN'S STATE -- dlgSOUND's six switches and the whole control
+   map. It rides in `settings.txt' beside the menu's own rows and on the same
+   two write events, and mainmenu.c edits it through a borrowed pointer (see
+   mainmenu_set_options). opts.h says what each field drives. */
+static opts_t opts;
 
 /* ---- THE PROFILE AND THE PORT'S OWN STATE, in both directions.
  *
@@ -492,6 +515,27 @@ static fx_emitter ai_em[AI_MAX_OPPONENTS];
    sea level" selects the ocean, which is the flattest surface on the map.
    This one is a 23-degree slope, so body pitch/roll is visible on spawn. */
 static vehicle_t veh;
+
+/* The placeholder car's model-to-world matrix, in the engine's row-major
+   row-vector layout -- which is byte-for-byte a column-major GL one, so this is
+   exactly the product the draw builds with glTranslatef/glRotatef below:
+   T(x,y,z) * Ry(yaw+180) * Rx(-pitch) * Rz(-roll). antenna.c needs it because
+   the whip is simulated in world space. */
+static void veh_model_matrix(const vehicle_t *v, float *m)
+{
+    const float d = 3.14159265f / 180.f;
+    float cy = cosf((v->yaw + 180.f) * d), sy = sinf((v->yaw + 180.f) * d);
+    float cp = cosf(-v->pitch * d), sp = sinf(-v->pitch * d);
+    float cr = cosf(-v->roll * d),  sr = sinf(-v->roll * d);
+    /* R = Ry * Rx * Rz, written out column by column */
+    m[0]  =  cy * cr + sy * sp * sr;  m[1]  =  cp * sr;
+    m[2]  = -sy * cr + cy * sp * sr;  m[3]  = 0.f;
+    m[4]  = -cy * sr + sy * sp * cr;  m[5]  =  cp * cr;
+    m[6]  =  sy * sr + cy * sp * cr;  m[7]  = 0.f;
+    m[8]  =  sy * cp;                 m[9]  = -sp;
+    m[10] =  cy * cp;                 m[11] = 0.f;
+    m[12] = v->x; m[13] = v->y; m[14] = v->z; m[15] = 1.f;
+}
 
 /* The game's own model, transcribed: rb.c + contact.c + collide.c. It is the
    ONLY model now -- the physics.c placeholder is no longer reachable. */
@@ -681,8 +725,23 @@ static void env_normal_matrix(const float *carm, float vpitch, float vyaw,
  * spawned seven metres up, rolled off the roof and fell out of the world. The
  * checkpoint markers want it just as much: they sit on the racing line, and on
  * these tracks the racing line runs under things.
+ *
+ * `drop` IS THE ENGINE'S OWN RESET, and it is why a car put back on a checkpoint
+ * falls the last half-metre instead of appearing already standing on the sand.
+ * rb_car_reset_upright (0x00508600) ends by pushing the body origin clear of
+ * geometry with a RB_RESET_CLEAR_RADIUS sphere -- half a metre, against a 0.42 m
+ * Overkill -- so on open ground it does not merely un-bury the car, it lifts it
+ * to that radius and lets go. collide.c has said so since it was transcribed;
+ * nothing but the Jump-when-upside-down path had ever called it. The heading
+ * survives: the function rebuilds the pose from the body's own flattened +Z,
+ * which rbcar_init has just set from `yaw` on the line above.
+ *
+ * The GRID does not take it (drop = 0). A race start is a car placed on its
+ * marker by the race, not a car put back by the world, and dropping the whole
+ * field an inch on the count of three is a change to the start and not to the
+ * respawn that was asked for.
  */
-static void place_car(float x, float z, float ref_y, float yaw)
+static void place_car_ex(float x, float z, float ref_y, float yaw, int drop)
 {
     float gy = ref_y, n0, n1, n2;
 
@@ -694,8 +753,10 @@ static void place_car(float x, float z, float ref_y, float yaw)
        quaternion both map the car's local +Z to (sin yaw, 0, cos yaw). Checked
        numerically, not assumed -- four bugs in this port have come from
        inheriting a convention unverified. cp_respawn_pose builds its yaw in that
-       same convention, atan2(dx, dz) along the spine. */
+       same convention, atan2(dx, dz) along the ROAD. */
     rbcar_init(&rc, cur_car, col_rb_world(&col), x, gy, z, yaw);
+    if (drop)
+        rb_car_reset_upright(&rc);
     rc.tire_upgrade = menu.tires;
     rc.reso_upgrade = menu.reso;
     rc.boost_upgrade = menu.boost;
@@ -742,6 +803,12 @@ static void place_car(float x, float z, float ref_y, float yaw)
        which refuses every race one-shot while sfx_race_active is 0. See sfx.h
        for why that is one question there rather than an `if' at each site. */
     sfx_respawn();
+}
+
+/* The grid, a track change, a car change: placed, not dropped. */
+static void place_car(float x, float z, float ref_y, float yaw)
+{
+    place_car_ex(x, z, ref_y, yaw, 0);
 }
 
 /* The race is starting: the grid, and everything that only a start resets. */
@@ -1083,7 +1150,24 @@ static void respawn(void)
      * the field, the characters, the clocks -- happens whenever it is called, so
      * what the menu sits in front of is a race ready to go. */
     countdown_start(&countdown);
-    sfx_countdown();
+    /* AND THE RACE IS AUDIBLE BEFORE THE FIRST RACE CUE IS RAISED. `sfx.c'
+     * refuses every race one-shot while the front end is up (sfx.h), and the
+     * frame loop's own call to this is made LATER in the frame than the menu
+     * action that starts a race -- so the 3-2-1 was posted while `no_race' was
+     * still set and dropped, on every race started from the front end. The
+     * loop's call keeps it in step from the next frame on; this one is for the
+     * cue on the line below it. Idempotent -- sfx_race_active returns on no
+     * change -- and it reads `in_main_menu', which every path that starts a
+     * race clears before it gets here. */
+    sfx_race_active(!in_main_menu);
+    /* THE BEEPS WAIT FOR THE OTHER MACHINES. In a network race the countdown is
+     * started here and HELD at 3 (net_wait_go, and countdown_step is given a dt
+     * of 0), so the wav -- whose four onsets are one second apart and land on
+     * the three digits and the GO -- has to be played when the hold comes down
+     * and not here. Every other race starts on this frame and sounds on it. */
+    net_wait_go = net_race && net_start_hold();
+    if (!net_wait_go)
+        sfx_countdown();
     /* The results' own state. Cleared HERE rather than at the flag, because a
        restart is the only thing that makes the last race's times wrong. */
     {
@@ -1142,6 +1226,11 @@ static void respawn(void)
  * go, and going to the grid is exactly what a race module would do. It comes out
  * as a full respawn() including the countdown, which is defensible -- the player
  * has driven none of the race -- and it is the one case where dying does restart.
+ *
+ * AND IT DROPS THE CAR IN. place_car_ex's `drop` is the engine's own
+ * rb_car_reset_upright, whose clear-radius sphere lifts the body to half a metre
+ * over open ground and lets it fall -- see place_car_ex. Only this path takes it:
+ * the grid is a placement, this is the world putting a car back.
  */
 static void respawn_checkpoint(void)
 {
@@ -1152,13 +1241,14 @@ static void respawn_checkpoint(void)
         return;
     }
 
-    place_car(p[0], p[2], p[1], yaw);
+    place_car_ex(p[0], p[2], p[1], yaw, 1);
     cp_resync(&cps, p[0], spawn_ground_y, p[2]);
 
     rlog("[rccars] respawn at checkpoint %d  (%d,%d,%d) cm  yaw=%d deg  "
-         "lap %d, race running\n",
+         "dropped from %+d cm over the ground, lap %d, race running\n",
          cps.last + 1, (int)(p[0] * 100.f), (int)(spawn_ground_y * 100.f),
-         (int)(p[2] * 100.f), (int)yaw, cps.lap);
+         (int)(p[2] * 100.f), (int)yaw,
+         (int)((rc.body.x[1] - spawn_ground_y) * 100.f), cps.lap);
 }
 
 /* THE MAIN MENU'S CAR VIEWPORT -- `animCar', the one control on the quick-race
@@ -2181,7 +2271,10 @@ int main(void)
        read at UPLOAD time, so a quality restored after the first load would show
        nothing until something forced a reload. A missing or unreadable file
        leaves menu_init's defaults exactly as they are. */
-    settings_load(&menu);
+    /* The Options screen starts from ITS defaults for the same reason the menu
+       does, and settings_load then lays last launch's file over both. */
+    opts_init(&opts);
+    settings_load(&menu, &opts);
     /* AND THE RECORD BOOK, which is `Track stats' -- read once here beside the
        settings and written only when a race finishes. Its own file, because it
        is a log of results rather than a set of preferences and the two have
@@ -2469,6 +2562,10 @@ int main(void)
         intro_set_font(mt.font_small);
         mainmenu_init(&mm, &mt);
         mainmenu_set_car_draw(&mm, menu_car_draw, NULL);
+        /* The Options screen is a VIEW of these two and owns neither: the two
+           volume rows it draws ARE menu.vol_sfx and menu.vol_music, which the
+           START menu also edits and settings.c persists. mainmenu.h. */
+        mainmenu_set_options(&mm, &opts, &menu);
         mm.track = menu.track;
         /* The settings file's car row is the QUICK race's; the profile's own is
            read by apply_player, below. mainmenu.h has why they are two. */
@@ -2726,7 +2823,7 @@ unsigned int acc_ticks = 0;
         {
             static int menu_was_open;
             if (menu_was_open && (!menu.open || menu.req_quit))
-                settings_save_if_changed(&menu);
+                settings_save_if_changed(&menu, &opts);
             menu_was_open = menu.open;
         }
         /* AND A SETTLE WRITE WHILE THE MENU IS STILL UP, which is the way out
@@ -2736,8 +2833,15 @@ unsigned int acc_ticks = 0;
            the last one -- settings.h has why it is not per keypress and not per
            frame. On the RAW frame clock, because `dt' is 0 while the menu is
            open and a settle timer that never advances never settles. */
-        if (menu.open)
-            settings_settle(&menu, frame_dt);
+        /* AND THE SETTLE RUNS UNDER THE FRONT END TOO, not only under the
+           START menu. The Options screen is where the sound and the controls
+           are edited now and it is a PAGE rather than an overlay, so `menu.open'
+           is 0 the whole time a player is moving those rows -- and the close
+           write above never fires. Same clock, same one-write-per-burst rule;
+           what changed is that there are two screens that can dirty the file
+           and only one of them is the overlay. */
+        if (menu.open || in_main_menu)
+            settings_settle(&menu, &opts, frame_dt);
         /* THE START MENU'S LAST ROW IS "Main menu", NOT "Quit". A race is
            something you leave, and where you leave it to is the front end.
            Opened FROM the main menu (its Options button) the row just closes
@@ -3063,6 +3167,13 @@ unsigned int acc_ticks = 0;
                 player_save_cur_if_dirty();
                 break;
             case MM_ACT_OPTIONS:
+                /* NOTHING RAISES THIS TODAY, and that is worth stating rather
+                   than deleting -- the same state MM_ACT_QUIT is in. The front
+                   page's Options button opens the Options SCREEN now and that
+                   screen's `Video options' bar, which used to raise this, is
+                   gone (mainmenu.h): the port's video rows live in the START
+                   menu and a race opens it with START. Give any row this one
+                   line and the overlay is reachable from the front end again. */
                 menu.open = 1;
                 break;
             case MM_ACT_QUIT:
@@ -3226,6 +3337,18 @@ unsigned int acc_ticks = 0;
                    : (dbg_isolate == 2) ? CHR_HIDE_ALL : CHR_HIDE_NONE;
         props.enabled = (dbg_isolate != 3);
         ai_hidden = (dbg_isolate == 4);
+        /* THE `Reset' ACTION -- the last of the Options screen's eight, and
+           the one thing on that page the port had no button for at all. It is
+           the same call a drowning makes: back to the last checkpoint crossed,
+           the lap and the opponents left alone (respawn_checkpoint). Edge
+           triggered, gated on there being a race to be in, and UNBOUND by
+           default -- opts.h says why. */
+        if (world_ready && !in_main_menu && !menu.open && !race_over
+            && opts_held(&opts, OPT_RESET, pad.buttons)
+            && !opts_held(&opts, OPT_RESET, prev_buttons)) {
+            rlog("[rccars] reset: player asked for the last checkpoint\n");
+            respawn_checkpoint();
+        }
         prev_buttons = pad.buttons;
 
         /* THE CAMERA, declared HERE rather than beside the branch that sets
@@ -3263,8 +3386,14 @@ unsigned int acc_ticks = 0;
            against the race's seven. */
         sfx_race_active(!in_main_menu);
         sfx_pause(menu.open);
-        audio_music_group((menu.open || in_main_menu) ? AUDIO_MUSIC_MENU
-                                                      : AUDIO_MUSIC_RACE);
+        /* AND WHICH PLAYLIST IS THE OPTIONS SCREEN'S `Music style' ROW. `Both'
+           is what this line has always done -- the menu bank under the front
+           end, the race bank in a race -- and the other two pin it to one of
+           the two groups `Autoexec.gm' ships. -1 is Background sound off, or
+           Use sound off, and stops the music outright. opts.h has the one
+           thing here that is not recovered: which of the two banks is the rock
+           one. */
+        audio_music_group(opts_music_group(&opts, menu.open || in_main_menu));
 
         /* The menu raises what the last input DID; turning that into one of
            the game's own interface sounds is this side's job, so menu.c
@@ -3278,8 +3407,14 @@ unsigned int acc_ticks = 0;
         }
         menu.cue = MENU_CUE_NONE;
 
-        sfx_volumes((float)menu.vol_sfx / (float)MENU_VOL_STEPS,
-                    (float)menu.vol_music / (float)MENU_VOL_STEPS);
+        /* THE TWO GAINS ARE THE OPTIONS SCREEN'S NOW, and the two notch counts
+           are still the START menu's own rows: Use sound, Background sound and
+           Master volume all fold into these two numbers, so nothing downstream
+           of sfx_volumes has to learn about any of them. */
+        sfx_volumes(opts_sfx_gain(&opts, menu.vol_sfx),
+                    opts_music_gain(&opts, menu.vol_music));
+        /* `Sound quality', which is the mixer's voice cap -- see opts.h. */
+        sfx_voice_cap(opts_voices(&opts));
 
         /* ---- AND NOTHING BELOW THIS RUNS UNTIL THERE IS A WORLD ------------
          *
@@ -3593,7 +3728,32 @@ unsigned int acc_ticks = 0;
                 player_save_cur_if_dirty();
             }
         }
-        race_ui_step(&race_ui, dt);
+        /* THE HUD'S OWN CLOCKS ARE OFF THE COUNTDOWN, exactly as `race_t' above
+         * is -- `!countdown_holding', the same gate, so the two rulers this
+         * file runs cannot disagree about when the race began.
+         *
+         * THEY USED TO DISAGREE BY THE WHOLE COUNTDOWN. `race_t' is what the
+         * results table, the record book and every lap time are measured on and
+         * it has always skipped the 3, 2, 1; `race_ui.t_race' is the number ON
+         * SCREEN and it counted from the grid, so the total the player watched
+         * all race was 3.00 s longer than the one the finish screen then
+         * printed. respawn() has said "the three seconds the countdown holds
+         * the car for are NOT on the race clock" since it was written; this is
+         * the line that makes it true of both of them.
+         *
+         * AND IT IS WHAT MAKES THE NETWORK BARRIER INVISIBLE. A machine held on
+         * the grid waiting for the other one (net_start_hold) is inside a
+         * countdown that is not ticking, so the seconds it waits are not on
+         * anybody's clock either -- which is the whole point: two players who
+         * started together must read the same total, not one that includes how
+         * long each of them waited.
+         *
+         * The lap BANNER's hold is stepped by the same call and deliberately
+         * runs "whether or not the race does" (race_ui.c) -- it cannot be up
+         * here, because respawn() clears it and only a lap crossing raises one,
+         * and a lap cannot be crossed during the countdown that precedes the
+         * first one. */
+        race_ui_step(&race_ui, countdown_holding(&countdown) ? 0.f : dt);
         /* PLAY TIME is time spent RACING, which is what the card's clock counts:
            `dt` is already 0 under either menu and while the app is paused, so
            this needs no gate of its own. */
@@ -3705,10 +3865,27 @@ unsigned int acc_ticks = 0;
                      dir_arrow.cp_seen + 1, (double)dir_arrow.cp_min);
             }
         }
+        /* THE NETWORK START BARRIER COMES DOWN. One GO datagram released every
+         * machine in the game within a hop of each other; this is the frame
+         * this one saw it, so this is the frame its own 3, 2, 1 begins and its
+         * own beeps start. See net.h at net_start_hold. */
+        if (net_wait_go && !net_race) {
+            /* The race was LEFT while it was held -- the START menu's own row,
+               or a host that went away. No beeps: nothing started. */
+            net_wait_go = 0;
+        } else if (net_wait_go && !net_start_hold()) {
+            net_wait_go = 0;
+            sfx_countdown();
+            rlog("[rccars] net: everybody is on the grid -- GO in %.1f s\n",
+                 (double)(CD_STEP_TIME * 3.f));
+        }
         /* The start light. dt is 0 while the menu is up, so it holds where it is
            along with everything else -- and since it is what gates the physics
-           ticks, the car stays on the line for as long as the menu is open. */
-        countdown_step(&countdown, dt);
+           ticks, the car stays on the line for as long as the menu is open.
+           AND WHILE THE BARRIER IS UP, for the same reason and through the same
+           one gate: `countdown_holding' is true at 3 and the whole world --
+           the car, the field, the props, both clocks -- is frozen by it. */
+        countdown_step(&countdown, net_wait_go ? 0.f : dt);
 
         /* PAUSE -- message slot 1, priority 9, the highest in the recovered
            table by a wide margin, so nothing takes the screen off it. HELD
@@ -3734,10 +3911,23 @@ unsigned int acc_ticks = 0;
         if (countdown.go)
             rlog("[rccars] GO\n");
 
-        float lx = axis(pad.lx), ly = axis(pad.ly);
+        /* THE CAMERA'S STICK IS RAW and the CAR'S IS THE OPTIONS SCREEN'S.
+           The free-fly camera is not part of the race -- the same rule the
+           countdown and the flag both follow -- so it keeps main.c's own
+           deadzone and no sensitivity; the car's steering goes through
+           opts_steer, which is the stick plus the two bound buttons, or the
+           bound buttons alone when `Use joystick' is off. */
+        float ly = axis(pad.ly);
         float rx = axis(pad.rx), ry = axis(pad.ry);
-        float thr = (pad.buttons & SCE_CTRL_RTRIGGER) ? 1.f : 0.f;
-        float brk = (pad.buttons & SCE_CTRL_LTRIGGER) ? 1.f : 0.f;
+        float cam_lx = axis(pad.lx);
+        float lx = opts_steer(&opts, pad.buttons, pad.lx);
+        float thr = opts_held(&opts, OPT_GEAR, pad.buttons) ? 1.f : 0.f;
+        float brk = opts_held(&opts, OPT_REVERSE, pad.buttons) ? 1.f : 0.f;
+        /* `Stop' is the engine's own DRIVE INHIBIT and not a third pedal --
+           opts.h and physics.md, "The brake IS reverse". Unbound by default,
+           so this is 0 until a player asks for it. */
+        const int stop_held = opts_held(&opts, OPT_STOP, pad.buttons)
+                              && !menu.open && !countdown_holding(&countdown);
         /* HELD ON THE LINE until GO. The controls are zeroed here so nothing
            downstream -- the physics, the rig, sfx_update's throttle-driven motor
            layers -- has to know about the countdown, and the physics TICKS are
@@ -3793,7 +3983,10 @@ unsigned int acc_ticks = 0;
             brk = 0.f;
             lx = 0.f;
         }
-        rbcar_hold(&rc, (race_over && !free_cam) ? 1 : 0);
+        /* THE HOLD IS TWO THINGS NOW and they are the same mechanism: the
+           flag, which is not the player's to release, and the player's own
+           `Stop'. Whichever is true blocks the drive and locks the wheels. */
+        rbcar_hold(&rc, ((race_over && !free_cam) || stop_held) ? 1 : 0);
 
         if (free_cam) {
             fly_yaw += rx * 2.2f;
@@ -3801,8 +3994,8 @@ unsigned int acc_ticks = 0;
             if (fly_pitch > 89.f) fly_pitch = 89.f;
             if (fly_pitch < -89.f) fly_pitch = -89.f;
             float r = fly_yaw * DEG, sp = 1.4f;
-            fly_x += (sinf(r) * -ly + cosf(r) * lx) * sp;
-            fly_z += (-cosf(r) * -ly + sinf(r) * lx) * sp;
+            fly_x += (sinf(r) * -ly + cosf(r) * cam_lx) * sp;
+            fly_z += (-cosf(r) * -ly + sinf(r) * cam_lx) * sp;
             if (thr) fly_y += sp;
             if (brk) fly_y -= sp;
             ex = fly_x; ey = fly_y; ez = fly_z;
@@ -3817,7 +4010,7 @@ unsigned int acc_ticks = 0;
             vin.throttle = thr;
             vin.brake = brk;
             vin.steer = lx;
-            vin.boost = (pad.buttons & SCE_CTRL_CROSS) ? 1 : 0;
+            vin.boost = opts_held(&opts, OPT_BOOST, pad.buttons);
 
             /* The physics.c placeholder used to be reachable here on TRIANGLE
                and from a menu row, for A/B against the transcribed model. Both
@@ -3836,9 +4029,10 @@ unsigned int acc_ticks = 0;
                  * a hop pressed on the line would sit in P, unintegrated, and
                  * launch the car on GO. The steering and throttle cannot do that
                  * -- they are read inside the tick that is not being spent. */
-                int jumped = rbcar_jump(&rc, (pad.buttons & SCE_CTRL_CIRCLE)
-                                             && !menu.open
-                                             && !countdown_holding(&countdown),
+                int jumped = rbcar_jump(&rc,
+                                        opts_held(&opts, OPT_JUMP, pad.buttons)
+                                            && !menu.open
+                                            && !countdown_holding(&countdown),
                                         dt);
                 /* FIXED TIMESTEP -- not rbcar_step(dt).
                    rb_car_tick can only simulate 8 * 1/240 = 33.3 ms per call,
@@ -3934,6 +4128,22 @@ unsigned int acc_ticks = 0;
                         me.susp[k] = (unsigned char)l;
                     }
                     me.steer = (short)(y[25] * AI_STEER_SCALE);
+                    /* AND OUR OWN PROGRESS ROUND THE TRACK, which in a
+                     * network race NOTHING ELSE MEASURES. `ai_step' is what
+                     * fills `player_dist' and a network race does not call it
+                     * -- so it stayed at 0 for the whole race, every remote car
+                     * ranked ahead of it, and both Vitas read `2nd' of two from
+                     * the grid to the flag. The lap watch above shares the
+                     * quantity, so the player's own best lap was never banked
+                     * either.
+                     *
+                     * ai_player_progress is `ai_step's own first block, lifted
+                     * out so the two callers cannot measure the player
+                     * differently -- see ai.h. After `cp_step' (it reads the
+                     * latched checkpoint) and before the place is asked for. */
+                    if (cps.enabled)
+                        ai_player_progress(&ai, &ai_tr, rc.body.x[0],
+                                           rc.body.x[1], rc.body.x[2]);
                     /* THE PLACE IS ASKED FOR HERE rather than read off the
                        HUD's own frame struct, which is filled later in the
                        frame and is a local of the drawing block. ai_player_place
@@ -3967,12 +4177,51 @@ unsigned int acc_ticks = 0;
                          * feeds. Without this every remote car sits at 0 and
                          * the player is always first. */
                         if (cps.enabled && ai_tr.spine && q) {
+                            const float len = ai_tr.spine_len;
                             float d = 0.f;
                             int cp = 0;
+                            /* HINTED WITH ITS OWN LAST ARC, which is what the
+                               field's own query is (ai_step passes
+                               `a->spine_at'). Unhinted, the projection flips
+                               between arc positions hundreds of metres apart
+                               wherever a track passes near itself -- 3 to 16
+                               times a lap on every shipped recording, and
+                               checkpoint.h says so at cp_spine_dist_near. Every
+                               one of those was a remote car's placing jumping
+                               for a frame. */
                             if (ai_tr.spine(ai_tr.ctx, s.p[0], s.p[1], s.p[2],
-                                            -1.f, &d, &cp))
-                                ai.car[a].spine_dist =
-                                    d + (float)q->lap * ai_tr.spine_len;
+                                            ai.car[a].spine_at, &d, &cp)) {
+                                /* AND ON THE PLAYER'S OWN ORIGIN, WHICH IS THE
+                                 * GRID. cp_lap_progress measures from the grid
+                                 * slot -- that is what cp_lap_origin is -- and
+                                 * a raw spine arc measures from the start/
+                                 * finish line, so ranking one against the other
+                                 * handed every remote car a free
+                                 * `spine_len - origin' (0.5 to 20.5 m on the
+                                 * ten) for the whole race. */
+                                float cum = d - (len - cp_lap_origin(&cps))
+                                            + (float)q->lap * len;
+                                /* AND THE LAP THAT ARRIVED IS SNAPPED TO THE
+                                 * ARC THAT IS HERE. The two wrap at different
+                                 * places -- the arc at the spine's origin, the
+                                 * peer's lap when ITS checkpoint 0 fired, up to
+                                 * a trigger radius apart -- so for the few
+                                 * frames between them the sum is a whole lap
+                                 * out and the car's place flickered at the line
+                                 * every lap. The nearest representative to
+                                 * where this car already was is the right one:
+                                 * a real lap is CONTINUOUS in this quantity and
+                                 * moves it by metres, and only the mismatch
+                                 * moves it by half a spine. */
+                                if (ai.car[a].spine_at >= 0.f && len > 1.f) {
+                                    const float prev = ai.car[a].spine_dist;
+                                    while (cum - prev > len * 0.5f) cum -= len;
+                                    while (prev - cum > len * 0.5f) cum += len;
+                                }
+                                ai.car[a].spine_at = d;
+                                ai.car[a].cp = cp;
+                                ai.car[a].spine_dist = cum;
+                            }
                         }
                     }
                     /* AND THEIR WHEELS TURN, which is not part of the pose.
@@ -4184,20 +4433,24 @@ unsigned int acc_ticks = 0;
             if (carp->has_rig) {
                 if (use_rb) {
                     carani_update(&carp->rig, &rc);
-                    /* The whip antenna. Acceleration is finite-differenced from
-                       the body's own linear velocity, which rb.c already keeps
-                       (P * 1/m) -- differencing the POSITION instead would be a
-                       second difference and mostly noise. */
+                    /* The whip antenna. It is simulated in WORLD space with its
+                       base clamped, so the only thing it needs is the matrix
+                       the whip's own geometry will be drawn under -- every
+                       inertial effect comes from the anchor being dragged
+                       through the world, exactly as carANTENNA_NEW::process
+                       drives it. That matrix is the body's, shifted down by
+                       CenterMassOY, because the rigid body's origin is the
+                       centre of mass and the model's is not: the draw does the
+                       same two steps a few hundred lines below and the chain
+                       has to be planted where the mesh will be. */
                     {
-                        static float prev_v[3];
-                        float acc[3];
+                        float mw[16];
+                        float com = rbcar_com_oy(cur_car);
                         int k;
-                        for (k = 0; k < 3; k++) {
-                            acc[k] = (dt > 1e-5f)
-                                ? (rc.body.v[k] - prev_v[k]) / dt : 0.f;
-                            prev_v[k] = rc.body.v[k];
-                        }
-                        antenna_step(&antenna, rc.m, acc, rbcar_speed(&rc), dt);
+                        memcpy(mw, rc.m, sizeof(mw));
+                        for (k = 0; k < 3; k++)
+                            mw[12 + k] -= com * rc.m[4 + k];
+                        antenna_step(&antenna, mw, dt);
                     }
                 } else {
                     static float flat_spin = 0.f;
@@ -4209,17 +4462,15 @@ unsigned int acc_ticks = 0;
                        wheels LEFT, so the stick is negated */
                     carani_update_flat(&carp->rig, -lx * 30.f, flat_spin);
                     {
-                        /* the placeholder has no body matrix; feed the antenna
-                           an upright frame and its forward speed */
-                        static const float up_m[16] = {1,0,0,0, 0,1,0,0,
-                                                       0,0,1,0, 0,0,0,1};
-                        static float prev_s;
-                        float acc[3];
-                        acc[0] = 0.f;
-                        acc[1] = 0.f;
-                        acc[2] = (dt > 1e-5f) ? (veh.vlong - prev_s) / dt : 0.f;
-                        prev_s = veh.vlong;
-                        antenna_step(&antenna, up_m, acc, veh.vlong, dt);
+                        /* The placeholder draws from veh.yaw/pitch/roll rather
+                           than from a matrix, so build the same frame the draw
+                           below builds: a half turn, then pitch and roll
+                           negated. The whip then feels this car's motion too --
+                           it is world-space now, and the anchor is all it
+                           needs. */
+                        float mw[16];
+                        veh_model_matrix(&veh, mw);
+                        antenna_step(&antenna, mw, dt);
                     }
                 }
             }
@@ -4328,6 +4579,16 @@ unsigned int acc_ticks = 0;
                      DBG_ISOLATE[dbg_isolate]);
                 char_dump(&chars, eye3);
                 prop_dump(&props, eye3, 30.f);
+                /* THE GEOMETRY, by texture name. The dynamic layer has had an
+                   inventory for years and the world had none, so "what is that
+                   big translucent sheet over the beach" had to be guessed at
+                   from a screenshot. 60 m because that is about as far as a
+                   thing can be and still be the thing you are pointing at. */
+                scene_dump_near(&track, "track", eye3, 60.f, 14);
+                if (water.horizon)
+                    rlog("[rccars]   horizon plane: ON, y %+.3f (the sea's own "
+                         "outer rim); it is CENTRED ON THE EYE, so it is the one "
+                         "water surface that moves with you\n", water.horizon_y);
                 rlog("[rccars] opponents: %d, %d drawn last frame\n", ai.n,
                      ai_drawn);
                 for (ai_i = 0; ai_i < ai.n; ai_i++) {
@@ -4595,6 +4856,20 @@ menu_only:
            port's answer to submitting the whole track every frame with no VBOs;
            see scene.h. */
         scene_frustum_from_gl();
+
+        /* THE HORIZON SEA, before anything solid and with depth off, so it is
+           left only where nothing else draws: the band between the authored
+           water tiles' outer edge and the camera-locked dome's lower rim. See
+           water_draw_horizon. ON show_vis with the rest of the water, so
+           SQUARE takes it away too -- that button exists so "is this new code
+           the problem?" is one press rather than a rebuild, and a draw that
+           ignores it defeats the point. */
+        if (show_vis) {
+            float heye[3];
+            heye[0] = ex; heye[1] = ey; heye[2] = ez;
+            water_draw_horizon(&water, heye);
+        }
+
         /* The solid world. Water is excluded here and drawn by water.c below,
            because it moves and because the foam has to blend; the transition
            decals are excluded because they MULTIPLY this rather than being part
@@ -4986,6 +5261,34 @@ menu_only:
                 else
                     countdown_draw(&countdown, SCR_W, SCR_H);
             }
+        }
+
+        /* AND WHY THE 3 IS NOT COUNTING DOWN: the other machine is still
+         * loading. `Wait players' is the game's own words for it -- the string
+         * behind the lobby page's own title (STR_UI_WAIT_PLAYERS, out of
+         * english.tbl) -- in the engine's own letters where they loaded, and in
+         * the compiled-in font where they did not, which is the fallback every
+         * page in this app has.
+         *
+         * UNDER the countdown cell rather than in the message layer: the layer
+         * shows ONE slot and the 3 has to stay on screen, since together they
+         * say what is happening. */
+        if (net_wait_go) {
+            const sfont sf = sf_small(mm.tex.font_small);
+            const char *w = STR_UI_WAIT_PLAYERS;
+            const float sc = (float)SCR_H / 600.f * 1.1f;
+            const float tw = sf.tex ? sf_w(&sf, sc, w) : ui_text_w(sc, w);
+            const float th = sf.tex ? sf_h(&sf, sc) : ui_text_h(sc);
+            const float x = ((float)SCR_W - tw) * 0.5f;
+            const float y = (float)SCR_H * 0.70f;
+            ui_begin(SCR_W, SCR_H);
+            ui_rect(x - th * 0.6f, y - th * 0.35f, tw + th * 1.2f, th * 1.7f,
+                    0.f, 0.f, 0.f, 0.55f);
+            if (sf.tex)
+                sf_text_shadowed(&sf, x, y, sc, 1.f, 1.f, 1.f, 1.f, w);
+            else
+                ui_text(x, y, sc, 1.f, 1.f, 1.f, 1.f, w);
+            ui_end();
         }
 
         /* THE FINISH SCREEN, over the world and under the settings menu -- the

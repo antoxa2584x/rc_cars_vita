@@ -23,11 +23,15 @@
 #ifdef __vita__
 #include <psp2/ctrl.h>
 #else
+#define SCE_CTRL_SELECT   0x00000001u
 #define SCE_CTRL_START    0x00000008u
 #define SCE_CTRL_UP       0x00000010u
 #define SCE_CTRL_RIGHT    0x00000020u
 #define SCE_CTRL_DOWN     0x00000040u
 #define SCE_CTRL_LEFT     0x00000080u
+#define SCE_CTRL_LTRIGGER 0x00000100u
+#define SCE_CTRL_RTRIGGER 0x00000200u
+#define SCE_CTRL_TRIANGLE 0x00001000u
 #define SCE_CTRL_CIRCLE   0x00002000u
 #define SCE_CTRL_CROSS    0x00004000u
 #define SCE_CTRL_SQUARE   0x00008000u

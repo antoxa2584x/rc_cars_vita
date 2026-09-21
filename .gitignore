@@ -16,6 +16,7 @@ sce_sys/livearea/contents/startup.png
 
 # Host-side test harnesses, built ad hoc with gcc (no extension, so listed
 # by name). Their sources -- rb_test.c, vis_test.c -- are tracked.
+aiphys
 aitest
 allstarts
 antheight
@@ -51,6 +52,7 @@ cpwide
 progchk
 proptest
 rb_test
+respawn
 results_test
 rockroll
 settings_test

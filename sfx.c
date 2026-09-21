@@ -967,6 +967,18 @@ void sfx_volumes(float sfx, float music)
     audio_unlock();
 }
 
+/* THE `Sound quality' ROW, and all it does is narrow what the mixer may
+   allocate -- see opts.h on why that is the reading, and mix.h on why a cap
+   coming down cannot click. Safe to call every frame: mix_voice_cap is a
+   clamped store. */
+void sfx_voice_cap(int n)
+{
+    if (!S.ok) return;
+    audio_lock();
+    mix_voice_cap(audio_mix(), n);
+    audio_unlock();
+}
+
 float sfx_vol_sfx(void) { return S.vol_sfx; }
 float sfx_vol_music(void) { return S.vol_music; }
 

@@ -581,13 +581,28 @@ void cp_resync(checkpoints_t *c, float x, float y, float z);
    drowning path takes cp_resync. */
 void cp_restart(checkpoints_t *c, float x, float y, float z);
 
+/* HOW FAR UP THE ROAD cp_respawn_pose LOOKS for the heading it faces a
+   resurrected car in. The fitted recordings run 0.06 to 0.25 m between samples,
+   so a tangent taken off one pair is the driver's own wobble; three metres is
+   about the ground the car covers as it lands, and it is short enough that a
+   hairpin's exit does not decide the entry's heading. */
+#define CP_RESPAWN_AIM 3.0f
+
 /* WHERE TO PUT A DEAD CAR BACK: the last checkpoint it actually crossed, aimed
- * along the spine at whatever comes next.
+ * ALONG THE ROAD -- the fitted recording's own tangent at that checkpoint's arc
+ * (line_at[last]), sampled over CP_RESPAWN_AIM.
+ *
+ * NOT along the spine, which is what this did until the respawn heading was
+ * measured: the spine's refining points are up to 63 m off the racing line and
+ * out of order (see checkpoints_t.station), so on 25 of the ten tracks' 50
+ * checkpoints the next stitched point lies more than 90 degrees away from the
+ * direction the race is driven in. The spine walk is still here as the fallback
+ * for a track whose recordings would not fit.
  *
  * -> 0 and touches nothing when no checkpoint has been crossed yet (`last` < 0),
- * when there is no spine, or when the spine is too degenerate to give a
- * direction -- in every one of which the caller should use the race start, which
- * is where the car would have been anyway.
+ * when there is neither a road nor a spine, or when both are too degenerate to
+ * give a direction -- in every one of which the caller should use the race start,
+ * which is where the car would have been anyway.
  *
  * `pos` is the checkpoint marker's own x/z with cp_t.ground for y, so the caller
  * still owns the ground probe and its ceiling (the marker floats 0.18 to 0.49 m

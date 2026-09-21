@@ -1373,3 +1373,57 @@ void scene_release(scene_t *s)
     free(s->batches);
     memset(s, 0, sizeof(*s));
 }
+
+/* ------------------------------------------------------------- inventory */
+
+void scene_dump_near(const scene_t *s, const char *label, const float eye[3],
+                     float rad, int limit)
+{
+    unsigned int i;
+    int shown = 0;
+
+    if (!s || !s->batches) {
+        rlog("[rccars]   %s: no scene\n", label);
+        return;
+    }
+    rlog("[rccars]   %s: %u batches, %u textures; those within %.0f m --\n",
+         label, s->n_batches, s->n_tex, rad);
+    /* Nearest first, by repeated scan: n_batches is a few hundred and this runs
+       on a button press, so a sort would be more code than it saves. */
+    for (;;) {
+        unsigned int best = s->n_batches;
+        float bestd = rad;
+        for (i = 0; i < s->n_batches; i++) {
+            const batch_t *b = &s->batches[i];
+            float d = 0.f, c;
+            int k;
+            if (!b->nverts || b->bmin[0] > b->bmax[0])
+                continue;
+            if (b->flags & 0x80000000u)     /* already printed, see below */
+                continue;
+            for (k = 0; k < 3; k++) {
+                c = eye[k] < b->bmin[k] ? b->bmin[k] - eye[k]
+                  : eye[k] > b->bmax[k] ? eye[k] - b->bmax[k] : 0.f;
+                d += c * c;
+            }
+            d = sqrtf(d);
+            if (d < bestd) { bestd = d; best = i; }
+        }
+        if (best == s->n_batches || shown >= limit)
+            break;
+        {
+            batch_t *b = &s->batches[best];
+            const char *nm = (b->tex < s->n_tex && s->tex_names)
+                           ? s->tex_names[b->tex] : "?";
+            rlog("[rccars]     %6.1f m  batch %-3u tex %-16s flags 0x%04x  "
+                 "%u tris  %.1f x %.1f x %.1f m  y[%.2f %.2f]\n",
+                 bestd, best, nm, b->flags, b->nidx / 3u,
+                 b->bmax[0] - b->bmin[0], b->bmax[1] - b->bmin[1],
+                 b->bmax[2] - b->bmin[2], b->bmin[1], b->bmax[1]);
+            b->flags |= 0x80000000u;        /* mark, cleared below */
+            shown++;
+        }
+    }
+    for (i = 0; i < s->n_batches; i++)
+        s->batches[i].flags &= ~0x80000000u;
+}

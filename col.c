@@ -663,6 +663,7 @@ int col_sphere(const col_t *c, const float centre[3], float radius,
             COL_PROF(tris, c->start[cell + 1] - c->start[cell]);
             for (k = c->start[cell]; k < c->start[cell + 1]; k++) {
                 const float *t;
+                unsigned int ti;
                 float q[3], dx, dy, dz, d2;
 
                 /* Vertical first, and out of the contiguous bounds index: that is
@@ -671,7 +672,8 @@ int col_sphere(const col_t *c, const float centre[3], float radius,
                    cannot be reached. */
                 if (!tri_y_reach(c, k, centre[1], radius))
                     continue;
-                t = &c->tris[(size_t)c->idx[k] * 9];
+                ti = c->idx[k];
+                t = &c->tris[(size_t)ti * 9];
                 if (!tri_reach_xz(t, centre, radius))
                     continue;
                 COL_PROF(narrow, 1);
@@ -698,7 +700,15 @@ int col_sphere(const col_t *c, const float centre[3], float radius,
                 hits[i].point[0] = q[0];
                 hits[i].point[1] = q[1];
                 hits[i].point[2] = q[2];
-                hits[i].surface = 0;
+                /* THE FACE'S OWN SURFACE CLASS, which this wrote as a flat 0 for
+                   the life of the port -- so carSurfaceDrag's `surface != 3'
+                   deep-sand branch (contact.c) had never once run. It is one
+                   array index off a triangle the query has already reached; the
+                   reduction over the faces a sphere touches is the CALLER's,
+                   because that is where the engine does it (FUN_00534fc0 takes
+                   the minimum over the positive classes at a contact, so a decal
+                   carrying 0 cannot veto the sand under it). See rb_collide. */
+                hits[i].surface = c->eng_surf ? (int)c->eng_surf[ti] : 0;
                 tri_normal(t, hits[i].normal);
             }
         }

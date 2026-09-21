@@ -31,16 +31,32 @@
  * contact solve, the sleep rule and the wind vector. The engine's own prop
  * integrator has not been located, so this is a small rigid body written to the
  * same conventions as rb.c rather than a transcription. It is bounded work --
- * a can that rolls plausibly is the whole requirement -- and nothing here can
- * move the car, deliberately:
+ * a can that rolls plausibly is the whole requirement.
  *
- * PROPS DO NOT PUSH BACK ON THE CAR. The car's handling is the transcribed
- * model and only that (CLAUDE.md, "Known issues"), and a reaction force would
- * perturb a system that has been checked against the disassembly line by line.
- * The heaviest prop is a 1.0 kg traffic cone against a 2 kg car whose top speed
- * is 7.5 m/s, so the honest error is small and it is in the direction of leaving
- * the recovered physics alone. One-way, and said so here rather than discovered
- * later.
+ * PROPS PUSH BACK ON THE CAR, and this note used to say they deliberately did
+ * not. The old reasoning was that a reaction would perturb a model checked
+ * against the disassembly line by line -- which is true of an INVENTED reaction
+ * and is not true of this one, because the impulse the prop already receives IS
+ * the two-body impulse. car_contact computes
+ *
+ *     jn = -(1+e) * vn * (M / (m + M)) / K_prop,    K_prop = 1/m + angular
+ *
+ * and in the point-mass limit K_prop is 1/m, so jn = (1+e) * |vn| * mM/(m+M) --
+ * exactly -(1+e)vn / (1/m + 1/M), the impulse a free two-body contact has. The
+ * `M/(m+M)` factor that was there to stop a balloon and a cone flying off at the
+ * same speed was the two-body correction all along; what was missing was only
+ * the other half of Newton's third law. Applying -jn to the car adds no constant
+ * and no law that was not already being solved, and it is the one thing a player
+ * driving into a traffic cone expects.
+ *
+ * What it costs is bounded by the masses, which is why it is safe to hand to the
+ * transcribed model: the car is 2 kg and the heaviest prop 1.0 kg, so no single
+ * contact can take more than (1+e)*m/(m+M) = about 0.4 of the closing speed off
+ * it, and the lightest (a 0.15 kg balloon) about 0.08. proptest part 9 measures
+ * the figure per model. The approximation that remains is that K_prop carries
+ * the PROP's angular term and not the car's, so an off-centre knock hands the
+ * car slightly more than a full two-body solve would; it is in the direction of
+ * a firmer knock, not a softer one, and the cap above still holds.
  */
 
 #ifndef PROP_H
@@ -115,13 +131,17 @@ typedef struct {
  *                  only object carrying it; the wind VECTOR is not in any file
  *                  found so far. A gentle steady breeze is the smallest thing
  *                  that makes the flag mean something.
- * PROP_CAR_MASS    the car does not receive a reaction (see the header note),
- *                  but the impulse it DELIVERS still uses a two-body reduced
- *                  mass M/(m+M). Treating the car as infinitely heavy instead
- *                  makes the delivered speed (1+e)*v_closing for every prop --
- *                  the mass cancels exactly -- so a 1.0 kg traffic cone and a
- *                  0.15 kg balloon fly off at the SAME speed, which looks wrong
- *                  and is wrong. 2.0 kg is the car's own mass from rb_data.h.
+ * PROP_CAR_MASS    the two-body reduced mass M/(m+M) in the impulse the car
+ *                  DELIVERS -- and, since the reaction landed, the mass the
+ *                  car's own share of that impulse is divided by. Treating the
+ *                  car as infinitely heavy instead makes the delivered speed
+ *                  (1+e)*v_closing for every prop -- the mass cancels exactly --
+ *                  so a 1.0 kg traffic cone and a 0.15 kg balloon fly off at the
+ *                  SAME speed, which looks wrong and is wrong. 2.0 kg is the
+ *                  car's own mass from rb_data.h, and it is READ FROM THE CAR
+ *                  now rather than compiled in, so the day rb_data.h's invented
+ *                  2.0 becomes the recording's own 1.0 this does not silently
+ *                  keep the old figure (see ai.h on the mass question).
  * PROP_ROLL_DAMP   rolling resistance, applied only while a prop is in contact.
  *                  Coulomb friction cannot stop a rolling sphere -- there is no
  *                  slip at the contact for it to act on -- so without this a can
@@ -168,8 +188,14 @@ void prop_init(props_t *pr, const scene_t *props_scene, const col_t *col,
 /* Back to the authored placement, asleep. Called on respawn and on a restart. */
 void prop_reset(props_t *pr);
 
-/* One step. `car` may be NULL, and then nothing pushes the props but gravity. */
-void prop_step(props_t *pr, const rb_car *car, float dt);
+/* One step. `car` may be NULL, and then nothing pushes the props but gravity.
+ *
+ * NOT const any more: a prop that is knocked knocks back, through
+ * rb_apply_impulse at the contact point -- see the header note. A caller that
+ * wants the old one-way behaviour does not have one; there is no flag for it,
+ * because two answers to "does a cone slow you down" is the shape of bug this
+ * project keeps writing down. */
+void prop_step(props_t *pr, rb_car *car, float dt);
 
 /* Draw every awake-or-not instance within PROP_ACTIVE_RANGE of `eye`. */
 void prop_draw(props_t *pr, const float eye[3]);

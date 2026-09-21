@@ -222,6 +222,12 @@ enum {
     NP_FINISH,
     NP_BYE,
     NP_KICK,
+    /* THE START BARRIER, and both carry nothing but their header: the slot is
+       in byte 6 and there is nothing else to say. NP_LOADED is a client
+       reporting itself on the grid, repeated until it is answered; NP_GO is the
+       host releasing everybody at once. See net.h at net_start_hold. */
+    NP_LOADED,
+    NP_GO,
     NP_N
 };
 
@@ -380,6 +386,13 @@ static struct {
     /* THE CLIENT'S OWN KEEP-ALIVE, on its own clock. See net_step. */
     float         peer_at;
     int           start_pending, race_over;
+    /* THE START BARRIER. `armed' is this machine reporting itself on the grid
+       (net_race_begin), `go' is the release -- decided by the host and carried
+       to everybody else in one NP_GO. `armed_at' is when the wait began, in the
+       clock that only runs while frames do, and `loaded_at' rate-limits the
+       client's own repeat of NP_LOADED. */
+    int           armed, go;
+    float         armed_at, loaded_at;
     char          log[NET_LOG_LINES][NET_LOG_CHARS];
     int           nlog;
     /* THE HARNESS'S OWN. A directed announce target, so the discovery path can
@@ -679,6 +692,35 @@ static void send_peer(void)
         send_to(&p, N.host_addr, N.host_port);
 }
 
+/* --------------------------------------------------------- the start barrier
+ *
+ * Neither packet carries a payload: `w_begin' puts our slot in the header and
+ * that is the whole message. See net.h at net_start_hold.
+ *
+ * NEITHER IS RETRANSMITTED ON A TIMER, and that is deliberate. The client
+ * repeats NP_LOADED until it sees a GO, and the host answers EVERY NP_LOADED it
+ * gets once it has gone -- so a lost GO is re-asked for by the only machine
+ * that noticed, at the rate it is willing to wait, and the host needs no list
+ * of who has acknowledged what. One retry loop, at the end that can tell. */
+static void send_loaded(void)
+{
+    pk p;
+    if (N.slot < 0 || !N.host_addr)
+        return;
+    w_begin(&p, NP_LOADED, N.slot);
+    send_to(&p, N.host_addr, N.host_port);
+}
+
+static void send_go(unsigned int addr, int port)
+{
+    pk p;
+    w_begin(&p, NP_GO, N.slot);
+    if (addr)
+        send_to(&p, addr, port);
+    else
+        send_others(&p);
+}
+
 /* ------------------------------------------------------------- receiving */
 
 static int server_slot(unsigned int addr, int port)
@@ -961,6 +1003,28 @@ static void handle(pk *p, int kind, int slot, unsigned int addr, int port)
         r_settings(p, &N.set);
         N.start_pending = 1;
         return;
+    /* THE START BARRIER, and the host's half of it. A peer that has finished
+       loading says so until it is answered; if the flag has already been
+       dropped, this one missed the GO and is told again, straight back. */
+    case NP_LOADED:
+        if (N.mode != NET_RACING || !net_is_host())
+            return;
+        if (slot < 0 || slot >= NET_MAX || !N.peer[slot].used)
+            return;
+        N.peer[slot].loaded = 1;
+        N.peer[slot].heard = N.clock;
+        if (N.go)
+            send_go(addr, port);
+        return;
+    /* AND THE CLIENT'S. Sticky: the race is started once and there is nothing
+       that can un-start it. */
+    case NP_GO:
+        if (N.mode != NET_RACING || net_is_host())
+            return;
+        if (addr != N.host_addr)
+            return;
+        N.go = 1;
+        return;
     case NP_STATE:
         if (N.mode != NET_RACING)
             return;
@@ -1085,6 +1149,20 @@ static void pump(void)
 static void reap(void)
 {
     int i;
+    /* NOBODY IS REAPED WHILE THE START BARRIER IS UP, and this line is the
+     * difference between a barrier that works and one that ends every race
+     * before it starts.
+     *
+     * A MACHINE THAT IS LOADING IS SILENT AND ITS CLOCK IS STOPPED -- net_step
+     * is not called from inside `race_load', so it sends nothing and `N.clock'
+     * does not move. The machine that finished first is running frames, and its
+     * clock does: at NET_TIMEOUT it would drop the peer it is waiting for, for
+     * the crime of still being where it said it was. The wait is bounded by
+     * NET_START_WAIT instead, and the moment it ends the reaper takes over
+     * again with a peer that has been quiet for the whole of it -- so a machine
+     * that really did die is still dropped, five seconds later. */
+    if (net_start_hold())
+        return;
     /* THE HOST DROPS A SILENT PEER; A CLIENT DROPS THE HOST. Both after
        NET_TIMEOUT, which is the engine's own `Max lag' idea. */
     if (net_is_host()) {
@@ -1182,6 +1260,49 @@ void net_step(float dt)
         && N.clock - N.peer_at >= 1.0f / NET_LOBBY_HZ) {
         N.peer_at = N.clock;
         send_peer();
+    }
+    /* ------------------------------------------------- THE START BARRIER
+     *
+     * The host decides and everybody else asks. See net.h at net_start_hold.
+     */
+    if (N.mode == NET_RACING && N.armed && !N.go) {
+        if (net_is_host()) {
+            int i, all = 1;
+            for (i = 0; i < NET_MAX; i++)
+                if (N.peer[i].used && !N.peer[i].loaded)
+                    all = 0;
+            /* AND A MACHINE THAT NEVER REPORTS DOES NOT HOLD THE RACE FOR
+               EVER. The wait is generous (net.h) because the only thing on the
+               other side of it is a crash; when it expires the race goes
+               without that peer and the reaper, released with the barrier,
+               drops it NET_TIMEOUT later. */
+            if (all || N.clock - N.armed_at > NET_START_WAIT) {
+                N.go = 1;
+                send_go(0, 0);
+                if (!all)
+                    rlog("[net] the start waited %.0f s for a machine that "
+                         "never reported in -- going without it\n",
+                         (double)NET_START_WAIT);
+            }
+        } else {
+            /* ASKED UNTIL IT IS ANSWERED, at the lobby's own rate: one
+               datagram can be lost and there is no other traffic from us that
+               the host reads as "on the grid". */
+            if (N.clock - N.loaded_at >= 1.0f / NET_LOBBY_HZ) {
+                N.loaded_at = N.clock;
+                send_loaded();
+            }
+            /* THE SAME BOUND AT THIS END, for a host that went away between
+               the start and the grid: without it the client sits on a frozen
+               track for ever, because the reaper that would notice is the one
+               the barrier has suspended. Driving alone for five seconds and
+               then being told the connection is lost is the better failure. */
+            if (N.clock - N.armed_at > NET_START_WAIT) {
+                N.go = 1;
+                rlog("[net] no GO from the host in %.0f s -- starting\n",
+                     (double)NET_START_WAIT);
+            }
+        }
     }
     reap();
 }
@@ -1431,6 +1552,7 @@ void net_start(void)
     for (i = 0; i < NET_MAX; i++) {
         N.peer[i].have = 0;
         N.peer[i].finished = 0;
+        N.peer[i].loaded = 0;
         N.peer[i].lap = 0;
         N.peer[i].best_lap = 0.f;
         N.peer[i].total = 0.f;
@@ -1439,6 +1561,11 @@ void net_start(void)
     N.mode = NET_RACING;
     N.state_at = -1000.f;
     N.peer_at = -1000.f;
+    /* NOT ARMED HERE. This is the host pressing Race, which is the moment
+       BEFORE its own load; the barrier goes up when the load is done and
+       `net_race_begin' says so, at both ends alike. */
+    N.armed = 0;
+    N.go = 0;
 }
 
 int net_take_start(void)
@@ -1457,11 +1584,32 @@ void net_race_begin(void)
     for (i = 0; i < NET_MAX; i++) {
         N.peer[i].have = 0;
         N.peer[i].finished = 0;
+        N.peer[i].loaded = 0;
     }
     N.race_over = 0;
     N.mode = NET_RACING;
     N.state_at = -1000.f;
     N.peer_at = -1000.f;
+    /* AND THE START BARRIER GOES UP -- see net.h at net_start_hold. Our own row
+     * is loaded by definition: this call IS the load finishing.
+     *
+     * CLEARED HERE AND NOT WHEN THE START WENT OUT, because the host's own
+     * datagrams are read by nobody while it is loading: a client that finished
+     * first has been sending NP_LOADED into a socket buffer for seconds, and
+     * those arrive on the first pump AFTER this. Clearing them afterwards would
+     * throw away the only report that machine sent. */
+    N.armed = 1;
+    N.go = 0;
+    N.armed_at = N.clock;
+    N.loaded_at = -1000.f;
+    if (N.slot >= 0 && N.slot < NET_MAX)
+        N.peer[N.slot].loaded = 1;
+}
+
+/* SEE net.h. Held while we are up and somebody else is not. */
+int net_start_hold(void)
+{
+    return N.mode == NET_RACING && N.armed && !N.go;
 }
 
 /* THE RACE IS OVER AND WE ARE BACK IN THE LOBBY -- net_race_begin's counterpart,
@@ -1491,6 +1639,12 @@ void net_race_end(void)
     host = net_is_host();
     N.mode = host ? NET_HOSTING : NET_JOINED;
     N.race_over = 0;
+    /* AND THE BARRIER COMES DOWN WITH IT. `net_start_hold' is written in terms
+       of the mode as well, so this is belt and braces -- and it is what makes
+       the NEXT race's barrier start from nothing rather than from whatever the
+       last one ended holding. */
+    N.armed = 0;
+    N.go = 0;
     /* So the next race's first state packet is not rate-limited against a
        timestamp from the last one. net_race_begin does the same on entry; doing
        it at both ends means neither depends on the other having run. */

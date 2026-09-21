@@ -27,7 +27,7 @@
    bounded by construction -- one line per key, MENU_N_CARS numbers on the
    longest of them -- so this is not a limit anything can grow into by accident,
    and settings_format truncates rather than overruns if it ever did. */
-#define SETTINGS_TEXT_MAX 1024
+#define SETTINGS_TEXT_MAX 4096
 
 static const char *file_path = SETTINGS_FILE;
 
@@ -54,7 +54,7 @@ const char *settings_path(void)
     return file_path;
 }
 
-void settings_from_menu(const menu_t *m, settings_t *s)
+void settings_from_menu(const menu_t *m, const opts_t *o, settings_t *s)
 {
     int i;
 
@@ -73,9 +73,16 @@ void settings_from_menu(const menu_t *m, settings_t *s)
     s->car_light = m->car_light;
     s->intro      = m->intro;
     s->pace       = m->pace;
+    /* The Options screen, whole. NULL is what the harnesses that know nothing
+       about it pass, and it leaves the memset's zeros -- which opts_clamp then
+       turns into a legal, if silent, set rather than into nonsense. */
+    if (o)
+        s->opt = *o;
+    else
+        opts_init(&s->opt);
 }
 
-void settings_to_menu(const settings_t *s, menu_t *m)
+void settings_to_menu(const settings_t *s, menu_t *m, opts_t *o)
 {
     int i;
 
@@ -93,6 +100,8 @@ void settings_to_menu(const settings_t *s, menu_t *m)
     m->car_light = s->car_light;
     m->intro     = s->intro;
     m->pace      = s->pace;
+    if (o)
+        *o = s->opt;
     /* DELIBERATELY NOT TOUCHED: req_track, req_car, req_reload, open, row, cue
        and skins. The caller does the first load itself off m->track and m->car,
        and raising a request here would load the track twice; `skins` is counted
@@ -123,6 +132,10 @@ void settings_clamp(settings_t *s)
        hand edit and 2 is the value this port ships. */
     if (s->pace != 0 && s->pace != 2 && s->pace != 3)
         s->pace = 2;
+    /* The Options screen clamps itself, including dropping a bound button that
+       is not one of the ten and a duplicate that no opts_bind could have
+       produced -- see opts.c. */
+    opts_clamp(&s->opt);
 }
 
 /*
@@ -165,6 +178,25 @@ static int read_ints(const char *p, int *out, int n)
 static int read_int(const char *p, int *out)
 {
     return read_ints(p, out, 1) == 1;
+}
+
+/* THE `bind' LINE IS AN INDEX LIST, not a list of SCE_CTRL_* bit patterns.
+   `0' is None and `i + 1' is OPT_BTN[i], so the file says `6 7' where the
+   binary says 512 and 16 -- and a hand edit that puts 99 in it is obviously
+   out of range rather than a plausible-looking bit mask. opts_clamp is what
+   finally refuses anything these two let through. */
+static int bind_code(unsigned int bits)
+{
+    int i;
+    for (i = 0; i < OPT_N_BTN; i++)
+        if (OPT_BTN[i] == bits)
+            return i + 1;
+    return 0;
+}
+
+static unsigned int bind_bits(int code)
+{
+    return (code >= 1 && code <= OPT_N_BTN) ? OPT_BTN[code - 1] : 0u;
 }
 
 int settings_parse(const char *text, settings_t *s)
@@ -227,6 +259,35 @@ int settings_parse(const char *text, settings_t *s)
             if ((v = match(q, "vol_music")) != NULL)   { read_int(v, &s->vol_music); continue; }
             if ((v = match(q, "tex_quality")) != NULL) { read_int(v, &s->tex_quality); continue; }
             if ((v = match(q, "tex_swap_rb")) != NULL) { read_int(v, &s->tex_swap_rb); continue; }
+            /* THE OPTIONS SCREEN. `snd_` and the rest are opts_t's own field
+               names with the struct's name in front of them, which keeps the
+               one rule this file has -- the key IS the field -- readable when
+               two structs share a namespace. */
+            if ((v = match(q, "snd_use")) != NULL)     { read_int(v, &s->opt.use_sound); continue; }
+            if ((v = match(q, "snd_quality")) != NULL) { read_int(v, &s->opt.quality); continue; }
+            if ((v = match(q, "snd_bg")) != NULL)      { read_int(v, &s->opt.bg_sound); continue; }
+            if ((v = match(q, "music_style")) != NULL) { read_int(v, &s->opt.music_style); continue; }
+            if ((v = match(q, "vol_master")) != NULL)  { read_int(v, &s->opt.vol_master); continue; }
+            if ((v = match(q, "stick")) != NULL)       { read_int(v, &s->opt.stick); continue; }
+            if ((v = match(q, "sens")) != NULL)        { read_int(v, &s->opt.sens); continue; }
+            if ((v = match(q, "deadzone")) != NULL)    { read_int(v, &s->opt.dead); continue; }
+            if ((v = match(q, "bind")) != NULL) {
+                int code[OPT_N_ACT * OPT_N_SLOT];
+                int got, a, k;
+                for (a = 0; a < OPT_N_ACT * OPT_N_SLOT; a++)
+                    code[a] = -1;
+                got = read_ints(v, code, OPT_N_ACT * OPT_N_SLOT);
+                /* A SHORT LINE LEAVES THE REST ALONE, the same way `skin' does:
+                   a file written by a build with fewer actions must not zero
+                   the ones it never heard of. */
+                for (a = 0; a < got; a++) {
+                    if (code[a] < 0) continue;
+                    k = a;
+                    s->opt.bind[k / OPT_N_SLOT][k % OPT_N_SLOT] =
+                        bind_bits(code[a]);
+                }
+                continue;
+            }
             /* Anything else is a key from another version of this file, or a
                typo. Skipped in silence -- it costs that line and nothing else. */
         }
@@ -271,13 +332,33 @@ void settings_format(const settings_t *s, char *out, int n)
     P("pace %d             # vblanks a race frame is held for: 0 off, 2 = even "
       "30, 3 = even 20\n", s->pace);
     P("intro %d           # 1 play the launch movies, 0 straight to the menu\n", s->intro);
+    P("\n# The Options screen -- dlgSOUND and dlgCONTROL_PLAYER.\n");
+    P("snd_use %d         # 1 sound on, 0 silence\n", s->opt.use_sound);
+    P("snd_quality %d     # 0 low, 1 medium, 2 high (mixer voices: 8/16/24)\n",
+      s->opt.quality);
+    P("snd_bg %d          # 1 music on, 0 off\n", s->opt.bg_sound);
+    P("music_style %d     # 0 rock, 1 techno, 2 both\n", s->opt.music_style);
+    P("vol_master %d      # 0..%d, over sfx and music together\n",
+      s->opt.vol_master, OPT_VOL_STEPS);
+    P("stick %d           # 1 the left stick steers, 0 only the bound buttons\n",
+      s->opt.stick);
+    P("sens %d            # 0..%d, stick gain 0.5 .. 1.5\n",
+      s->opt.sens, OPT_SENS_STEPS);
+    P("deadzone %d        # 0..%d, raw units are 8x this out of 128\n",
+      s->opt.dead, OPT_DEAD_STEPS);
+    P("bind");
+    for (i = 0; i < OPT_N_ACT * OPT_N_SLOT; i++)
+        P(" %d", bind_code(s->opt.bind[i / OPT_N_SLOT][i % OPT_N_SLOT]));
+    P("\n#      Gear Reverse TurnL TurnR Boost Jump Stop Reset, two slots each.\n");
+    P("#      0 None, 1 Cross, 2 Circle, 3 Square, 4 Triangle, 5 L, 6 R,\n");
+    P("#      7 Up, 8 Down, 9 Left, 10 Right.\n");
 #undef P
 
     if (n > 0)
         out[n - 1] = 0;
 }
 
-int settings_load(menu_t *m)
+int settings_load(menu_t *m, opts_t *o)
 {
     char text[SETTINGS_TEXT_MAX];
     settings_t s;
@@ -296,14 +377,14 @@ int settings_load(menu_t *m)
     /* Start from what menu_init left, so a file missing a key -- an older one,
        or a hand-written one with two lines in it -- keeps that default rather
        than a zero. */
-    settings_from_menu(m, &s);
+    settings_from_menu(m, o, &s);
     if (!settings_parse(text, &s)) {
         rlog("[rccars] settings: %s is from a newer version -- ignored\n",
              file_path);
         return 0;
     }
     settings_clamp(&s);
-    settings_to_menu(&s, m);
+    settings_to_menu(&s, m, o);
 
     /* This IS what is on the card now, so a menu closed without a change writes
        nothing. */
@@ -315,6 +396,11 @@ int settings_load(menu_t *m)
          file_path, s.track, s.car, s.skin[0], s.skin[1], s.skin[2],
          s.tires, s.reso, s.boost, s.vol_sfx, s.vol_music,
          s.tex_quality, s.tex_swap_rb, s.car_light);
+    rlog("[rccars] settings: options -- sound %d q%d bg %d style %d master %d, "
+         "stick %d sens %d dead %d, map %s\n",
+         s.opt.use_sound, s.opt.quality, s.opt.bg_sound, s.opt.music_style,
+         s.opt.vol_master, s.opt.stick, s.opt.sens, s.opt.dead,
+         opts_is_custom(&s.opt) ? "custom" : "default");
     return 1;
 }
 
@@ -338,7 +424,7 @@ static int write_file(const char *path, const char *text, size_t len)
     return 1;
 }
 
-int settings_save(const menu_t *m)
+int settings_save(const menu_t *m, const opts_t *o)
 {
     char text[SETTINGS_TEXT_MAX];
     char tmp[160];
@@ -346,7 +432,7 @@ int settings_save(const menu_t *m)
     size_t len;
     int ok;
 
-    settings_from_menu(m, &s);
+    settings_from_menu(m, o, &s);
     /* Clamped on the way OUT as well as in. Nothing in the menu can leave a row
        out of range, but this is the file every later launch trusts, and the
        cheapest place to be sure of it is where it is written. */
@@ -398,20 +484,20 @@ int settings_save(const menu_t *m)
     return 1;
 }
 
-int settings_save_if_changed(const menu_t *m)
+int settings_save_if_changed(const menu_t *m, const opts_t *o)
 {
     settings_t s;
 
-    settings_from_menu(m, &s);
+    settings_from_menu(m, o, &s);
     settings_clamp(&s);
     if (have_saved && memcmp(&s, &saved, sizeof(s)) == 0)
         return 0;
-    return settings_save(m);
+    return settings_save(m, o);
 }
 
 /* See settings.h. Two pieces of state and no allocation: the settings the last
    call saw, and how long they have been still. */
-int settings_settle(const menu_t *m, float dt)
+int settings_settle(const menu_t *m, const opts_t *o, float dt)
 {
     static settings_t last;
     static int have_last;
@@ -420,7 +506,7 @@ int settings_settle(const menu_t *m, float dt)
 
     if (!m)
         return 0;
-    settings_from_menu(m, &s);
+    settings_from_menu(m, o, &s);
     settings_clamp(&s);
     if (!have_last || memcmp(&s, &last, sizeof(s)) != 0) {
         /* Something moved. Start the clock again -- a burst of presses keeps
@@ -448,5 +534,5 @@ int settings_settle(const menu_t *m, float dt)
     still += dt > 0.f ? dt : 0.f;
     if (still < SETTINGS_SETTLE_DELAY)
         return 0;
-    return settings_save_if_changed(m);
+    return settings_save_if_changed(m, o);
 }

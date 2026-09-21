@@ -42,7 +42,12 @@
  *                texSpeedMin/Max being pairs is what says the record was filled
  *                by drawing from the range, but the draw itself is at
  *                tessellation time and is not transcribed. water.c hashes the
- *                vertex index, which needs no storage and survives a reload.
+ *                vertex's own POSITION, through the weld map below, which needs
+ *                no storage and survives a reload. It used to hash the vertex
+ *                INDEX, and that is one half of the seam this port had: the
+ *                engine's grid shares its vertices and the authored tiles
+ *                duplicate theirs, so the two sides of every tile edge drew
+ *                their own independent shimmer and the texture tore.
  *   NOT          the pool's UV noise. Its table entry sets the noise flag at
  *                +0x24 and clears the scroll flag at +0x20, so a pool shimmers
  *                in place rather than flowing: 0x523555 jitters each U by
@@ -94,6 +99,60 @@
    Steepness is what the packer prints for each track now, and it is the number
    that says whether the units have been read right -- a height on its own says
    nothing at all. */
+
+/* THE HORIZON RING. Sized against the frustum, not against a track: the far
+   plane is 4000 m (main.c's perspective call), the widest sky dome spans about
+   220 m and is drawn camera-locked, and the authored sea reaches at most ~230 m
+   from the map centre. An inner radius past the map and an outer one short of
+   the far plane puts the ring entirely in the band the tiles cannot reach.
+   32 segments is an 11.25-degree facet, which at these radii is well under a
+   pixel of silhouette error. */
+#define WATER_HORIZON_SEGMENTS 32
+#define WATER_HORIZON_MID  200.0f
+#define WATER_HORIZON_OUT 3000.0f
+/* World metres to UV. The sea texture is a few metres of water, so this is a
+   tile every 8 m -- the same order as the authored tiles carry. */
+#define WATER_HORIZON_UV  0.125f
+/* How many of the surface's outermost vertices the plane's height is averaged
+   over. The swell is what is being averaged away -- a sample of one carries the
+   whole wave -- and the radius band widens until this many are in it. */
+#define WATER_HORIZON_RIM_MIN 64u
+
+/* How close two sea vertices have to be to be the SAME point. The shipped
+   tiles duplicate their shared edges and the duplicates agree only to about a
+   millimetre, so this is sized an order of magnitude above that disagreement
+   and three below the coarsest grid step on any track. */
+/* The ceiling on either seam grid's bucket table, in entries (1 MB of int).
+   The cell size is derived from the sea's extent and this, in double, because
+   the naive 4 mm cell over a 200 m sea is billions of buckets and the product
+   does not fit in a 32-bit long -- which the Vita has and the host does not. */
+#define WATER_GRID_MAX_CELLS 262144u
+
+#define WATER_WELD_TOL 0.004f
+
+/* How far off an edge a vertex may sit and still count as lying ON it. Same
+   reasoning; the T-junction vertices in the shipped meshes are exact to well
+   inside this. */
+#define WATER_STITCH_TOL 0.004f
+
+/* How far the chord may be from the surface before closing the crack costs
+   more than it buys. Above this the vertex is left where the swell puts it and
+   the hairline stays open -- see build_stitch for why the geometric fix is not
+   available here. 5 cm is a tenth of the smallest track's swell and about a
+   pixel at the distance these edges are seen from. The worst case is measured
+   over a phase sweep long enough to cover a full period of both wave trains on
+   every track (the slowest is beach_1's 3.5 s). */
+#define WATER_STITCH_MAX_SAG 0.05f
+#define WATER_STITCH_SWEEP_T 8.0f
+#define WATER_STITCH_SWEEP_N 24
+
+/* One T-junction: vertex `v` sits at fraction `t` along the edge a..b of a
+   neighbouring tile, so after the swell has moved a and b its height has to be
+   put back on the chord or the surface splits along that edge. */
+typedef struct {
+    unsigned short v, a, b;
+    float t;
+} wstitch_t;
 
 /* Depth over which the surface ramps from alphaMin to alphaMax.
  *
@@ -193,7 +252,10 @@
 #define WATER_MAX_SPAWN 8
 
 typedef struct {
-    float x, y, z;          /* current position, world */
+    float x, y, z;          /* current position, world; `y` is the marker's own
+                               and is no longer what the sprite is drawn at --
+                               see wave_base_y */
+    float sea_y;            /* rest height of the sea surface under the spawner */
     float dx, dz;           /* unit travel direction, ground plane */
     float life, age;        /* seconds */
     float u0;               /* texture scroll offset at birth */
@@ -202,6 +264,7 @@ typedef struct {
 
 typedef struct {
     float x, y, z;
+    float sea_y;            /* the sea's rest height at this marker */
     float dx, dz;           /* the marker's facing */
     float t_long, t_short;  /* the two spawn timers */
 } wave_spawn_t;
@@ -262,6 +325,44 @@ typedef struct {
     vtx_t **vring[WATER_DRAW_RINGS];
     unsigned int ring;
 
+    /* THE SEAM TABLES. Both exist because the port displaces AUTHORED tiles
+     * where the engine displaces a grid it tessellates itself -- see
+     * WATER_WELD_TOL and wstitch_t above.
+     *
+     *   site[bi][j]  the vertex whose rest position speaks for j. Coincident
+     *                vertices at a tile seam are DUPLICATED in the shipped
+     *                mesh -- 646 of beach_1's 7,007 -- and only about half of
+     *                them agree bit for bit, so keying anything per-vertex
+     *                makes the two sides of a seam disagree. Everything
+     *                position-derived is read through this: the height, the
+     *                depth damping and the UV orbit's own hash.
+     *   stitch[bi]   the T-JUNCTIONS. A vertex of a finely tessellated tile
+     *                that lands on the INTERIOR of a coarser neighbour's edge
+     *                is not coincident with anything, so welding cannot reach
+     *                it: the fine side follows the swell and the coarse side
+     *                stays a chord, and the surface opens. 269 on beach_1,
+     *                the longest edge 17.4 m against a 10.5 m wavelength, so
+     *                the crack is the full swell: 0.34 m there and 0.60 m on
+     *                beach_3.
+     *                Each entry pins one vertex's height to the lerp along the
+     *                edge it sits on. */
+    int **site;
+    wstitch_t **stitch;
+    unsigned int *n_stitch;
+
+    /* THE HORIZON. The engine's water is a LOD grid it lays out around the
+       camera (_wlodQual, _wlodRRProcessStripe, the lod0..lod4 sliders); the
+       port's is the authored tiles, which stop at the edge of the map. Stand
+       near that edge and the sea ends short of the sky dome -- which is drawn
+       camera-locked, i.e. at infinity -- and the band between them is a hole.
+       This is one flat plane at the sea's own mean level, drawn with the sky
+       and before anything else, so every pixel the world covers is still the
+       world's. Zero on a track with no sea surface at all. */
+    int   horizon;          /* 1 when this track has a sea to continue */
+    float horizon_y;        /* world height of the mean sea surface */
+    GLuint horizon_tex;     /* the sea batch's own texture */
+    float horizon_alpha;    /* the deep-water alpha, WSURF alphaMax */
+
     GLuint wave_tex;
     wave_t waves[WATER_MAX_WAVES];
     wave_spawn_t spawn[WATER_MAX_SPAWN];
@@ -297,6 +398,14 @@ void water_step(water_t *w, float dt);
    world; leaves GL state as it found it. `eye` is the camera position, which
    the wave sprites billboard about their crest towards. */
 void water_draw(water_t *w, const float eye[3]);
+
+/* The horizon sea: one camera-centred plane at the track's own mean sea level,
+   reaching past the sky dome. Draw it WITH THE SKY -- after the dome, before
+   the world, depth test and depth write both off -- so it fills only what
+   nothing else covers. Does nothing on a track with no sea, and nothing when
+   the eye is at or below the surface (there is no horizon to fill from under
+   the water). `eye` is the camera position. */
+void water_draw_horizon(const water_t *w, const float eye[3]);
 
 /* The surface's displacement at (x, z) -- the same sum the surface batches
    use, before the depth damping and before the track's vertical offset. Handy

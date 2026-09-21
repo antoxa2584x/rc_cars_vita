@@ -272,16 +272,20 @@ static int ground_contact(props_t *pr, prop_t *p, const prop_model_t *pm,
     return 1;
 }
 
-/* The car, one-way -- see the note at the top of prop.h.
+/* The car -- BOTH WAYS now; see the note at the top of prop.h for why the
+ * reaction is not an invented force but the other half of an impulse this was
+ * already solving.
  *
  * `closing` takes the HARDEST closing speed of this call, along the contact
  * normal: it is what the sound is scaled by, and the loudest of several
  * simultaneous sphere contacts is the one that describes the knock. */
-static int car_contact(prop_t *p, const prop_model_t *pm, const rb_car *car,
+static int car_contact(prop_t *p, const prop_model_t *pm, rb_car *car,
                        const float (*cs)[4], int ncs, const float m[16],
                        float inv_m, float inv_i, float *closing)
 {
     int i, k, hit = 0;
+    /* The car's own mass, not the compiled-in one -- see PROP_CAR_MASS. */
+    float cm = (car->body.mass > 0.f) ? car->body.mass : PROP_CAR_MASS;
     for (i = 0; i < pm->n_spheres; i++) {
         float pc[3], pr_ = sphere_world(p, pm, i, m, pc);
         for (k = 0; k < ncs; k++) {
@@ -292,6 +296,20 @@ static int car_contact(prop_t *p, const prop_model_t *pm, const rb_car *car,
             dl = v3_len(d);
             if (dl >= pr_ + cs[k][3] || dl < 1e-6f)
                 continue;
+            /* IN CONTACT, which is a different question from being HIT, and the
+               reaction is what forced them apart. `hit` (and through it
+               prop_t.touched, the sleep timer and the sound's edge) means the
+               car and this prop are OVERLAPPING; the impulse below wants the
+               pair to be CLOSING as well.
+             *
+               They used to be the same line, and they agreed while nothing the
+               prop did could move the car: a car leaning on a can had vn == 0,
+               which is not `> 0`, so the overlap fell through to here anyway.
+               With the reaction the pair separates for a step and re-closes the
+               next, so raising `hit` after the impulse made a held contact
+               report as intermittent -- 98 steps of 240 in proptest part 7, and
+               three chirps where a wedged can should make one. */
+            hit = 1;
             n[0] = d[0] / dl; n[1] = d[1] / dl; n[2] = d[2] / dl;
 
             /* Velocity of the CAR at the contact, so a spinning car flicks a can
@@ -322,15 +340,53 @@ static int car_contact(prop_t *p, const prop_model_t *pm, const rb_car *car,
                 float pen = (pr_ + cs[k][3]) - dl;
                 v3_mad(p->pos, n, pen);
             }
-            /* Two-body reduced mass, applied to the prop only -- see
-               PROP_CAR_MASS in prop.h for why the infinite-mass form is wrong
-               here even though the reaction is deliberately dropped. */
+            /* Two-body reduced mass -- see PROP_CAR_MASS in prop.h for why the
+               infinite-mass form is wrong here. The prop's side of this is
+               UNCHANGED by the reaction below: bit for bit the impulse it
+               received before, which is what keeps parts 4, 5 and 8 measuring
+               what they measured. */
             jn = -(1.f + pm->restitution) * vn
-                 * (PROP_CAR_MASS / (pm->mass + PROP_CAR_MASS))
+                 * (cm / (pm->mass + cm))
                  / contact_denom(inv_m, inv_i, rel, n);
             imp[0] = n[0] * jn; imp[1] = n[1] * jn; imp[2] = n[2] * jn;
             apply_impulse(p, inv_m, inv_i, imp, pc);
-            hit = 1;
+            /* AND THE EQUAL AND OPPOSITE ONE ON THE CAR -- AT ITS CENTRE OF
+             * MASS, so the car is SLOWED and not SPUN.
+             *
+             * That placement is the port's one deliberate divergence in this
+             * contact and it is worth being explicit about, because applying the
+             * same impulse at the contact POINT is the textbook thing to do and
+             * it was tried first. `jn` above carries the car's mass through the
+             * reduced-mass scalar and nothing of its rotational inertia, so an
+             * off-centre reaction is sized as though the car could only
+             * translate: measured over the thirteen models on beach_1, driving
+             * into a traffic cone put the car at 441 deg/s of yaw and a
+             * tumbleweed at 785, against 12 deg/s for the same drive with
+             * nothing in the way. Putting the car's own rb_impulse_denom in the
+             * denominator as well -- the correct two-body solve, and the
+             * engine's own 0x004754a0 -- sizes the impulse properly and still
+             * leaves the spin, because a 2 kg 0.42 m car hit off-centre by a
+             * 1 kg cone at 5.5 m/s really does rotate that fast. The spin is
+             * physical; it is a handling change, and slowing the car is what
+             * this layer was asked for.
+             *
+             * So: the LINEAR half of the reaction, exactly, and the angular half
+             * dropped. r = 0 makes rb_apply_impulse's `r x j` vanish, which is
+             * why the centre of mass is passed rather than the contact. Linear
+             * momentum is conserved to the float (proptest part 9a); angular
+             * momentum is not, and that is the trade, stated here.
+             *
+             * INSIDE the loop, so the next sphere pair of the same step reads a
+             * car that has already been slowed -- the pair is Gauss-Seidel over
+             * a cluster of contacts the way the car's own solve is, and a can
+             * under a wheel cannot collect the same hit from thirteen spheres at
+             * once. `vn > 0` above is what closes it: once the pair is
+             * separating there is no further impulse. */
+            {
+                float back[3];
+                back[0] = -imp[0]; back[1] = -imp[1]; back[2] = -imp[2];
+                rb_apply_impulse(car, car->body.x, back);
+            }
             /* vn is negative when closing, and this runs BEFORE the impulse has
                changed anything the caller can see. */
             if (closing && -vn > *closing)
@@ -340,7 +396,7 @@ static int car_contact(prop_t *p, const prop_model_t *pm, const rb_car *car,
     return hit;
 }
 
-void prop_step(props_t *pr, const rb_car *car, float dt)
+void prop_step(props_t *pr, rb_car *car, float dt)
 {
     float cs[RB_MAX_WHEELS + 16][4];
     int ncs = 0, i;

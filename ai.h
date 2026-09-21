@@ -372,6 +372,54 @@ typedef struct {
      * that a car is somebody else's -- which is the whole reason a remote car
      * is an ai_car in the first place. See net.h. */
     int   remote;
+
+    /* -- THE ENGINE'S OWN DISPATCH. See the block above AI_PHYS_LOST_T.
+     *
+     * `phys_mode' IS `phys+0x4398': zero and the car is the replay this file has
+     * always been, nonzero and it is a real rb_car that carPhysTick -- here
+     * rbcar_step -- integrates, with the recovered controller on the sticks.
+     * Zero on every car a caller memsets, so a field nothing touches is
+     * bit-identical to one from before this existed, which is the property
+     * aitest part 9 already checks the offset for.
+     *
+     * `phys_t' is `phys+0x439c', seconds since the mode was armed: the two exit
+     * tests and the controller's own full-lock second are all read off it. */
+    int   phys_mode;
+    float phys_t;
+    /* Seconds the mode is held open for, refreshed by every contact -- see
+       AI_PHYS_HOME_MIN. The exit tests do not run while it is positive. */
+    float phys_hold;
+    /* The controller's own rate-limited steer angle, DEGREES, carried between
+       ticks because AI_CTRL_RATE limits how fast it may change. */
+    float ctrl_steer;
+
+    /* -- THE EASE HOME, FUN_00503190 driven by the `phys+0x443c' countdown that
+     * FUN_004fda10 arms at 1.0. While it is running the pose is dead-reckoned
+     * from where the car ACTUALLY ended up (`blend_x'/`blend_q', the snapshot
+     * FUN_004fda10 takes off `phys+0x5884'/`+0x5890'), carried forward by the
+     * step the RECORDING took, and lerped toward the recording by `1 - t'.
+     *
+     * This is what makes leaving the mode continuous. The port's own answer used
+     * to be to zero the offset, which is a jump of up to the whole offset and is
+     * the reported "they teleport"; the engine's only snap is AI_BLEND_SNAP, two
+     * metres. `ai_seam_latch' arms the same blend at the lap seam, which is
+     * FUN_00503880's own fourth call to FUN_004fda10. */
+    float blend_t;
+    float blend_x[3];
+    float blend_q[4];
+    /* METRES OF POSITIONAL DEPENETRATION this car has taken THIS TICK.
+     *
+     * The engine has no positional push between cars at all (`carSubstepCCD`
+     * caps a car's advance at 0.9 of a sphere radius per substep, so the proxies
+     * barely overlap); the port has one because it has no CCD between cars. On a
+     * kinematic car it was bounded by `ai_bump_clamp`. On a SIMULATED one it
+     * went straight into the body, AI_DEPEN_PASSES times, and 8 passes of up to
+     * 0.285 m is a 1.457 m step -- measured, against a player control in the
+     * same places that never once exceeded its own velocity. So it is budgeted:
+     * a car may not be pushed further in a tick than it could DRIVE in a tick,
+     * which is the same bound aitest part 9 case 4c holds the offset to. What a
+     * car refuses, `ai_actor_move` already hands to the other body. */
+    float sim_push;
 } ai_car;
 
 typedef struct {
@@ -639,8 +687,27 @@ const float *ai_matrix(const ai_t *ai, int i);
    and voice-budget decisions main.c has to make. */
 int   ai_within(const ai_t *ai, int i, float x, float y, float z, float d);
 
+/* THE PLAYER'S OWN PROGRESS ROUND THE TRACK, and nothing else: `player_dist',
+ * `player_at', `player_lap_seam', `player_at_proj' and `player_cp'. `ai_step'
+ * calls it first and a caller that does not step the field at all calls it
+ * instead -- which is a NETWORK RACE, where every other car is somebody else's
+ * and the step is not called (ai_car.remote, and main.c's own gate).
+ *
+ * WITHOUT IT THE PLACING IS A CONSTANT. `ai_player_place' ranks the player's
+ * cumulative distance against every car's, and a `player_dist' left at 0 puts
+ * the player behind everybody who has moved: two Vitas racing each other both
+ * read `2nd', from the grid to the flag, and so did the lap watch that shares
+ * the quantity (main.c's own, which is why a network race filed no best lap).
+ *
+ * -> whether the SPINE PROJECTION answered, which is `ai_step's own
+ * `have_spine' and means the track's spine is bound and usable. The lap
+ * progress is a separate query and is applied whether or not it did. */
+int   ai_player_progress(ai_t *ai, const ai_track *tr,
+                         float px, float py, float pz);
+
 /* Race placing 1..n+1 for the player, by cumulative spine distance. Needs
-   ai_step to have run at least once with a non-NULL `tr`. */
+   ai_step -- or ai_player_progress, in a network race -- to have run at least
+   once with a non-NULL `tr`. */
 int   ai_player_place(const ai_t *ai);
 
 /* WHERE EACH CHECKPOINT REALLY FALLS ROUND A LAP, as a fraction in [0, 1), fitted
@@ -813,6 +880,14 @@ float ai_collide_player(ai_t *ai, rb_car *player, float dt);
  * impulse and measure the recovery against it, rather than having to arrange a
  * collision and then argue about what the collision delivered. */
 void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
+
+/* ARM THE ENGINE'S PHYSICS MODE on opponent `i` -- FUN_004fd9d0, reachable from
+ * outside for the same reason ai_bump_impulse is: a fixture wants to put a car
+ * into the state without having to stage a collision first, and a caller that
+ * hits an opponent by some path ai.c does not own (a prop, a character) has to
+ * be able to say so. Idempotent. -> nothing; ai_phys_active reads it back. */
+void ai_phys_bump(ai_t *ai, int i);
+int  ai_phys_active(const ai_t *ai, int i);
 
 /* Broad phase for the above: an opponent further than this from the player
  * cannot be touching it. The proxy reaches about 0.30 m from a centre of mass
@@ -1082,6 +1157,167 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  * reasoning: after it, the spring has finished and whatever is still true is
  * going to stay true. */
 #define AI_BURIED_SETTLE 3.0f
+
+/* =========================================================================
+ * THE ENGINE'S OWN DISPATCH -- a replay UNTIL SOMETHING TOUCHES IT, and a
+ * FULLY SIMULATED CAR from that moment until it is back on its line.
+ * =========================================================================
+ *
+ * TRANSCRIBED, not invented, and it replaces an invention. `docs/ai-opponents.md`
+ * has the whole correction; the short form is that this project believed
+ * `phys+0x4398` had "exactly two writers", both after the flag, and therefore
+ * that a retail opponent was a kinematic replay nothing could move. It has
+ * ELEVEN more, and the first two are `FUN_00533990` -- the `$CAR`/`$CAR`
+ * collision resolver -- arming it on BOTH cars of every contact.
+ *
+ *     phys+0x4398 == 0  ->  FUN_00503880, the replay (what this file did)
+ *     phys+0x4398 != 0  ->  carPhysTick, a REAL car, with FUN_004fddd0
+ *                           steering it back to its recorded path
+ *
+ *     FUN_004fd9d0  (PS2: carAiStartPhysicsMode)  sets it, on contact
+ *     FUN_004fda10  (PS2: carAiEndPhysicsMode)    clears it, snapshots the
+ *                                                 pose and arms a 1 s blend
+ *
+ * The PS2 build of this engine is not stripped and names all of it; see
+ * `C:\tools\smashcars_ps2\README.md`.
+ *
+ * WHY IT IS AFFORDABLE, when this file argued for a long time that it was not.
+ * That argument ("three simulated cars do not fit in a Vita frame") is about
+ * simulating the WHOLE FIELD ALL RACE, which the engine does not do either. It
+ * simulates only cars that have been TOUCHED, for as long as it takes them to
+ * get home -- a second or two, and rarely more than one car at a time.
+ *
+ * WHAT IT RETIRES. Everything that exists to give a kinematic replay somewhere
+ * to go: the burial respawn (an instant teleport with no counterpart anywhere in
+ * the engine), the wall stop, and the offset's role as the place a contact
+ * lands. A car in this mode takes contacts in its own rigid state, the way the
+ * player does -- `ai_actor` hands it through with `ai = NULL`.
+ */
+
+/* HOW LONG BEFORE A LOST CAR GIVES UP AND SNAPS BACK, seconds -- `0x554730`,
+   read at `0x4fdbe5`. Guarded by "and nothing can see it": FUN_004fd440 with
+   AI_PHYS_SEE_NEAR / _FAR below. */
+#define AI_PHYS_LOST_T     5.0f
+/* THE WINDOW IN WHICH THE CHEAP EXIT IS TESTED, seconds -- `0x5543c8` (2.0),
+   read at `0x4fdcbd`. Past it only the lookahead test can end the mode. */
+#define AI_PHYS_SETTLE_T   2.0f
+/* HOW CLOSE TO THE LINE COUNTS AS HOME, metres -- `0x554424`, read at
+   `0x4fdcf2` and again at `0x4fdd71`. Tested HORIZONTALLY, against the nearest
+   point on the path and against the lookahead point. */
+#define AI_PHYS_HOME_DIST  0.10f
+/* AND HOW WELL ALIGNED, degrees -- `0x554490`, read at `0x4fdd12`. The angle is
+   between the car's heading and its own VELOCITY (`phys+0x58e0`), so a car
+   sliding sideways across its line is not home however close it is. */
+#define AI_PHYS_HOME_ANG   10.0f
+/* The "is anybody looking" pair handed to FUN_004fd440 at `0x4fdbf6`. */
+/* HOW LONG AFTER THE LAST CONTACT THE CAR STAYS SIMULATED, seconds. THE PORT'S.
+ *
+ * Without it the mode is a no-op and the whole feature does nothing visible,
+ * which is what "when i hit ai car, it just stops and not bumps" was. The exit
+ * test is "is the car back on its line", and a car rammed from BEHIND never
+ * leaves its line -- so it armed the mode, passed the exit test on the very next
+ * tick, and handed straight back to the blend, which then eased the body back
+ * onto the recording and wiped the velocity the hit had just given it. The car
+ * absorbed the blow and showed nothing.
+ *
+ * So the mode is held open for a moment after every contact, and `ai_phys_start`
+ * refreshes it on every touching tick -- a car being leaned on stays simulated
+ * for as long as the lean lasts, and for this long afterwards. That is the
+ * window in which a shove is actually a shove. */
+#define AI_PHYS_HOME_MIN   0.35f
+
+/* HOW HARD A CONTACT HAS TO BE TO HAND A CAR TO THE PHYSICS, m/s of closing
+ * speed. Anchored to the engine's own REST CLAMP: `FUN_004f6610` treats a car
+ * slower than 0.18 m/s as stopped (`physics.md` -- the test reads |P| over a
+ * 2 kg body, so it trips at |v| = 0.18). A touch that closes slower than the
+ * speed at which the engine stops believing a car is moving is not an impact.
+ *
+ * WITHOUT IT THE FIELD STOPS REPLAYING ITS OWN LAPS. The three recordings on a
+ * track were driven on three different afternoons and run nose to tail 0.74 m
+ * apart for the whole lap (`ai-opponents.md`), so their proxies brush
+ * constantly at near-zero closing speed -- and arming on those put cars into
+ * simulation semi-permanently. Measured with `progchk`: an opponent covering
+ * "exactly one spine length per lap of road" drifted **-30.91 m/lap** on two of
+ * the ten tracks, and the placing regressed on three more (`wideline`). With
+ * the mode disabled outright both files were byte-identical to the pre-change
+ * reference, which is what identified it.
+ *
+ * The HOLD is a separate question and refreshes on ANY touch, so a player
+ * LEANING on a car -- whose closing speed is ~0 after the first instant --
+ * keeps it simulated for as long as the lean lasts. Arming asks "was this a
+ * hit"; holding asks "are we still touching". */
+#define AI_PHYS_MIN_HIT    0.18f
+#define AI_PHYS_SEE_NEAR   50.0f
+#define AI_PHYS_SEE_FAR   100.0f
+
+/* THE RECOVERED CONTROLLER, FUN_004fddd0 -- every constant already written down
+ * in docs/ai-opponents.md, "The other mode, recovered and deliberately not
+ * transcribed". It is transcribed now. The lookahead is the same FUN_004fda90
+ * ai_steer_decide already uses, which is why they share ai_path_ahead. */
+#define AI_CTRL_LOOKAHEAD   2.7f    /* metres up the path -- `0x402ccccd` */
+#define AI_CTRL_DEADBAND    0.5f    /* degrees of slop before it steers at all */
+#define AI_CTRL_LOCK       35.0f    /* degrees, the controller's own clamp */
+#define AI_CTRL_RATE       90.0f    /* degrees per second of steer rate limit */
+#define AI_CTRL_FULL_T      1.0f    /* full lock for the first second */
+#define AI_CTRL_V_NEAR      4.0f    /* m/s wanted within AI_CTRL_D_NEAR */
+#define AI_CTRL_V_FAR      10.0f    /* m/s wanted at AI_CTRL_D_FAR and beyond */
+#define AI_CTRL_D_NEAR      1.0f
+#define AI_CTRL_D_FAR      10.0f
+#define AI_CTRL_ANG_K       0.025f  /* speed *= 1 - k*|angle| ... */
+#define AI_CTRL_ANG_FLOOR   0.5f    /* ... floored here, i.e. past 20 degrees */
+/* HOW MANY SEGMENTS FORWARD the nearest-point search looks (FUN_004fd8b0 is
+ * "searched from the last cursor", and this is the port's bound on that).
+ *
+ * FORWARD-ONLY AND WINDOWED IS THE POINT, not a cost saving: traps.md records
+ * three failed attempts at projecting onto a polyline, and where a track passes
+ * near itself the nearest segment is genuinely ambiguous -- a search anchored on
+ * the previous answer is the only form that is not. Samples are 5 to 25 cm
+ * apart, the cursor is re-synced every tick and a car moves ~0.1 m in one, so
+ * the window only has to cover a car that has been thrown; 192 segments is 9 to
+ * 48 m of road. It is paid only by cars that have been TOUCHED.
+ *
+ * AND IT IS CENTRED. AI_CTRL_BACK of those segments are BEHIND the cursor,
+ * because a car that has been knocked backwards or spun round is genuinely
+ * behind it -- a forward-only sweep then picks the nearest point it is allowed
+ * to see, which teleports the cursor up the path and takes `dist` with it. */
+#define AI_CTRL_SEARCH    512      /* hard sample guard; the real bound is below */
+/* AND THE REAL BOUND IS IN METRES, NOT SAMPLES, because a sample count is a
+ * different distance on every profile -- beach_3's are 6 cm apart and beach_2's
+ * 25 -- so a window sized in samples is 11 m of road on one track and 48 on
+ * another. On the 6 cm one that let the search reach a place the track passes
+ * near ITSELF and latch onto it: measured as a car's recorded position jumping
+ * 11.993 m in one tick while the car moved 0.042 m, which takes `dist` and the
+ * placing with it. It is the aliasing traps.md records three failed attempts at,
+ * and the fix is the same one -- keep the window smaller than the ambiguity.
+ *
+ * A car moves at most 0.162 m in a tick and is re-synced every tick, so forward
+ * only has to cover one tick plus slack. Backward has to cover a car that was
+ * just knocked back, which is bounded by its own proxy reach. */
+#define AI_CTRL_FWD_M     3.0f
+/* AND THE SEARCH DOES NOT RETREAT. The cursor is where the car is ON THE TRACK,
+ * and letting it slide backwards is a positive feedback loop that turns the car
+ * round: the controller aims AI_CTRL_LOOKAHEAD metres past the cursor, so a
+ * cursor that has moved behind the car puts the target behind it too, the car
+ * turns to chase it, that moves the nearest point further back again, and it
+ * drives away down the track until the lost-exit snaps it home.
+ *
+ * Measured on a 2 m/s knock: cursor 93 -> 149 -> 84 over three seconds while the
+ * car went from 0.13 m off its line to 4.25 m and stalled at 0.1 m/s, then the
+ * 5 s timeout fired. `FUN_004fd8b0` is "searched FROM the last cursor" for this
+ * reason. The slack below is numerical only -- enough that a car sitting exactly
+ * on a sample cannot chatter between two segments. */
+#define AI_CTRL_BACK_M    0.25f
+
+/* HOW LONG THE EASE HOME TAKES once the mode ends -- the countdown
+ * `phys+0x443c` that FUN_004fda10 sets to 1.0f and FUN_00503880 decrements by
+ * dt, read by FUN_00503190 as `t = 1 - countdown`. One second.
+ *
+ * AND THE GIVE-UP: past this many metres adrift FUN_00503190 abandons the blend
+ * and takes the recording outright. That is the ONLY snap anywhere in the
+ * engine's opponent model, and it is 2 m -- which is what makes the burial
+ * respawn this replaces indefensible. */
+#define AI_BLEND_T          1.0f
+#define AI_BLEND_SNAP       2.0f
 
 /* ------------------------------------------------------ the steering decision
  *

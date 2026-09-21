@@ -56,7 +56,10 @@ copying:
 ./build.sh --import "/path/to/RC Cars"
 ```
 
-Either way you end up with `build/rccars_viewer.vpk`, ready for VitaShell.
+Either way you end up with `build/rc_cars_vita<BUILD_VERSION>.vpk` -- today
+`build/rc_cars_vita0.8.vpk` -- ready for VitaShell. The version is
+`BUILD_VERSION` in `CMakeLists.txt`, and it is bumped on every commit; see
+BUILD.md, "Versioning".
 
 <details>
 <summary><b>What goes in <code>game_data/</code></b></summary>
@@ -101,7 +104,7 @@ its input, so the second run goes straight to compiling.
 | `tables` | `gen_tracks.py`, `gen_font.py`, `gen_char_data.py`, `gen_hud_data.py`, `gen_dlg_data.py`, `gen_str_data.py`, `gen_champ_data.py`, `gen_sce_sys.py` | `tracks.h`, `font.h`, `char_data.h`, `hud_data.h`, `dlg_data.h`, `str_data.h`, `champ_data.h`, the app art |
 | `ai` | `gen_ai_data.py`, `pack_ai.py` | `ai_data.h` and ten `.aip` opponent paths |
 | `check` | `vsc_check.py` | every packed scene, against its source `.sb` — exit 0 is clean |
-| `build` | cmake + make | `build/rccars_viewer.vpk` |
+| `build` | cmake + make | `build/rc_cars_vita<BUILD_VERSION>.vpk` |
 
 The movies are ~21 MB on the card and the port does not need them: deleting
 `assets/intro.vid` is how you turn the launch sequence off, which is what the
@@ -461,7 +464,7 @@ export VITASDK=/usr/local/vitasdk
 export PATH=$VITASDK/bin:$PATH        # a separate statement — see below
 mkdir -p build && cd build
 cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake ..
-make -j8                              # -> rccars_viewer.vpk
+make -j8                              # -> rc_cars_vita<BUILD_VERSION>.vpk
 ```
 
 Packaging notes that cost time once already:

@@ -34,6 +34,26 @@
    fall through the pier onto the seabed while the car is airborne. */
 #define SHADOW_DEPTH 1.5f
 
+/* THE PORT'S, and the only invented number in this file: how much darker than
+ * the engine's own ShadowDensity the shadow is drawn. Asked for -- the shadow
+ * read as too faint -- so it is a look decision and not a recovered one, and it
+ * lives here at the point of use rather than in vis_data.h beside the values
+ * that came out of the game.
+ *
+ * The anchor is the alpha it produces. ShadowDensity is 34, i.e. 0.133, and the
+ * engine spends it on a silhouette RE-RENDERED from above onto the render faces
+ * it marks; this port projects one BAKED texture onto COLLISION faces, which are
+ * coarser and carry no lighting of their own, so the same alpha does not cover
+ * the same pixels. 1.5 puts the peak at 51/255 = 0.200: still far under the 0.5
+ * alpha test the world draws at (which is why shadow_project turns that test
+ * off), and still translucent enough to read as a shadow rather than as paint.
+ *
+ * ONE PLACE ONLY. sh->density is what every draw multiplies, so changing this
+ * cannot leave a second copy behind -- and vis_test part 4 holds the product
+ * against the recovered 34 written out longhand, so a mutant has to break two
+ * copies rather than one. */
+#define SHADOW_DARKEN 1.5f
+
 void shadow_init(shadow_t *sh, const scene_t *src, int car)
 {
     static const float size[3] = SHADOW_SIZE;
@@ -47,7 +67,9 @@ void shadow_init(shadow_t *sh, const scene_t *src, int car)
     if (src && src->shadow_radius > sh->size)
         sh->size = src->shadow_radius;
     sh->shift = shift[car];
-    sh->density = (float)SHADOW_DENSITY / 255.f;
+    sh->density = (float)SHADOW_DENSITY / 255.f * SHADOW_DARKEN;
+    if (sh->density > 1.f)
+        sh->density = 1.f;
     sh->enabled = (sh->tex != 0);
 }
 

@@ -63,10 +63,35 @@ Two packaging gotchas worth remembering:
                                       # because it is the only LOAD-ONCE scene
     mkdir -p build && cd build
     cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake ..
-    make -j8            # -> rccars_viewer.vpk
+    make -j8            # -> rc_cars_vita<BUILD_VERSION>.vpk, e.g. rc_cars_vita0.8.vpk
 
 Current `beach_1` payload: 74 textures (3.7 MB of pixels), 75 draw batches,
 57,636 vertices, 52,358 triangles, 5.1 MB scene file, 2.9 MB vpk.
+
+## Versioning
+
+`BUILD_VERSION` in `CMakeLists.txt` is the ONE place the version is written. It
+is `MAJOR.MINOR`, it names the package -- `rc_cars_vita<BUILD_VERSION>.vpk` --
+and the sfo's fixed-width `APP_VER` is derived from it (`0.8` -> `00.80`; the
+minor pads on the RIGHT, because it is a fraction). `build.sh` reads it back out
+of `CMakeLists.txt` with `sed` rather than keeping a second copy, so there is
+nothing to keep in step.
+
+**Bump it before every commit, by what the commit changes:**
+
+| change | bump | example |
+|--------|------|---------|
+| a new subsystem, a mode, a screen -- anything a player would notice as new | MINOR +1 | 0.8 -> 0.9 |
+| a fix, a tuning change, a refactor, notes, tools | MINOR +0.01 | 0.8 -> 0.81 |
+| the port is feature-complete against the retail game | MAJOR +1 | 0.9 -> 1.0 |
+
+The point is the file on the card: two vpks in a downloads folder are told apart
+by their names, and a tester reporting a bug reads the version off the LiveArea
+bubble. A commit that does not bump leaves two different builds sharing one
+name, which is the one failure this scheme exists to prevent.
+
+Only `MAJOR.MINOR` is accepted, both numeric, major below 100 -- cmake stops the
+configure otherwise rather than letting `vita-mksfoex` reject the sfo later.
 
 ## App identity: the bubble and the LiveArea
 
@@ -104,7 +129,7 @@ visible. The files also come out about 3x smaller.
 Two guards, because a stale build directory would look fixed:
 
     python3 rccars_re/gen_sce_sys.py                    # regenerate, verify on disk
-    python3 rccars_re/gen_sce_sys.py --check-vpk build/rccars_viewer.vpk
+    python3 rccars_re/gen_sce_sys.py --check-vpk build/rc_cars_vita0.8.vpk
 
 `verify()` re-reads each IHDR after writing; `check_vpk` asserts the same of the
 art *inside* the packaged vpk, which is the file that actually gets promoted.
@@ -550,7 +575,7 @@ leaves the previous binary sitting there to answer for it:
           rockroll allstarts track wetcheck proptest chartest ceiling audio_test \
           colprof flipped antheight aitest chrfloat dogstuck curb hudshot wideline \
           mainmenu_test menushot results_test finishshot introtest player_test \
-          cpwide \
+          cpwide respawn \
           garage_test champ_test net_test
 
     gcc -I. -O2 -fno-fast-math -ffp-contract=off \
@@ -622,14 +647,17 @@ leaves the previous binary sitting there to answer for it:
         -lm -o menu_test    # the menu. The model is on this line because the
                             # booster row quotes rb_boost_capacity -- the menu
                             # names the tank size the upgrade buys.
-    gcc -I. -O2 rccars_re/settings_test.c settings.c menu.c rlog.c \
+    gcc -I. -O2 rccars_re/settings_test.c settings.c menu.c rlog.c opts.c \
         contact.c rb.c collide.c -lm -o settings_test
                             # the SETTINGS FILE -- ux0:data/rccars/settings.txt.
                             # menu.c is on the line for menu_init, which is where
                             # every default the file may omit comes from, and
                             # rlog.c because settings.c says what it read; the
                             # model tags along behind menu.c as it does for
-                            # menu_test. Runs on files in the current directory
+                            # menu_test. opts.c is the OPTIONS SCREEN's half of
+                            # the same file -- dlgSOUND's six switches and the
+                            # whole control map ride in settings.txt beside the
+                            # menu's rows and on the same two write events. Runs on files in the current directory
                             # through settings_set_path and removes them again.
                             # 74 checks; 21 of 23 mutants die, and the two that
                             # live are named in the file's own header.
@@ -763,9 +791,31 @@ leaves the previous binary sitting there to answer for it:
                             # the rule every other line here is blind to. `-v'
                             # prints the 200-row table. 4 of 4 mutants die.
                             # Exits non-zero.
+    gcc -I. -Itestgl -O2 -Wall rccars_re/respawn.c scene.c checkpoint.c col.c \
+        ai.c rb.c rbcar.c contact.c collide.c carani.c rlog.c carlight.c \
+        rccars_re/glstub_host.c -lm -o respawn
+                            # WHICH WAY A RESPAWN FACES, and WHERE THE DEEP SAND
+                            # IS. Four parts, and two of them carry the rule they
+                            # replaced:
+                            #   1. the spine heading against the raw recorded lap,
+                            #      with the shipped road rule beside it. The SPINE
+                            #      column has to go on failing (25 of 50 past 90
+                            #      deg, worst 171) or this probe has stopped being
+                            #      able to see the bug, which is asserted.
+                            #   2. the COL4 surface-class histogram per track, the
+                            #      deep sand's area and how much of each racing
+                            #      line crosses it.
+                            #   3. end to end on beach_1: a wheel on Sand_trample
+                            #      reports class 3 and carSurfaceDrag resists it,
+                            #      with the ordinary-sand run as the control.
+                            #   4. the respawn DROP on every checkpoint of every
+                            #      track, against the same respawn without it --
+                            #      because "still moving two seconds later" is
+                            #      beach_4's 20 deg slope and not the drop.
+                            # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/mainmenu_test.c mainmenu.c champ.c \
         touch.c ui.c sfont.c records.c rlog.c player.c garage.c \
-        net.c ime.c -lm -o mainmenu_test
+        net.c ime.c opts.c -lm -o mainmenu_test
                             # THE MAIN MENU's input and its HIT BOXES -- the half
                             # a picture cannot answer. The focus ring skipping the
                             # five unbuilt rows, a drag off a button cancelling it,
@@ -801,10 +851,25 @@ leaves the previous binary sitting there to answer for it:
                             # internal names, and the record book behind
                             # `Track stats' -- the merge, the sort with `n/a'
                             # last, and a round trip through its own file.
+                            #
+                            # AND THE OPTIONS SCREEN's three pages: each ring
+                            # walked a full lap, the two PINNED enums skipped,
+                            # the three bars with nothing behind them denying,
+                            # Video options raising the overlay WITHOUT leaving
+                            # the page, a volume clamping where a picker wraps,
+                            # and the sixteen cells of the control table each
+                            # having a box to aim at. The one that earns its
+                            # place is the REBIND INVARIANT -- a hundred
+                            # arbitrary binds and then a sweep for any button
+                            # held in two slots, because "no conflicts" on that
+                            # page is a claim about opts_bind and not a message
+                            # it computes. Plus opts.c away from the screen: the
+                            # steering axis, the three gains, and what
+                            # opts_clamp does to a hand-edited map.
                             # Exits non-zero.
     gcc -I. -Itestgl -O2 -Wall rccars_re/menushot.c rccars_re/glrec.c \
         mainmenu.c champ.c touch.c ui.c sfont.c records.c rlog.c \
-        player.c garage.c net.c ime.c -lm -o menushot
+        player.c garage.c net.c ime.c opts.c -lm -o menushot
                             # and hudshot's twin for the menu: it PRINTS the
                             # front end's triangles and rccars_re/hudshot.py
                             # composites them over the real .csi and .tga art.
@@ -830,7 +895,11 @@ leaves the previous binary sitting there to answer for it:
                             #   ./menushot 800 600 E | ...      # ...engine
                             #   ./menushot 800 600 T | ...      # ...and tyre page
                             #   ./menushot 800 600 Brr | ...    # ...picker two up
-                            #   ./menushot 800 600 M | ...      # MULTIPLAYER
+                            #   ./menushot 800 600 o | ...      # THE OPTIONS SCREEN -- dlgSOUND
+    #   ./menushot 800 600 i | ...      # ...Input devices
+    #   ./menushot 800 600 k | ...      # ...Customize controls
+    #   ./menushot 800 600 K | ...      # ...and its bind prompt
+    #   ./menushot 800 600 M | ...      # MULTIPLAYER
                             #   ./menushot 800 600 L | ...      # ...the LOBBY,
                             #                                   # and I / C / R
                             #
@@ -1026,6 +1095,13 @@ leaves the previous binary sitting there to answer for it:
                             # profile on every track, so it costs ~9 s of the
                             # suite's ~17 s. All three of its cases fail on the
                             # pre-fix ai.c -- see docs/harnesses.md.
+    gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
+        rccars_re/aiphys.c ai.c col.c rb.c rbcar.c contact.c collide.c \
+        carani.c scene.c rlog.c carlight.c rccars_re/glstub_host.c \
+        -lm -o aiphys       # the three REPORTED symptoms of the opponent model
+                            # -- stuck, teleport, suspension -- each written
+                            # against the symptom rather than the mechanism, with
+                            # the player as its own control. See docs/harnesses.md
     gcc -I. -Itestgl -O2 -fno-fast-math -ffp-contract=off \
         rccars_re/antheight.c scene.c antenna.c carani.c col.c rb.c rbcar.c \
         contact.c collide.c rlog.c carlight.c rccars_re/glstub_host.c \

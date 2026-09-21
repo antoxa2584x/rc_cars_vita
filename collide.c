@@ -300,7 +300,7 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
 {
     float spheres[RB_MAX_SPHERES][4];
     rb_world_hit hits[8];
-    int nspheres, i, h, nh;
+    int nspheres, i, h, nh, surf_cls;
     int found = 0;
 
     (void)opaque;
@@ -331,6 +331,23 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
             continue;
         found = 1;
 
+        /* THE SURFACE CLASS OF THIS CONTACT, over all the faces the sphere
+         * reached rather than off whichever one the query happened to return
+         * first. FUN_00534fc0 walks the contact's own face list and takes the
+         * MINIMUM over the POSITIVE classes, skipping 0 -- and 0 is what a decal
+         * carries, which is the whole reason it loops rather than picks: the
+         * sand transition strips sit a centimetre above the sand they modulate,
+         * so the topmost face at a wheel is routinely the one with no opinion.
+         * col_surface_at already applies this rule for the tyre marks and the
+         * dust; this is the same rule on the face list the contact gather has in
+         * hand, which costs no second query. */
+        surf_cls = 0;
+        for (h = 0; h < nh; h++) {
+            int e = hits[h].surface;
+            if (e > 0 && (surf_cls == 0 || e < surf_cls))
+                surf_cls = e;
+        }
+
         for (h = 0; h < nh; h++) {
             float nrm[3];
             double len;
@@ -359,7 +376,7 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
                         w->point[k] = (float)((double)spheres[i][k]
                                               - (double)radius * nrm[k]);
                     }
-                    w->surface = hits[h].surface;
+                    w->surface = surf_cls;
                     w->in_water = 0;
                     w->water_gap = 0.0f;
                     if (c->world->water

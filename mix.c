@@ -260,15 +260,17 @@ static int pick_slot(mix_t *m, int prio)
     int i, worst = -1;
     int worst_prio = prio;
     double worst_pos = -1.0;
+    /* The cap, or the whole pool when nothing has set one -- see mix.h. */
+    const int n = (m->vcap > 0 && m->vcap < MIX_VOICES) ? m->vcap : MIX_VOICES;
 
-    for (i = 0; i < MIX_VOICES; i++)
+    for (i = 0; i < n; i++)
         if (!m->v[i].active) return i;
 
     /* All busy. Steal the lowest-priority voice, and among equals the one
        furthest through its sample -- a one-shot about to end is the cheapest
        thing to lose. A looping voice never "ends", so its progress is measured
        modulo its length and it competes on priority alone. */
-    for (i = 0; i < MIX_VOICES; i++) {
+    for (i = 0; i < n; i++) {
         mix_v *v = &m->v[i];
         double prog;
         if (v->prio > worst_prio) continue;
@@ -411,6 +413,14 @@ void mix_listener(mix_t *m, float x, float y, float z, float yaw_deg)
     for (i = 0; i < MIX_VOICES; i++)
         if (m->v[i].active && m->v[i].positional)
             voice_targets(m, &m->v[i]);
+}
+
+void mix_voice_cap(mix_t *m, int n)
+{
+    if (!m) return;
+    if (n < 1) n = 1;
+    if (n > MIX_VOICES) n = MIX_VOICES;
+    m->vcap = n;
 }
 
 void mix_master(mix_t *m, float sfx, float music)

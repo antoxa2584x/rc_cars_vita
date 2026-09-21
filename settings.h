@@ -37,6 +37,7 @@
 #define SETTINGS_H
 
 #include "menu.h"
+#include "opts.h"
 
 /* The save is written here and renamed over the real file, so a machine that
    loses power mid-write loses THIS save rather than every setting stored before
@@ -71,6 +72,16 @@ typedef struct {
     int car_light;
     int intro;          /* AutoRunIntro -- the launch movies */
     int pace;           /* vblanks a race frame is held for: 0 off, 2, or 3 */
+    /* THE OPTIONS SCREEN, whole -- dlgSOUND's six switches and
+       dlgCONTROL_PLAYER's whole control map. Embedded rather than kept in a
+       file of its own: it is a PREFERENCE like every other field here, it is
+       written on the same two events, and a second file would be a second
+       chance to write one of them and not the other. `opts_t' is all int and
+       unsigned int, so the memcmp above still reads no padding.
+       The two VOLUMES that page edits are not in here -- they are `vol_sfx'
+       and `vol_music' above, because the START menu edits the same two rows
+       and there is one of each in this app. */
+    opts_t opt;
 } settings_t;
 
 /* Read the file and apply it to `m`, which must already have been through
@@ -78,15 +89,15 @@ typedef struct {
    Returns 1 if a file was read, 0 if there was none (or it was unusable), in
    which case `m` is untouched. Never raises a req_* -- the caller does the first
    load itself, off `m->track` and `m->car`. */
-int settings_load(menu_t *m);
+int settings_load(menu_t *m, opts_t *o);
 
 /* Write `m`'s preferences out. Returns 1 on success.
  *
    The `_if_changed` form is the one the frame loop calls: it returns 0 without
    touching the card when nothing differs from what was last read or written,
    so opening the menu to look at the map costs no I/O. */
-int settings_save(const menu_t *m);
-int settings_save_if_changed(const menu_t *m);
+int settings_save(const menu_t *m, const opts_t *o);
+int settings_save_if_changed(const menu_t *m, const opts_t *o);
 
 /* THE SETTLE WRITE, and it is what covers the way out this module could not see.
  *
@@ -109,7 +120,7 @@ int settings_save_if_changed(const menu_t *m);
  * menu-close write is unaffected: whichever comes first makes the other a
  * no-op. */
 #define SETTINGS_SETTLE_DELAY 1.0f
-int settings_settle(const menu_t *m, float dt);
+int settings_settle(const menu_t *m, const opts_t *o, float dt);
 
 /* Where the file is, for the log line that says so. */
 const char *settings_path(void);
@@ -124,8 +135,8 @@ void settings_set_path(const char *path);
    `format`, and `parse` starts from whatever `s` already holds so a partial file
    keeps the caller's defaults. `parse` returns 0 if the text declares a version
    this build will not read. */
-void settings_from_menu(const menu_t *m, settings_t *s);
-void settings_to_menu(const settings_t *s, menu_t *m);
+void settings_from_menu(const menu_t *m, const opts_t *o, settings_t *s);
+void settings_to_menu(const settings_t *s, menu_t *m, opts_t *o);
 int settings_parse(const char *text, settings_t *s);
 void settings_format(const settings_t *s, char *out, int n);
 void settings_clamp(settings_t *s);

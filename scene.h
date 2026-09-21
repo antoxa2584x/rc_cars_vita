@@ -579,6 +579,15 @@ void scene_read_texture(FILE *f, GLuint id, char *name_out, size_t cap,
 /* Free everything scene_load allocated, and the GL textures it made. */
 void scene_release(scene_t *s);
 
+/* WHAT AM I LOOKING AT, for BATCHES. Logs every batch whose world AABB comes
+   within `rad` of `eye`, nearest first: its texture name, its flags, its size
+   and how far away it is. The dynamic layer has had char_dump and prop_dump
+   since the day a screenshot could not name a white box; geometry had nothing,
+   and "there is a big translucent sheet over the beach" cost a whole afternoon
+   of guessing from a JPEG. `label` names the scene in the log. */
+void scene_dump_near(const scene_t *s, const char *label, const float eye[3],
+                     float rad, int limit);
+
 /*
  * Draw just the batches belonging to one VSC8 model, under `m`.
  *

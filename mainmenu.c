@@ -630,6 +630,26 @@ static const mm_enum MM_Q_ENUM[MM_N_PAGES][MM_Q_N_ROWS] = {
 };
 static const int MM_Q_NENUM[MM_N_PAGES] = { 0, 4, 2, 1 };
 
+/* THE OPTIONS SCREEN'S RING SHAPE, needed here because mm_draw_race and
+   mm_draw_quit come long before the block that builds those pages: all three
+   of them end `..., Race, Back, the seven bars', so the green button is always
+   at nav-2 and the Main menu corner at nav-1. The page's own cursor is one of
+   three fields for the same reason the Garage's and the ladder's are separate
+   -- switching pages must not move the one you left. */
+static int mm_o_nav_ro(int page)
+{
+    if (page == MM_PAGE_OPTIONS)  return MM_O_NAV;
+    if (page == MM_PAGE_INPUT)    return MM_I_NAV;
+    return MM_K_NAV;
+}
+
+static int mm_o_focus_ro(const mainmenu_t *m)
+{
+    if (m->page == MM_PAGE_OPTIONS)  return m->ofocus;
+    if (m->page == MM_PAGE_INPUT)    return m->ifocus;
+    return m->kfocus;
+}
+
 /* ------------------------------------------------- dlgMAPINFO's shot list
  *
  * FIVE SCREENSHOTS PER TRACK, and the pack has carried them since the beginning
@@ -1209,6 +1229,12 @@ void mainmenu_init(mainmenu_t *m, const mainmenu_tex *tex)
     m->gsel = 0;
     m->garmed = -1;
     m->gskins = 1;
+    /* The Options screen's three cursors, so the page opens on a live row
+       whichever bar reached it -- the two PINNED enums are not stops. */
+    m->ofocus = MM_O_USE;
+    m->ifocus = MM_I_STICK;
+    m->kfocus = MM_K_TABLE;
+    m->oarmed = m->iarmed = m->karmed = -1;
     mainmenu_players_sync(m);
 }
 
@@ -1271,7 +1297,12 @@ static void mm_fire(mainmenu_t *m, int focus)
         m->cue = MM_CUE_PRESS;
         break;
     case MM_OPTIONS:
-        m->action = MM_ACT_OPTIONS;
+        /* THE OPTIONS SCREEN, which is what this button opens in the original
+           -- dlgSOUND with the seven-bar column beside it. It used to raise
+           MM_ACT_OPTIONS and open the START menu overlay straight away; that
+           overlay is now what the column's own `Video options' bar opens,
+           because the port's video rows are the only ones that live there. */
+        mainmenu_open_options(m);
         m->cue = MM_CUE_PRESS;
         break;
     case MM_CREDITS:
@@ -1527,6 +1558,17 @@ static void mm_s_step(mainmenu_t *m, unsigned int down, const touch_state *tp,
 static void mm_s_draw(const mainmenu_t *m, const mmframe *f);
 static void mm_step_modal(mainmenu_t *m, unsigned int down,
                           const touch_state *tp, int screen_w, int screen_h);
+/* THE OPTIONS SCREEN's three pages, its bind prompt and its drawer, all
+   defined in the block at the end of this file. */
+static void mm_step_options(mainmenu_t *m, unsigned int down,
+                            const touch_state *tp, int screen_w, int screen_h);
+static void mm_o_step_bind(mainmenu_t *m, unsigned int down,
+                           const touch_state *tp);
+static void mm_draw_options(const mainmenu_t *m, const mmframe *f);
+/* The eight actions' own names, so the bind prompt -- which is drawn with the
+   roster page's panel, long before that block -- can say which cell it is
+   about. */
+static const char *mm_o_act_name(int act);
 
 void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
                    int screen_w, int screen_h, float dt)
@@ -1578,6 +1620,10 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
            every modal here has in common. */
         if (m->modal == MM_MODAL_SERVERS)
             mm_s_step(m, down, tp, screen_w, screen_h);
+        /* THE BIND PROMPT takes the NEXT button rather than a choice, so it
+           does not go through the roster's Ok/Cancel machine either. */
+        else if (m->modal == MM_MODAL_BIND)
+            mm_o_step_bind(m, down, tp);
         else
             mm_step_modal(m, down, tp, screen_w, screen_h);
         /* AND A JOIN THAT LANDED closes it, which the page below has to see --
@@ -1614,6 +1660,10 @@ void mainmenu_step(mainmenu_t *m, unsigned int buttons, const touch_state *tp,
     }
     if (m->page == MM_PAGE_CHRACE) {
         mm_step_chrace(m, down, tp, screen_w, screen_h);
+        return;
+    }
+    if (MM_PAGE_IS_OPT(m->page)) {
+        mm_step_options(m, down, tp, screen_w, screen_h);
         return;
     }
 
@@ -1799,7 +1849,9 @@ static void mm_draw_race(const mainmenu_t *m, const mmframe *f)
             : (MM_PAGE_IS_CAR(m->page) ? (m->gfocus == MM_G_RACE)
             : (m->page == MM_PAGE_MULTI ? (m->mfocus_multi == MM_M_RACE)
             : (m->page == MM_PAGE_LOBBY ? (m->lfocus == MM_LB_RACE)
-                                        : (m->focus == MM_FOCUS_RACE)))))))
+            : (MM_PAGE_IS_OPT(m->page)
+               ? (mm_o_focus_ro(m) == mm_o_nav_ro(m->page) - 2)
+                                        : (m->focus == MM_FOCUS_RACE))))))))
            ? 3 : 1;
     if ((int)(m->t / MM_RACE_ANIM) & 1)
         cell += 1;
@@ -1844,7 +1896,9 @@ static void mm_draw_quit(const mainmenu_t *m, const mmframe *f)
                        ? (m->mfocus_multi == MM_M_BACK)
                     : (m->page == MM_PAGE_LOBBY
                        ? (m->lfocus == MM_LB_BACK)
-                       : (m->focus == MM_FOCUS_QUIT))))));
+                    : (MM_PAGE_IS_OPT(m->page)
+                       ? (mm_o_focus_ro(m) == mm_o_nav_ro(m->page) - 1)
+                       : (m->focus == MM_FOCUS_QUIT)))))));
 
     /* HeaderSkin's third cell is the plain silver bar the orange one sits on. */
     if (m->tex.header)
@@ -1870,7 +1924,8 @@ static void mm_draw_quit(const mainmenu_t *m, const mmframe *f)
              : (MM_PAGE_IS_CAR(m->page) ? STR_UI_BACK
              : (m->page == MM_PAGE_MULTI ? STR_UI_MAIN_MENU
              : (m->page == MM_PAGE_LOBBY ? STR_UI_DISCONNECT
-                                         : STR_UI_QUIT))))),
+             : (MM_PAGE_IS_OPT(m->page) ? STR_UI_MAIN_MENU
+                                        : STR_UI_QUIT)))))),
              1.f, 1.f, 1.f);
 }
 
@@ -1906,7 +1961,12 @@ static void mm_draw_header(const mainmenu_t *m, const mmframe *f)
                           : (MM_PAGE_IS_CAR(m->page) ? STR_UI_GARAGE
                           : (m->page == MM_PAGE_MULTI ? STR_UI_MULTIPLAYER
                           : (m->page == MM_PAGE_LOBBY ? STR_UI_WAIT_PLAYERS
-                                                      : STR_UI_MAIN_MENU)))));
+                          /* "Options" on all THREE of its pages, which is what
+                             the game's own shots of dlgSOUND and
+                             dlgCONTROL_PLAYER both have -- the column says
+                             which one you are on, the header does not. */
+                          : (MM_PAGE_IS_OPT(m->page) ? STR_UI_OPTIONS
+                                                     : STR_UI_MAIN_MENU))))));
         /* right-aligned against the triangle the cell already carries */
         const float tr = px(f, MM_HDR_X + MM_HDR_TEXT_R);
         const float tw = sf.tex ? sf_w(&sf, sc, title) : ui_text_w(sc, title);
@@ -6315,8 +6375,22 @@ static void mp_draw_modal(const mainmenu_t *m, const mmframe *f)
        panel so a one-line dialog sits exactly where the game's own shot of
        "Can't remove last player" has it. */
     {
+        /* THE BIND PROMPT composes its line here rather than borrowing one:
+           what it has to say is which cell it is about, and that is two fields
+           of the state and no string in the table. The second line names the
+           two buttons that are not candidates -- START to keep the binding and
+           SELECT to clear it -- because a prompt that takes ANY button has to
+           say which ones it will not take. */
+        char bind[160];
         const char *say = m->modal == MM_MODAL_REMOVE ? STR_UI_REMOVE_ASK
                                                       : (m->msay ? m->msay : "");
+        if (m->modal == MM_MODAL_BIND) {
+            snprintf(bind, sizeof bind,
+                     "%s -- key %d\nPress a button."
+                     "  START cancels, SELECT clears.",
+                     mm_o_act_name(m->kact), m->kslot + 1);
+            say = bind;
+        }
         const char *q = say;
         int nl = 1;
         float ty;
@@ -6340,6 +6414,11 @@ static void mp_draw_modal(const mainmenu_t *m, const mmframe *f)
     if (m->modal == MM_MODAL_REMOVE || m->modal == MM_MODAL_ASK) {
         mp_draw_btn(m, f, 0, 1, STR_UI_YES, m->mfocus == MM_MODAL_OK);
         mp_draw_btn(m, f, 1, 1, STR_UI_NO,  m->mfocus == MM_MODAL_CANCEL);
+    } else if (m->modal == MM_MODAL_BIND) {
+        /* One button, and it is Cancel: there is nothing to confirm here, the
+           next press IS the answer. A touch anywhere cancels too, which is
+           what makes the whole panel that button's hit box. */
+        mp_draw_btn(m, f, 0, 0, STR_UI_CANCEL, 1);
     } else {
         mp_draw_btn(m, f, 0, 0, STR_UI_OK, 1);
     }
@@ -7787,6 +7866,8 @@ void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
         mm_draw_multi(m, &f);
     } else if (m->page == MM_PAGE_LOBBY) {
         mm_draw_lobby(m, &f);
+    } else if (MM_PAGE_IS_OPT(m->page)) {
+        mm_draw_options(m, &f);
     } else if (MM_PAGE_IS_CHAMP(m->page)) {
         /* THE LADDER IS UNDER BOTH. dlgCHRACE is a PANEL over dlgCHAMP -- the
            game's own screenshot of it has the ladder still there, dimmed --
@@ -7815,4 +7896,828 @@ void mainmenu_draw(const mainmenu_t *m, int screen_w, int screen_h)
         mp_draw_modal(m, &f);
     if (m->credits)
         mm_draw_credits(m, &f);
+}
+
+/* ================================================== THE OPTIONS SCREEN
+ *
+ * Three dialogs on one frame -- dlgSOUND, dlgCONTROL and dlgCONTROL_PLAYER --
+ * with the game's own seven-bar column down the right moving between them.
+ * mainmenu.h has the bars, the three focus rings and what is not built; opts.h
+ * has the state and what each control actually drives. This block is the
+ * layout and the drawing.
+ *
+ * TWO OF THE THREE SHIP EVERY RECTANGLE. dlgCONTROL.ini and
+ * dlgCONTROL_PLAYER.ini are ordinary `Settings/' slider files and dlg_data.h
+ * emits them whole, so nothing about the Input devices page or the control
+ * table below was measured off anything.
+ *
+ * dlgSOUND.ini SHIPS ONE RECTANGLE and it is not a row: the RULE between
+ * `Music style' and `Master volume', (95, 357) to (542, 357). So the sound
+ * page's rows are derived rather than eyeballed, and here is the derivation:
+ *
+ *   - both dialogs that DO ship a labelled enum put it at x 115 with the
+ *     label/value split at 0.40 of the row's width and the row 25 tall
+ *     (DLG_CONTROL_enumCtrlType*, DLG_CONTROL_PLAYER_enumLayout*), so the
+ *     sound page's rows are that same shape;
+ *   - a row therefore RUNS FROM 115 to the rule's own right end, 542, which is
+ *     where the game's own screenshot of the page has the sliders ending;
+ *   - the six rows above the rule are at 118 + 35i and Master volume below it
+ *     at 398, which is that screenshot measured AGAINST the shipped rule: its
+ *     white line lands on 357 and the row centres on 130, 166, 201, 236, 271,
+ *     306 and 411.
+ *
+ * The one thing deliberately not copied off that screenshot is where an ENUM's
+ * two arrows sit. The original insets them about 45 px from the ends of the
+ * value column; every other enum this port draws -- the quick-race page's, the
+ * Garage's, the lobby's -- puts them at the column's own ends, and three
+ * dialogs of one screen disagreeing about that reads as a bug rather than as
+ * the artists' intent.
+ */
+
+/* The four bars, on the frame's own first four row positions. Rows 4..7 are
+   empty, the way two of dlgCHAMP's are -- mainmenu.h says which three of the
+   game's seven went and why. */
+const int MM_OB_ROW[MM_OB_N] = { 0, 1, 2, 3 };
+
+static const char *const MM_OB_NAME[MM_OB_N] = {
+    STR_UI_COCKPIT_OPTS, STR_UI_SOUND_FX,
+    STR_UI_INPUT_DEVICES, STR_UI_CUSTOM_CTRL
+};
+
+/* Which page each bar opens; -1 for the one that is not built. */
+static const int MM_OB_PAGE[MM_OB_N] = {
+    -1, MM_PAGE_OPTIONS, MM_PAGE_INPUT, MM_PAGE_CONTROLS
+};
+
+static int mm_o_bar_live(int bar)
+{
+    return MM_OB_PAGE[bar] >= 0;
+}
+
+/* Which bar the page on screen is, for the white radio dot -- and -1 for the
+   overlay bar, which is never "here". */
+static int mm_o_here(const mainmenu_t *m, int bar)
+{
+    return MM_OB_PAGE[bar] >= 0 && MM_OB_PAGE[bar] == m->page;
+}
+
+/* ------------------------------------------------------------ the rows */
+
+/* A row of any of the three pages: the rectangle, the label/value split and
+   the label, plus whether the value is a SLIDER rather than a picker. The
+   first five fields are exactly mm_enum's, because a labelled enum is the same
+   control on every page in this front end. */
+typedef struct {
+    float x0, y0, sx, sy, se;
+    const char *label;
+    int slider;
+} mm_orow;
+
+/* dlgSOUND -- the seven, derived as the block header says. */
+#define MM_SND_X0     115.f
+#define MM_SND_SX     (DLG_SOUND_lineX1 - MM_SND_X0)        /* to 542 */
+#define MM_SND_SE     DLG_CONTROL_enumCtrlTypeSE            /* 0.40 */
+#define MM_SND_SY     DLG_CONTROL_enumCtrlTypeSY            /* 25 */
+#define MM_SND_Y0     118.f
+#define MM_SND_PITCH   35.f
+#define MM_SND_MASTER_Y 398.f
+
+#define MM_SND_ROW(i, lbl, sl) \
+    { MM_SND_X0, MM_SND_Y0 + MM_SND_PITCH * (float)(i), MM_SND_SX, \
+      MM_SND_SY, MM_SND_SE, lbl, sl }
+
+static const mm_orow MM_O_ROW[MM_O_N_ROWS] = {
+    MM_SND_ROW(0, STR_UI_USE_SOUND,     0),
+    MM_SND_ROW(1, STR_UI_SOUND_QUALITY, 0),
+    MM_SND_ROW(2, STR_UI_SOUND_VOLUME,  1),
+    MM_SND_ROW(3, STR_UI_BG_SOUND,      0),
+    MM_SND_ROW(4, STR_UI_BG_VOLUME,     1),
+    MM_SND_ROW(5, STR_UI_MUSIC_STYLE,   0),
+    { MM_SND_X0, MM_SND_MASTER_Y, MM_SND_SX, MM_SND_SY, MM_SND_SE,
+      STR_UI_MASTER_VOLUME, 1 }
+};
+
+/* dlgCONTROL -- Input devices, on its own rectangles MOVED UP ONE ROW. The
+   dialog's first control is `enumCtrlType' at y 120 and this port does not draw
+   it (mainmenu.h), so the three that remain take the 40 px pitch the file's own
+   rows are spaced at rather than leaving a hole where a control used to be. */
+#define MM_I_SHIFT (DLG_CONTROL_enumJoystickY0 - DLG_CONTROL_enumCtrlTypeY0)
+
+static const mm_orow MM_I_ROW[MM_I_N_ROWS] = {
+    { DLG_CONTROL_enumJoystickX0, DLG_CONTROL_enumJoystickY0 - MM_I_SHIFT,
+      DLG_CONTROL_enumJoystickSX, DLG_CONTROL_enumJoystickSY,
+      DLG_CONTROL_enumJoystickSE, STR_UI_USE_JOYSTICK, 0 },
+    { DLG_CONTROL_sliderJoySensX0, DLG_CONTROL_sliderJoySensY0 - MM_I_SHIFT,
+      DLG_CONTROL_sliderJoySensSX, DLG_CONTROL_sliderJoySensSY,
+      DLG_CONTROL_enumJoystickSE, STR_UI_JOY_SENS, 1 },
+    { DLG_CONTROL_sliderJoyDeadX0, DLG_CONTROL_sliderJoyDeadY0 - MM_I_SHIFT,
+      DLG_CONTROL_sliderJoyDeadSX, DLG_CONTROL_sliderJoyDeadSY,
+      DLG_CONTROL_enumJoystickSE, STR_UI_JOY_DEAD, 1 }
+};
+
+/* How many row stops the page on screen has, and its row table. dlgCONTROL_
+   PLAYER has NONE: its two enums are gone and the page is its table. */
+static const mm_orow *mm_o_rows(int page, int *n)
+{
+    if (page == MM_PAGE_OPTIONS)  { *n = MM_O_N_ROWS; return MM_O_ROW; }
+    if (page == MM_PAGE_INPUT)    { *n = MM_I_N_ROWS; return MM_I_ROW; }
+    *n = 0;
+    return 0;
+}
+
+/* THE CONTROL TABLE -- dlgCONTROL_PLAYER's `rectLines', eight actions by two
+   slots. The row height falls straight out of the rectangle (288 / 8 = 36) and
+   the four columns are measured off the game's own screenshot of the page as
+   fractions of the rectangle's own width, which is how dlgSTAT's table was
+   done for the same reason: the .ini ships the box and not its inside. */
+#define MM_KT_X   DLG_CONTROL_PLAYER_rectLinesX0
+#define MM_KT_Y   DLG_CONTROL_PLAYER_rectLinesY0
+#define MM_KT_W   DLG_CONTROL_PLAYER_rectLinesSX
+#define MM_KT_H   DLG_CONTROL_PLAYER_rectLinesSY
+#define MM_KT_ROW (MM_KT_H / (float)OPT_N_ACT)      /* 36 */
+#define MM_KT_LBL   0.050f      /* the action's name, left edge */
+#define MM_KT_RULE  0.320f      /* ...and how far its rule runs */
+#define MM_KT_BULL  0.375f      /* the red chevron before the first slot */
+#define MM_KT_COL0  0.520f      /* slot 0's centre */
+#define MM_KT_COL1  0.870f      /* slot 1's centre */
+
+/* The eight actions' names, in OPT_* order -- which IS the order the game's
+   own screenshot of this page lists them in. See opts.h on 10305/10306. */
+static const char *const MM_KT_NAME[OPT_N_ACT] = {
+    STR_UI_ACT_GEAR, STR_UI_ACT_REVERSE, STR_UI_ACT_TURN_L, STR_UI_ACT_TURN_R,
+    STR_UI_ACT_BOOST, STR_UI_ACT_JUMP, STR_UI_ACT_STOP, STR_UI_ACT_RESET
+};
+
+static const char *mm_o_act_name(int act)
+{
+    return (act >= 0 && act < OPT_N_ACT) ? MM_KT_NAME[act] : "";
+}
+
+static void mm_kt_cell(const mmframe *f, int act, int slot,
+                       float *x, float *y, float *w, float *h)
+{
+    const float cx = MM_KT_X + MM_KT_W * (slot ? MM_KT_COL1 : MM_KT_COL0);
+    const float half = MM_KT_W * (MM_KT_COL1 - MM_KT_COL0) * 0.5f;
+    mm_gbox(f, MM_KT_X + MM_KT_W * 0.5f, cx - half,
+            MM_KT_Y + MM_KT_ROW * (float)act, half * 2.f, MM_KT_ROW,
+            x, y, w, h);
+}
+
+/* ------------------------------------------------------ the rings */
+
+/* Whether a stop on the page on screen does anything. The two PINNED enums are
+   the only dead ones: `Control type' can only be Gamepad on this machine and
+   `Show controls for' can only be Player 1, and both are drawn in the artists'
+   own disabled arrows rather than hidden -- the same call the Garage's
+   staticCarEnum gets. */
+int mainmenu_o_live(const mainmenu_t *m, int stop)
+{
+    int nav;
+    if (!m || !MM_PAGE_IS_OPT(m->page))
+        return 0;
+    nav = m->page == MM_PAGE_OPTIONS ? MM_O_NAV
+        : (m->page == MM_PAGE_INPUT ? MM_I_NAV : MM_K_NAV);
+    if (stop >= nav)
+        return mm_o_bar_live(stop - nav);
+    /* Every row on these pages needs the state behind it; without it they draw
+       and do nothing, which is what a NULL `opt' means (mainmenu.h). */
+    if (stop < nav - 2 && !m->opt)
+        return 0;
+    return 1;
+}
+
+static int mm_o_nfocus(int page)
+{
+    if (page == MM_PAGE_OPTIONS)  return MM_O_N_FOCUS;
+    if (page == MM_PAGE_INPUT)    return MM_I_N_FOCUS;
+    if (page == MM_PAGE_CONTROLS) return MM_K_N_FOCUS;
+    return 0;
+}
+
+/* The page's own cursor, by reference, so one step function serves all three
+   -- the three rings have the same SHAPE (rows, Race, Back, the column) and
+   differ only in how many rows they start with. */
+static int *mm_o_focus(mainmenu_t *m)
+{
+    if (m->page == MM_PAGE_OPTIONS)  return &m->ofocus;
+    if (m->page == MM_PAGE_INPUT)    return &m->ifocus;
+    return &m->kfocus;
+}
+
+static int *mm_o_armed(mainmenu_t *m)
+{
+    if (m->page == MM_PAGE_OPTIONS)  return &m->oarmed;
+    if (m->page == MM_PAGE_INPUT)    return &m->iarmed;
+    return &m->karmed;
+}
+
+static int mm_o_next(const mainmenu_t *m, int from, int d)
+{
+    const int n = mm_o_nfocus(m->page);
+    int i, k = from;
+    for (i = 0; i < n; i++) {
+        k += d;
+        if (k < 0)  k = n - 1;
+        if (k >= n) k = 0;
+        if (mainmenu_o_live(m, k))
+            return k;
+    }
+    return from;
+}
+
+/* ------------------------------------------------------ what a row shows */
+
+/* Yes / No, which is the string table's own 10008 / 10009. */
+static const char *mm_o_yesno(int v) { return v ? STR_UI_YES : STR_UI_NO; }
+
+static const char *const MM_O_QUALITY_NAME[OPT_N_QUALITY] = {
+    STR_UI_LOW, STR_UI_MEDIUM, STR_UI_HIGH
+};
+static const char *const MM_O_MUSIC_NAME[OPT_N_MUSIC] = {
+    STR_UI_MUSIC_ROCK, STR_UI_MUSIC_TECHNO, STR_UI_MUSIC_BOTH
+};
+
+/* A slider's fill, 0..1, or -1 when this row is not one. */
+static float mm_o_frac(const mainmenu_t *m, int page, int row)
+{
+    const opts_t *o = m->opt;
+    if (!o)
+        return -1.f;
+    if (page == MM_PAGE_OPTIONS) {
+        if (row == MM_O_VOL_SFX)
+            return m->set ? (float)m->set->vol_sfx / (float)MENU_VOL_STEPS : 0.f;
+        if (row == MM_O_VOL_MUSIC)
+            return m->set ? (float)m->set->vol_music / (float)MENU_VOL_STEPS : 0.f;
+        if (row == MM_O_VOL_MASTER)
+            return (float)o->vol_master / (float)OPT_VOL_STEPS;
+    }
+    if (page == MM_PAGE_INPUT) {
+        if (row == MM_I_SENS) return (float)o->sens / (float)OPT_SENS_STEPS;
+        if (row == MM_I_DEAD) return (float)o->dead / (float)OPT_DEAD_STEPS;
+    }
+    return -1.f;
+}
+
+/* The words between a picker's two arrows. A slider has none: its value is the
+   bar, exactly as the track picker's value is the photograph. */
+static void mm_o_value(const mainmenu_t *m, int page, int row,
+                       char *out, int n)
+{
+    const opts_t *o = m->opt;
+    out[0] = 0;
+    if (!o)
+        return;
+    if (page == MM_PAGE_OPTIONS) {
+        switch (row) {
+        case MM_O_USE:     snprintf(out, n, "%s", mm_o_yesno(o->use_sound)); break;
+        case MM_O_QUALITY: snprintf(out, n, "%s",
+                               MM_O_QUALITY_NAME[o->quality % OPT_N_QUALITY]); break;
+        case MM_O_BG:      snprintf(out, n, "%s", mm_o_yesno(o->bg_sound)); break;
+        case MM_O_STYLE:   snprintf(out, n, "%s",
+                               MM_O_MUSIC_NAME[o->music_style % OPT_N_MUSIC]); break;
+        default: break;
+        }
+        return;
+    }
+    if (page == MM_PAGE_INPUT && row == MM_I_STICK)
+        snprintf(out, n, "%s", mm_o_yesno(o->stick));
+}
+
+/* ------------------------------------------------------ moving a row */
+
+static int clamp_step(int v, int d, int lo, int hi)
+{
+    v += d;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int wrap_step(int v, int d, int n)
+{
+    v += d;
+    while (v < 0)  v += n;
+    while (v >= n) v -= n;
+    return v;
+}
+
+/* One press of a row's own arrow. THE VOLUMES AND THE TWO STICK ROWS CLAMP and
+   the pickers wrap, which is exactly the rule menu.c already states: one press
+   past full must not be silence, and one press past Both is Rock. */
+static void mm_o_move(mainmenu_t *m, int row, int d)
+{
+    opts_t *o = m->opt;
+    if (!o)
+        return;
+    if (m->page == MM_PAGE_OPTIONS) {
+        switch (row) {
+        case MM_O_USE:     o->use_sound = !o->use_sound; break;
+        case MM_O_BG:      o->bg_sound = !o->bg_sound; break;
+        case MM_O_QUALITY: o->quality = wrap_step(o->quality, d, OPT_N_QUALITY); break;
+        case MM_O_STYLE:   o->music_style = wrap_step(o->music_style, d, OPT_N_MUSIC); break;
+        case MM_O_VOL_SFX:
+            if (m->set) m->set->vol_sfx = clamp_step(m->set->vol_sfx, d, 0, MENU_VOL_STEPS);
+            break;
+        case MM_O_VOL_MUSIC:
+            if (m->set) m->set->vol_music = clamp_step(m->set->vol_music, d, 0, MENU_VOL_STEPS);
+            break;
+        case MM_O_VOL_MASTER:
+            o->vol_master = clamp_step(o->vol_master, d, 0, OPT_VOL_STEPS);
+            break;
+        default: return;
+        }
+        m->cue = MM_CUE_ARROW;
+        return;
+    }
+    if (m->page == MM_PAGE_INPUT) {
+        switch (row) {
+        case MM_I_STICK: o->stick = !o->stick; break;
+        case MM_I_SENS:  o->sens = clamp_step(o->sens, d, 0, OPT_SENS_STEPS); break;
+        case MM_I_DEAD:  o->dead = clamp_step(o->dead, d, 0, OPT_DEAD_STEPS); break;
+        default: return;
+        }
+        m->cue = MM_CUE_ARROW;
+    }
+    /* dlgCONTROL_PLAYER has no rows left to move -- its page is the table, and
+       a cell is changed through the bind prompt and not with an arrow. */
+}
+
+/* ------------------------------------------------------ the hit boxes */
+
+/* A row's own back and forward arrows, and the value box between them. */
+static void mm_o_arrows(const mmframe *f, const mm_orow *r,
+                        float *bx, float *fx, float *ay, float *sz)
+{
+    *sz = MM_Q_ARROW * f->us;
+    *ay = py(f, r->y0 + r->sy * 0.5f) - *sz * 0.5f;
+    *bx = px(f, r->x0 + r->sx * r->se);
+    *fx = px(f, r->x0 + r->sx) - *sz;
+}
+
+int mainmenu_o_stop_at(const mainmenu_t *m, int screen_w, int screen_h,
+                       float x, float y, int *left, int *row, int *slot)
+{
+    const mmframe f = mm_frame(screen_w, screen_h);
+    const mm_orow *rows;
+    float bx, by, bw, bh;
+    int i, n, nav;
+
+    if (left) *left = 0;
+    if (row)  *row = -1;
+    if (slot) *slot = -1;
+    if (!m || !MM_PAGE_IS_OPT(m->page))
+        return -1;
+    nav = mm_o_nav_ro(m->page);
+    for (i = 0; i < MM_OB_N; i++) {
+        mm_bar_rect(&f, MM_OB_ROW[i], &bx, &by, &bw, &bh);
+        if (touch_in(x, y, bx, by, bw, bh))
+            return nav + i;
+    }
+    mm_race_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return nav - 2;             /* MM_*_RACE */
+    mm_quit_rect(&f, &bx, &by, &bw, &bh);
+    if (touch_in(x, y, bx, by, bw, bh))
+        return nav - 1;             /* MM_*_BACK */
+
+    /* THE TABLE, and it is one stop with sixteen targets -- the ladder's rule
+       applied to a grid. A touch on a cell both focuses the table and moves
+       its cursor there, which is one press where the pad needs several. */
+    if (m->page == MM_PAGE_CONTROLS) {
+        int a, s;
+        for (a = 0; a < OPT_N_ACT; a++)
+            for (s = 0; s < OPT_N_SLOT; s++) {
+                mm_kt_cell(&f, a, s, &bx, &by, &bw, &bh);
+                if (touch_in(x, y, bx, by, bw, bh)) {
+                    if (row)  *row = a;
+                    if (slot) *slot = s;
+                    return MM_K_TABLE;
+                }
+            }
+    }
+
+    rows = mm_o_rows(m->page, &n);
+    for (i = 0; i < n; i++) {
+        float ax, fx, ay, sz;
+        mm_o_arrows(&f, &rows[i], &ax, &fx, &ay, &sz);
+        if (touch_in(x, y, ax, ay, sz, sz)) {
+            if (left) *left = 1;
+            return i;
+        }
+        if (touch_in(x, y, fx, ay, sz, sz))
+            return i;
+        /* THE WHOLE VALUE BOX IS THE FORWARD ARROW on a slider, because a
+           slider's ends are 40 px apart on a 960 px screen and a thumb is
+           wider than that. The two arrows still work; this only means a tap in
+           the middle steps up rather than doing nothing. */
+        if (rows[i].slider
+            && touch_in(x, y, ax, ay, fx - ax + sz, sz))
+            return i;
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------ the step */
+
+static void mm_o_fire(mainmenu_t *m, int stop)
+{
+    const int nav = mm_o_nav_ro(m->page);
+
+    if (!mainmenu_o_live(m, stop)) {
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    if (stop >= nav) {
+        const int bar = stop - nav;
+        m->press_row = MM_OB_ROW[bar];
+        m->press_t = 0.f;
+        if (MM_OB_PAGE[bar] >= 0 && MM_OB_PAGE[bar] != m->page) {
+            m->page = MM_OB_PAGE[bar];
+            *mm_o_armed(m) = -1;
+            m->cue = MM_CUE_PRESS;
+        }
+        return;
+    }
+    if (stop == nav - 2) {          /* the green button */
+        m->action = MM_ACT_RACE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    if (stop == nav - 1) {          /* Main menu */
+        m->page = MM_PAGE_MAIN;
+        m->focus = MM_OPTIONS;
+        m->anim_t = MM_ANIM_FOC;
+        m->anim_prev = -1;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    /* A ROW. On the control table CROSS opens the bind prompt on the cell the
+       cursor is in; everywhere else it steps the row forward, which is what
+       makes a picker usable with one button. */
+    if (m->page == MM_PAGE_CONTROLS && stop == MM_K_TABLE) {
+        m->modal = MM_MODAL_BIND;
+        m->marmed = -1;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    mm_o_move(m, stop, +1);
+    m->cue = MM_CUE_PRESS;
+}
+
+/* THE BIND PROMPT. The next bindable button is the binding, START cancels, and
+   a touch anywhere cancels -- there is nothing on this panel to aim at, so
+   anywhere is the honest hit box. Called with the frame's EDGES, so the CROSS
+   that opened it cannot also be the button it captures. */
+static void mm_o_step_bind(mainmenu_t *m, unsigned int down,
+                           const touch_state *tp)
+{
+    int i;
+
+    if ((down & SCE_CTRL_START) || (tp && tp->released)) {
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_DENY;
+        return;
+    }
+    for (i = 0; i < OPT_N_BTN; i++) {
+        if (!(down & OPT_BTN[i]))
+            continue;
+        if (m->opt)
+            opts_bind(m->opt, m->kact, m->kslot, OPT_BTN[i]);
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_PRESS;
+        return;
+    }
+    /* SELECT clears the cell, which is the one thing a bind prompt needs that
+       no button press can say -- an action with no button is `None' and there
+       has to be a way back to it. SELECT is not bindable, so it is free to
+       mean this. */
+    if (down & SCE_CTRL_SELECT) {
+        if (m->opt)
+            opts_bind(m->opt, m->kact, m->kslot, 0u);
+        m->modal = MM_MODAL_NONE;
+        m->cue = MM_CUE_PRESS;
+    }
+}
+
+static void mm_step_options(mainmenu_t *m, unsigned int down,
+                            const touch_state *tp, int screen_w, int screen_h)
+{
+    int *focus = mm_o_focus(m);
+    int *armed = mm_o_armed(m);
+    const int table = m->page == MM_PAGE_CONTROLS && *focus == MM_K_TABLE;
+
+    /* UP and DOWN walk the TABLE while it has the focus and the ring
+       otherwise, which is the rule the ladder and the roster both follow; LEFT
+       and RIGHT walk its two slots there and step the row's value everywhere
+       else. */
+    if (table) {
+        if (down & SCE_CTRL_DOWN) {
+            m->kact = wrap_step(m->kact, +1, OPT_N_ACT);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_UP) {
+            m->kact = wrap_step(m->kact, -1, OPT_N_ACT);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_RIGHT) {
+            m->kslot = wrap_step(m->kslot, +1, OPT_N_SLOT);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_LEFT) {
+            m->kslot = wrap_step(m->kslot, -1, OPT_N_SLOT);
+            m->cue = MM_CUE_FOCUS;
+        }
+    } else {
+        if (down & SCE_CTRL_DOWN) {
+            *focus = mm_o_next(m, *focus, +1);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_UP) {
+            *focus = mm_o_next(m, *focus, -1);
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (down & SCE_CTRL_RIGHT) mm_o_move(m, *focus, +1);
+        if (down & SCE_CTRL_LEFT)  mm_o_move(m, *focus, -1);
+    }
+    /* THE TABLE HAS TO BE LEAVABLE, and UP/DOWN are spoken for while it is
+       focused. L and R step the ring past it, which is what a shoulder button
+       is for on a page with a grid in the middle of it. */
+    if (down & SCE_CTRL_RTRIGGER) {
+        *focus = mm_o_next(m, *focus, +1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & SCE_CTRL_LTRIGGER) {
+        *focus = mm_o_next(m, *focus, -1);
+        m->cue = MM_CUE_FOCUS;
+    }
+    if (down & (SCE_CTRL_CROSS | SCE_CTRL_START))
+        mm_o_fire(m, *focus);
+    if (down & SCE_CTRL_CIRCLE) {
+        mm_o_fire(m, mm_o_nav_ro(m->page) - 1);
+        return;
+    }
+
+    if (!tp)
+        return;
+    if (tp->pressed) {
+        int r, s;
+        *armed = mainmenu_o_stop_at(m, screen_w, screen_h, tp->x, tp->y,
+                                    0, &r, &s);
+        if (*armed >= 0 && mainmenu_o_live(m, *armed) && *focus != *armed) {
+            *focus = *armed;
+            m->cue = MM_CUE_FOCUS;
+        }
+        if (r >= 0) {
+            if (m->kact != r || m->kslot != s)
+                m->cue = MM_CUE_FOCUS;
+            m->kact = r;
+            m->kslot = s;
+        }
+    }
+    if (tp->released) {
+        int left = 0, r, s;
+        const int at = mainmenu_o_stop_at(m, screen_w, screen_h, tp->x, tp->y,
+                                          &left, &r, &s);
+        if (at >= 0 && at == *armed) {
+            /* A ROW'S BACK ARROW STEPS IT BACKWARDS; everything else fires.
+               One enum walks both ways under a thumb, exactly as the
+               quick-race page's do. */
+            if (left && at < mm_o_nav_ro(m->page) - 2)
+                mm_o_move(m, at, -1);
+            else
+                mm_o_fire(m, at);
+        }
+        *armed = -1;
+    }
+}
+
+/* ------------------------------------------------------------ the drawing */
+
+/* THE SLIDER, out of `Progressor' -- the loading screen's own bar, which is
+   the only slider art in the pack. Five quads, the same five
+   mainmenu_draw_loading lays down, at an arbitrary rectangle. */
+#define MM_O_BAR_CAP 12.f       /* design px of cap at either end */
+
+static void mm_o_bar_quad(const mainmenu_t *m, const mmframe *f,
+                          float x0, float x1, float y, float h,
+                          float u0, float u1, float v0, float v1)
+{
+    if (x1 <= x0)
+        return;
+    ui_image(px(f, x0), y, px(f, x1) - px(f, x0), h,
+             m->tex.progressor, u0, v0, u1, v1, 1.f, 1.f, 1.f, 1.f);
+}
+
+static void mm_o_slider(const mainmenu_t *m, const mmframe *f,
+                        const mm_orow *r, float frac)
+{
+    /* BETWEEN the row's two arrows, not under them. The trough and the arrows
+       are separate art -- the game's own slider has its ends built in -- so a
+       bar drawn across the whole value column runs beneath both chevrons and
+       reads as one control with two lids. MM_Q_ARROW is their width. */
+    const float x0 = r->x0 + r->sx * r->se + MM_Q_ARROW;
+    const float x1 = r->x0 + r->sx - MM_Q_ARROW;
+    const float h = r->sy * 0.66f * f->us;
+    const float y = py(f, r->y0 + r->sy * 0.5f) - h * 0.5f;
+    const float m0 = x0 + MM_O_BAR_CAP, m1 = x1 - MM_O_BAR_CAP;
+    float p = frac < 0.f ? 0.f : (frac > 1.f ? 1.f : frac);
+
+    if (!m->tex.progressor) {
+        /* No `Progressor' in the pack: the port's own plain bar, the same
+           fallback the loading screen keeps. */
+        const float bx = px(f, x0), bw = px(f, x1) - bx;
+        ui_rect(bx - 1.f, y - 1.f, bw + 2.f, h + 2.f, 0.f, 0.f, 0.f, 0.5f);
+        ui_rect(bx, y, bw * p, h, 0.85f, 0.09f, 0.13f, 1.f);
+        return;
+    }
+    mm_o_bar_quad(m, f, x0, m0, y, h, 0.f, 1.f,
+                  LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+    mm_o_bar_quad(m, f, m0, m1, y, h, LP_BAR_MID_U0, 1.f,
+                  LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+    mm_o_bar_quad(m, f, m1, x1, y, h, 1.f, 0.f,
+                  LP_BAR_TROUGH_V0, LP_BAR_TROUGH_V1);
+    if (p > 0.f) {
+        const float end = x0 + (x1 - x0) * p;
+        mm_o_bar_quad(m, f, x0, m0 < end ? m0 : end, y, h, 0.f, 1.f,
+                      LP_BAR_FILL_V0, LP_BAR_FILL_V1);
+        if (end > m0)
+            mm_o_bar_quad(m, f, m0, end < m1 ? end : m1, y, h,
+                          LP_BAR_MID_U0, 1.f, LP_BAR_FILL_V0, LP_BAR_FILL_V1);
+        /* AND THE FILL'S RIGHT CAP, which the loading bar does not draw. That
+           one is a PROGRESS bar and never has to look finished; this is a
+           volume, and a row at full that still shows trough at its right end
+           says the row is not at full. Mirrored, exactly as the trough's own
+           right cap is. */
+        if (end > m1)
+            mm_o_bar_quad(m, f, m1, end, y, h, 1.f, 0.f,
+                          LP_BAR_FILL_V0, LP_BAR_FILL_V1);
+    }
+}
+
+static void mm_o_draw_bars(const mainmenu_t *m, const mmframe *f)
+{
+    const int nav = mm_o_nav_ro(m->page);
+    const int focus = m->page == MM_PAGE_OPTIONS ? m->ofocus
+                    : (m->page == MM_PAGE_INPUT ? m->ifocus : m->kfocus);
+    int i;
+
+    for (i = 0; i < MM_OB_N; i++) {
+        float bx, by, bw, bh, slide = 0.f;
+        const int here = mm_o_here(m, i);
+        const int lit = focus == nav + i;
+        const int live = mm_o_bar_live(i);
+
+        if (here || lit)
+            slide = MM_SLIDE * MM_SETTLED;
+        mm_draw_wedge(m, f, MM_OB_ROW[i]);
+        mm_bar_draw_rect(m, f, MM_OB_ROW[i], slide, &bx, &by, &bw, &bh);
+        /* THE THREE PAGES ARE RADIO CELLS and Video options is not: it goes
+           somewhere else rather than switching the view, which is the same
+           split the quick-race column already draws -- three radios and one
+           arrow. The dead three keep the artists' grey. */
+        if (MM_OB_PAGE[i] >= 0 && m->tex.radio) {
+            const float v = here ? MM_V_RAD_ON : MM_V_RAD;
+            ui_image(bx, by, bw, bh, m->tex.radio,
+                     0.f, v, 1.f, v + MM_V_RAD_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else if (m->tex.buttons) {
+            const float v = !live ? MM_V_GREY : (lit ? MM_V_RED_F : MM_V_RED);
+            ui_image(bx, by, bw, bh, m->tex.buttons,
+                     0.f, v, 1.f, v + MM_V_CELL, 1.f, 1.f, 1.f, 1.f);
+        } else {
+            ui_rect(bx, by, bw, bh, live ? 0.72f : 0.45f,
+                    live ? 0.09f : 0.45f, live ? 0.11f : 0.47f, 1.f);
+        }
+        mm_label(m, f, bx, by, bw, bh, MM_OB_NAME[i],
+                 live ? 1.f : 0.82f, live ? 1.f : 0.82f, live ? 1.f : 0.84f);
+    }
+}
+
+/* One labelled row: the chevron, the name over its rule, the two arrows and
+   either the value or the slider between them. */
+static void mm_o_draw_row(const mainmenu_t *m, const mmframe *f,
+                          const mm_orow *r, int stop, int focus)
+{
+    const int live = mainmenu_o_live(m, stop);
+    const int lit = focus == stop;
+    const int state = live ? (lit ? 1 : 0) : 2;
+    float ax, fx, ay, sz;
+    char line[64];
+
+    mm_o_arrows(f, r, &ax, &fx, &ay, &sz);
+    mm_arrow(m, px(f, r->x0 - MM_Q_BULLET_GAP),
+             py(f, r->y0 + r->sy * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
+             MM_Q_BULLET * f->us, state, 0);
+    mm_q_text(m, f, 0, r->x0, r->y0, MM_TS_LABEL, 0, live ? 1.f : 0.82f,
+              r->label);
+    mm_rule_at(f, px(f, r->x0), py(f, r->y0 + 24.f),
+               (r->sx * r->se - 30.f) * f->us);
+    mm_arrow(m, ax, ay, sz, state, 0);
+    mm_arrow(m, fx, ay, sz, state, 1);
+    if (r->slider) {
+        mm_o_slider(m, f, r, mm_o_frac(m, m->page, stop));
+        return;
+    }
+    mm_o_value(m, m->page, stop, line, sizeof line);
+    if (line[0])
+        mg_value(m, f, ax, sz, fx, py(f, r->y0 + r->sy * 0.5f),
+                 live ? 1.f : 0.82f, line);
+}
+
+static void mm_o_draw_table(const mainmenu_t *m, const mmframe *f)
+{
+    const int focus = m->kfocus == MM_K_TABLE;
+    int a, s;
+
+    for (a = 0; a < OPT_N_ACT; a++) {
+        const float ry = MM_KT_Y + MM_KT_ROW * (float)a;
+        const float ty = ry + (MM_KT_ROW - MM_SND_SY) * 0.5f;
+        /* The action's name over its own rule, which is what every label on
+           these three pages stands on. */
+        mm_q_text(m, f, 0, MM_KT_X + MM_KT_W * MM_KT_LBL, ty,
+                  MM_TS_LABEL, 0, 1.f, MM_KT_NAME[a]);
+        mm_rule_at(f, px(f, MM_KT_X + MM_KT_W * MM_KT_LBL),
+                   py(f, ty + 24.f), MM_KT_W * MM_KT_RULE * f->us);
+        /* The chevron, red as the game's own page has it and silver on the
+           row the cursor is on. */
+        mm_arrow(m, px(f, MM_KT_X + MM_KT_W * MM_KT_BULL),
+                 py(f, ry + MM_KT_ROW * 0.5f) - MM_Q_BULLET * f->us * 0.5f,
+                 MM_Q_BULLET * f->us,
+                 (focus && m->kact == a) ? 1 : 0, 1);
+        for (s = 0; s < OPT_N_SLOT; s++) {
+            const int on = focus && m->kact == a && m->kslot == s;
+            const char *name = m->opt ? opts_btn_name(m->opt->bind[a][s])
+                                      : STR_UI_NONE;
+            float cx, cy, cw, ch;
+            mm_kt_cell(f, a, s, &cx, &cy, &cw, &ch);
+            /* THE CURSOR IS A PLATE UNDER THE CELL, not a colour on the word:
+               `None' in red beside `None' in white is two words, and which of
+               them is selected is the one thing this table has to say. Drawn
+               NARROWER than the cell -- the hit box runs the whole half of the
+               table so a thumb can find it, and a plate that wide reaches back
+               over the row's own chevron. */
+            if (on)
+                ui_rect(cx + cw * 0.15f, cy + ch * 0.10f,
+                        cw * 0.70f, ch * 0.80f, 0.85f, 0.10f, 0.12f, 0.55f);
+            mg_value(m, f, cx, 0.f, cx + cw, cy + ch * 0.5f,
+                     m->opt && m->opt->bind[a][s] ? 1.f : 0.72f, name);
+        }
+    }
+}
+
+static void mm_draw_options(const mainmenu_t *m, const mmframe *f)
+{
+    const mm_orow *rows;
+    const int focus = m->page == MM_PAGE_OPTIONS ? m->ofocus
+                    : (m->page == MM_PAGE_INPUT ? m->ifocus : m->kfocus);
+    int i, n;
+
+    mm_o_draw_bars(m, f);
+    rows = mm_o_rows(m->page, &n);
+    for (i = 0; i < n; i++)
+        mm_o_draw_row(m, f, &rows[i], i, focus);
+
+    if (m->page == MM_PAGE_OPTIONS) {
+        /* dlgSOUND's ONE SHIPPED RECTANGLE: the rule between Music style and
+           Master volume, at the coordinates the file gives. */
+        mm_rule_at(f, px(f, DLG_SOUND_lineX0), py(f, DLG_SOUND_lineY1),
+                   (DLG_SOUND_lineX1 - DLG_SOUND_lineX0) * f->us);
+        return;
+    }
+    if (m->page == MM_PAGE_INPUT) {
+        /* staticPlayer -- the page's own heading, `Player 1', over its rule.
+           The original draws a second block of the same rows for player two,
+           `plr2YShift' (220) below this one; there is one pad here. */
+        mm_q_text(m, f, 0, DLG_CONTROL_staticPlayerX0,
+                  DLG_CONTROL_staticPlayerY0, MM_TS_LABEL, 0, 1.f,
+                  STR_UI_PLAYER_1);
+        mg_rule(f, DLG_CONTROL_staticPlayerX0, DLG_CONTROL_staticPlayerY0,
+                DLG_CONTROL_staticPlayerSX, DLG_CONTROL_staticPlayerSY);
+        return;
+    }
+    mm_o_draw_table(m, f);
+    /* staticExplain. It is the game's own "No conflicts" and it is always
+       true: opts_bind clears a button out of wherever else it was, so this
+       page cannot reach the state the other two strings describe. */
+    mm_q_text(m, f, 0, DLG_CONTROL_PLAYER_staticExplainX0,
+              DLG_CONTROL_PLAYER_staticExplainY0, MM_TS_INFO, 0, 1.f,
+              STR_UI_NO_CONFLICTS);
+}
+
+void mainmenu_set_options(mainmenu_t *m, opts_t *o, menu_t *set)
+{
+    if (!m)
+        return;
+    m->opt = o;
+    m->set = set;
+}
+
+void mainmenu_open_options(mainmenu_t *m)
+{
+    if (!m)
+        return;
+    m->page = MM_PAGE_OPTIONS;
+    m->ofocus = MM_O_USE;
+    m->ifocus = MM_I_STICK;
+    m->kfocus = MM_K_TABLE;     /* the only row stop that page has */
+    m->oarmed = m->iarmed = m->karmed = -1;
+    m->kact = 0;
+    m->kslot = 0;
 }

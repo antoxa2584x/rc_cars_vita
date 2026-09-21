@@ -42,6 +42,10 @@
  *               grid out of its `.aip' first samples and slot k is seated on
  *               it. Before that every peer was placed on the track's single
  *               player marker, i.e. inside each other.
+ *               AND THEN A BARRIER: a machine that has finished loading sends
+ *               NET_LOADED and is HELD on the grid until the host answers
+ *               NET_GO, which it does once every machine has reported in. The
+ *               two countdowns therefore start together -- see net_start_hold.
  *   the race    every peer sends its own NET_STATE to every other peer directly,
  *               `sendFrameRate' times a second (network.ini's own key, floored
  *               at NET_STATE_FLOOR). No relay: the addresses came out of
@@ -157,8 +161,21 @@
 
 /* THE PROTOCOL'S OWN VERSION, in every header. Two builds that disagree about
    the packet layout must not half-work: a peer whose version does not match is
-   ignored, so an old build simply does not see a new one's game. */
-#define NET_VERSION 2
+   ignored, so an old build simply does not see a new one's game.
+   3 is the START BARRIER -- NET_LOADED and NET_GO, two kinds a version 2 build
+   neither sends nor understands, and a race between the two would hang one end
+   on the grid for NET_START_WAIT. */
+#define NET_VERSION 3
+
+/* HOW LONG THE START BARRIER WAITS for a machine that never reports in,
+   seconds, measured in FRAMES RUN and not wall clock -- `net_time' only
+   advances inside `net_step', so the seconds a peer spends blocked in its own
+   track load are not counted against anybody, which is the whole point.
+   A track load is 3 to 6 seconds off the card (`docs/vita-port.md'); this is
+   an order of magnitude over that, because the only thing it protects against
+   is a machine that has CRASHED, and going without one that is merely slow is
+   the one failure this barrier exists to prevent. */
+#define NET_START_WAIT 30.0f
 
 /* The message log's own depth -- the panel on the game's own lobby screenshot
    is about four lines of the wide font. */
@@ -206,6 +223,10 @@ typedef struct {
     unsigned char  skin;
     unsigned char  ready;
     unsigned char  face;         /* which FacesSys portrait, for the table */
+    /* THE START BARRIER: this machine has finished loading and is sitting on
+       the grid. Set on the host by NET_LOADED and on our own row by
+       `net_race_begin'; read by nothing above net.c. */
+    unsigned char  loaded;
     /* THE RACE. TWO states, not one: `s' is the newest that arrived and `s0'
        the one before it, with `s_at'/`s0_at' saying when. `have' counts them,
        0, 1 or 2 -- at 2 the remote car is drawn BETWEEN them (net_remote_pose
@@ -318,8 +339,36 @@ int  net_take_start(void);
 
 /* ------------------------------------------------------------- the race */
 
-/* The app has finished loading and the race is running. */
+/* The app has finished loading and the race is running -- and it is also this
+   machine reporting itself ON THE GRID, which is what raises the start barrier
+   below. Call it once the world, the car and the field are up and the countdown
+   is about to run. */
 void net_race_begin(void);
+
+/* HOLD THE START: 1 while this machine is on the grid and at least one other is
+ * not yet, 0 as soon as everybody is up (or NET_START_WAIT has run out).
+ *
+ * WHY IT EXISTS. Every machine used to start its own 3-2-1 the instant its own
+ * load finished, and two Vitas do not finish together: the two clocks in the
+ * screenshot that produced this were 2.78 s apart on the same race, which is
+ * two loads of the same track differing by that much. Nothing in the protocol
+ * ever compared them, so the gap was permanent -- one player crossed the line
+ * with a total the other could not have matched, and both of them were racing a
+ * car that had started at a different time.
+ *
+ * WHAT IT IS NOT: a clock synchronisation. Nothing here estimates an offset or
+ * a round trip. The barrier makes the GO a single EVENT -- one datagram out of
+ * the host, arriving at every machine within a LAN's own latency -- and that is
+ * what the two countdowns are started from. The residual skew is the spread of
+ * one hop across the access point, sub-millisecond against the 2.78 s it
+ * replaces, and it needs no clock either end has to agree about.
+ *
+ * The caller holds the countdown (and therefore the physics, which the
+ * countdown already gates) while this is 1; `main.c' does it by stepping the
+ * start light with a `dt' of 0, which is the same freeze the START menu uses.
+ *
+ * -> 0 outside a network race, so a caller needs no mode test of its own. */
+int  net_start_hold(void);
 
 /* AND THE RACE IS OVER: back to the lobby, host or client. Call it on every
    path that leaves a race -- the finish screen, the START menu's `Main menu'

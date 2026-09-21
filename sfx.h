@@ -225,6 +225,10 @@ void sfx_volumes(float sfx, float music);
 float sfx_vol_sfx(void);
 float sfx_vol_music(void);
 
+/* How many mixer voices may be in use at once, 1..MIX_VOICES -- the Options
+   screen's `Sound quality' row. */
+void sfx_voice_cap(int n);
+
 /* Telemetry for main.c's once-a-second log line. */
 const char *sfx_surface_name(int mat);
 int   sfx_current_surface(void);

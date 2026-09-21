@@ -14,7 +14,30 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "RC Cars")
 set(VITA_TITLEID  "RCCV00001")
-set(VITA_VERSION  "01.00")
+
+# THE ONE PLACE THE VERSION IS WRITTEN. Bump it before every commit -- patch for
+# a fix, minor for a feature; see BUILD.md, "Versioning". It names the package
+# (rc_cars_vita<BUILD_VERSION>.vpk), so the file on the card says which build it
+# is, and build.sh reads it back out of this file rather than keeping a copy.
+set(BUILD_VERSION "0.8")
+
+# APP_VER in the sfo is fixed width ##.##, so derive it instead of writing the
+# number twice. The minor is a FRACTION and pads on the right: 0.8 is 00.80.
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)$" _bv_match "${BUILD_VERSION}")
+if(NOT _bv_match)
+  message(FATAL_ERROR "BUILD_VERSION must be MAJOR.MINOR, got '${BUILD_VERSION}'")
+endif()
+set(_bv_major "${CMAKE_MATCH_1}")
+set(_bv_minor "${CMAKE_MATCH_2}")
+string(LENGTH "${_bv_major}" _bv_major_len)
+if(_bv_major_len EQUAL 1)
+  set(_bv_major "0${_bv_major}")
+elseif(_bv_major_len GREATER 2)
+  message(FATAL_ERROR "BUILD_VERSION major must be below 100, got '${_bv_major}'")
+endif()
+string(SUBSTRING "${_bv_minor}00" 0 2 _bv_minor)
+set(VITA_VERSION "${_bv_major}.${_bv_minor}")
+set(VITA_VPK_NAME "rc_cars_vita${BUILD_VERSION}")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -ffast-math -mtune=cortex-a9 -mfpu=neon")
 
@@ -36,7 +59,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -ffast-math -mtune=cortex-a9 -mfpu
 # allstarts) in the two hottest modules in the port.
 set(PHYSICS_C_FLAGS "-Wall -O3 -fno-fast-math -ffp-contract=off -mtune=cortex-a9")
 
-add_executable(${PROJECT_NAME} main.c physics.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c sfont.c dirarrow.c msg.c menu.c mainmenu.c intro.c avc.c results.c touch.c settings.c records.c player.c garage.c champ.c net.c ime.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
+add_executable(${PROJECT_NAME} main.c physics.c opts.c rb.c contact.c collide.c col.c rbcar.c cam.c carani.c ui.c hud.c countdown.c race_ui.c sfont.c dirarrow.c msg.c menu.c mainmenu.c intro.c avc.c results.c touch.c settings.c records.c player.c garage.c champ.c net.c ime.c antenna.c carparts.c scene.c shadow.c water.c checkpoint.c sun.c fx.c trace.c envmap.c carlight.c
   prop.c char.c ai.c mix.c audio.c sfx.c rlog.c)
 
 separate_arguments(PHYSICS_FLAGS_LIST UNIX_COMMAND "${PHYSICS_C_FLAGS}")
@@ -101,7 +124,7 @@ vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
 # rccars_re/gen_sce_sys.py: icon0.png is GameIcon.ico's 256x256 frame, and
 # bg.png / startup.png are header.jpg. Regenerate with that script rather than
 # editing the PNGs by hand.
-vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
+vita_create_vpk(${VITA_VPK_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE assets assets

@@ -145,6 +145,308 @@ static float depth_at(const col_t *col, const vtx_t *v)
     return v->y - gy;
 }
 
+/*
+ * THE SEAM TABLES -- see water.h. Both are built once, off the rest positions,
+ * and both exist only because the port displaces authored tiles where the
+ * engine tessellates its own grid.
+ */
+
+/* A uniform XZ cell grid over one batch's rest vertices, used by both builders.
+   `cell` is the bucket size; buckets are singly-linked through `next`. */
+typedef struct {
+    int   *head;            /* per bucket */
+    int   *next;            /* per vertex */
+    int    nx, nz;
+    float  x0, z0, cell;
+} wgrid_t;
+
+static int wgrid_build(wgrid_t *g, const batch_t *b, float cell)
+{
+    float x1, z1;
+    double ax, az, want;
+    unsigned int j, cells;
+
+    if (!b->nverts || !b->rest)
+        return 0;
+    g->x0 = x1 = b->rest[0].x;
+    g->z0 = z1 = b->rest[0].z;
+    for (j = 1; j < b->nverts; j++) {
+        if (b->rest[j].x < g->x0) g->x0 = b->rest[j].x;
+        if (b->rest[j].x > x1)    x1    = b->rest[j].x;
+        if (b->rest[j].z < g->z0) g->z0 = b->rest[j].z;
+        if (b->rest[j].z > z1)    z1    = b->rest[j].z;
+    }
+    ax = (double)x1 - (double)g->x0;
+    az = (double)z1 - (double)g->z0;
+    if (cell <= 0.f)
+        cell = 1.f;
+
+    /* SIZE THE TABLE IN DOUBLE, AND SIZE IT UP FRONT.
+     *
+     * A 4 mm weld cell over beach_3's 216 x 197 m sea is 54,002 x 49,252
+     * buckets -- 2.66e9, which does not fit in the 32-bit `long` the Vita has
+     * and does fit in the 64-bit one the host has. The first version of this
+     * computed that product as a `long` and halved the cell until it was under
+     * a ceiling: on the host the loop ran, on the device it never ran at all,
+     * the bucket count wrapped, and the fill below indexed a table a fraction
+     * of the size it thought it had. beach_3 and beach_4 are the two tracks
+     * whose seas are big enough to do it, and they are the two that crashed.
+     *
+     * A coarser cell is only ever slower here -- both callers scan a
+     * neighbourhood and compare real distances -- so this picks the cell from
+     * the extent instead of discovering it. */
+    want = (ax / (double)cell + 2.0) * (az / (double)cell + 2.0);
+    if (want > (double)WATER_GRID_MAX_CELLS)
+        cell *= (float)sqrt(want / (double)WATER_GRID_MAX_CELLS);
+
+    /* That scaling is only approximate -- the +2 margins do not scale with the
+       cell -- so settle it by measuring, not by trusting the estimate. A
+       handful of steps at worst, and the loop is bounded so a NaN cannot spin
+       it. The first try at this REFUSED the grid when the estimate came out a
+       few buckets over, which silently turned the weld off on every track:
+       build_weld returns with w->site[bi] still NULL, animate_surface falls
+       back to the raw vertex index, and build_stitch is never called at all. */
+    for (j = 0; j < 40u; j++) {
+        g->nx = (int)(ax / (double)cell) + 2;
+        g->nz = (int)(az / (double)cell) + 2;
+        if (g->nx < 1) g->nx = 1;
+        if (g->nz < 1) g->nz = 1;
+        if ((double)g->nx * (double)g->nz <= (double)WATER_GRID_MAX_CELLS)
+            break;
+        cell *= 1.25f;
+    }
+    if ((double)g->nx * (double)g->nz > (double)WATER_GRID_MAX_CELLS)
+        return 0;
+    g->cell = cell;
+    cells = (unsigned int)g->nx * (unsigned int)g->nz;
+
+    g->head = malloc((size_t)cells * sizeof(int));
+    g->next = malloc((size_t)b->nverts * sizeof(int));
+    if (!g->head || !g->next) {
+        free(g->head); free(g->next);
+        g->head = NULL; g->next = NULL;
+        return 0;
+    }
+    for (j = 0; j < cells; j++)
+        g->head[j] = -1;
+    for (j = 0; j < b->nverts; j++) {
+        int cx = (int)((b->rest[j].x - g->x0) / g->cell);
+        int cz = (int)((b->rest[j].z - g->z0) / g->cell);
+        int c;
+        if (cx < 0) cx = 0;
+        if (cx >= g->nx) cx = g->nx - 1;
+        if (cz < 0) cz = 0;
+        if (cz >= g->nz) cz = g->nz - 1;
+        c = cz * g->nx + cx;
+        g->next[j] = g->head[c];
+        g->head[c] = (int)j;
+    }
+    return 1;
+}
+
+static void wgrid_free(wgrid_t *g)
+{
+    free(g->head); free(g->next);
+    g->head = NULL; g->next = NULL;
+}
+
+/* site[j] = the lowest-numbered vertex within WATER_WELD_TOL of j in XZ. */
+static void build_weld(water_t *w, unsigned int bi)
+{
+    batch_t *b = &w->scene->batches[bi];
+    wgrid_t g;
+    int *site;
+    unsigned int j;
+
+    site = malloc((size_t)b->nverts * sizeof(int));
+    if (!site)
+        return;
+    for (j = 0; j < b->nverts; j++)
+        site[j] = (int)j;
+    if (!wgrid_build(&g, b, WATER_WELD_TOL)) {
+        free(site);
+        return;
+    }
+    for (j = 0; j < b->nverts; j++) {
+        int cx = (int)((b->rest[j].x - g.x0) / g.cell);
+        int cz = (int)((b->rest[j].z - g.z0) / g.cell);
+        int dx, dz;
+        for (dz = -1; dz <= 1 && site[j] == (int)j; dz++)
+            for (dx = -1; dx <= 1 && site[j] == (int)j; dx++) {
+                int ux = cx + dx, uz = cz + dz, k;
+                if (ux < 0 || uz < 0 || ux >= g.nx || uz >= g.nz)
+                    continue;
+                for (k = g.head[uz * g.nx + ux]; k >= 0; k = g.next[k]) {
+                    float ex, ez;
+                    if (k >= (int)j || site[k] != k)
+                        continue;   /* only ever point at an earlier ORIGINAL */
+                    ex = b->rest[k].x - b->rest[j].x;
+                    ez = b->rest[k].z - b->rest[j].z;
+                    if (ex * ex + ez * ez <= WATER_WELD_TOL * WATER_WELD_TOL) {
+                        site[j] = k;
+                        break;
+                    }
+                }
+            }
+    }
+    wgrid_free(&g);
+    w->site[bi] = site;
+}
+
+/* Exactly the height animate_surface writes, for one vertex at one time. The
+   stitch's own bound is measured with it, so the bound is measured against the
+   thing that will actually be drawn -- including the SHALLOW-WATER DAMPING,
+   which is where the last of the big corrections came from: a vertex in the
+   shallows, whose swell is damped almost flat, pinned to a chord between two
+   deep-water vertices carrying the full wave. Near the beach, which is where
+   "the waves look cut from one side" was reported. */
+static float stitch_h(const water_t *w, unsigned int bi, int j, float t)
+{
+    const batch_t *b = &w->scene->batches[bi];
+    const wsurf_t *c = w->cfg;
+    float k = (w->damp && w->damp[bi]) ? w->damp[bi][j] : 1.f;
+    return b->rest[j].y + c->offset + (1.f - k) * c->magnet_offset
+         + k * surf_disp(w, b->rest[j].x, b->rest[j].z, t);
+}
+
+/* Every vertex that lands on the interior of some triangle edge it is not an
+   endpoint of. Built off the index buffer, deduplicated by the (lo,hi) pair. */
+static void build_stitch(water_t *w, unsigned int bi)
+{
+    batch_t *b = &w->scene->batches[bi];
+    const int *site = w->site[bi];
+    wstitch_t *list = NULL;
+    unsigned int n = 0, cap = 0;
+    wgrid_t g;
+    unsigned int e;
+
+    if (!b->idx || !b->nidx || b->nverts > 0xffffu)
+        return;
+    /* A metre of cell is enough: the scan walks the edge's whole bounding box
+       and the sea's own grid step is a metre or more everywhere. */
+    if (!wgrid_build(&g, b, 1.f))
+        return;
+
+    for (e = 0; e + 2 < b->nidx; e += 3) {
+        int tri[3];
+        int q;
+        tri[0] = b->idx[e]; tri[1] = b->idx[e + 1]; tri[2] = b->idx[e + 2];
+        for (q = 0; q < 3; q++) {
+            int ia = tri[q], ib = tri[(q + 1) % 3];
+            float ax, az, ex, ez, len2, x0, x1, z0, z1;
+            int cx0, cx1, cz0, cz1, cx, cz;
+
+            /* Both directions. A tile's OUTER edge belongs to one triangle
+               only -- the neighbouring tile has its own duplicated copy -- so
+               a canonical-direction filter drops every edge whose single
+               winding happens to run the wrong way, which is most of the
+               seams that matter. Walking both is a few hundred duplicate
+               entries and the fixup is idempotent. */
+            if (site[ia] == site[ib])
+                continue;
+            ax = b->rest[ia].x; az = b->rest[ia].z;
+            ex = b->rest[ib].x - ax; ez = b->rest[ib].z - az;
+            len2 = ex * ex + ez * ez;
+            if (len2 < 1e-8f)
+                continue;
+            x0 = ax < ax + ex ? ax : ax + ex; x1 = ax + ex > ax ? ax + ex : ax;
+            z0 = az < az + ez ? az : az + ez; z1 = az + ez > az ? az + ez : az;
+            cx0 = (int)((x0 - g.x0) / g.cell) - 1;
+            cx1 = (int)((x1 - g.x0) / g.cell) + 1;
+            cz0 = (int)((z0 - g.z0) / g.cell) - 1;
+            cz1 = (int)((z1 - g.z0) / g.cell) + 1;
+            if (cx0 < 0) cx0 = 0;
+            if (cz0 < 0) cz0 = 0;
+            if (cx1 >= g.nx) cx1 = g.nx - 1;
+            if (cz1 >= g.nz) cz1 = g.nz - 1;
+            for (cz = cz0; cz <= cz1; cz++)
+                for (cx = cx0; cx <= cx1; cx++) {
+                    int k;
+                    for (k = g.head[cz * g.nx + cx]; k >= 0; k = g.next[k]) {
+                        float px, pz, t, perp;
+                        /* EVERY vertex on the edge, not just the site's
+                           representative. Narrowing this to representatives
+                           passes the whole suite on the ten shipped tracks --
+                           no T-junction vertex in any of them is itself a
+                           duplicate -- but that is a property of this
+                           tessellation, not of the rule: a duplicated one would
+                           have its representative put back on the chord and its
+                           twin left up on the swell. A few dozen more entries in
+                           a list of a few hundred buys not having to rely on it. */
+                        if (site[k] == site[ia] || site[k] == site[ib])
+                            continue;
+                        px = b->rest[k].x - ax; pz = b->rest[k].z - az;
+                        t = (px * ex + pz * ez) / len2;
+                        if (t <= 1e-3f || t >= 1.f - 1e-3f)
+                            continue;
+                        perp = (px * ez - pz * ex);
+                        if (perp * perp > WATER_STITCH_TOL * WATER_STITCH_TOL
+                                          * len2)
+                            continue;
+                        /* IS THE CHORD ACTUALLY THE SURFACE HERE?
+                         *
+                         * Pinning the vertex to the chord closes the hole, and
+                         * it closes it by DELETING whatever the swell was doing
+                         * between the two endpoints. Over a short edge that is
+                         * a hairline either way. Over a long one it is a
+                         * straight flat scar across the water -- measured on
+                         * beach_2, a 9.1 m edge whose vertex was dropped 0.92 m,
+                         * and on beach_3 nine edges over 8 m and one of 23.5 m.
+                         * That was reported as "the waves near the beach look
+                         * cut from one side", and it is worse than the crack.
+                         *
+                         * The geometric fix -- splitting the coarse triangle at
+                         * the vertex -- is NOT available: the tiles carry their
+                         * own UV parameterisation and a seam pair's UVs differ
+                         * by up to 43 units, so splicing the neighbour's vertex
+                         * into the coarse triangle would tear the texture far
+                         * worse than the crack it closed.
+                         *
+                         * So close the ones that are hairlines and leave the
+                         * rest, on the worst case over a phase sweep of the
+                         * track's own displacement rather than on a rule of
+                         * thumb about length. Undamped, i.e. full amplitude,
+                         * because build_damping has not run yet and because
+                         * that can only ever exclude more. */
+                        {
+                            float worst = 0.f;
+                            int q2;
+                            for (q2 = 0; q2 < WATER_STITCH_SWEEP_N; q2++) {
+                                float tt = WATER_STITCH_SWEEP_T
+                                    * (float)q2 / (float)WATER_STITCH_SWEEP_N;
+                                float hv = stitch_h(w, bi, k, tt);
+                                float ha = stitch_h(w, bi, site[ia], tt);
+                                float hb = stitch_h(w, bi, site[ib], tt);
+                                float e = fabsf(hv - (ha + (hb - ha) * t));
+                                if (e > worst) worst = e;
+                            }
+                            if (worst > WATER_STITCH_MAX_SAG)
+                                continue;
+                        }
+                        if (n == cap) {
+                            unsigned int nc = cap ? cap * 2u : 32u;
+                            wstitch_t *nl = realloc(list,
+                                                    nc * sizeof(wstitch_t));
+                            if (!nl)
+                                goto done;
+                            list = nl; cap = nc;
+                        }
+                        list[n].v = (unsigned short)k;
+                        list[n].a = (unsigned short)site[ia];
+                        list[n].b = (unsigned short)site[ib];
+                        list[n].t = t;
+                        n++;
+                    }
+                }
+        }
+    }
+done:
+    wgrid_free(&g);
+    w->stitch[bi] = list;
+    w->n_stitch[bi] = n;
+
+}
+
 static void build_damping(water_t *w, const col_t *col)
 {
     scene_t *s = w->scene;
@@ -164,8 +466,14 @@ static void build_damping(water_t *w, const col_t *col)
                divides by magnetRadius and clamps, with no shaping. The 2.55 m
                it clamps over is five times the guess, so the swell now settles
                out over a real shelf rather than snapping flat at the last
-               half-metre. */
-            float d = depth_at(col, &b->verts[j]) / c->magnet_radius;
+               half-metre.
+
+               Sampled at the WELD REPRESENTATIVE, not at this vertex: two sides
+               of a tile seam sit up to a millimetre apart and the seabed under
+               them is not the same triangle, so a per-vertex query gives the
+               duplicates different damping and the seam parts. */
+            unsigned int r = w->site[i] ? (unsigned int)w->site[i][j] : j;
+            float d = depth_at(col, &b->verts[r]) / c->magnet_radius;
             if (d < 0.f) d = 0.f;
             if (d > 1.f) d = 1.f;
             w->damp[i][j] = d;
@@ -196,12 +504,17 @@ void water_free(water_t *w)
         if (w->damp)       free(w->damp[i]);
         if (w->coast_rgba) free(w->coast_rgba[i]);
         if (w->surf_rgba)  free(w->surf_rgba[i]);
+        if (w->site)       free(w->site[i]);
+        if (w->stitch)     free(w->stitch[i]);
         for (r = 0; r < WATER_DRAW_RINGS; r++)
             if (w->vring[r]) free(w->vring[r][i]);
     }
     free(w->damp);
     free(w->coast_rgba);
     free(w->surf_rgba);
+    free(w->site);
+    free(w->stitch);
+    free(w->n_stitch);
     {
         int r;
         for (r = 0; r < WATER_DRAW_RINGS; r++)
@@ -236,6 +549,9 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
     w->damp = calloc(scene->n_batches, sizeof(float *));
     w->coast_rgba = calloc(scene->n_batches, sizeof(unsigned char *));
     w->surf_rgba = calloc(scene->n_batches, sizeof(unsigned char *));
+    w->site = calloc(scene->n_batches, sizeof(int *));
+    w->stitch = calloc(scene->n_batches, sizeof(wstitch_t *));
+    w->n_stitch = calloc(scene->n_batches, sizeof(unsigned int));
 
     for (i = 0; i < scene->n_batches; i++) {
         batch_t *b = &scene->batches[i];
@@ -244,8 +560,14 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
         scene_keep_rest(b);
         if (b->flags & BATCH_COAST)
             w->coast_rgba[i] = malloc((size_t)b->nverts * 4);
-        if (b->flags & BATCH_WATER)
+        if (b->flags & BATCH_WATER) {
             w->surf_rgba[i] = malloc((size_t)b->nverts * 4);
+            /* The weld only. The stitch is built after build_damping below:
+               it reads the weld map AND the damping, because its own bound is
+               measured against the height that will be drawn. */
+            if (w->site)
+                build_weld(w, i);
+        }
         /* A draw ring only where the draw is big enough for vitaGL to hand GXM
            this array instead of copying it -- three batches over the ten tracks.
            See water_t.vring. The gate is the batch's own size, so nothing has to
@@ -263,6 +585,15 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
         }
     }
     build_damping(w, col);
+
+    /* and now the T-junctions, which need the damping to judge themselves */
+    for (i = 0; i < scene->n_batches; i++) {
+        batch_t *b = &scene->batches[i];
+        if (!(b->flags & BATCH_WATER))
+            continue;
+        if (w->site && w->site[i] && w->stitch && w->n_stitch)
+            build_stitch(w, i);
+    }
 
     /* The surface's own alpha, from the depth measure build_damping just made:
        alphaMin in the shallows so the wet sand reads through, alphaMax out at
@@ -292,6 +623,99 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
         }
     }
 
+    /* ------------------------------------------------------------ the horizon
+     *
+     * Where the sea CONTINUES once the authored tiles run out. The engine has
+     * no such problem: its water is a LOD grid laid out around the camera, so
+     * it always reaches the far plane. The port has the tiles the artists drew
+     * over the map, and the sky dome is drawn camera-locked -- at infinity --
+     * so from the edge of the water the band between the tiles' outer rim and
+     * the dome's lower edge is a hole. Reported as "the ocean ends before the
+     * skydome".
+     *
+     * The plane's height is taken from the OUTER rim of the authored surface,
+     * not from its mean: that rim is where the horizon has to carry on from,
+     * and on beach_1 the sea is not flat. The swell's own mean, amp*0.25 (the
+     * directional train's sine averages zero and the 0.25 bias does not), plus
+     * the track's offset, puts it level with the tiles at rest.
+     */
+    {
+        double cx = 0.0, cz = 0.0, sy = 0.0;
+        unsigned int nv = 0, nout = 0;
+        float r2max = 0.f, rcut;
+
+        for (i = 0; i < scene->n_batches; i++) {
+            batch_t *b = &scene->batches[i];
+            unsigned int j;
+            if (!(b->flags & BATCH_WATER) || !b->rest)
+                continue;
+            for (j = 0; j < b->nverts; j++) {
+                cx += b->rest[j].x; cz += b->rest[j].z; nv++;
+            }
+        }
+        if (nv) {
+            cx /= (double)nv; cz /= (double)nv;
+            for (i = 0; i < scene->n_batches; i++) {
+                batch_t *b = &scene->batches[i];
+                unsigned int j;
+                if (!(b->flags & BATCH_WATER) || !b->rest)
+                    continue;
+                for (j = 0; j < b->nverts; j++) {
+                    float dx = b->rest[j].x - (float)cx;
+                    float dz = b->rest[j].z - (float)cz;
+                    float r2 = dx * dx + dz * dz;
+                    if (r2 > r2max) r2max = r2;
+                }
+            }
+            /* The outer tenth by radius -- far enough out to be the rim the
+               horizon carries on from -- but widened until the sample is big
+               enough to mean the SWELL away as well. beach_2's sea is a long
+               thin strip and its outermost decile is a handful of vertices,
+               each of them at whatever phase of the wave it happens to sit;
+               one of those is not a sea level. */
+            rcut = 0.81f * r2max;
+            for (;;) {
+                unsigned int c2 = 0;
+                for (i = 0; i < scene->n_batches; i++) {
+                    batch_t *b = &scene->batches[i];
+                    unsigned int j;
+                    if (!(b->flags & BATCH_WATER) || !b->rest)
+                        continue;
+                    for (j = 0; j < b->nverts; j++) {
+                        float dx = b->rest[j].x - (float)cx;
+                        float dz = b->rest[j].z - (float)cz;
+                        if (dx * dx + dz * dz >= rcut)
+                            c2++;
+                    }
+                }
+                if (c2 >= WATER_HORIZON_RIM_MIN || rcut <= 0.f)
+                    break;
+                rcut *= 0.5f;
+            }
+            for (i = 0; i < scene->n_batches; i++) {
+                batch_t *b = &scene->batches[i];
+                unsigned int j;
+                if (!(b->flags & BATCH_WATER) || !b->rest)
+                    continue;
+                for (j = 0; j < b->nverts; j++) {
+                    float dx = b->rest[j].x - (float)cx;
+                    float dz = b->rest[j].z - (float)cz;
+                    if (dx * dx + dz * dz < rcut)
+                        continue;
+                    sy += b->rest[j].y; nout++;
+                }
+                if (!w->horizon_tex)
+                    w->horizon_tex = b->gl_tex;
+            }
+            if (nout) {
+                w->horizon = 1;
+                w->horizon_y = (float)(sy / (double)nout) + w->cfg->offset
+                             + 0.25f * w->cfg->amp;
+                w->horizon_alpha = w->cfg->alpha_max;
+            }
+        }
+    }
+
     w->wave_tex = scene_tex(scene, "water_wave");
 
     /* One spawner per water_wave_N marker, each with the two independent
@@ -305,6 +729,26 @@ void water_init(water_t *w, scene_t *scene, const col_t *col, int track)
         sp->x = m->x;
         sp->y = m->y;
         sp->z = m->z;
+        /* The sea's REST height under this marker, from the nearest surface
+           vertex -- the sprite stands on the water and the tiles are not all at
+           one height (beach_1's run from -0.22 to 0.00). Falls back to the
+           marker's own y where the track has no sea at all. */
+        {
+            float best = 1e30f;
+            unsigned int bi2, j2;
+            sp->sea_y = m->y;
+            for (bi2 = 0; bi2 < scene->n_batches; bi2++) {
+                batch_t *wb = &scene->batches[bi2];
+                if (!(wb->flags & BATCH_WATER) || !wb->rest)
+                    continue;
+                for (j2 = 0; j2 < wb->nverts; j2++) {
+                    float dx = wb->rest[j2].x - m->x;
+                    float dz = wb->rest[j2].z - m->z;
+                    float d2 = dx * dx + dz * dz;
+                    if (d2 < best) { best = d2; sp->sea_y = wb->rest[j2].y; }
+                }
+            }
+        }
         sp->dx = sinf(m->yaw * DEG);
         sp->dz = cosf(m->yaw * DEG);
         /* stagger the first firing so all five markers do not break together */
@@ -337,6 +781,7 @@ static void wave_spawn(water_t *w, const wave_spawn_t *sp, int is_long)
     a = (rnd01(w) * 2.f - 1.f) * WAVE_SPAWN_LEN;
     w->waves[i].x = sp->x + w->waves[i].dz * a;
     w->waves[i].y = sp->y;
+    w->waves[i].sea_y = sp->sea_y;
     w->waves[i].z = sp->z - w->waves[i].dx * a;
     /* FUN_00529c60: a long wave takes TimeLifeLong flat, a short one takes
        TimeLifeShort with +/- TimeLifeShortDisp of spread. */
@@ -410,6 +855,34 @@ void water_step(water_t *w, float dt)
  *
  * u sweeps one full turn of the texture, offset by the record's scroll value.
  */
+/* A BREAKING WAVE STANDS ON THE WATER, not at the height its marker was
+ * authored at.
+ *
+ * wave_spawn takes the sprite's y straight from the `water_wave_N` marker, and
+ * measured against the surface the port actually draws those markers sit BELOW
+ * it: 0.8 m under on beach_1, 0.2 m on beach_2, level to a couple of
+ * centimetres on beach_4. A 0.3 m crest 0.8 m down is never seen at all, and
+ * one a fifth of a metre down is sliced by the waterline as the swell rolls
+ * over it -- which is what "the waves near the beach look cut from one side"
+ * is.
+ *
+ * The markers are authored in the ENGINE's frame, and the port's surface is the
+ * authored tiles plus WSURF's own offset, so the two do not have to agree and
+ * on four of the five tracks they do not. The surface is the thing that can be
+ * measured, so the sprite is put on it: the swell at the sprite's own position,
+ * which also makes the crest rise and fall with the water under it instead of
+ * hanging at a fixed height while the sea moves through it.
+ *
+ * Kept: the marker's y decides NOTHING here any more, which is a divergence and
+ * is named as one. What is not recovered is where the engine puts the sprite;
+ * FUN_0052a030 reads the record's own position and the record is filled by the
+ * spawner, so the answer is in FUN_00525700's write and not yet read out.
+ */
+static float wave_base_y(const water_t *w, const wave_t *v)
+{
+    return v->sea_y + w->cfg->offset + surf_disp(w, v->x, v->z, w->t);
+}
+
 static void wave_draw(water_t *w, const wave_t *v, const float eye[3])
 {
     vtx_t q[4];
@@ -420,6 +893,7 @@ static void wave_draw(water_t *w, const wave_t *v, const float eye[3])
     float env = wave_env(v);
     float h = WAVE_HEIGHT * env;
     float u0 = v->u0 + w->t * WAVE_ANIM_SPEED;
+    float base = wave_base_y(w, v);
 
     ux = ex - ax * d;
     uy = ey;
@@ -430,7 +904,7 @@ static void wave_draw(water_t *w, const wave_t *v, const float eye[3])
     ux /= len; uy /= len; uz /= len;
 
     q[0].x = v->x - ax * WAVE_LEN + ux * WAVE_DHEIGHT;
-    q[0].y = v->y + uy * WAVE_DHEIGHT;
+    q[0].y = base + uy * WAVE_DHEIGHT;
     q[0].z = v->z - az * WAVE_LEN + uz * WAVE_DHEIGHT;
     q[1].x = v->x + ax * WAVE_LEN + ux * WAVE_DHEIGHT;
     q[1].y = q[0].y;
@@ -467,14 +941,23 @@ static void animate_surface(water_t *w, unsigned int bi)
     batch_t *b = &w->scene->batches[bi];
     const wsurf_t *c = w->cfg;
     const float *damp = w->damp[bi];
+    const int *site = w->site ? w->site[bi] : NULL;
     unsigned int j;
 
     if (!b->rest)
         return;
     for (j = 0; j < b->nverts; j++) {
+        /* THROUGH THE WELD MAP. `rest` for the height, and the vertex INDEX for
+           the UV orbit's hash, both come from the site rather than from j: the
+           shipped tiles duplicate their shared edges, so keying either on j
+           gives the two sides of a seam a different swell and a different
+           shimmer, and the texture tears along every tile boundary. The engine
+           has neither problem because it tessellates one shared grid. */
+        unsigned int sj = site ? (unsigned int)site[j] : j;
         const vtx_t *r = &b->rest[j];
+        const vtx_t *sr = &b->rest[sj];
         float k = damp ? damp[j] : 1.f;
-        unsigned int h = vhash(j + 1u);
+        unsigned int h = vhash(sj + 1u);
         /* FUN_005240c0 does NOT scroll the sea's UVs along a line. It advances
            a phase per vertex by rate*dt and puts the UV on a circle of radius
            texRad about its rest value -- a shimmer, not a current. The port had
@@ -487,10 +970,29 @@ static void animate_surface(water_t *w, unsigned int bi)
         float rate = c->tex_speed_min
                    + (c->tex_speed_max - c->tex_speed_min) * slice(h, 1);
         float ph   = slice(h, 2) + w->t * rate * (1.f / 360.f);  /* turns */
-        b->verts[j].y = r->y + c->offset + (1.f - k) * c->magnet_offset
-                      + k * surf_disp(w, r->x, r->z, w->t);
+        b->verts[j].y = sr->y + c->offset + (1.f - k) * c->magnet_offset
+                      + k * surf_disp(w, sr->x, sr->z, w->t);
         b->verts[j].u = r->u + rad * fsin(ph + 0.25f);
         b->verts[j].v = r->v + rad * fsin(ph);
+    }
+
+    /* THE T-JUNCTIONS. A vertex sitting part-way along a coarser tile's edge
+       has to end up on that edge, or the swell opens the two apart -- 269 of
+       them on beach_1, and the worst of them opens 0.34 m (0.60 m on
+       beach_3), because the edge under it is 17.4 m and the wavelength is
+       10.5 m. Endpoints are ordinary grid vertices and were written above,
+       so one pass is enough. */
+    if (w->stitch && w->stitch[bi]) {
+        const wstitch_t *st = w->stitch[bi];
+        unsigned int q, ns = w->n_stitch[bi];
+        /* ONE pass. A second was written for the case where a T-junction's
+           own chord endpoint is itself a T-junction vertex of a third tile; a
+           mutation that removed it changed nothing on any of the ten shipped
+           tracks, so that case does not occur in this data and the pass was
+           dead. The endpoints are ordinary grid vertices, written above. */
+        for (q = 0; q < ns; q++)
+            b->verts[st[q].v].y = b->verts[st[q].a].y
+                + (b->verts[st[q].b].y - b->verts[st[q].a].y) * st[q].t;
     }
 }
 
@@ -567,6 +1069,92 @@ static void draw_batch_v(const batch_t *b, const vtx_t *v)
 static void draw_batch(const batch_t *b)
 {
     draw_batch_v(b, b->verts);
+}
+
+void water_draw_horizon(const water_t *w, const float eye[3])
+{
+    /* A flat DISC centred on the eye, in two radius bands. It goes down with
+       the sky -- depth test and depth write both off, before any world geometry
+       -- so every pixel the world owns is painted over it and this is left only
+       where nothing else reached: the band between the authored tiles' outer
+       edge and the dome's lower rim. A disc rather than a ring because the
+       tiles stop at a different distance in every direction and a ring with an
+       inner radius would leave the shortfall showing; covering the middle costs
+       nothing, since the seabed is drawn over it and the translucent sea then
+       blends against the seabed exactly as before.
+
+       A plane at or below eye level never projects above the horizon line, so
+       it cannot bleed into the sky. */
+    static const float band[3] = { 0.f, WATER_HORIZON_MID, WATER_HORIZON_OUT };
+    const int N = WATER_HORIZON_SEGMENTS;
+    /* STATIC, not stack. These are handed to GL as client pointers and this
+       function returns immediately afterwards; vitaGL copies a draw this small
+       into its own buffer today, but that is a property of the speed hack's
+       threshold and not a promise, and a client pointer into a dead frame is
+       the kind of bug that shows up as one corrupt draw a minute. */
+    static float verts[WATER_HORIZON_SEGMENTS * 6][3];
+    static float uv[WATER_HORIZON_SEGMENTS * 6][2];
+    int i, r;
+
+    if (!w->horizon || !w->horizon_tex)
+        return;
+    /* Under the surface there is no horizon to continue, and the plane would
+       fill the screen. */
+    if (eye[1] <= w->horizon_y + 0.05f)
+        return;
+
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* glColor4f is ignored while a colour array is bound, and scene_draw only
+       turns one off again when it had lighting on -- which the sky pass, the
+       thing that draws immediately before this, does not. */
+    glDisableClientState(GL_COLOR_ARRAY);
+    glBindTexture(GL_TEXTURE_2D, w->horizon_tex);
+    glColor4f(1.f, 1.f, 1.f, w->horizon_alpha);
+
+    for (r = 0; r < 2; r++) {
+        /* Plain triangles rather than a strip: the port's GL surface is the one
+           both the device and testgl/ implement, and a strip is not in it. */
+        for (i = 0; i < N; i++) {
+            const float a0 = (float)i * (TWO_PI / (float)N);
+            const float a1 = (float)(i + 1) * (TWO_PI / (float)N);
+            float quad[4][2];
+            /* WOUND FOR AN UPWARD NORMAL. The obvious 0,1,2 / 0,2,3 over a
+               ring laid out by increasing angle comes out CLOCKWISE seen from
+               above, i.e. facing DOWN, and the race frame draws with
+               GL_CULL_FACE on (main.c) -- so the first version of this plane
+               was submitted in full and culled in full, and the gap it was
+               written to close stayed exactly as it was. testgl records draws
+               and does not cull, which is why nothing here could see it; part 3
+               now checks the winding itself. */
+            static const int order[6] = { 0, 2, 1, 0, 3, 2 };
+            int q;
+            quad[0][0] = cosf(a0) * band[r];     quad[0][1] = sinf(a0) * band[r];
+            quad[1][0] = cosf(a0) * band[r + 1]; quad[1][1] = sinf(a0) * band[r + 1];
+            quad[2][0] = cosf(a1) * band[r + 1]; quad[2][1] = sinf(a1) * band[r + 1];
+            quad[3][0] = cosf(a1) * band[r];     quad[3][1] = sinf(a1) * band[r];
+            for (q = 0; q < 6; q++) {
+                int k = i * 6 + q;
+                verts[k][0] = eye[0] + quad[order[q]][0];
+                verts[k][1] = w->horizon_y;
+                verts[k][2] = eye[2] + quad[order[q]][1];
+                uv[k][0] = verts[k][0] * WATER_HORIZON_UV;
+                uv[k][1] = verts[k][2] * WATER_HORIZON_UV;
+            }
+        }
+        glVertexPointer(3, GL_FLOAT, sizeof(verts[0]), &verts[0][0]);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(uv[0]), &uv[0][0]);
+        glDrawArrays(GL_TRIANGLES, 0, N * 6);
+    }
+
+    glColor4f(1.f, 1.f, 1.f, 1.f);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_ALPHA_TEST);
 }
 
 void water_draw(water_t *w, const float eye[3])

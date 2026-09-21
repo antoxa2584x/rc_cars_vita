@@ -29,9 +29,12 @@ typedef struct {
        NULL on any older grid, and then col_surface_at answers 0 everywhere.
        Separate from `surf` above on purpose: that one is a keyword guess at the
        same idea and drives AUDIO, this one is the game's own answer and drives
-       the tyre marks. Still not plumbed into rb_wheel_contact.surface -- doing
-       that turns on carSurfaceDrag's deep-sand branch and is a handling change,
-       not a visual one. */
+       the tyre marks -- AND, since the deep sand landed, rb_wheel_contact.surface
+       as well: col_sphere copies it per hit and rb_collide reduces it the way
+       FUN_00534fc0 does, which is what turns on carSurfaceDrag's `surface != 3'
+       branch. That branch is class 3, SURF_DUNESAND, and the only texture in the
+       shipped game that carries it is beach_1's `Sand_trample` -- 219 triangles,
+       0.06% of all ten grids. rccars_re/respawn.c measures it. */
     unsigned char *eng_surf;
     /* COL5: how bright the LEVEL'S OWN LIGHTMAP is on each triangle, 0..254,
        COL_LIGHT_NONE where that face has no lightmap layer. This is the quantity

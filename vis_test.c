@@ -777,8 +777,18 @@ static void part1_shadow(void)
     ck(sh.enabled, "shadow enabled", "tex=%u", sh.tex);
     ck(near(sh.size, R > 0.36f ? R : 0.36f, 1e-5f), "radius = max(ShadowSize, baked)",
        "%.3f m (ShadowSize 0.360, baked %.3f)", sh.size, R);
-    ck(near(sh.density, 34.f / 255.f, 1e-5f), "density = ShadowDensity/255",
-       "%.4f", sh.density);
+    /* ShadowDensity written out longhand, as it always was, times the port's own
+       SHADOW_DARKEN -- so the recovered 34 has two copies and a mutant has to
+       break both. The second check is a RELATION and not a value: the shadow is
+       darker than the engine's own density (which is what a mutant putting the
+       factor back to 1 loses) and still translucent (which is what stops the
+       factor growing into paint). Neither can be satisfied by moving the
+       constant they guard. */
+    ck(near(sh.density, 34.f / 255.f * 1.5f, 1e-5f),
+       "density = ShadowDensity/255 * SHADOW_DARKEN", "%.4f", sh.density);
+    ck(sh.density > 34.f / 255.f && sh.density < 0.5f,
+       "darker than the engine's own 34/255, and still see-through",
+       "%.4f against %.4f", sh.density, 34.f / 255.f);
 
     /* --- upright, facing +Z: the identity case ------------------------- */
     gl_cap_reset();
@@ -2139,6 +2149,19 @@ static void part2_checkpoints(void)
 
 /* ============================================================== part 3 ==== */
 
+/* What animate_surface writes for one vertex BEFORE the stitch touches it --
+   the test's own copy, off WSURF and water.c's damping table, so the seam
+   checks below measure against the surface and not against the stitch list. */
+static float own_h(const water_t *w, unsigned int bi, int j)
+{
+    const batch_t *b = &w->scene->batches[bi];
+    unsigned int sj = (w->site && w->site[bi]) ? (unsigned)w->site[bi][j]
+                                               : (unsigned)j;
+    float k = (w->damp && w->damp[bi]) ? w->damp[bi][j] : 1.f;
+    return b->rest[sj].y + w->cfg->offset + (1.f - k) * w->cfg->magnet_offset
+         + k * water_height(w, b->rest[sj].x, b->rest[sj].z);
+}
+
 static void part3_water(void)
 {
     static const char *tex[] = {"water_wave", "water_wave_alpha"};
@@ -3025,6 +3048,526 @@ static void part3_water(void)
             scene_release(&ts);
         }
     }
+
+    /* --- THE BREAKING WAVES STAND ON THE WATER, on the REAL tracks --------
+     *
+     * wave_spawn used to take the sprite's height straight from its
+     * `water_wave_N` marker, and measured against the surface the port draws,
+     * those markers are UNDER it: 0.8 m down on beach_1, 0.2 m on beach_2. A
+     * 0.3 m crest 0.8 m below the water is never seen, and one a fifth of a
+     * metre down is sliced by the waterline as the swell rolls over it --
+     * reported as "the waves near the beach look cut from one side". Nothing in
+     * this part could see it: every other wave check measures the sprite
+     * against ITSELF (its width against Len, its rise against Height, its crest
+     * against the travel direction) and none of them against the sea.
+     */
+    {
+        int t;
+        for (t = 0; t < N_TRACKS; t++) {
+            char path[64];
+            scene_t ts;
+            col_t tc;
+            water_t w;
+            float eye[3] = {0.f, 6.f, 0.f};
+            int j, checked = 0;
+            float worst = 0.f;
+
+            snprintf(path, sizeof(path), "assets/%s.vsc", TRACKS[t].base);
+            if (!scene_load(path, &ts))
+                continue;
+            snprintf(path, sizeof(path), "assets/%s.col", TRACKS[t].base);
+            memset(&tc, 0, sizeof(tc));
+            if (!col_load(path, &tc)) { scene_release(&ts); continue; }
+            water_init(&w, &ts, &tc, t);
+            if (!w.n_spawn) {
+                water_free(&w); col_free(&tc); scene_release(&ts);
+                continue;
+            }
+            /* run long enough that both timers have fired */
+            for (j = 0; j < 240; j++)
+                water_step(&w, 1.f / 60.f);
+            gl_cap_reset();
+            water_draw(&w, eye);
+
+            /* Every live sprite's lowest vertex against the surface AT ITS OWN
+               position -- read back through the recorder, so this is the
+               geometry that draws and not a number water.c agreed with itself
+               about. The quad is the only thing in the frame drawn as a 4-vertex
+               fan, which is how it is picked out. */
+            {
+                int d;
+                for (d = 0; d < glcap.n_draws; d++) {
+                    float lo = 1e30f, cx = 0.f, cz = 0.f, sea;
+                    int q;
+                    if (glcap.draws[d].count != 4)
+                        continue;
+                    for (q = 0; q < 4; q++) {
+                        const float *p = glcap.pos[glcap.draws[d].first + q];
+                        if (p[1] < lo) lo = p[1];
+                        cx += p[0] * 0.25f; cz += p[2] * 0.25f;
+                    }
+                    sea = w.spawn[0].sea_y + w.cfg->offset
+                        + water_height(&w, cx, cz);
+                    if (fabsf(lo - sea) > worst) worst = fabsf(lo - sea);
+                    checked++;
+                }
+            }
+            if (checked) {
+                /* WAVE_DHEIGHT (-0.05 m) is the quad's own lift along the
+                   billboard axis, so the base is allowed to sit that far off
+                   the surface and no further. */
+                ck(worst < 0.12f,
+                   "a breaking wave stands ON the water, not at its marker",
+                   "%s: %d sprites, worst base %.3f m off the surface under it "
+                   "(the marker is %+.2f m from the sea's own rest height)",
+                   TRACKS[t].base, checked, worst,
+                   w.spawn[0].y - w.spawn[0].sea_y);
+            }
+            water_free(&w);
+            col_free(&tc);
+            scene_release(&ts);
+        }
+    }
+
+    /* --- THE SEAMS, over the REAL ten -------------------------------------
+     *
+     * Reported as "some places with a cut, like between the waves". Two causes,
+     * both of them the same underlying fact: the port displaces the tiles the
+     * artists drew, and the engine displaces a grid it tessellates itself, so
+     * the port has SEAMS where the engine has none.
+     *
+     *   1. Coincident vertices. A tile's edge is duplicated in its neighbour --
+     *      646 of beach_1's 7,007 -- and only about half of the duplicates agree
+     *      bit for bit. Key the height, the depth damping or the UV orbit's hash
+     *      on the vertex INDEX and the two sides of every seam disagree.
+     *   2. T-junctions. A vertex of a finer tile lands on the INTERIOR of a
+     *      coarser neighbour's edge, which no amount of welding can reach: the
+     *      fine side follows the swell and the coarse side stays a chord.
+     *
+     * This scan is INDEPENDENT of water.c's own tables -- it finds the pairs and
+     * the T-junctions itself, off the index buffer -- so it cannot pass by
+     * agreeing with the thing it guards. And it reports the gap the UNSTITCHED
+     * surface would have had, which is what says the check is not vacuous:
+     * beach_1's worst edge is 17.4 m, two thirds of a wavelength.
+     */
+    {
+        int t;
+        for (t = 0; t < N_TRACKS; t++) {
+            char path[64];
+            scene_t ts;
+            col_t tc;
+            water_t w;
+            float eye[3] = {0.f, 5.f, 0.f};
+            unsigned int bi;
+            float worst_y = 0.f, worst_uv = 0.f, worst_tj = 0.f, raw_tj = 0.f;
+            int npair = 0, ntj = 0, any = 0, nopen = 0;
+            int hair = 0, hair_open = 0, coarse = 0;
+            float worst_pull = 0.f;
+
+            snprintf(path, sizeof(path), "assets/%s.vsc", TRACKS[t].base);
+            if (!scene_load(path, &ts))
+                continue;
+            snprintf(path, sizeof(path), "assets/%s.col", TRACKS[t].base);
+            memset(&tc, 0, sizeof(tc));
+            if (!col_load(path, &tc)) { scene_release(&ts); continue; }
+            water_init(&w, &ts, &tc, t);
+            water_step(&w, 3.7f);           /* somewhere off the phase origin */
+            gl_cap_reset();
+            water_draw(&w, eye);
+
+            for (bi = 0; bi < ts.n_batches; bi++) {
+                batch_t *b = &ts.batches[bi];
+                unsigned int j, q;
+                int *cell, ncx, ncz;
+                float x0 = 1e30f, x1 = -1e30f, z0 = 1e30f, z1 = -1e30f;
+                int *nxt;
+                const float CELL = 1.0f;
+
+                if (!(b->flags & BATCH_WATER) || !b->rest || !b->nverts)
+                    continue;
+                any = 1;
+                for (j = 0; j < b->nverts; j++) {
+                    if (b->rest[j].x < x0) x0 = b->rest[j].x;
+                    if (b->rest[j].x > x1) x1 = b->rest[j].x;
+                    if (b->rest[j].z < z0) z0 = b->rest[j].z;
+                    if (b->rest[j].z > z1) z1 = b->rest[j].z;
+                }
+                ncx = (int)((x1 - x0) / CELL) + 2;
+                ncz = (int)((z1 - z0) / CELL) + 2;
+                cell = malloc((size_t)ncx * ncz * sizeof(int));
+                nxt = malloc((size_t)b->nverts * sizeof(int));
+                if (!cell || !nxt) { free(cell); free(nxt); continue; }
+                for (j = 0; j < (unsigned)(ncx * ncz); j++) cell[j] = -1;
+                for (j = 0; j < b->nverts; j++) {
+                    int cx = (int)((b->rest[j].x - x0) / CELL);
+                    int cz = (int)((b->rest[j].z - z0) / CELL);
+                    nxt[j] = cell[cz * ncx + cx];
+                    cell[cz * ncx + cx] = (int)j;
+                }
+
+                /* (1) every coincident pair draws at the same height AND with
+                       the same UV offset off its own rest value */
+                for (j = 0; j < b->nverts; j++) {
+                    int cx = (int)((b->rest[j].x - x0) / CELL);
+                    int cz = (int)((b->rest[j].z - z0) / CELL);
+                    int k;
+                    for (k = cell[cz * ncx + cx]; k >= 0; k = nxt[k]) {
+                        float dx, dz, dy, du, dv;
+                        if (k >= (int)j) continue;
+                        dx = b->rest[k].x - b->rest[j].x;
+                        dz = b->rest[k].z - b->rest[j].z;
+                        if (dx * dx + dz * dz > WATER_WELD_TOL * WATER_WELD_TOL)
+                            continue;
+                        npair++;
+                        dy = fabsf(b->verts[k].y - b->verts[j].y);
+                        du = fabsf((b->verts[k].u - b->rest[k].u)
+                                 - (b->verts[j].u - b->rest[j].u));
+                        dv = fabsf((b->verts[k].v - b->rest[k].v)
+                                 - (b->verts[j].v - b->rest[j].v));
+                        if (dy > worst_y) worst_y = dy;
+                        if (du > worst_uv) worst_uv = du;
+                        if (dv > worst_uv) worst_uv = dv;
+                    }
+                }
+
+                /* (2b) NOTHING is dragged off its own surface. Computed
+                       here from WSURF and water.c's own damping table, which is
+                       what animate_surface writes before the stitch touches
+                       anything -- so this sees a stitch that overreaches. */
+                for (j = 0; j < b->nverts; j++) {
+                    float pull = fabsf(b->verts[j].y - own_h(&w, bi, (int)j));
+                    if (pull > worst_pull) worst_pull = pull;
+                }
+
+                /* (2) every T-junction vertex sits on its neighbour's chord */
+                for (q = 0; q + 2 < b->nidx; q += 3) {
+                    int tri[3], e;
+                    tri[0] = b->idx[q]; tri[1] = b->idx[q+1]; tri[2] = b->idx[q+2];
+                    for (e = 0; e < 3; e++) {
+                        int ia = tri[e], ib = tri[(e + 1) % 3];
+                        float ax = b->rest[ia].x, az = b->rest[ia].z;
+                        float ex = b->rest[ib].x - ax, ez = b->rest[ib].z - az;
+                        float l2 = ex * ex + ez * ez;
+                        int cx0, cx1, cz0, cz1, cx, cz;
+                        if (ia >= ib || l2 < 1e-8f) continue;
+                        cx0 = (int)(((ax < ax+ex ? ax : ax+ex) - x0) / CELL) - 1;
+                        cx1 = (int)(((ax > ax+ex ? ax : ax+ex) - x0) / CELL) + 1;
+                        cz0 = (int)(((az < az+ez ? az : az+ez) - z0) / CELL) - 1;
+                        cz1 = (int)(((az > az+ez ? az : az+ez) - z0) / CELL) + 1;
+                        if (cx0 < 0) cx0 = 0;
+                        if (cz0 < 0) cz0 = 0;
+                        if (cx1 >= ncx) cx1 = ncx - 1;
+                        if (cz1 >= ncz) cz1 = ncz - 1;
+                        for (cz = cz0; cz <= cz1; cz++)
+                            for (cx = cx0; cx <= cx1; cx++) {
+                                int k;
+                                for (k = cell[cz * ncx + cx]; k >= 0; k = nxt[k]) {
+                                    float px, pz, tt, perp, chord, gap;
+                                    if (k == ia || k == ib) continue;
+                                    px = b->rest[k].x - ax; pz = b->rest[k].z - az;
+                                    tt = (px * ex + pz * ez) / l2;
+                                    if (tt <= 1e-3f || tt >= 1.f - 1e-3f) continue;
+                                    perp = px * ez - pz * ex;
+                                    if (perp * perp > WATER_STITCH_TOL
+                                                    * WATER_STITCH_TOL * l2)
+                                        continue;
+                                    ntj++;
+                                    chord = b->verts[ia].y
+                                          + (b->verts[ib].y - b->verts[ia].y) * tt;
+                                    gap = fabsf(b->verts[k].y - chord);
+                                    if (gap > worst_tj) worst_tj = gap;
+                                    if (gap > 1e-5f) nopen++;
+                                    /* THE RULE, restated here rather than read
+                                       off water.c's table: how far is the chord
+                                       from the surface each end would have had?
+                                       Under the bound, the crack is a hairline
+                                       and has to be closed; over it, closing
+                                       would flatten more than it mends and it
+                                       is allowed to stay open. */
+                                    {
+                                        /* the WORST case over the wave's own
+                                           phases, which is what the rule says
+                                           and what one instant cannot tell you:
+                                           an edge can lie flat against the
+                                           surface at this moment and be half a
+                                           metre off it a second later. w.t is
+                                           the clock the displacement reads, so
+                                           walk it and put it back. */
+                                        float t0 = w.t, err = 0.f;
+                                        int ph;
+                                        for (ph = 0; ph < WATER_STITCH_SWEEP_N; ph++) {
+                                            float hv, ha, hb, e;
+                                            w.t = WATER_STITCH_SWEEP_T
+                                                * (float)ph
+                                                / (float)WATER_STITCH_SWEEP_N;
+                                            hv = own_h(&w, bi, k);
+                                            ha = own_h(&w, bi, ia);
+                                            hb = own_h(&w, bi, ib);
+                                            e = fabsf(hv - (ha + (hb - ha) * tt));
+                                            if (e > err) err = e;
+                                        }
+                                        w.t = t0;
+                                        if (err <= WATER_STITCH_MAX_SAG) {
+                                            hair++;
+                                            if (gap > 1e-4f) hair_open++;
+                                        } else {
+                                            coarse++;
+                                        }
+                                    }
+                                    /* WHAT THE CRACK WAS, computed from the
+                                       swell itself rather than from this
+                                       build's vertices -- water_height is the
+                                       displacement function, so this is the
+                                       sag of the wave over that edge and it
+                                       stays true however the draw is fixed.
+                                       Without the fixup the fine vertex sits
+                                       here and the coarse edge stays a chord,
+                                       and the surface opens by the difference. */
+                                    {
+                                        float ha = b->rest[ia].y
+                                            + water_height(&w, b->rest[ia].x,
+                                                           b->rest[ia].z);
+                                        float hb = b->rest[ib].y
+                                            + water_height(&w, b->rest[ib].x,
+                                                           b->rest[ib].z);
+                                        float hk = b->rest[k].y
+                                            + water_height(&w, b->rest[k].x,
+                                                           b->rest[k].z);
+                                        gap = fabsf(hk - (ha + (hb - ha) * tt));
+                                        if (gap > raw_tj) raw_tj = gap;
+                                    }
+                                }
+                            }
+                    }
+                }
+                free(cell); free(nxt);
+            }
+
+            if (any) {
+                /* 1e-5 of UV, not zero: the offset is read back as
+                   (rest + orbit) - rest in single precision, which is not the
+                   orbit to the last bit. 1e-5 UV is a four-thousandth of a
+                   pixel on a 256-wide sea texture; the bug this catches gave
+                   the two sides INDEPENDENT orbits, worth the whole texRad. */
+                ck(worst_y < 1e-5f && worst_uv < 1e-5f,
+                   "the sea has no seam where two tiles share an edge",
+                   "%s: %d coincident pairs, worst height gap %.6f m, "
+                   "worst UV divergence %.7f", TRACKS[t].base, npair,
+                   worst_y, worst_uv);
+                /* TWO CLAUSES, and they fail in OPPOSITE directions, so
+                   nothing satisfies both by cheating.
+                     1. no crack wider than the bound -- fails if the stitch is
+                        removed (0.60 m on beach_3);
+                     2. no vertex pulled further than the bound from the surface
+                        its own swell puts it on -- fails if the stitch closes
+                        everything regardless, which is the flattening that was
+                        reported on beach_2 as waves "cut from one side" (a
+                        9.1 m chord dropped its vertex 0.92 m).
+                   A T-junction whose chord is further than the bound from the
+                   surface is deliberately LEFT OPEN: see build_stitch. */
+                ck(hair > 0 && hair_open == 0,
+                   "every HAIRLINE T-junction is closed",
+                   "%s: %d of %d T-junctions are hairlines, %d still open; the "
+                   "other %d have a chord further than %.3f m from the surface "
+                   "and are left alone (worst %.4f m, and the same edges open "
+                   "%.4f m with no stitch at all)",
+                   TRACKS[t].base, hair, ntj, hair_open, coarse,
+                   WATER_STITCH_MAX_SAG, worst_tj, raw_tj);
+                ck(worst_pull <= WATER_STITCH_MAX_SAG + 1e-4f,
+                   "and no vertex is dragged off its own swell by more",
+                   "%s: worst %.4f m against a %.3f m bound",
+                   TRACKS[t].base, worst_pull, WATER_STITCH_MAX_SAG);
+            }
+            water_free(&w);
+            col_free(&tc);
+            scene_release(&ts);
+        }
+    }
+
+    /* --- THE HORIZON ------------------------------------------------------
+     *
+     * Reported as "the ocean ends before the skydome, so there is a gap". The
+     * sky is drawn camera-locked, i.e. at infinity; the authored sea stops at
+     * the edge of the map. See water_draw_horizon.
+     */
+    {
+        int t, done_sea = 0, done_dry = 0;
+        /* EVERY track with a sea, not the first one: beach_1's tiles happen to
+           sit at y = 0, so a plane that dropped the authored height entirely
+           would still land right there and nowhere else. beach_2's sea is at
+           1.54 m and beach_3's at 2.15 m. */
+        for (t = 0; t < N_TRACKS; t++) {
+            char path[64];
+            scene_t ts;
+            col_t tc;
+            water_t w;
+            float eye[3] = {12.f, 6.f, -20.f};
+            unsigned int bi;
+            int has_sea = 0;
+
+            snprintf(path, sizeof(path), "assets/%s.vsc", TRACKS[t].base);
+            if (!scene_load(path, &ts))
+                continue;
+            snprintf(path, sizeof(path), "assets/%s.col", TRACKS[t].base);
+            memset(&tc, 0, sizeof(tc));
+            if (!col_load(path, &tc)) { scene_release(&ts); continue; }
+            water_init(&w, &ts, &tc, t);
+            for (bi = 0; bi < ts.n_batches; bi++)
+                if (ts.batches[bi].flags & BATCH_WATER) has_sea = 1;
+
+            if (has_sea) {
+                float r2 = 0.f, worst_y = 0.f;
+                int d, q, nv = 0;
+                double cx = 0.0, cz = 0.0, rim = 0.0;
+                float rmax = 0.f;
+                unsigned int nsea = 0, nrim = 0;
+                done_sea++;
+
+                /* Where the authored surface is actually DRAWN at its outer
+                   rim -- measured here, not read back off water.c, so the
+                   plane's height is checked against the sea and not against
+                   itself. A step at the join is as visible as the gap was. */
+                water_step(&w, 2.3f);
+                water_draw(&w, eye);
+                for (bi = 0; bi < ts.n_batches; bi++) {
+                    batch_t *b = &ts.batches[bi];
+                    unsigned int j;
+                    if (!(b->flags & BATCH_WATER)) continue;
+                    for (j = 0; j < b->nverts; j++) {
+                        cx += b->rest[j].x; cz += b->rest[j].z; nsea++;
+                    }
+                }
+                if (nsea) { cx /= nsea; cz /= nsea; }
+                for (bi = 0; bi < ts.n_batches; bi++) {
+                    batch_t *b = &ts.batches[bi];
+                    unsigned int j;
+                    if (!(b->flags & BATCH_WATER)) continue;
+                    for (j = 0; j < b->nverts; j++) {
+                        float dx = b->rest[j].x - (float)cx;
+                        float dz = b->rest[j].z - (float)cz;
+                        float rr = dx * dx + dz * dz;
+                        if (rr > rmax) rmax = rr;
+                    }
+                }
+                {
+                    /* Widen the band until the sample is big enough to mean the
+                       SWELL away -- beach_2's sea is a long thin strip whose
+                       outermost vertices are one or two, each at its own phase.
+                       A different fraction from water.c's on purpose. */
+                    float cut = 0.64f;
+                    while (cut > 1e-4f) {
+                        rim = 0.0; nrim = 0;
+                        for (bi = 0; bi < ts.n_batches; bi++) {
+                            batch_t *b = &ts.batches[bi];
+                            unsigned int j;
+                            if (!(b->flags & BATCH_WATER)) continue;
+                            for (j = 0; j < b->nverts; j++) {
+                                float dx = b->rest[j].x - (float)cx;
+                                float dz = b->rest[j].z - (float)cz;
+                                if (dx * dx + dz * dz < cut * rmax) continue;
+                                rim += b->verts[j].y; nrim++;
+                            }
+                        }
+                        if (nrim >= 128u) break;
+                        cut *= 0.5f;
+                    }
+                }
+                if (nrim) rim /= nrim;
+                ck(nrim > 0 && fabsf((float)rim - w.horizon_y) < 0.05f,
+                   "the horizon plane lines up with the sea it continues",
+                   "%s: plane at %+.3f, the tiles' own outer rim draws at "
+                   "%+.3f (%u vertices)", TRACKS[t].base, w.horizon_y,
+                   (float)rim, nrim);
+
+                gl_cap_reset();
+                water_draw_horizon(&w, eye);
+                for (d = 0; d < glcap.n_draws; d++)
+                    for (q = 0; q < glcap.draws[d].count; q++) {
+                        const float *p = glcap.pos[glcap.draws[d].first + q];
+                        float dx = p[0] - eye[0], dz = p[2] - eye[2];
+                        float rr = dx * dx + dz * dz;
+                        if (rr > r2) r2 = rr;
+                        if (fabsf(p[1] - w.horizon_y) > worst_y)
+                            worst_y = fabsf(p[1] - w.horizon_y);
+                        nv++;
+                    }
+                /* THE WINDING, because a plane that is submitted and then
+                   CULLED passes every other check in this block. The race frame
+                   draws with GL_CULL_FACE on and testgl does not cull, so the
+                   first version of this shipped invisible: every triangle faced
+                   DOWN. A front face is counter-clockwise, which for a plane at
+                   constant y means its normal has to point +Y. */
+                {
+                    int d2, q2, down = 0, tris = 0;
+                    for (d2 = 0; d2 < glcap.n_draws; d2++)
+                        for (q2 = 0; q2 + 2 < glcap.draws[d2].count; q2 += 3) {
+                            const float *p0 = glcap.pos[glcap.draws[d2].first + q2];
+                            const float *p1 = glcap.pos[glcap.draws[d2].first + q2 + 1];
+                            const float *p2 = glcap.pos[glcap.draws[d2].first + q2 + 2];
+                            float ax2 = p1[0] - p0[0], az2 = p1[2] - p0[2];
+                            float bx2 = p2[0] - p1[0], bz2 = p2[2] - p1[2];
+                            float ny = az2 * bx2 - ax2 * bz2;
+                            if (fabsf(ny) < 1e-6f) continue;
+                            tris++;
+                            if (ny < 0.f) down++;
+                        }
+                    ck(tris > 0 && down == 0,
+                       "and it FACES UP -- a culled plane closes nothing",
+                       "%s: %d of %d triangles wound face-down",
+                       TRACKS[t].base, down, tris);
+                }
+
+                ck(w.horizon && nv > 0 && sqrtf(r2) > 2000.f && worst_y < 1e-4f,
+                   "a track with a sea continues it to the horizon",
+                   "%s: %d vertices out to %.0f m at y %+.3f (the authored "
+                   "surface's own outer rim), worst %.5f m off plane",
+                   TRACKS[t].base, nv, sqrtf(r2), w.horizon_y, worst_y);
+
+                /* and it reaches every bearing, or the gap just moves */
+                {
+                    int sector[8], i2, missing = 0;
+                    for (i2 = 0; i2 < 8; i2++) sector[i2] = 0;
+                    for (d = 0; d < glcap.n_draws; d++)
+                        for (q = 0; q < glcap.draws[d].count; q++) {
+                            const float *p = glcap.pos[glcap.draws[d].first + q];
+                            float dx = p[0] - eye[0], dz = p[2] - eye[2];
+                            float ang;
+                            if (dx * dx + dz * dz < 4.f) continue;
+                            ang = atan2f(dz, dx) + 3.14159265f;
+                            sector[(int)(ang / (6.2831853f / 8.f)) & 7]++;
+                        }
+                    for (i2 = 0; i2 < 8; i2++) if (!sector[i2]) missing++;
+                    ck(!missing, "all the way round, not just one quadrant",
+                       "%d of 8 bearings empty", missing);
+                }
+
+                /* under the surface there is no horizon to fill from */
+                {
+                    float low[3];
+                    low[0] = eye[0]; low[1] = w.horizon_y - 0.5f; low[2] = eye[2];
+                    gl_cap_reset();
+                    water_draw_horizon(&w, low);
+                    ck(glcap.n_draws == 0,
+                       "and nothing is drawn from under the water",
+                       "%d draws at y %+.3f", glcap.n_draws, low[1]);
+                }
+            } else if (!has_sea && !done_dry) {
+                done_dry = 1;
+                gl_cap_reset();
+                water_draw_horizon(&w, eye);
+                ck(!w.horizon && glcap.n_draws == 0,
+                   "a track with no sea gets no horizon plane",
+                   "%s: horizon=%d, %d draws", TRACKS[t].base, w.horizon,
+                   glcap.n_draws);
+            }
+            water_free(&w);
+            col_free(&tc);
+            scene_release(&ts);
+        }
+        ck(done_sea && done_dry,
+           "and both cases were actually reached",
+           "sea=%d dry=%d", done_sea, done_dry);
+    }
 }
 
 /* ============================================================== part 4 ==== */
@@ -3093,14 +3636,38 @@ static void part4_scene(void)
 
 /* ============================================================== part 5 ==== */
 
+/* Drive a kinematic car: hold `ax` m/s^2 along world +X and `vz` m/s along +Z
+   for `secs`, stepping the antenna with the matrix the car's model would be
+   drawn under. The chain is simulated in WORLD space now, so this is the only
+   way to make it feel anything -- there is no acceleration argument any more,
+   and that is the point: the engine drives it entirely through the anchor. */
+static void ant_drive(antenna_t *a, float ax, float vz, float secs, float dt)
+{
+    static float px, pz, pvx;
+    float m[16];
+    int i, n = (int)(secs / dt + 0.5f);
+
+    if (secs < 0.f) {           /* reset the rig between manoeuvres */
+        px = pz = pvx = 0.f;
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        pvx += ax * dt;
+        px += pvx * dt;
+        pz += vz * dt;
+        body_matrix(m, 0.f, px, 0.f, pz);
+        antenna_step(a, m, dt);
+    }
+}
+
 static void part5_antenna(void)
 {
     static const char *tex[] = {"t"};
     scene_t *s = make_scene(tex, 1);
     antenna_t a;
     batch_t *b;
-    float m[16], acc[3] = {0.f, 0.f, 0.f};
-    float rest_tip, tip0, tipL, tipR, base_moved;
+    float m[16];
+    float rest_tip, tip0, tipL, tipR, base_moved, tip_fast;
     int i, k;
 
     printf("\n-- part 5: the whip antenna --\n");
@@ -3130,22 +3697,18 @@ static void part5_antenna(void)
 
     /* --- level and still: the whip stands up ----------------------------
      *
-     * Nudge it first. A perfectly symmetric chain with no bending force sits in
-     * UNSTABLE equilibrium -- gravity is along its own axis and the length
-     * constraint holds it -- so it stays vertical and this check passes for
-     * entirely the wrong reason. The nudge makes it a stability test. */
-    acc[0] = 4.f;
-    for (i = 0; i < 20; i++)
-        antenna_step(&a, m, acc, 0.f, 1.f / 60.f);
-    acc[0] = 0.f;
-    for (i = 0; i < 600; i++)
-        antenna_step(&a, m, acc, 0.f, 1.f / 60.f);
+     * Nudge it first. A perfectly symmetric chain sits in UNSTABLE equilibrium
+     * with gravity along its own axis and the length constraint holding it, so
+     * it stays vertical and this check passes for entirely the wrong reason.
+     * The nudge makes it a stability test. */
+    ant_drive(&a, 0.f, 0.f, -1.f, 0.f);         /* reset the rig */
+    ant_drive(&a, 4.f, 0.f, 0.3f, 1.f / 60.f);
+    ant_drive(&a, 0.f, 0.f, 8.0f, 1.f / 60.f);
     antenna_apply(&a);
     tip0 = b->verts[b->nverts - 1].x;
-    /* HEIGHT, not just x. The first version of this checked the tip's x alone,
-       and gravity pulls along -y: a whip that had collapsed into a hanging wire
-       -- which is exactly what the no-bending-force version did -- kept x = 0
-       and sailed through. It stands up or it does not. */
+    /* HEIGHT, not just x. Gravity pulls along -y: a whip that had collapsed
+       into a hanging wire -- which is what a chain with no bending term does --
+       keeps x = 0 and would sail through a plan check alone. */
     ck(b->verts[b->nverts - 1].y > a.base_y + 0.85f * (a.tip_y - a.base_y),
        "a parked car's antenna STANDS UP",
        "tip y %.4f, base %.3f, rest tip %.3f",
@@ -3159,21 +3722,36 @@ static void part5_antenna(void)
        "base moved %.5f m",
        fabsf(b->verts[0].y - b->rest[0].y));
 
+    /* --- A CAR AT SPEED DOES NOT BEND IT --------------------------------
+     *
+     * This is the check the rewrite exists for. The port used to push every
+     * point back with `windFriction * speed * height`, which at 30 m/s is 138
+     * units of force on a 0.25 kg tip -- 55 times its own weight -- and drew
+     * the whip streaming backwards like a rope in a gale. The engine has no
+     * wind at all: getUserForceCB writes the zero vector for every point but
+     * the last, and the last one's is _carAntennaDirZ scaled by a literal 0.0f.
+     * Constant velocity is no force, so the whip has to stand exactly as it
+     * does parked. 30 m/s is above the fastest car's top speed. */
+    ant_drive(&a, 0.f, 30.f, 4.0f, 1.f / 60.f);
+    antenna_apply(&a);
+    tip_fast = b->verts[b->nverts - 1].z;
+    ck(fabsf(tip_fast - b->rest[b->nverts - 1].z) < 0.01f
+       && b->verts[b->nverts - 1].y > a.base_y + 0.85f * (a.tip_y - a.base_y),
+       "30 m/s of CONSTANT velocity does not bend it -- there is no wind term",
+       "tip z %.4f against rest %.4f, tip y %.4f",
+       tip_fast, b->rest[b->nverts - 1].z, b->verts[b->nverts - 1].y);
+
     /* --- accelerate one way, then the other ----------------------------- */
-    /* Hold each acceleration long enough to SETTLE before reading. The spring
-       rings at about 4 Hz and damps with a ~0.9 s time constant, so a 1-second
-       sample lands mid-oscillation and its sign is a coin toss -- which is how
-       an earlier version of this check read the deflection backwards. */
-    acc[0] = 6.f;
-    for (i = 0; i < 300; i++)
-        antenna_step(&a, m, acc, 0.f, 1.f / 60.f);
+    /* Hold each acceleration long enough to SETTLE before reading: the spring
+       rings and a sample taken mid-swing has a sign that is a coin toss. */
+    ant_drive(&a, 0.f, 0.f, -1.f, 0.f);
+    ant_drive(&a, 6.f, 0.f, 4.0f, 1.f / 60.f);
     antenna_apply(&a);
     tipR = b->verts[b->nverts - 1].x;
     base_moved = fabsf(b->verts[0].x - b->rest[0].x);
 
-    acc[0] = -6.f;
-    for (i = 0; i < 300; i++)
-        antenna_step(&a, m, acc, 0.f, 1.f / 60.f);
+    ant_drive(&a, 0.f, 0.f, -1.f, 0.f);
+    ant_drive(&a, -6.f, 0.f, 4.0f, 1.f / 60.f);
     antenna_apply(&a);
     tipL = b->verts[b->nverts - 1].x;
 
@@ -3187,34 +3765,55 @@ static void part5_antenna(void)
     {
         float worst = 0.f;
         for (i = 1; i < a.n; i++) {
-            float dx = a.p[i][0] - a.p[i-1][0];
-            float dy = a.p[i][1] - a.p[i-1][1];
-            float dz = a.p[i][2] - a.p[i-1][2];
+            float dx = a.p[a.cur][i][0] - a.p[a.cur][i-1][0];
+            float dy = a.p[a.cur][i][1] - a.p[a.cur][i-1][1];
+            float dz = a.p[a.cur][i][2] - a.p[a.cur][i-1][2];
             float len = sqrtf(dx*dx + dy*dy + dz*dz);
             float err = fabsf(len - a.seg);
             if (err > worst) worst = err;
         }
-        ck(worst < 0.1f * a.seg, "segments hold their length under load",
-           "worst error %.4f m on %.4f m segments", worst, a.seg);
+        ck(worst < 0.02f * a.seg, "segments hold their length under load",
+           "worst error %.5f m on %.4f m segments", worst, a.seg);
     }
 
     /* --- and it settles back -------------------------------------------- */
-    acc[0] = 0.f;
-    for (i = 0; i < 900; i++)
-        antenna_step(&a, m, acc, 0.f, 1.f / 60.f);
+    ant_drive(&a, 0.f, 0.f, -1.f, 0.f);
+    ant_drive(&a, 0.f, 0.f, 10.f, 1.f / 60.f);
     antenna_apply(&a);
     /* Tolerances sized to the FAILURE, not to the noise. A whip under its own
-       weight really does bow: the tip sits about 27 mm below vertical and a few
-       mm off plan, and that is an equilibrium, not a failure to settle. What
-       this has to catch is the bug it was written for -- a chain with no
-       bending force lies down, putting the tip near 0.25 rather than 0.43 and
-       leaving it wherever the last shove left it. 85% of span and 20 mm of plan
-       separate those two by a wide margin; the mutation battery confirms it. */
+       weight really does bow a little, and that is an equilibrium, not a
+       failure to settle. What this has to catch is a chain with no bending
+       force, which lies down: the tip near 0.25 rather than 0.43, and left
+       wherever the last shove put it. */
     ck(fabsf(b->verts[b->nverts - 1].x - rest_tip) < 0.02f
        && b->verts[b->nverts - 1].y > a.base_y + 0.85f * (a.tip_y - a.base_y),
        "and settles back upright once the car stops",
        "tip (%.4f, %.4f) against rest (%.4f, %.3f)",
        b->verts[b->nverts - 1].x, b->verts[b->nverts - 1].y, rest_tip, a.tip_y);
+
+    /* --- A TELEPORT REPLANTS IT RATHER THAN WHIPPING IT ------------------
+     *
+     * process__14carANTENNA_NEW tests the anchor's travel against 2.5 m at the
+     * top of every frame and calls initInPos when it is over. A respawn moves
+     * a car across the map in one frame, and without this the chain arrives as
+     * a straight line dragged behind it at a few hundred metres a second. */
+    {
+        body_matrix(m, 0.f, 400.f, 0.f, -300.f);
+        antenna_step(&a, m, 1.f / 60.f);
+        antenna_apply(&a);
+        /* Against the CHAIN's own reach, not the mesh's: chainLength is
+           0.25 m and the mesh is 0.267 m tall, so a perfectly upright whip
+           puts its tip at base_y + seg*(n-1) and never at tip_y. */
+        ck(fabsf(b->verts[b->nverts - 1].x - rest_tip) < 0.005f
+           && b->verts[b->nverts - 1].y
+              > a.base_y + 0.99f * a.seg * (float)(a.n - 1),
+           "a 500 m jump replants the chain instead of whipping it",
+           "tip (%.4f, %.4f)", b->verts[b->nverts - 1].x,
+           b->verts[b->nverts - 1].y);
+        ant_drive(&a, 0.f, 0.f, -1.f, 0.f);
+        body_matrix(m, 0.f, 0.f, 0.f, 0.f);
+        antenna_step(&a, m, 1.f / 60.f);
+    }
 
     /* --- and the deformation has to REACH THE SCREEN ---------------------
      *
@@ -3257,13 +3856,11 @@ static void part5_antenna(void)
            "ready=%d vbo=%u ibo=%u", a3.ready,
            (unsigned)b->gl_vbo, (unsigned)b->gl_ibo);
 
-        acc[0] = 6.f;
-        for (i = 0; i < 300; i++)
-            antenna_step(&a3, m, acc, 0.f, 1.f / 60.f);
-        acc[0] = 0.f;
+        ant_drive(&a3, 0.f, 0.f, -1.f, 0.f);
+        ant_drive(&a3, 6.f, 0.f, 4.0f, 1.f / 60.f);
         antenna_apply(&a3);
 
-        /* The mesh is a 8 mm column about x = 0, so |x| out at the tip IS the
+        /* The mesh is an 8 mm column about x = 0, so |x| out at the tip IS the
            deflection. Compare what was drawn against what was computed rather
            than against a number: a stale buffer draws the packed +-0.004 and
            cannot reach anywhere near it. */
@@ -3303,7 +3900,7 @@ static void part5_antenna(void)
         for (ci = 0; ci < 3; ci++) {
             scene_t cs;
             antenna_t ac;
-            float bend = 0.f;
+            float bend = 0.f, wind_bend = 0.f;
 
             if (!scene_load(files[ci], &cs)) {
                 ck(0, "the packed car loads (run from rccars_vita/)",
@@ -3318,10 +3915,15 @@ static void part5_antenna(void)
                ac.batch ? ac.batch->nverts : 0u,
                ac.batch ? (unsigned)ac.batch->gl_vbo : 0u);
             if (ac.ready) {
-                acc[0] = 6.f;
-                for (i = 0; i < 300; i++)
-                    antenna_step(&ac, m, acc, 0.f, 1.f / 60.f);
-                acc[0] = 0.f;
+                /* 20 m/s^2 -- twice this engine's gravity, which is a boost
+                   launch or a landing, not a cruise. The retail whip is STIFF:
+                   stiffness 10 against a 0.25 kg mass on 83 mm links bends it
+                   a couple of degrees under 6 m/s^2 and that is the answer the
+                   config gives. Sized to catch a chain that does not move at
+                   all -- unbound, or driven only by a wind term that no longer
+                   exists. */
+                ant_drive(&ac, 0.f, 0.f, -1.f, 0.f);
+                ant_drive(&ac, 20.f, 0.f, 4.0f, 1.f / 60.f);
                 antenna_apply(&ac);
                 for (k = 0; k < (int)ac.batch->nverts; k++) {
                     float dx = fabsf(ac.batch->verts[k].x
@@ -3330,10 +3932,24 @@ static void part5_antenna(void)
                 }
                 /* Against the whip's own length, not a constant: the three
                    cars' antennae differ in height and in chainLength. */
-                ck(bend > 0.05f * (ac.tip_y - ac.base_y),
+                ck(bend > 0.04f * (ac.tip_y - ac.base_y),
                    "and the real mesh bends when the car accelerates",
                    "%s: %.1f mm on a %.0f mm whip", names[ci], bend * 1000.f,
                    (ac.tip_y - ac.base_y) * 1000.f);
+
+                /* and the same mesh at a steady 30 m/s does NOT */
+                ant_drive(&ac, 0.f, 0.f, -1.f, 0.f);
+                ant_drive(&ac, 0.f, 30.f, 4.0f, 1.f / 60.f);
+                antenna_apply(&ac);
+                for (k = 0; k < (int)ac.batch->nverts; k++) {
+                    float dz = fabsf(ac.batch->verts[k].z
+                                     - ac.batch->rest[k].z);
+                    if (dz > wind_bend) wind_bend = dz;
+                }
+                ck(wind_bend < 0.02f * (ac.tip_y - ac.base_y),
+                   "and does not stream backwards at a steady 30 m/s",
+                   "%s: %.1f mm on a %.0f mm whip", names[ci],
+                   wind_bend * 1000.f, (ac.tip_y - ac.base_y) * 1000.f);
             }
             scene_release(&cs);
         }
@@ -3347,7 +3963,7 @@ static void part5_antenna(void)
         antenna_init(&a2, bare, 0);
         ck(!a2.ready, "no ANTENNA part means no antenna, not a crash",
            "ready=%d", a2.ready);
-        antenna_step(&a2, m, acc, 5.f, 1.f / 60.f);
+        antenna_step(&a2, m, 1.f / 60.f);
         antenna_apply(&a2);
         ck(1, "and stepping it anyway is safe", "no fault");
     }
@@ -6675,9 +7291,18 @@ static void part14_aifx(void)
             {
                 int t2, oback = 0, pback = 0, thin = 0, done = 0;
                 float pworst = 0.f;
+                /* AND THE NETWORK RACE'S OWN COPY OF THE PLAYER'S MEASURE --
+                   see the check at the bottom of this block. */
+                int netdiff = 0;
+                float networst = 0.f;
                 for (t2 = 0; t2 < 10; t2++) {
                     char pth[160];
                     scene_t s4; col_t c4; checkpoints_t k4; ai_t a4; ai_track t4;
+                    /* THE SAME PLAYER, MEASURED THE WAY A NETWORK RACE MEASURES
+                       IT: ai_player_progress and no ai_step at all. No
+                       opponents, because in a network race ai.c has no
+                       recording for any of them. */
+                    ai_t a5;
                     int i2, q;
                     float oprev[AI_MAX_OPPONENTS], pprev = -1e9f;
                     float ofwd = 0.f, pfwd = 0.f;
@@ -6723,6 +7348,11 @@ static void part14_aifx(void)
                         cp_restart(&k4, pc->s[0].p[0], pc->s[0].p[1],
                                    pc->s[0].p[2]);
                         for (q = 0; q < AI_MAX_OPPONENTS; q++) oprev[q] = -1e9f;
+                        memset(&a5, 0, sizeof a5);
+                        /* ai_reset's own value, and it is not 0: 0 is a valid
+                           arc (the start line) and this field means "not found
+                           on the spine yet". */
+                        a5.player_at = -1.f;
                         pc = &a4.car[0];
                         /* 12000 ticks -- 200 s. The slowest track's player-side
                            measure needs that to clear one full lap, and "one full
@@ -6733,6 +7363,21 @@ static void part14_aifx(void)
                                     pc->s[si].p[2], 1.f / 60.f);
                             ai_step(&a4, &t4, pc->s[si].p[0], pc->s[si].p[1],
                                     pc->s[si].p[2], k4.lap, 1.f / 60.f);
+                            /* THE NETWORK RACE'S CALL, on the same position and
+                               the same frame -- and AFTER ai_step, because both
+                               read `k4' and the one that runs second must not be
+                               the one being compared against a different
+                               checkpoint state. Neither writes to it. */
+                            ai_player_progress(&a5, &t4, pc->s[si].p[0],
+                                               pc->s[si].p[1], pc->s[si].p[2]);
+                            {
+                                float d = a5.player_dist - a4.player_dist;
+                                if (d < 0.f) d = -d;
+                                if (d > 1e-4f) {
+                                    netdiff++;
+                                    if (d > networst) networst = d;
+                                }
+                            }
                             for (q = 0; q < a4.n; q++) {
                                 if (oprev[q] > -1e8f) {
                                     float d = a4.car[q].spine_dist - oprev[q];
@@ -6786,6 +7431,26 @@ static void part14_aifx(void)
                    "and re-anchored at each checkpoint, where the old chord rule "
                    "stepped back 22.7 m",
                    "%d steps, worst %.1f m", pback, pworst);
+                /* AND A NETWORK RACE MEASURES THE PLAYER THE SAME WAY, which is
+                 * the whole of the fix for `both players read 2nd'.
+                 *
+                 * `main.c' does not call ai_step in a network race -- every
+                 * other car is somebody else's and there is nothing to step --
+                 * so `player_dist' was never written and sat at 0 from the grid
+                 * to the flag. Every remote car ranked ahead of it and the HUD
+                 * read `2nd of 2' on BOTH machines at once, which is a placing
+                 * that is arithmetically impossible and was on a photograph.
+                 *
+                 * ai_player_progress is that block lifted out of ai_step, so
+                 * this drives 200 s of a real lap on all ten tracks through BOTH
+                 * paths on the same positions and asks for the same number.
+                 * EXACTLY the same: they are one piece of code, and a bound
+                 * would let a second implementation back in. */
+                ck(netdiff == 0,
+                   "and ai_player_progress alone -- the NETWORK race's only "
+                   "measure of the player -- gives ai_step's own answer",
+                   "%d of 120000 frames differ, worst %.4f m", netdiff,
+                   networst);
             }
 
             /* --- THE PLACING IS THE POSITION ON THE SPINE, not the clock ------

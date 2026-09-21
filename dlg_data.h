@@ -518,6 +518,59 @@
 #define DLG_CHRACE_staticRemainderSX             520.f
 #define DLG_CHRACE_staticRemainderSY             60.f
 
+/* dlgSOUND.ini -- 4 keys */
+#define DLG_SOUND_lineX0                         95.f
+#define DLG_SOUND_lineY0                         0.f
+#define DLG_SOUND_lineX1                         542.f
+#define DLG_SOUND_lineY1                         357.f
+
+/* dlgCONTROL.ini -- 25 keys */
+#define DLG_CONTROL_staticPlayerX0               115.f
+#define DLG_CONTROL_staticPlayerY0               78.f
+#define DLG_CONTROL_staticPlayerSX               396.f
+#define DLG_CONTROL_staticPlayerSY               25.f
+#define DLG_CONTROL_editPlayerSE                 0.4000f   /* 40% */
+#define DLG_CONTROL_enumJoystickX0               115.f
+#define DLG_CONTROL_enumJoystickY0               160.f
+#define DLG_CONTROL_enumJoystickSX               425.f
+#define DLG_CONTROL_enumJoystickSY               25.f
+#define DLG_CONTROL_enumJoystickSE               0.4000f   /* 40% */
+#define DLG_CONTROL_sliderJoySensX0              115.f
+#define DLG_CONTROL_sliderJoySensY0              200.f
+#define DLG_CONTROL_sliderJoySensSX              425.f
+#define DLG_CONTROL_sliderJoySensSY              25.f
+#define DLG_CONTROL_sliderJoyDeadX0              115.f
+#define DLG_CONTROL_sliderJoyDeadY0              240.f
+#define DLG_CONTROL_sliderJoyDeadSX              425.f
+#define DLG_CONTROL_sliderJoyDeadSY              25.f
+#define DLG_CONTROL_plr2YShift                   220.f
+#define DLG_CONTROL_nChars                       30.f
+#define DLG_CONTROL_enumCtrlTypeX0               115.f
+#define DLG_CONTROL_enumCtrlTypeY0               120.f
+#define DLG_CONTROL_enumCtrlTypeSX               425.f
+#define DLG_CONTROL_enumCtrlTypeSY               25.f
+#define DLG_CONTROL_enumCtrlTypeSE               0.4000f   /* 40% */
+
+/* dlgCONTROL_PLAYER.ini -- 18 keys */
+#define DLG_CONTROL_PLAYER_enumShowForX0         115.f
+#define DLG_CONTROL_PLAYER_enumShowForY0         90.f
+#define DLG_CONTROL_PLAYER_enumShowForSX         360.f
+#define DLG_CONTROL_PLAYER_enumShowForSY         25.f
+#define DLG_CONTROL_PLAYER_enumShowForSE         0.3800f   /* 38% */
+#define DLG_CONTROL_PLAYER_enumLayoutX0          115.f
+#define DLG_CONTROL_PLAYER_enumLayoutY0          130.f
+#define DLG_CONTROL_PLAYER_enumLayoutSX          360.f
+#define DLG_CONTROL_PLAYER_enumLayoutSY          25.f
+#define DLG_CONTROL_PLAYER_enumLayoutSE          0.3800f   /* 38% */
+#define DLG_CONTROL_PLAYER_staticExplainX0       112.f
+#define DLG_CONTROL_PLAYER_staticExplainY0       470.f
+#define DLG_CONTROL_PLAYER_staticExplainSX       419.f
+#define DLG_CONTROL_PLAYER_staticExplainSY       100.f
+#define DLG_CONTROL_PLAYER_rectLinesX0           89.f
+#define DLG_CONTROL_PLAYER_rectLinesY0           176.f
+#define DLG_CONTROL_PLAYER_rectLinesSX           456.f
+#define DLG_CONTROL_PLAYER_rectLinesSY           288.f
+
 /* network.ini -- the multiplayer state rate. Emitted with its
    own declared RANGE, because the reading is not certain: the
    key is called a `FrameRate' and its slider runs 1..50, which
