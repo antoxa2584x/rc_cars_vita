@@ -277,6 +277,32 @@ int rb_gather_spheres(const rb_car *c, float out[][4])
     return n;
 }
 
+/* THE NEAREST FACE, which is the only one carCollide ever sees. The engine's
+ * sphere query (0x004549f0) without flag 0x400 keeps a single hit -- its first
+ * pass accepts a face only while `d + 1e-4 < best` (0x4550d4) and 0x455253 then
+ * sets the count to 1 -- and carCollide copies that one record into the wheel's
+ * slot. col_sphere returns up to eight overlaps in grid order, not sorted, so
+ * hits[0] is merely the first one the cells happened to yield. */
+static int rb_nearest_hit(const float centre[3], const rb_world_hit *hits,
+                          int nh)
+{
+    double best = 0.0;
+    int h, k, hn = 0;
+
+    for (h = 0; h < nh; h++) {
+        double d2 = 0.0;
+        for (k = 0; k < 3; k++) {
+            double e = (double)centre[k] - hits[h].point[k];
+            d2 += e * e;
+        }
+        if (h == 0 || d2 < best) {
+            best = d2;
+            hn = h;
+        }
+    }
+    return hn;
+}
+
 /* 0x004efe00 -- query every sphere and turn the results into per-wheel
  * contacts.
  *
@@ -300,7 +326,7 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
 {
     float spheres[RB_MAX_SPHERES][4];
     rb_world_hit hits[8];
-    int nspheres, i, h, nh, surf_cls;
+    int nspheres, i, h, nh, hn, surf_cls;
     int found = 0;
 
     (void)opaque;
@@ -330,23 +356,16 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
                               hits, (int)(sizeof(hits) / sizeof(hits[0])), &nh))
             continue;
         found = 1;
+        hn = rb_nearest_hit(spheres[i], hits, nh);
 
-        /* THE SURFACE CLASS OF THIS CONTACT, over all the faces the sphere
-         * reached rather than off whichever one the query happened to return
-         * first. FUN_00534fc0 walks the contact's own face list and takes the
-         * MINIMUM over the POSITIVE classes, skipping 0 -- and 0 is what a decal
-         * carries, which is the whole reason it loops rather than picks: the
-         * sand transition strips sit a centimetre above the sand they modulate,
-         * so the topmost face at a wheel is routinely the one with no opinion.
-         * col_surface_at already applies this rule for the tyre marks and the
-         * dust; this is the same rule on the face list the contact gather has in
-         * hand, which costs no second query. */
-        surf_cls = 0;
-        for (h = 0; h < nh; h++) {
-            int e = hits[h].surface;
-            if (e > 0 && (surf_cls == 0 || e < surf_cls))
-                surf_cls = e;
-        }
+        /* THE SURFACE CLASS OF THIS CONTACT is the NEAREST face's -- the one
+         * record carCollide keeps (rb_nearest_hit). FUN_00534fc0 takes the hit's
+         * face index and reduces over THAT face's own texture layers, the minimum
+         * POSITIVE class; pack_col.py stores exactly that per triangle in COL4.
+         * This used to take the minimum over every face the sphere reached,
+         * reading "the faces under a contact" into a loop that walks the layers
+         * of one. */
+        surf_cls = hits[hn].surface;
 
         for (h = 0; h < nh; h++) {
             float nrm[3];
@@ -367,7 +386,7 @@ int rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
             }
 
             /* only wheel spheres produce per-wheel contacts */
-            if (hit_out && i < limit && i < c->nwheels) {
+            if (hit_out && i < limit && i < c->nwheels && h == hn) {
                 rb_wheel_contact *w = &hit_out[i];
                 if (!w->active) {
                     w->active = 1;
@@ -442,6 +461,73 @@ int rb_coll_list(rb_car *c, float tol, int mode, rb_coll_contact *out, int max)
                               (int)(sizeof(hits) / sizeof(hits[0])), &nh))
             continue;
 
+        /* THE QUERY'S OWN RULES, 0x004549f0 with flag 0x404 (0x4eff45). Pass
+         * one finds the nearest face, d_min (0x454aff); pass two keeps a face
+         * only while its distance is under min(d_min, r) + tol (0x454fa1..
+         * 0x454fcb), drops a point within 0.2 r of one already kept
+         * (0x454fe7..0x455049), and stops at six (`[ebx+8]` 5, 0x454f99). Taken
+         * nearest first, so the deepest contact is the one a duplicate loses
+         * to. This used to keep every face col_sphere returned, up to eight,
+         * with no dedupe -- and a sphere lying across a crease reported the
+         * same patch several times over, each one a separate impulse. */
+        {
+            double dist[8], dmin = 0.0, bound, r0 = spheres[i][3];
+            int order[8], kept_n = 0, a, b;
+            float kept[6][3];
+
+            for (h = 0; h < nh; h++) {
+                double dd = 0.0;
+                int k;
+                for (k = 0; k < 3; k++) {
+                    double e = (double)spheres[i][k] - hits[h].point[k];
+                    dd += e * e;
+                }
+                dist[h] = sqrt(dd);
+                if (h == 0 || dist[h] < dmin)
+                    dmin = dist[h];
+                order[h] = h;
+            }
+            for (a = 1; a < nh; a++)                   /* nearest first */
+                for (b = a; b > 0 && dist[order[b]] < dist[order[b - 1]]; b--) {
+                    int t = order[b]; order[b] = order[b - 1]; order[b - 1] = t;
+                }
+            bound = (dmin < r0 ? dmin : r0) + (double)tol;
+            for (a = 0; a < nh; a++) {
+                int keep = 1, k;
+                h = order[a];
+                if (!(dist[h] < bound) || kept_n >= 6) {
+                    order[a] = -1;
+                    continue;
+                }
+                for (b = 0; b < kept_n && keep; b++) {
+                    double dd = 0.0;
+                    for (k = 0; k < 3; k++) {
+                        double e = (double)hits[h].point[k] - kept[b][k];
+                        dd += e * e;
+                    }
+                    if (sqrt(dd) < 0.2 * r0)
+                        keep = 0;
+                }
+                if (!keep) {
+                    order[a] = -1;
+                    continue;
+                }
+                for (k = 0; k < 3; k++)
+                    kept[kept_n][k] = hits[h].point[k];
+                kept_n++;
+            }
+            /* compact the survivors, in order, back into hits[] */
+            {
+                rb_world_hit tmp[8];
+                int m = 0;
+                for (a = 0; a < nh; a++)
+                    if (order[a] >= 0)
+                        tmp[m++] = hits[order[a]];
+                memcpy(hits, tmp, (size_t)m * sizeof(hits[0]));
+                nh = m;
+            }
+        }
+
         for (h = 0; h < nh && n < max; h++) {
             float nrm[3];
             double len;
@@ -508,10 +594,12 @@ int rb_coll_list(rb_car *c, float tol, int mode, rb_coll_contact *out, int max)
                 }
             }
 
+            /* The point is on the sphere's own surface: centre - r * n with the
+               RAW radius (0x4f0105), not the tol-inflated one the query used. */
             for (k = 0; k < 3; k++) {
                 out[n].normal[k] = nrm[k];
                 out[n].point[k] = (float)((double)spheres[i][k]
-                                          - (double)radius * nrm[k]);
+                                          - (double)spheres[i][3] * nrm[k]);
             }
             out[n].is_wheel = (i < c->nwheels);
             n++;
@@ -1430,7 +1518,7 @@ void rb_car_reset_upright(rb_car *c)
         rb_world_hit hits[8];
         float d[3];
         double dl, push;
-        int nh = 0, k;
+        int nh = 0, k, hn;
 
         if (!c->world || !c->world->sphere)
             break;
@@ -1438,8 +1526,10 @@ void rb_car_reset_upright(rb_car *c)
                               hits, (int)(sizeof(hits)/sizeof(hits[0])), &nh))
             break;
 
+        /* 0x508856 queries with type 4, i.e. the single nearest face. */
+        hn = rb_nearest_hit(pos, hits, nh);
         for (k = 0; k < 3; k++)
-            d[k] = (float)((double)pos[k] - hits[0].point[k]);
+            d[k] = (float)((double)pos[k] - hits[hn].point[k]);
         dl = sqrt((double)d[0]*d[0] + (double)d[1]*d[1] + (double)d[2]*d[2]);
         if (dl >= (double)EPS && fabs(dl - 1.0) >= (double)EPS) {
             double inv = 1.0 / dl;

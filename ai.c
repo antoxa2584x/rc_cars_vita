@@ -3709,38 +3709,62 @@ static int ai_pair_resolve(ai_actor *A, ai_actor *B,
             return 0;
     }
 
-    /* THE VELOCITY HALF, and it still runs FIRST. Same ten passes, same 0.02
-     * gate, same 0.05 m/s separation target as rb_coll_resolve, and the
-     * denominator is still the PAIR's so the impulse delivers its dv across both
-     * bodies rather than all of it into one. What is gone is the loop over
-     * contacts: there is one contact now, which is what FUN_00533990 builds.
+    /* THE VELOCITY HALF, and it still runs FIRST: FUN_00533990 hands its one
+     * contact to FUN_004f0730 with a SECOND BODY at +0x40, and in 0x4f0750 that
+     * is a different law from the one-body wall solve (rb_coll_resolve):
      *
-     * The order still matters for the reason it always did -- `impact` is the
-     * sound's, and it has to be the closing speed before anything has been
-     * applied -- and it matters less than it did, because the positional half no
-     * longer moves the bodies out from under a list of stale normals. There is
-     * no list. */
+     *   - the relative speed is 0x4f04e0's, n.v1 - n.v2 over the two CENTRE OF
+     *     MASS velocities (+0xec), not the contact point's -- and anything in
+     *     (0, 1) m/s comes back as 0, so a pair that is merely drifting apart
+     *     still counts as touching;
+     *   - dv = -2 * vrel (0x5543ec), floored at 0.2 m/s (0x5544f0): an ELASTIC
+     *     bounce, e = 1, never less than 0.2 a pass;
+     *   - pass 0 resolves the contact even when it is separating
+     *     (0x4f079f..0x4f07a8), and a later pass only while vrel <= 0.02
+     *     (0x55458c); the loop ends on the first pass that finds nothing active.
+     *
+     * The effect is a push of at least 0.2 m/s a pass until the two centres part
+     * at a metre a second, for at most ten passes. This file used to run the
+     * WALL law here -- point velocities, "0.05 - vrel" and a stop above 0.02 --
+     * under a note saying the PC had no restitution on this path; it has, and
+     * the PS2's carResolvePairCDT(e = 1.0, 0.2) is the same numbers out of line.
+     *
+     * The denominator is still the PAIR's so the impulse delivers its dv across
+     * both bodies, and `impact` is still the closing speed before anything has
+     * been applied, because that is the sound's. */
     for (pass = 0; pass < AI_CONTACT_PASSES; pass++) {
         float va[3], vb[3], j[3];
         double vrel, dv, kd;
 
         /* Re-measured every pass: the impulses move both bodies, so the line
-           between their centres is not the line it was. Cheap, and it is the
-           only thing this solve is about. */
+           between their centres is not the line it was. */
         if (!ai_centre_contact(A, B, n, p))
             break;
-        ai_actor_point_vel(A, p, va);
-        ai_actor_point_vel(B, p, vb);
-        vrel = (double)(va[0] - vb[0]) * n[0]
-             + (double)(va[1] - vb[1]) * n[1]
-             + (double)(va[2] - vb[2]) * n[2];
-        if (vrel > AI_CONTACT_VREL)
+        if (pass == 0 && impact) {
+            double vc;
+            ai_actor_point_vel(A, p, va);
+            ai_actor_point_vel(B, p, vb);
+            vc = (double)(va[0] - vb[0]) * n[0]
+               + (double)(va[1] - vb[1]) * n[1]
+               + (double)(va[2] - vb[2]) * n[2];
+            if (-vc > *impact)
+                *impact = (float)-vc;   /* the sound, before any impulse */
+        }
+        /* 0x4f04e0: centre-of-mass velocities -- the point velocity AT the
+           centre, which for an opponent still carries its offset velocity. */
+        ai_actor_point_vel(A, A->car->body.x, va);
+        ai_actor_point_vel(B, B->car->body.x, vb);
+        vrel = (float)((double)n[0] * va[0] + (double)n[1] * va[1]
+                       + (double)n[2] * va[2]
+                       - ((double)n[0] * vb[0] + (double)n[1] * vb[1]
+                          + (double)n[2] * vb[2]));
+        if (vrel > 0.0 && vrel < 1.0)
+            vrel = 0.0;
+        if (vrel > AI_CONTACT_VREL && pass > 0)
             break;
-        if (pass == 0 && impact && -vrel > *impact)
-            *impact = (float)-vrel;   /* the sound, before any impulse */
-        dv = AI_CONTACT_SEP - vrel;
-        if (dv < 0.0)
-            dv = 0.0;
+        dv = -2.0 * vrel;
+        if (dv < AI_PAIR_DV_MIN)
+            dv = AI_PAIR_DV_MIN;
         kd = ai_actor_denom(A, p, n) + ai_actor_denom(B, p, n);
         if (kd < 1e-09)
             break;
@@ -3750,6 +3774,8 @@ static int ai_pair_resolve(ai_actor *A, ai_actor *B,
         ai_actor_impulse(A, p, j);
         j[0] = -j[0]; j[1] = -j[1]; j[2] = -j[2];
         ai_actor_impulse(B, p, j);
+        if (vrel > AI_CONTACT_VREL)
+            break;                   /* pass 0's separating contact: not active */
     }
 
     /* THE POSITIONAL HALF -- THE PORT'S, and the only part of this function that

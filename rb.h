@@ -663,8 +663,8 @@ void rb_clamp_momentum(rb_car *c);
  *
  * Any control input resets them all and parks the no-contact timer at 1999872.0
  * (0x49f42400), which is how "being driven" is expressed. Otherwise: time below
- * 0.3611111 m/s (measured on the LARGER of |v| and |P|, which for a 2 kg car is
- * always |P|), time below 1.0 rad/s, time since the last contact, and time
+ * 0.3611111 m/s (measured on the LARGER of |v| and |P|, which for the engine's
+ * 1 kg car are the same number), time below 1.0 rad/s, time since the last contact, and time
  * continuously in contact. */
 void rb_car_rest_update(rb_car *c, float dt);
 

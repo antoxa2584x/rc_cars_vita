@@ -850,7 +850,7 @@ float rb_car_tick(rb_car *c, float dt)
     float y0[RB_STATE_N], y1[RB_STATE_N];
     float pre[RB_MAX_SPHERES][4];
     float remaining = dt;
-    int iter = 0, stuck, event, toi, npre = 0;
+    int iter = 0, stuck, event, toi, emb, npre = 0;
 
     if (!c->world || !c->world->sphere) {
         rb_car_get_state(c, y0);
@@ -1018,16 +1018,35 @@ float rb_car_tick(rb_car *c, float dt)
         if (toi)
             event = 1;
         stuck = 0;
+        emb = 0;
         if (!event) {
-            stuck = rb_car_update_suspension(c, step, 0, 0);
+            stuck = rb_car_update_suspension(c, step, 0, &emb);
             if (stuck && rb_collide(c, 0.0f, -RB_PENETRATION_SLACK, 0, -1, 0))
                 event = 1;
         }
+
+        /* THE SPRING ENABLE, phys+0x48, which rb_susp_build tests. carPhysTick
+           writes it every substep AFTER the advance, so what it gates is the
+           NEXT substep's integration: 0x4f60ea sets it and 0x4f60ff clears it
+           when the mode-0 pass reported a buried wheel. The port used to set it
+           once in rbcar_init and never touch it.
+
+           DIVERGENCE: 0x4f6127 clears it AGAIN on every contact event, and that
+           half is not applied. In the PC it disarms the springs for
+           carSubstepContact's own re-integration of the event substep -- the
+           bisection this port does not have -- and an event there is rare. Here
+           an event is the TOI gate, the -RB_PENETRATION_SLACK body test and a
+           stuck strut, which on progchk's ten tracks is ~92,000 events, and a
+           simulated opponent that keeps brushing something then runs whole
+           seconds with no suspension: beach_1's car 0 sat still for 97 frames
+           (progchk, "moves with the car", against 3). */
+        c->susp_enabled = !emb;
 
         if (event) {
             rb_coll_contact rec[RB_MAX_COLL_CONTACTS];
             int nrec;
 
+            rb_car_rest_touch(c);                           /* 0x4f6136 -> 0x4f5980 */
             rb_body_depenetrate(c);
             nrec = rb_coll_list(c, RB_CONTACT_TOL, 2, rec,
                                 RB_MAX_COLL_CONTACTS);
@@ -1035,6 +1054,10 @@ float rb_car_tick(rb_car *c, float dt)
                 rb_coll_friction(c, nrec, rec, step);
                 rb_coll_resolve(c, nrec, rec);
             }
+            /* 0x4f61b6: carUpdateSuspension(car, step, 1, NULL) -- the SLOW
+               pass, run only on an event substep and only after the solve. On a
+               clear substep the mode-0 pass above is the only one. */
+            rb_car_update_suspension(c, step, 1, 0);
         }
 
         /* 0x004fbe60, the last call in carPhysTick's loop body. */

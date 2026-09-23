@@ -19,7 +19,7 @@ set(VITA_TITLEID  "RCCV00001")
 # a fix, minor for a feature; see BUILD.md, "Versioning". It names the package
 # (rc_cars_vita<BUILD_VERSION>.vpk), so the file on the card says which build it
 # is, and build.sh reads it back out of this file rather than keeping a copy.
-set(BUILD_VERSION "0.86")
+set(BUILD_VERSION "0.87")
 
 # APP_VER in the sfo is fixed width ##.##, so derive it instead of writing the
 # number twice. The minor is a FRACTION and pads on the right: 0.8 is 00.80.

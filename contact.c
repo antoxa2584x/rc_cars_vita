@@ -355,10 +355,10 @@ void rb_angular_accel(rb_body *b, const float pts[][3], int n,
  * which the sliding speed along dir is changing. That is the right-hand side
  * quantity a contact solve needs.
  *
- * QUIRK: the centripetal term is built from r x w and then crossed with w,
- * giving out += w x (r x w) = +w^2 * r_perp. The textbook point acceleration is
- * a + alpha x r + w x (w x r), i.e. the opposite sign. Reproduced as-is; it
- * only perturbs the friction RHS and only at high yaw rate.
+ * The centripetal term is w x (w x r), the textbook one: 0x476c50 builds
+ * u = (rz*wy - ry*wz, ...) = w x r and then adds (u.z*wy - u.y*wz, ...) = w x u.
+ * These notes called it a flipped-sign quirk for a long time; the arithmetic
+ * below was always the PC's, only the reading of it was wrong.
  */
 void rb_point_accel_along(rb_body *b, const float p[3], const float dir[3],
                           const float pts[][3], int n, const float f[][3],
@@ -386,7 +386,7 @@ void rb_point_accel_along(rb_body *b, const float p[3], const float dir[3],
     ay += (double)alpha[2] * rx - (double)rz * alpha[0];
     az += (double)alpha[0] * ry - (double)alpha[1] * rx;
 
-    /* u = r x w, then out += w x u   (see QUIRK above) */
+    /* u = w x r, then out += w x u */
     u[0] = (float)(rz * b->w[1] - ry * b->w[2]);
     u[1] = (float)(rx * b->w[2] - rz * b->w[0]);
     u[2] = (float)(ry * b->w[0] - rx * b->w[1]);
@@ -749,7 +749,7 @@ int rb_gather_contacts(rb_car *c, float dt, rb_contact *rec, int *nrec,
     } else {
         int kr, kf;
         if (c->steer >= 0.01f) kr = 2 + (c->hit[3].active != 0);
-        else                   kr = 3 - (c->hit[1].active != 0);
+        else                   kr = 3 - (c->hit[2].active != 0);   /* 0x4ee2fa: [ebp+0x17c], wheel 2 */
         rb_contact_record(c, kr, 0.0f, &rec[*nrec]);
         rec[*nrec].wheel = kr;
         (*nrec)++;

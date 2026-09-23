@@ -897,11 +897,15 @@ int  ai_phys_active(const ai_t *ai, int i);
  * this is 2.5x clear of that. */
 #define AI_COLLIDE_RANGE 1.5f
 
-/* rb_coll_resolve's own two numbers (0x004f0750): solve any contact closing
- * faster than -0.02 m/s, and give it 0.05 m/s of separation. */
+/* 0x004f0750's gate and pass count: a contact is active while its relative
+ * normal speed is <= 0.02 m/s (0x55458c), for at most ten passes. With a second
+ * body (car-vs-car) the dv is -2 * vrel floored at AI_PAIR_DV_MIN (0x5544f0) --
+ * see ai_pair_resolve. AI_CONTACT_SEP is the ONE-body law's 0.05 m/s target
+ * (0x554514), which is rb_coll_resolve's and not this file's. */
 #define AI_CONTACT_VREL  0.02f
 #define AI_CONTACT_SEP   0.05f
 #define AI_CONTACT_PASSES 10
+#define AI_PAIR_DV_MIN   0.2f
 
 /* How many times the positional half re-measures and pushes again. A car proxy
  * is 13 spheres and they WEDGE -- clearing the deepest pair moves the car into a
@@ -1229,10 +1233,12 @@ int  ai_phys_active(const ai_t *ai, int i);
 #define AI_PHYS_HOME_MIN   0.35f
 
 /* HOW HARD A CONTACT HAS TO BE TO HAND A CAR TO THE PHYSICS, m/s of closing
- * speed. Anchored to the engine's own REST CLAMP: `FUN_004f6610` treats a car
- * slower than 0.18 m/s as stopped (`physics.md` -- the test reads |P| over a
- * 2 kg body, so it trips at |v| = 0.18). A touch that closes slower than the
- * speed at which the engine stops believing a car is moving is not an impact.
+ * speed. THE PORT'S OWN NUMBER NOW. It was anchored to the engine's REST
+ * CLAMP read over a 2 kg body -- `FUN_004f6610` compares the larger of |v| and
+ * |P| with 0.3611, which at 2 kg trips at |v| = 0.18 -- and the body is 1 kg
+ * (FUN_004f2270, gen_rb_data.py), so that clamp is 0.3611 m/s. Left at 0.18
+ * deliberately, as the value everything below was measured with, rather than
+ * doubled along with an anchor that turned out to be a guess.
  *
  * WITHOUT IT THE FIELD STOPS REPLAYING ITS OWN LAPS. The three recordings on a
  * track were driven on three different afternoons and run nose to tail 0.74 m
