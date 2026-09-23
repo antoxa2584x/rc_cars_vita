@@ -179,8 +179,9 @@ static float speed_kmh(const rb_car *c)
    is the index fx_surf[] is built for.
  *
  * COL4 IS THAT ID, so this is the identity and there is no mapping step. The
- * grid carries FUN_00534fc0's own answer per triangle (pack_col.eng_surface_class)
- * and col_surface_at applies the engine's own min-over-positive rule to it.
+ * grid carries FUN_00534fc0's own answer per triangle (pack_col.eng_surface_class,
+ * the minimum over that face's layers) and rb_collide copies the NEAREST face's
+ * into the wheel's contact, which is the record the dust reads.
  *
  * It used to go through col_material_at + FX_SURF_MAP instead, and that was
  * wrong twice over. pack_col.py's own docstring says that classification "drives
@@ -198,14 +199,17 @@ static float speed_kmh(const rb_car *c)
  * col_surface_at would answer 0 -- i.e. no dust anywhere -- rather than silently
  * turning the effect off for an asset that has not been repacked.
  */
-static int surf_id(const col_t *col, const float p[3])
+static int surf_id(const col_t *col, const rb_wheel_contact *h)
 {
+    const float *p = h->point;
     int m;
 
     if (!col)
         return 0;
     if (col->eng_surf) {
-        m = col_surface_at(col, p[0], p[1], p[2]);
+        /* The wheel's own contact, as for the tyre mark: 0x52e3b5 fetches it
+           through 0x501820 and 0x52e4c4 classifies that one record. */
+        m = h->surface;
     } else {
         static const int map[] = FX_SURF_MAP;
         m = col_material_at(col, p[0], p[1], p[2]);
@@ -629,7 +633,7 @@ void fx_emit(fx_t *fx, fx_emitter *em, const rb_car *c, const col_t *col,
         if (dx * dx + dy * dy + dz * dz >= FX_EMIT_RANGE * FX_EMIT_RANGE)
             continue;
 
-        sid = surf_id(col, h->point);
+        sid = surf_id(col, h);
         rate = fx_dust_rate(fx, c, w, sid, speed_kmh(c));
         n = emit_count(rate, dt, &em->carry_dust[w]);
         if (!n)

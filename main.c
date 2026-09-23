@@ -5104,6 +5104,15 @@ menu_only:
         {
             float aeye[3];
             aeye[0] = ex; aeye[1] = ey; aeye[2] = ez;
+            /* The camera the lost-car exit asks (ai_set_view): the view looks
+               along F(yaw) = (-sin, 0, -cos) -- physics.md, "Conventions". The
+               pitch is left out; against a 100-degree cone it is noise. */
+            {
+                float vf[3];
+                double yr = (double)vyaw * (3.14159265358979323846 / 180.0);
+                vf[0] = (float)-sin(yr); vf[1] = 0.0f; vf[2] = (float)-cos(yr);
+                ai_set_view(&ai, aeye, vf);
+            }
             {
             const double da0 = rlog_now_ms();
             draw_ai(aeye, vpitch, vyaw);

@@ -48,6 +48,32 @@
 #include <string.h>
 #include <stdarg.h>
 
+/* THE HOST'S HALF OF A WHEEL CONTACT. fx.c and trace.c read the surface class
+   off rb_wheel_contact.surface -- the nearest face's, which rb_collide fills for
+   a real car and ai_fake_contacts for a replayed one -- instead of re-querying
+   the grid. These fixtures build their contacts by hand, so every emit below
+   first fills the class the same way, from the plane it is handed. */
+static void vt_stamp(rb_car *c, col_t *col)
+{
+    int w;
+    const rb_world *wd = col ? col_rb_world(col) : NULL;
+    for (w = 0; w < c->nwheels && w < RB_MAX_WHEELS; w++) {
+        rb_wheel_contact *h = &c->hit[w];
+        float r = c->wheel[w].radius > 0.f ? c->wheel[w].radius : 0.07f;
+        float ctr[3];
+        if (!h->active || !wd)
+            continue;
+        ctr[0] = h->point[0] + h->normal[0] * r;
+        ctr[1] = h->point[1] + h->normal[1] * r;
+        ctr[2] = h->point[2] + h->normal[2] * r;
+        h->surface = rb_world_surface_at(wd, ctr, r + RB_CONTACT_TOL);
+    }
+}
+#define fx_emit(fx, em, c, col, eye, dt) \
+    (vt_stamp((rb_car *)(c), (col_t *)(col)), fx_emit(fx, em, c, col, eye, dt))
+#define fx_step(fx, c, col, ...) \
+    (vt_stamp((rb_car *)(c), (col_t *)(col)), fx_step(fx, c, col, __VA_ARGS__))
+
 /* ------------------------------------------------------- the GL recorder */
 
 glcap_t glcap;

@@ -995,11 +995,14 @@ static int ai_bump_death(ai_car *a, float dt)
              a->name, (int)(-gap * 100.0f));
         dead = 1;
     }
-    /* BURIED -- the ground is ABOVE the car. This is the engine's own
-     * `gmIsPointInCDT(pos)`, the first arm of `carCheckAIResetInPhysMode`:
-     * inside geometry, reset the car and put it back on its path. That function's
-     * other two arms are the drowning above and a scripted `RESET_VOL`, which
-     * the port has no data for.
+    /* BURIED -- the ground is ABOVE the car. THE PORT'S TEST, and NOT the one
+     * this comment used to call it: the PS2's `carCheckAIResetInPhysMode` arm
+     * `gmIsPointInCDT(pos)` fires when the point is OUTSIDE the collision grid
+     * or over an empty column -- off the map, not buried -- and that function
+     * and its water arm are PS2-only: the PC's physics-mode dispatch
+     * (FUN_004fe1f0) calls neither. The PC's own arms are the RESET volumes
+     * (FUN_004fe3f0, data the port does not have), the tipped arm and the stuck
+     * detector (AI_TIP_DEG, AI_STUCK_T).
      *
      * WHAT CHANGED IS WHO IT CAN HAPPEN TO, and that is the reported teleport.
      * It used to run on a KINEMATIC car placed by an offset and a terrain
@@ -1855,6 +1858,10 @@ static void ai_phys_start(ai_car *a)
         return;
     a->phys_mode = 1;
     a->phys_t = 0.0f;
+    a->tip_t = 0.0f;
+    a->stuck_on = 0;
+    a->stuck_t = 0.0f;
+    a->slow_t = 0.0f;
     a->ctrl_steer = 0.0f;
     a->blend_t = 0.0f;
 
@@ -2080,6 +2087,40 @@ static void ai_ctrl_command(ai_car *a, const float look[3],
 
 /* One tick of a simulated opponent -- FUN_004fdb50's body, in its own order.
  * -> nonzero if the car went home this tick. */
+void ai_set_view(ai_t *ai, const float eye[3], const float fwd[3])
+{
+    double l;
+    if (!ai || !eye || !fwd)
+        return;
+    l = sqrt((double)fwd[0] * fwd[0] + (double)fwd[1] * fwd[1]
+             + (double)fwd[2] * fwd[2]);
+    if (!(l > 1e-6))
+        return;
+    ai->view_eye[0] = eye[0]; ai->view_eye[1] = eye[1]; ai->view_eye[2] = eye[2];
+    ai->view_fwd[0] = (float)(fwd[0] / l);
+    ai->view_fwd[1] = (float)(fwd[1] / l);
+    ai->view_fwd[2] = (float)(fwd[2] / l);
+    ai->view_ok = 1;
+}
+
+/* 0x406ab0(cam, p, 50, 100): within AI_PHYS_SEE_NEAR of the eye AND within
+   AI_PHYS_SEE_ANG of the view direction. */
+static int ai_view_sees(const ai_t *ai, const float p[3])
+{
+    double d[3], l, c;
+    int k;
+    for (k = 0; k < 3; k++)
+        d[k] = (double)p[k] - ai->view_eye[k];
+    l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (l > (double)AI_PHYS_SEE_NEAR)
+        return 0;
+    if (l < 1e-6)
+        return 1;
+    c = (d[0] * ai->view_fwd[0] + d[1] * ai->view_fwd[1]
+         + d[2] * ai->view_fwd[2]) / l;
+    return c >= cos((double)AI_PHYS_SEE_ANG * (3.14159265358979323846 / 180.0));
+}
+
 static int ai_phys_step(ai_t *ai, ai_car *a, float dt)
 {
     float near_pt[3], look[3], throttle = 0.0f, brake = 0.0f, steer = 0.0f;
@@ -2094,6 +2135,27 @@ static int ai_phys_step(ai_t *ai, ai_car *a, float dt)
        mode that can drive a car anywhere like that. */
     if (ai_bump_death(a, dt))
         return 1;
+
+    /* THE TIPPED ARM -- see AI_TIP_DEG. Without it a car knocked onto its side
+       lay there until the player was out of sight, and the elastic pair law
+       knocks them over (progchk country_4, 52 deg for the rest of the run). */
+    {
+        const float *m = rbcar_matrix(&a->rb);
+        double ul = sqrt((double)m[4] * m[4] + (double)m[5] * m[5]
+                         + (double)m[6] * m[6]);
+        double c = ul > 1e-9 ? (double)m[5] / ul : 1.0;
+        double ang;
+        if (c > 1.0) c = 1.0; else if (c < -1.0) c = -1.0;
+        ang = acos(c) * (180.0 / 3.14159265358979323846);
+        if (ang <= (double)AI_TIP_DEG)
+            a->tip_t = 0.0f;
+        else if (rb_collide(&a->rb, 0.0f, RB_CONTACT_TOL, 1, RB_JUMP_LIMIT, 0))
+            a->tip_t += dt;
+        if (a->tip_t > AI_TIP_T) {
+            rb_car_reset_upright(&a->rb);
+            a->tip_t = 0.0f;
+        }
+    }
 
     /* ===== PROGRESS IS THE RECORDING'S; ONLY THE BODY IS THE PHYSICS' =====
      *
@@ -2171,11 +2233,53 @@ static int ai_phys_step(ai_t *ai, ai_car *a, float dt)
     dn = ai_path_gap(a);
     (void)near_pt;
 
-    /* EXIT 1 -- LOST AND UNWATCHED. See AI_PHYS_LOST_T. */
+    /* THE STUCK DETECTOR, FUN_004fe490 -- see AI_STUCK_T. Armed, it replaces the
+       controller (and so every exit, which FUN_004fdb50 holds) for 1.5 s. */
+    a->stuck_t += dt;
+    if (a->stuck_on) {
+        if (a->stuck_t > AI_STUCK_REV_T) {
+            a->stuck_on = 0;
+            a->slow_t = 0.0f;
+        }
+    } else {
+        const float *v = a->rb.body.v;
+        double sp = sqrt((double)v[0] * v[0] + (double)v[1] * v[1]
+                         + (double)v[2] * v[2]);
+        if (sp < (double)AI_STUCK_SLOW_MPS)
+            a->slow_t += dt;
+        else
+            a->slow_t = 0.0f;
+        if (a->slow_t > AI_STUCK_T) {
+            a->stuck_on = 1;
+            a->stuck_t = 0.0f;
+        }
+    }
+    if (a->stuck_on) {
+        float st = a->rb.steer;
+        float lim = RB_CARS[a->car].steer_max_deg;
+        if (a->stuck_t > AI_STUCK_STEER_T) {           /* FUN_0049d7e0 */
+            float step = AI_STUCK_STEER_RATE * dt;
+            float d = AI_STUCK_STEER_DEG - st;
+            st += d > step ? step : (d < -step ? -step : d);
+        }
+        /* rbcar_step takes the STICK and walks c->steer to -stick * lock at
+           four locks a second, faster than 30 deg/s, so this lands exactly. */
+        rbcar_step(&a->rb, 0.0f, 1.0f, lim > 0.0f ? -st / lim : 0.0f, 0, dt);
+        a->speed = rbcar_speed(&a->rb);
+        ai_bump_measure(a);
+        return 0;
+    }
+
+    /* EXIT 1 -- LOST AND UNWATCHED. See AI_PHYS_LOST_T and AI_PHYS_SEE_NEAR. */
     if (a->phys_t > AI_PHYS_LOST_T) {
-        double dx = (double)ai->player_prev[0] - a->rb.body.x[0];
-        double dz = (double)ai->player_prev[2] - a->rb.body.x[2];
-        int seen = sqrt(dx * dx + dz * dz) < (double)AI_PHYS_SEE_FAR;
+        int seen;
+        if (ai->view_ok) {
+            seen = ai_view_sees(ai, a->rb.body.x) || ai_view_sees(ai, a->rec_x);
+        } else {
+            double dx = (double)ai->player_prev[0] - a->rb.body.x[0];
+            double dz = (double)ai->player_prev[2] - a->rb.body.x[2];
+            seen = sqrt(dx * dx + dz * dz) < (double)AI_PHYS_SEE_FAR;
+        }
         if (!seen) {
             ai_pose(a);
             ai_phys_end(a);
@@ -2776,6 +2880,18 @@ static void ai_fake_contacts(ai_car *a)
          * radius*(1-cos t), which at the Overkill's 70 mm wheel is 1 mm at 10
          * degrees and 4 mm at 20. A dust puff is 0.42 m across. */
         rb_wheel_frame(&a->rb, i, 1, centre, &radius, NULL, NULL);
+        /* THE SURFACE, which the tyre marks and the dust read off this record
+           (trace.c, fx.c). A replayed car has no physics contact to reuse, and
+           the engine's 0x5015c0 then runs its OWN single-nearest-face sphere
+           query at the wheel, so this pays that one query per LOADED wheel; a
+           hanging wheel marks nothing and raises no dust. The reach is the
+           physics gather's own, radius + RB_CONTACT_TOL (0x4f5fc9): which `r'
+           0x5015c0 adds is not settled, and anything larger reaches faces
+           under the one the wheel stands on. Left at the memset's 0 this
+           silenced every opponent's dust. */
+        if (loaded)
+            a->rb.hit[i].surface = rb_world_surface_at(w, centre,
+                                                       radius + RB_CONTACT_TOL);
         a->rb.hit[i].point[0] = centre[0] - a->rb.m[4] * radius;
         a->rb.hit[i].point[1] = centre[1] - a->rb.m[5] * radius;
         a->rb.hit[i].point[2] = centre[2] - a->rb.m[6] * radius;

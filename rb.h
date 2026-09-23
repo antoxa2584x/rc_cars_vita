@@ -592,6 +592,12 @@ int  rb_gather_spheres(const rb_car *c, float out[][4]);
  * and a strict solid test flips on and off under sub-millimetre motion.
  * 1 mm is ~1.4% of a wheel radius, the same scale the retract works at. */
 #define RB_PENETRATION_SLACK  0.001f
+/* The engine's surface class under a sphere, the way FUN_005015c0 answers it
+ * for a wheel with no physics contact to reuse: one sphere query (flags 4, no
+ * 0x400 -- the single nearest face) and FUN_00534fc0 on that face, i.e. its
+ * COL4 class. 0 when nothing is reached or the host supplies no classes. */
+int  rb_world_surface_at(const rb_world *w, const float centre[3], float radius);
+
 int  rb_collide(rb_car *c, float opaque, float tol, int mode, int limit,
                 rb_wheel_contact *hit_out);
 

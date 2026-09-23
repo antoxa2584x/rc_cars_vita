@@ -386,6 +386,14 @@ typedef struct {
      * tests and the controller's own full-lock second are all read off it. */
     int   phys_mode;
     float phys_t;
+    /* `phys+0x43bc': seconds this simulated car has lain past AI_TIP_DEG with a
+       BODY sphere on something. FUN_004fe310 rights it at AI_TIP_T. */
+    float tip_t;
+    /* FUN_004fe490's three: `phys+0x4424' armed, `+0x4428' seconds in the
+       current phase, `+0x442c' seconds slow or in contact. See AI_STUCK_*. */
+    int   stuck_on;
+    float stuck_t;
+    float slow_t;
     /* Seconds the mode is held open for, refreshed by every contact -- see
        AI_PHYS_HOME_MIN. The exit tests do not run while it is positive. */
     float phys_hold;
@@ -473,6 +481,11 @@ typedef struct {
     float  player_prev[3];
     float  player_v[3];
     int    player_seen;
+    /* THE CAMERA, for the lost-car exit's "can anything see it" -- see
+       ai_set_view. `view_ok' 0 until the app hands one over. */
+    int    view_ok;
+    float  view_eye[3];
+    float  view_fwd[3];
 } ai_t;
 
 /* ---------------------------------------------------- A REMOTE PLAYER'S CAR
@@ -889,6 +902,12 @@ void ai_bump_impulse(ai_t *ai, int i, const float point[3], const float j[3]);
  * hits an opponent by some path ai.c does not own (a prop, a character) has to
  * be able to say so. Idempotent. -> nothing; ai_phys_active reads it back. */
 void ai_phys_bump(ai_t *ai, int i);
+
+/* The camera the player is looking through, once a frame: its eye and its unit
+ * view direction. FUN_004fd440 asks EVERY camera whether it can see a simulated
+ * car before the lost-car exit may put it back -- see AI_PHYS_SEE_NEAR. Without
+ * a view (the harnesses) the exit falls back to the player's distance. */
+void ai_set_view(ai_t *ai, const float eye[3], const float fwd[3]);
 int  ai_phys_active(const ai_t *ai, int i);
 
 /* Broad phase for the above: an opponent further than this from the player
@@ -1202,8 +1221,41 @@ int  ai_phys_active(const ai_t *ai, int i);
 
 /* HOW LONG BEFORE A LOST CAR GIVES UP AND SNAPS BACK, seconds -- `0x554730`,
    read at `0x4fdbe5`. Guarded by "and nothing can see it": FUN_004fd440 with
-   AI_PHYS_SEE_NEAR / _FAR below. */
+   AI_PHYS_SEE_NEAR / AI_PHYS_SEE_ANG below. */
 #define AI_PHYS_LOST_T     5.0f
+/* THE TIPPED ARM, FUN_004fe310, run by the physics-mode dispatch FUN_004fe1f0
+ * while the race is on: the angle between the car's up axis and world Y
+ * (FUN_00410130 against 0x55e9a0), and past 45 deg (0x5543e4) WITH a body sphere
+ * touching -- FUN_004efdc0 mode 1 at 0.006, the query carJump's reset uses --
+ * time accumulates; at or under 45 it is zeroed. Past 2.0 s (0x5543c8) the car
+ * goes through carResetUpright (0x508600) and the timer restarts. It does NOT
+ * end the mode. A car balanced on its wheel edges touches no body sphere and is
+ * left alone, as in the original. */
+#define AI_TIP_DEG         45.0f
+#define AI_TIP_T            2.0f
+
+/* THE STUCK DETECTOR, FUN_004fe490, and what FUN_004fe1f0 does with it. A car
+ * in physics mode counts `slow_t' while it is slower than 0.5556 m/s (0x554a80);
+ * anything else zeroes it. Past 2.0 s (0x5543c8) it ARMS for 1.5 s:
+ * the controller is skipped, every input cleared, the brake (which is reverse)
+ * held at 1.0, and after the first 0.5 s the steer angle is walked to 5 deg at
+ * 30 deg/s (FUN_0049d7e0(steer, 5, 30, dt)). The tipped arm runs either way.
+ *
+ * DIVERGENCE: the PC ALSO counts, and arms after only 0.5 s, while a contact
+ * EVENT is recent (`phys+0x4430', time since the last one, < 1.5 dt and < 0.5 s).
+ * Not applied, for the reason the spring enable's event half is not
+ * (physics.md): without carSubstepContact's bisection the port raises events on
+ * nearly every substep a simulated car touches anything. With that branch in,
+ * 661 of 662 arms over progchk's ten tracks came through it -- opponents
+ * reversing for no reason, held in the mode with their exits skipped, and the
+ * frame spikes reported on hardware (country_2: 5,194 host ticks over 0.5 ms
+ * against 326 without it). */
+#define AI_STUCK_SLOW_MPS   0.5555556f
+#define AI_STUCK_T          2.0f
+#define AI_STUCK_REV_T      1.5f
+#define AI_STUCK_STEER_T    0.5f
+#define AI_STUCK_STEER_DEG  5.0f
+#define AI_STUCK_STEER_RATE 30.0f
 /* THE WINDOW IN WHICH THE CHEAP EXIT IS TESTED, seconds -- `0x5543c8` (2.0),
    read at `0x4fdcbd`. Past it only the lookahead test can end the mode. */
 #define AI_PHYS_SETTLE_T   2.0f
@@ -1255,7 +1307,17 @@ int  ai_phys_active(const ai_t *ai, int i);
  * keeps it simulated for as long as the lean lasts. Arming asks "was this a
  * hit"; holding asks "are we still touching". */
 #define AI_PHYS_MIN_HIT    0.18f
+/* WHAT "SEEN" MEANS to the lost-car exit: FUN_004fd440(inst, 50, 100) asks each
+ * camera, through 0x406ab0, about the car's origin and then its nearest path
+ * sample, and 50 is a DISTANCE to the camera while 100 is an ANGLE in degrees
+ * off the camera's view direction (0x406a00 / 0x406ab0). This file read the
+ * pair as two distances and used the 100 as metres from the player -- and
+ * every point of a small track is within 100 m of every other, so on country_1
+ * two opponents stuck in physics mode stayed there for the whole run (probe:
+ * 1.67 simulated cars a tick, 210 s in the mode). AI_PHYS_SEE_FAR is that old
+ * reading, kept only for a caller that hands over no camera. */
 #define AI_PHYS_SEE_NEAR   50.0f
+#define AI_PHYS_SEE_ANG   100.0f
 #define AI_PHYS_SEE_FAR   100.0f
 
 /* THE RECOVERED CONTROLLER, FUN_004fddd0 -- every constant already written down

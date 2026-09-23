@@ -2862,8 +2862,23 @@ int main(void)
                it. The upper bound catches a depenetration that lifts once per
                penetrating sphere; the lower bound catches a normal that points
                into the ground. */
-            ck(y_rest > 0.0f && y_rest < 0.25f,
-               "an inverted car rests on the surface, all three cars");
+            /* The ceiling is the car's OWN proxy, not a typed 0.25: inverted,
+               the centre of mass can stand no higher than its tallest body
+               station reaches (offset y + radius), plus a centimetre of contact
+               tolerance. It was 0.25 while the proxy was the port's invented
+               roof; the retail stations out of cdt<n>.ini put the inverted
+               Hummer at 0.26 on its own 0.11 m central station. */
+            {
+                float top = 0.0f;
+                int s;
+                for (s = 0; s < 3; s++) {
+                    const rb_body_sphere *bs = &RB_CARS[carn].tune.body_sphere[s];
+                    if (bs->offset[1] + bs->radius > top)
+                        top = bs->offset[1] + bs->radius;
+                }
+                ck(y_rest > 0.0f && y_rest < top + 0.01f,
+                   "an inverted car rests on the surface, all three cars");
+            }
             ck(slide_end < 0.05f, "and body friction brings a slide to a stop");
             ck(spin_end < 0.20f, "and the contact impulse arrests its spin");
         }

@@ -142,49 +142,27 @@ void rbcar_init(rb_car *c, int car, const rb_world *w,
     }
     rb_car_setup_springs(c);
 
-    /* Inertia. The original's source for this is not recovered, so build it from
-     * the geometry that IS: half the mass as a box over the body mesh extents,
-     * half as point masses at the wheel centres.
+    /* Inertia -- FUN_004f2270, the PS2's carSetMassInert. A UNIFORM BOX over
+     * the AABB of every vertex of the car's main model in rest pose
+     * (0x450050 -> 0x4502a0; the frame at car+0x138 is the instance's inverse
+     * world matrix, so model space), built by 0x4752b0:
      *
-     * Body-box-only is what this used to do and it is badly wrong for roll: the
-     * wheels sit at +-half_track, and leaving them out gives about a quarter of
-     * the real roll inertia, which makes the car flip on a 10-degree slope. The
-     * suspension roll torque is amplified by coeffMomentOZ (1.87) on top.
+     *     I = diag(dy^2 + dz^2, dx^2 + dz^2, dx^2 + dy^2) * m / 12
      *
-     * The box is placed so that the WHOLE distribution's centroid lands on the
-     * body origin, which is what "the origin is the centre of mass" means. That
-     * used to need no thought: com_oy was not recovered, mount_y was a bare
-     * len_free - sag, so the wheel centres sat at body y = 0 and a box centred
-     * on the origin already balanced them. With the real CenterMassOY the wheel
-     * centres are 57 / 29 / 39 mm ABOVE the origin, so a box left at 0 would
-     * describe a body whose com is half that distance up -- i.e. it would quietly
-     * put back part of the very offset this is meant to remove. One
-     * parallel-axis term fixes it, and it raises pitch and roll inertia by about
-     * 8% and 14%.
-     */
+     * and for the Buggy (phys+0x54 == 1) I[10], roll about the forward axis,
+     * DOUBLED (0x4f2307). No point masses and no parallel-axis term: the box is
+     * the whole model's, antenna and upgrade sets included, which is why it is
+     * wide and tall enough that the shell-only box's missing roll inertia --
+     * what the wheel point masses used to stand in for -- is simply there. The
+     * dimensions are RB_CARS[].ibox; the PS2 hard-codes the same boxes. */
     {
-        double ex = d->extent[0], ey = d->extent[1], ez = d->extent[2];
-        double mb = (double)d->mass * 0.5;          /* body share */
-        double mw = ((double)d->mass * 0.5) / (double)c->nwheels;
-        double ix = mb * (ey * ey + ez * ez) / 12.0;
-        double iy = mb * (ex * ex + ez * ez) / 12.0;
-        double iz = mb * (ex * ex + ey * ey) / 12.0;
-        double wsum = 0.0, by;
-        for (i = 0; i < c->nwheels; i++)
-            wsum += (double)c->wheel[i].mount[1] - c->wheel[i].len;
-        /* the two halves are equal, so the box centre is minus the mean wheel
-           height whatever nwheels is */
-        by = -wsum / (double)c->nwheels;
-        ix += mb * by * by;
-        iz += mb * by * by;
-        for (i = 0; i < c->nwheels; i++) {
-            double wx = c->wheel[i].mount[0];
-            double wy = (double)c->wheel[i].mount[1] - c->wheel[i].len;
-            double wz = c->wheel[i].mount[2];
-            ix += mw * (wy * wy + wz * wz);
-            iy += mw * (wx * wx + wz * wz);
-            iz += mw * (wx * wx + wy * wy);
-        }
+        double ex = d->ibox[0], ey = d->ibox[1], ez = d->ibox[2];
+        double m = (double)d->mass;
+        double ix = (ey * ey + ez * ez) * m * (1.0 / 12.0);
+        double iy = (ex * ex + ez * ez) * m * (1.0 / 12.0);
+        double iz = (ex * ex + ey * ey) * m * (1.0 / 12.0);
+        if (car == 1)
+            iz += iz;
         memset(c->body.ibody_inv, 0, sizeof(c->body.ibody_inv));
         c->body.ibody_inv[0]  = (float)(1.0 / ix);
         c->body.ibody_inv[5]  = (float)(1.0 / iy);

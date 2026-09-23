@@ -303,6 +303,22 @@ static int rb_nearest_hit(const float centre[3], const rb_world_hit *hits,
     return hn;
 }
 
+int rb_world_surface_at(const rb_world *w, const float centre[3], float radius)
+{
+    rb_world_hit hits[8];
+    float s[4];
+    int nh = 0;
+
+    if (!w || !w->sphere)
+        return 0;
+    s[0] = centre[0]; s[1] = centre[1]; s[2] = centre[2]; s[3] = radius;
+    memset(hits, 0, sizeof(hits));
+    if (!w->sphere(w->ctx, s, radius, hits,
+                   (int)(sizeof(hits) / sizeof(hits[0])), &nh) || nh <= 0)
+        return 0;
+    return hits[rb_nearest_hit(centre, hits, nh)].surface;
+}
+
 /* 0x004efe00 -- query every sphere and turn the results into per-wheel
  * contacts.
  *

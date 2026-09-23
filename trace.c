@@ -366,8 +366,13 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
            DOES mark starts a fresh strip rather than joining across the gap. */
         {
             static const float st[TRACE_SURF_CLASSES] = TRACE_STRENGTH_TABLE;
-            int cls = col ? col_surface_at(col, h->point[0], h->point[1],
-                                           h->point[2]) : 0;
+            /* The WHEEL'S OWN CONTACT's class: FUN_0052f310 takes it from
+               0x501820 -> 0x5015c0, which reuses the wheel's physics record --
+               one nearest face (query flags 4, no 0x400) -- and 0x52f4f8 hands
+               that record to FUN_00534fc0. rb_collide has already filled it the
+               same way. This used to re-query col_surface_at, a minimum over
+               every face in a 5 cm band, which is no rule of the engine's. */
+            int cls = col ? h->surface : 0;
             if (!col || !col->eng_surf)
                 strength = TRACE_STRENGTH;      /* no data: as before */
             else if (cls > 0 && cls < TRACE_SURF_CLASSES)

@@ -24,7 +24,12 @@ typedef struct {
     const char *name;
     int   nwheels;
     float mass;
-    float extent[3];      /* box extents for the inertia tensor */
+    float extent[3];      /* the ENVIR_CAR_BODY shell's box, x y z */
+    /* THE INERTIA BOX, FUN_004f2270: the AABB of every vertex of the main CarN
+       model in rest pose (0x450050 / 0x4502a0, antenna and all four upgrade
+       sets included), dx dy dz. The PS2's carSetMassInert hard-codes the same
+       boxes to four decimals. */
+    float ibox[3];
     float half_track;     /* lenAxe */
     float half_base;      /* from the mesh */
     float mount_y;
@@ -55,10 +60,11 @@ static const rb_car_data RB_CARS[3] = {
     /* nwheels        */ 4,
     /* mass           */ 1.000000f,
     /* extent         */ {0.140000f,0.106000f,0.422000f},
+    /* ibox           */ {0.384000f,0.477700f,0.512400f},
     /* half_track     */ 0.141000f,
     /* half_base      */ 0.149000f,
-    /* mount_y        */ 0.155142f,
-    /* com_oy         */ 0.000000f,
+    /* mount_y        */ 0.122818f,
+    /* com_oy         */ 0.032323f,
     /* steer_max_deg  */ 30.000000f,
     { /* tune */
       /* moment_ox     */ 1.045455f,
@@ -89,14 +95,14 @@ static const rb_car_data RB_CARS[3] = {
       /* reso_accel    */ {0.700000f,0.800000f,0.900000f,1.000000f},
       /* accel curve   */ { rb_accel1, 3 },
       /* restrict      */ { rb_restr1, 2 },
-      /* cdt_rad_wheel */ 0.071818f,
-      /* cdt_rad_back  */ 0.071818f,
+      /* cdt_rad_wheel */ 0.070909f,
+      /* cdt_rad_back  */ 0.070909f,
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
-      /* cdt_side_x    */ 0.050000f,
+      /* cdt_side_x    */ 0.070707f,
       /* body_sphere   */ {
-        { {0.000000f,0.087879f,0.075758f}, 0.051010f, 0.000000f },  /* X->centre clamped */
-        { {0.000000f,0.185240f,-0.160040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 28 mm proud */
-        { {0.000000f,0.185240f,0.181040f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 28 mm proud */
+        { {-0.003030f,0.116162f,0.118182f}, 0.083232f, 0.118182f },
+        { {-0.003030f,0.128283f,-0.003030f}, 0.092020f, -0.003030f },
+        { {-0.003030f,0.116162f,-0.154545f}, 0.077374f, -0.154545f },
       },
     },
     /* len_free */ 0.217879f,
@@ -104,11 +110,12 @@ static const rb_car_data RB_CARS[3] = {
     /* len_max  */ 0.239667f,
     /* sag      */ 0.119437f,
     /* k_speed  */ 4.181818f,
-    /* radius   */ 0.071818f },
+    /* radius   */ 0.070909f },
   { "Buggy",
     /* nwheels        */ 4,
     /* mass           */ 1.000000f,
     /* extent         */ {0.216000f,0.157500f,0.532800f},
+    /* ibox           */ {0.351000f,0.260100f,0.541800f},
     /* half_track     */ 0.146700f,
     /* half_base      */ 0.182250f,
     /* mount_y        */ 0.176005f,
@@ -146,11 +153,11 @@ static const rb_car_data RB_CARS[3] = {
       /* cdt_rad_wheel */ 0.049091f,
       /* cdt_rad_back  */ 0.067438f,
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
-      /* cdt_side_x    */ 0.050000f,
+      /* cdt_side_x    */ 0.090909f,
       /* body_sphere   */ {
-        { {0.000000f,0.041448f,0.184848f}, 0.051010f, 0.000000f },  /* X->centre Y>floor clamped */
-        { {0.000000f,0.110167f,-0.246890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft */
-        { {0.000000f,0.110167f,0.183890f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore */
+        { {-0.003030f,0.091919f,0.154545f}, 0.065657f, 0.027273f },
+        { {-0.003030f,0.128283f,-0.015152f}, 0.086162f, -0.003030f },
+        { {-0.003030f,0.146465f,-0.190909f}, 0.083232f, -0.021212f },
       },
     },
     /* len_free */ 0.242626f,
@@ -163,6 +170,7 @@ static const rb_car_data RB_CARS[3] = {
     /* nwheels        */ 6,
     /* mass           */ 1.000000f,
     /* extent         */ {0.194220f,0.118170f,0.507780f},
+    /* ibox           */ {0.421200f,0.470400f,0.566300f},
     /* half_track     */ 0.170235f,
     /* half_base      */ 0.182520f,
     /* mount_y        */ 0.137488f,
@@ -197,14 +205,14 @@ static const rb_car_data RB_CARS[3] = {
       /* reso_accel    */ {0.750000f,0.850000f,0.950000f,1.000000f},
       /* accel curve   */ { rb_accel3, 3 },
       /* restrict      */ { rb_restr3, 3 },
-      /* cdt_rad_wheel */ 0.059091f,
-      /* cdt_rad_back  */ 0.059091f,
+      /* cdt_rad_wheel */ 0.068182f,
+      /* cdt_rad_back  */ 0.068182f,
       /* cdt_front_x   */ 0.000000f,  /* FrontWheelDeltaX: scale unrecovered */
-      /* cdt_side_x    */ 0.050000f,
+      /* cdt_side_x    */ 0.070707f,
       /* body_sphere   */ {
-        { {0.000000f,0.073737f,0.015152f}, 0.051010f, 0.000000f },  /* X->centre clamped */
-        { {0.000000f,0.177577f,-0.209900f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, aft, 4 mm proud */
-        { {0.000000f,0.177577f,0.195860f}, 0.051010f, 0.000000f },  /* THE PORT'S: roof, fore, 4 mm proud */
+        { {-0.003030f,0.146465f,0.178788f}, 0.094949f, 0.178788f },
+        { {-0.003030f,0.146465f,-0.003030f}, 0.109596f, -0.003030f },
+        { {-0.003030f,0.146465f,-0.184848f}, 0.094949f, -0.184848f },
       },
     },
     /* len_free */ 0.217879f,
@@ -212,7 +220,7 @@ static const rb_car_data RB_CARS[3] = {
     /* len_max  */ 0.239667f,
     /* sag      */ 0.119437f,
     /* k_speed  */ 4.181818f,
-    /* radius   */ 0.059091f },
+    /* radius   */ 0.068182f },
 };
 
 /* Camera, from Settings/Camera.crs via physLoadCamera (0x004f9da0).
