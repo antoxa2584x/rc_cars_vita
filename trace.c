@@ -176,12 +176,14 @@ int trace_break_test(const float prev[3], const float head[3],
    NULL for the first of a strip -- the running length accumulates through it. */
 static void write_pt(trace_pt *p, const trace_pt *link, const float pos[3],
                      const float nrm[3], const float lat[3],
-                     float half_w, float strength, int tex, unsigned int strip)
+                     float half_w, float strength, int tex, int fwd,
+                     unsigned int strip)
 {
     int k;
 
     memset(p, 0, sizeof(*p));
     p->used = 1;
+    p->fwd = fwd;
     p->life = TRACE_LIFE;
     p->strength = strength;
     p->tex = tex;
@@ -219,7 +221,7 @@ static void write_pt(trace_pt *p, const trace_pt *link, const float pos[3],
  */
 static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
                      const float lat[3], float half_w, float strength, int tex,
-                     int force_new)
+                     int fwd, int force_new)
 {
     int prev;
     trace_pt *head;
@@ -227,14 +229,18 @@ static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
     if (r->head < 0) {
         r->head = 0;
         r->strip++;
-        write_pt(&r->pt[0], NULL, pos, nrm, lat, half_w, strength, tex,
+        write_pt(&r->pt[0], NULL, pos, nrm, lat, half_w, strength, tex, fwd,
                  r->strip);
         r->n = 1;
         return;
     }
     head = &r->pt[r->head];
 
-    if (!force_new && head->tex == tex) {
+    /* A change of direction ends the strip: FUN_0052f700 compares the head's
+       +0x4c with param_6 and flags both ends +0x48, which FUN_0052fd00 will not
+       draw a quad across. The texture is compared too, as before -- it cannot
+       change within a car, so that half never fires. */
+    if (!force_new && head->tex == tex && head->fwd == fwd) {
         prev = ring_prev(r, r->head);
         if (prev >= 0 && r->pt[prev].strip == head->strip) {
             const trace_pt *pp = &r->pt[prev];
@@ -245,7 +251,7 @@ static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
                 if (code == 5)
                     return;                 /* the car has not moved */
                 if (code == 0) {
-                    write_pt(head, pp, pos, nrm, lat, half_w, strength, tex,
+                    write_pt(head, pp, pos, nrm, lat, half_w, strength, tex, fwd,
                              head->strip);
                     return;
                 }
@@ -253,7 +259,7 @@ static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
         }
         /* Not mergeable, but the strip carries on: append into the same strip. */
         r->head = (r->head + 1) % r->cap;
-        write_pt(&r->pt[r->head], head, pos, nrm, lat, half_w, strength, tex,
+        write_pt(&r->pt[r->head], head, pos, nrm, lat, half_w, strength, tex, fwd,
                  head->strip);
         if (r->n < r->cap)
             r->n++;
@@ -262,7 +268,7 @@ static void ring_add(trace_ring *r, const float pos[3], const float nrm[3],
 
     r->head = (r->head + 1) % r->cap;
     r->strip++;
-    write_pt(&r->pt[r->head], NULL, pos, nrm, lat, half_w, strength, tex,
+    write_pt(&r->pt[r->head], NULL, pos, nrm, lat, half_w, strength, tex, fwd,
              r->strip);
     if (r->n < r->cap)
         r->n++;
@@ -280,8 +286,9 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
     for (w = 0; w < c->nwheels && w < RB_MAX_WHEELS; w++) {
         const rb_wheel_contact *h = &c->hit[w];
         trace_ring *r = &tr->w[w];
-        float lat[3], len, half_w, strength;
-        int tex, force;
+        float lat[3], len, half_w, strength, vlen, vdir[3];
+        const float *vel;
+        int tex, force, fwd;
 
         /* Age this wheel's ring whatever happens to it this frame. */
         for (k = 0; k < TRACE_RING; k++) {
@@ -303,22 +310,45 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
             continue;
         }
 
-        /* Across the mark: the wheel's axle direction, projected onto the
-           contact plane. The body's +X is the axle line (see CLAUDE.md, "Car
-           axes"), and taking the component along the normal out of it keeps the
-           quad flat on the surface even on a slope. */
-        lat[0] = c->m[0];
-        lat[1] = c->m[1];
-        lat[2] = c->m[2];
-        len = lat[0] * h->normal[0] + lat[1] * h->normal[1]
-              + lat[2] * h->normal[2];
-        for (k = 0; k < 3; k++)
-            lat[k] -= len * h->normal[k];
+        /* THE CAR MUST BE MOVING -- FUN_0052f310 at 0x0052f35c, the first test
+           after the ageing loop. It is the car body's speed (FUN_0050b6a0 reads
+           phys+0x58e0 and returns |v| * 3.6), one number for all four wheels,
+           so a car pivoting on the spot lays nothing: its wheels are sliding
+           round a point the body is not travelling away from. The port used to
+           mark at any speed, and a pivot painted every wheel's arc as a fan of
+           quads each as wide as the AXLE was turned -- "if turn almost on one
+           place, wheel marks start acting weird". Falling out here clears the
+           strip exactly as the engine's `*param_4 = 0` does, so the next mark
+           starts a new one rather than joining across the stop. */
+        vel = c->body.v;
+        vlen = sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+        if (vlen * 3.6f < TRACE_MIN_KMH) {
+            r->was_down = 0;
+            continue;
+        }
+        vdir[0] = vel[0] / vlen; vdir[1] = vel[1] / vlen; vdir[2] = vel[2] / vlen;
+
+        /* Across the mark: NORMAL x TRAVEL, 0x0052f5f4 -- local_e4 is the
+           contact normal crossed with the normalised body velocity. Not the
+           axle: this read `c->m[0..2]` for as long as the marks existed, which is
+           the same line while the car rolls straight and a different one the
+           moment it slides, and on a pivot it is at right angles to the travel,
+           so each quad came out a sliver along its own length. Already in the
+           contact plane, since it is perpendicular to the normal; normalised
+           here because a velocity with a component into the ground shortens it. */
+        lat[0] = h->normal[1] * vdir[2] - h->normal[2] * vdir[1];
+        lat[1] = h->normal[2] * vdir[0] - h->normal[0] * vdir[2];
+        lat[2] = h->normal[0] * vdir[1] - h->normal[1] * vdir[0];
         len = sqrtf(lat[0] * lat[0] + lat[1] * lat[1] + lat[2] * lat[2]);
-        if (len < 1e-4f)
-            continue;                       /* body rolled onto its side */
+        if (len < 1e-4f) {
+            r->was_down = 0;               /* moving straight into the ground */
+            continue;
+        }
         for (k = 0; k < 3; k++)
             lat[k] /= len;
+        /* FORWARDS, param_6: row 2 of the car's matrix against the same
+           velocity (0x0052f615..). A reversal ends the strip. */
+        fwd = (c->m[8] * vdir[0] + c->m[9] * vdir[1] + c->m[10] * vdir[2]) > 0.0f;
 
         /* FUN_0052f990's `param_9 * 0.05`, with param_9 the tyre table's own
            entry for this car's tyre level -- the one place a level becomes a
@@ -344,8 +374,14 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
                 strength = st[cls];
             else
                 strength = 0.f;
-            if (strength <= 0.f)
+            /* NOTHING LAID ENDS THE STRIP -- the engine's `goto` lands on the
+               same `*param_4 = 0` as every other refusal, and this used to
+               `continue` with was_down still set, so a mark that crossed a
+               strip of asphalt was drawn as one quad straight over it. */
+            if (strength <= 0.f) {
+                r->was_down = 0;
                 continue;
+            }
         }
         /* FUN_0052f310 at 0x0052f537 halves the strength for wheels 0 and 1 --
            the front pair -- so the steered wheels leave a fainter mark than the
@@ -369,7 +405,7 @@ void trace_step(trace_t *tr, const rb_car *c, const col_t *col, float dt)
            join), so a landing that is not flagged here is drawn as one quad
            reaching all the way back to the take-off. */
         force = (r->head < 0) || !r->pt[r->head].used || !r->was_down;
-        ring_add(r, h->point, h->normal, lat, half_w, strength, tex, force);
+        ring_add(r, h->point, h->normal, lat, half_w, strength, tex, fwd, force);
         r->was_down = 1;
     }
 }

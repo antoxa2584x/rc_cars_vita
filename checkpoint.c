@@ -1129,6 +1129,23 @@ float cp_dist_to_next(const checkpoints_t *c, float x, float y, float z)
     return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
+/* FUN_0052b1d0's breathing value for the checkpoint being headed for, 0..255:
+   a phase ramps 0 -> 0.4 and back, mapping to 50 -> 250, clamped at 220. */
+static float cp_pulse(const checkpoints_t *c)
+{
+    float ph = fmodf(c->t, 2.f * CP_PULSE_TIME);
+    float x = (ph < CP_PULSE_TIME) ? ph : (2.f * CP_PULSE_TIME - ph);
+    float pulse = 50.f + x * 500.f;
+    return pulse > 220.f ? 220.f : pulse;
+}
+
+float cp_paint_alpha(const checkpoints_t *c, int k)
+{
+    if (!c || k < 0 || k >= c->n)
+        return 1.f;
+    return ((k == c->next) ? cp_pulse(c) : CP_ALPHA_OTHER) / 255.f;
+}
+
 void cp_draw(checkpoints_t *c, const float eye[3])
 {
     float pulse;
@@ -1138,27 +1155,25 @@ void cp_draw(checkpoints_t *c, const float eye[3])
         return;
 
     /*
-     * The pulse, from FUN_0052b1d0: a phase ramps 0 -> 0.4 and back, mapping to
-     * alpha 50 -> 250 (`x*500 + 50` one way, `250 - x*500` the other), and the
-     * caller at 0x0052afe0 clamps it at 220. Out of 255, so the marker breathes
-     * between about 20% and 86% rather than blinking on and off.
+     * ONE MARKER, OVER THE CURRENT CHECKPOINT, ADDED ONTO THE SCENE.
      *
-     * That is for the checkpoint being headed for. FUN_0052b1d0's FIRST act is
-     * `cmp` on its two index arguments and `mov $0x32, %al` when they differ:
-     * every OTHER checkpoint gets a flat alpha 50. FUN_0052b170 then walks the
-     * whole registered list applying it, so the game marks EVERY checkpoint --
-     * the others dim, the current one breathing.
+     * FUN_0052abc0 looks up the ACP object whose index is the one being headed
+     * for and draws a single quad at its centroid -- nothing for any other
+     * checkpoint. The flat-50-for-the-others rule this loop used to apply to
+     * every floating marker is FUN_0052b170's, and FUN_0052b170 writes it into
+     * the ACP OBJECTS' own colour (`obj+0x2fc`), i.e. the GRAFFITI: that is
+     * cp_paint_alpha now. This file drew a marker over every checkpoint, first at
+     * 50 and then at a hand-raised 140, off that misreading.
      *
-     * Drawing only the current one, which this file did first, is why just one
-     * marker was ever visible.
+     * AND ADDITIVELY. The quad's material flags are 0x80000005, whose low byte
+     * FUN_0045c3c0 decodes as bit 0x4 -> mode 3, and mode 3 at 0x0045c81e is
+     * SRCBLEND = esi = 5 (D3DBLEND_SRCALPHA) with DESTBLEND = 2 (ONE) wherever
+     * the device reports D3DPBLENDCAPS_ONE -- `dst += src * a`. Alpha-blending it
+     * over the scene is what drew it dim.
+     *
+     * Alpha is the breathing value times the distance ramp below, as before.
      */
-    {
-        float ph = fmodf(c->t, 2.f * CP_PULSE_TIME);
-        float x = (ph < CP_PULSE_TIME) ? ph : (2.f * CP_PULSE_TIME - ph);
-        pulse = 50.f + x * 500.f;
-        if (pulse > 220.f)
-            pulse = 220.f;
-    }
+    pulse = cp_pulse(c);
 
     /* time / BlinkDelta modulo 3, the same index FUN_0052abc0 takes */
     frame = (int)(c->t / CP_BLINK_DELTA) % 3;
@@ -1167,7 +1182,7 @@ void cp_draw(checkpoints_t *c, const float eye[3])
 
     glDisable(GL_ALPHA_TEST);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
 
@@ -1196,13 +1211,15 @@ void cp_draw(checkpoints_t *c, const float eye[3])
          * no far cull at all -- the right way round for a navigation marker, and
          * the exact opposite of what this file did first.
          */
+        if (k != c->next)
+            continue;                     /* FUN_0052abc0: the current one only */
         dist = sqrtf(dx * dx + dz * dz);
         if (dist < CP_MIN_DIST)
             continue;
         alpha = (dist >= CP_MAX_DIST)
             ? 1.f
             : (dist - CP_MIN_DIST) / (CP_MAX_DIST - CP_MIN_DIST);
-        alpha *= ((k == c->next) ? pulse : CP_ALPHA_OTHER) / 255.f;
+        alpha *= pulse / 255.f;
         if (alpha <= 0.f)
             continue;
 
@@ -1251,6 +1268,7 @@ void cp_draw(checkpoints_t *c, const float eye[3])
     glColor4f(1.f, 1.f, 1.f, 1.f);
     glEnable(GL_CULL_FACE);
     glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_BLEND);
     glEnable(GL_ALPHA_TEST);
 }

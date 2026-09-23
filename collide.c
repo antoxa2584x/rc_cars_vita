@@ -1336,6 +1336,19 @@ static double vec3_angle_deg(const float a[3], const float b[3])
     return acos(cs) * (double)RB_RAD2DEG;
 }
 
+void rb_car_set_reset_heading(rb_car *c, const float fwd[3])
+{
+    if (!c)
+        return;
+    if (!fwd) {
+        c->reset_fwd_on = 0;
+        return;
+    }
+    c->reset_fwd[0] = fwd[0];
+    c->reset_fwd[1] = fwd[2];
+    c->reset_fwd_on = 1;
+}
+
 /* 0x00508600 -- see rb.h. */
 void rb_car_reset_upright(rb_car *c)
 {
@@ -1361,9 +1374,8 @@ void rb_car_reset_upright(rb_car *c)
      * plane and renormalised, falling back to world +Z (0x0055e9b0) when the car
      * is standing exactly on its nose and the flattened vector vanishes.
      *
-     * The original consults the track spline first (FUN_004873c0) and only uses
-     * the car's forward when the car has none bound; the port always takes that
-     * second branch -- see rb.h.
+     * The original consults the CAMERA bound to the car first (FUN_004873c0)
+     * and only uses the car's forward when none is -- see rb.h.
      *
      * Only x and z are carried, as fwd[0] and fwd[1]. The original zeroes the y
      * component explicitly because it goes on to hand the whole vector to
@@ -1372,8 +1384,15 @@ void rb_car_reset_upright(rb_car *c)
      * twice. A y term that nothing reads would look like part of the calculation
      * and would not be -- mutating it survived the whole suite, which is how this
      * shape got chosen. */
-    fwd[0] = c->m[8];
-    fwd[1] = c->m[10];
+    /* The bound camera's forward first (FUN_004873c0 / 0x00406660), then the
+       car's own -- see rb.h. Either is flattened the same way below. */
+    if (c->reset_fwd_on) {
+        fwd[0] = c->reset_fwd[0];
+        fwd[1] = c->reset_fwd[1];
+    } else {
+        fwd[0] = c->m[8];
+        fwd[1] = c->m[10];
+    }
     len = sqrt((double)fwd[0]*fwd[0] + (double)fwd[1]*fwd[1]);
     if (len < (double)EPS) {
         fwd[0] = 0.0f; fwd[1] = 1.0f;              /* world +Z, DAT_0055e9b0 */

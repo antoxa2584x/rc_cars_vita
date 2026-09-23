@@ -124,6 +124,12 @@
    which is what the port drew everywhere before, so an old grid is unchanged. */
 #define TRACE_STRENGTH 1.0f
 
+/* FUN_0052f310 lays nothing below 1 km/h of the CAR's speed: `FUN_0050b6a0`
+   returns |phys+0x58e0| * 3.6 -- the body's linear velocity, not a wheel's --
+   and the mark is gated on it being >= 1.0 (0x0052f35c). A car turning on the
+   spot is therefore not marking at all in the original. */
+#define TRACE_MIN_KMH 1.0f
+
 typedef struct {
     float pos[3];           /* record +0x08, the contact point */
     float nrm[3];           /* record +0x14, the surface normal */
@@ -141,7 +147,12 @@ typedef struct {
     /* record +0x04, FUN_0052f990's param_5: how hard this sample marks the
        ground, 0..1. The fade multiplies it; see TRACE_STRENGTH. */
     float strength;
-    int tex;                /* record +0x34, which t_halfdry_tire2_<n> */
+    int tex;                /* record +0x54, which t_halfdry_tire2_<n> */
+    /* record +0x4c, FUN_0052f700's param_6: the car was moving FORWARDS when
+       this was laid (row 2 of the car's matrix dotted with the body velocity,
+       > 0). A change breaks the strip. This field was read for a year as the
+       texture, which is param_7 and lives at +0x54. */
+    int fwd;
     /* The engine keeps two flags per record (+0x44 "nothing follows me yet" and
        +0x48 "the strip breaks after me") and FUN_0052fd00 joins a pair only when
        both are clear. A strip id is the same statement in one field, and it is

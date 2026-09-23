@@ -2088,7 +2088,6 @@ static int ai_phys_step(ai_t *ai, ai_car *a, float dt)
     a->phys_t += dt;
     if (a->phys_hold > 0.0f)
         a->phys_hold -= dt;
-    a->sim_push = 0.0f;
 
     /* THE TWO DEATHS THE PLAYER ALSO HAS -- drowned, or below its own recorded
        height by AI_FELL_BELOW. Only reachable from this mode, which is the only
@@ -2355,10 +2354,32 @@ static void ai_blend_pose(ai_car *a, const float x0[3], const float q0[4],
     memcpy(a->rb.body.q, res_q, sizeof(res_q));
     rb_car_update_matrix(&a->rb);
 
-    /* FUN_00503880 decrements it, not FUN_00503190. */
+    /* FUN_00503880 decrements it, not FUN_00503190. ON THE GUARD'S OWN
+       EPSILON: AI_BLEND_T less sixty ticks of 1/60 leaves 2.8e-7 in float, not
+       0, and the guard above takes that as finished -- so the countdown used to
+       stop one hair short of zero for ever and the hand-back below never ran. */
     a->blend_t -= dt;
-    if (a->blend_t < 0.0f)
+    if (a->blend_t <= 1e-6f)
         a->blend_t = 0.0f;
+
+    /* AND THE HAND-BACK HAS TO BE WHERE THE EASE LEFT THE CAR. From the next
+     * tick the pose is ai_bump_apply's again, `rec + off`, and nothing above
+     * reads `off` -- but the impulse half of every contact during the ease still
+     * lands in `offv`, and ai_bump_relax integrates it, so the offset the ease
+     * hands back is one that was never on screen. `aiphys` measured it as the
+     * rest of the unattributed kinematic steps: a car standing exactly on its
+     * recording with 0.27 to 0.52 m of offset nobody had seen, realised in one
+     * tick when the countdown ran out. The offset is re-based on the body instead
+     * -- about zero at the end of an ease, by construction -- so the hand-back is
+     * continuous and the spring takes it from there. */
+    if (a->blend_t <= 0.0f) {
+        for (i = 0; i < 3; i++) {
+            a->off[i] = a->rb.body.x[i] - a->rec_x[i];
+            a->offv[i] = 0.0f;
+        }
+        a->off_yaw = a->off_yawv = 0.0f;
+        a->off_gnd = 0.0f;
+    }
 }
 
 static int ai_advance(ai_car *a, float target, float dt)
@@ -2958,6 +2979,11 @@ void ai_step(ai_t *ai, const ai_track *tr, float px, float py, float pz,
         if (a->remote)
             continue;
 
+        /* THE PUSH BUDGET'S TICK STARTS HERE, for either mode -- see
+           ai_car.sim_push. A simulated car used to reset it at the top of
+           ai_phys_step, which is this same instant. */
+        a->sim_push = 0.0f;
+
         /* ===== THE DISPATCH, and it is FUN_004f72f0's own =====
          *
          * A car something has touched is not a replay: it is a real rb_car that
@@ -3321,12 +3347,65 @@ static void ai_actor_move(ai_actor *b, const float dv[3], float taken[3])
         return;
     }
     memcpy(before, a->off, sizeof(before));
-    for (k = 0; k < 3; k++)
-        a->off[k] += dv[k];
+    {
+        /* AND A KINEMATIC ONE HAS THE SAME BUDGET, which `ai_bump_clamp` never
+         * was: that bounds how FAR off its line the car is, not how fast it gets
+         * there. Two replays whose recordings run through each other overlap by
+         * up to half a car in one tick, and the positional half cleared all of it
+         * at once -- measured by `aiphys` as a car stepping 0.40 to 0.57 m in a
+         * tick at 3 to 6 m/s, every one of them a field pair and never the
+         * player. What is refused here is handed to the other body exactly as a
+         * simulated car's refusal is, and what neither takes is left for the next
+         * tick. */
+        double mag = sqrt((double)dv[0] * dv[0] + (double)dv[1] * dv[1]
+                        + (double)dv[2] * dv[2]);
+        double room = (double)RB_CARS[a->car].tune.speed_boost_max
+                      / 3.6 / 60.0 - a->sim_push;
+        double k2 = 1.0;
+        if (room < 0.0) room = 0.0;
+        if (mag > room)
+            k2 = (mag > 1e-9) ? room / mag : 0.0;
+        /* A CAR UNDER THE EASE HOME IS NOT POSED FROM ITS OFFSET, and that was
+         * the whole of `aiphys`'s "unattributed" sub-metre jumps. FUN_00503190
+         * owns the pose while `blend_t` runs -- it is `blend_x` carried along the
+         * recording and eased onto it, and `off` plays no part -- so re-posing
+         * through ai_bump_apply here put the body back on `rec + off`, which is
+         * the recording itself: every one of the four was a car 0.40 to 0.57 m
+         * out on its ease, pushed by a field pair and landing on its line in one
+         * tick. The push moves what the ease will read next instead, so the car
+         * is displaced by the push and nothing else and the ease goes on from
+         * there. DOWN IS REFUSED, for ai_bump_clamp's own reason: the ground is
+         * under it and nothing on this path can see it. */
+        if (a->blend_t > 1e-6f) {
+            float mv[3];
+            mv[0] = (float)(dv[0] * k2);
+            mv[1] = (float)(dv[1] * k2);
+            mv[2] = (float)(dv[2] * k2);
+            if (mv[1] < 0.0f) mv[1] = 0.0f;
+            for (k = 0; k < 3; k++) {
+                a->blend_x[k] += mv[k];
+                a->rb.body.x[k] += mv[k];
+                taken[k] = mv[k];
+            }
+            rb_car_update_matrix(&a->rb);
+            a->sim_push += (float)sqrt((double)mv[0] * mv[0]
+                                     + (double)mv[1] * mv[1]
+                                     + (double)mv[2] * mv[2]);
+            return;
+        }
+        for (k = 0; k < 3; k++)
+            a->off[k] += (float)(dv[k] * k2);
+    }
     ai_bump_clamp(a);
     ai_bump_apply(a);
-    for (k = 0; k < 3; k++)
-        taken[k] = a->off[k] - before[k];
+    {
+        double mag = 0.0;
+        for (k = 0; k < 3; k++) {
+            taken[k] = a->off[k] - before[k];
+            mag += (double)taken[k] * taken[k];
+        }
+        a->sim_push += (float)sqrt(mag);
+    }
 }
 
 /* One pair of proxies, already gathered. -> nonzero if they were touching, and

@@ -225,6 +225,18 @@ typedef struct { float u2, v2, mu, mv; } blend_uv_t;
  */
 #define BATCH_NO_TEXTURE 0x4000u
 
+/*
+ * A CHECKPOINT'S OWN GROUND MARKING -- the mesh an `ACP<n>` token names, packed
+ * as a batch of its own with n in `batch_t.model` (pack_vsc.py). FUN_0052b170
+ * walks the engine's registry of these objects every frame and writes each one's
+ * colour, `alpha << 24 | 0xffffff`, off FUN_0052b1d0: a flat 50 for every
+ * checkpoint but the current one, which breathes. So the graffiti of the
+ * checkpoint being headed for pulses and every other one is dim. Drawn by
+ * scene_draw_acp at the caller's alpha; the plain passes skip nothing, so a
+ * caller that has not heard of it draws the marking as it always did.
+ */
+#define BATCH_ACP 0x8000u
+
 /* Which CarEnvMap alpha this batch's glance is drawn at -- must match
    pack_vsc.py's ENV_*. 0 means the batch has no glance and carries no normals. */
 #define ENV_NONE      0
@@ -612,6 +624,14 @@ int scene_model_index(const scene_t *s, const char *name);
    `scene_draw(s, BATCH_SKY, BATCH_SKY)`, and water.c asks for its own. */
 void scene_draw(const scene_t *s, unsigned int mask, unsigned int match);
 
+/* The batches of ONE checkpoint's ground marking (BATCH_ACP, model == acp_n,
+   the `ACP<n>` number -- checkpoint n-1), with the same mask/match filter and the
+   same culling as scene_draw, under whatever colour the caller has set. */
+void scene_draw_acp(const scene_t *s, unsigned int mask, unsigned int match,
+                    unsigned int acp_n);
+/* The largest ACP number any batch carries, 0 on a scene packed before them. */
+unsigned int scene_acp_count(const scene_t *s);
+
 /* The transition bands -- every BATCH_BLEND batch, in three passes of its own.
    Call it straight after the solid world (which must EXCLUDE BATCH_BLEND) and
    before anything translucent; it leaves the state the solid world established.
@@ -666,6 +686,16 @@ void scene_set_frustum(const float viewproj[16]);
    Preferred over building the matrix by hand: a frustum that disagrees with the
    draw by even a little culls geometry that is on screen. */
 void scene_frustum_from_gl(void);
+
+/* Is a world-space sphere at least partly inside the LAST frustum set? For a
+   caller that culls its own instances -- a character, whose pose is where the
+   cost is -- against the same planes the track was culled with this frame.
+   Answers 1 when no frustum has been set (or after scene_frustum_forget), so a
+   harness that never builds one sees everything, exactly as scene_draw does.
+   It reads the planes whether or not culling is ON: scene_cull_off stops the
+   batch test, it does not un-know where the camera is. */
+int  scene_sphere_visible(const float c[3], float r);
+void scene_frustum_forget(void);
 
 /* Draw everything again, until the next scene_set_frustum. */
 void scene_cull_off(void);

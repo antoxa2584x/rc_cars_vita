@@ -1622,6 +1622,37 @@ static void jump_water_checks(void)
             ck(dx > 0.49f, "and the wall too -- the loop ran more than once");
         }
 
+        /* THE CAMERA BOUND TO THE CAR WINS (FUN_004873c0 -> mat4GetRow2 of the
+           viewport camera that follows it). Bound 90 degrees off whatever the
+           car is lying at, so "kept its own heading" and "took the bound one"
+           cannot both pass. And rbcar_init unbinds it: a respawn placed by yaw
+           must keep that yaw, not whichever way the camera happened to face. */
+        {
+            float cf[3], fx, fz, fl, cosang, ox, oz;
+            tilt_and_rest(&c, 0, 180.0f, 1);
+            /* The car's own forward, flattened, turned a quarter turn: the
+               bound heading. Measured on the BODY's +Z afterwards, not through a
+               yaw convention -- this test first compared rbcar_yaw_deg with an
+               atan2 of its own and read the mirror as a failure. */
+            ox = c.m[8]; oz = c.m[10];
+            fl = sqrtf(ox * ox + oz * oz); ox /= fl; oz /= fl;
+            cf[0] = oz; cf[1] = -0.3f; cf[2] = -ox;
+            rb_car_set_reset_heading(&c, cf);
+            c.jump_t = RB_JUMP_COOLDOWN;
+            ck(rbcar_jump(&c, 1, 0.0f) == RB_JUMP_RESET,
+               "an inverted car with a camera bound resets");
+            fx = c.m[8]; fz = c.m[10];
+            fl = sqrtf(fx * fx + fz * fz);
+            cosang = (fx * cf[0] + fz * cf[2]) / (fl * sqrtf(cf[0] * cf[0] + cf[2] * cf[2]));
+            printf("reset to the camera: own (%.2f, %.2f), camera (%.2f, %.2f), "
+                   "got (%.2f, %.2f)\n", ox, oz, cf[0], cf[2], fx / fl, fz / fl);
+            ck(cosang > 0.9999f,
+               "and faces where the CAMERA looks, not where it lay -- FUN_004873c0");
+            rbcar_init(&c, 0, c.world, c.body.x[0], 0.0f, c.body.x[2], 0.0f);
+            ck(!c.reset_fwd_on, "rbcar_init unbinds it, so a placed respawn keeps its yaw");
+            rb_car_set_reset_heading(&c, NULL);
+        }
+
         /* And it lands back on its wheels rather than bouncing off again. */
         for (i = 0; i < 300; i++) rbcar_step(&c, 0.0f, 0.0f, 0.0f, 0, 1.0f/60.0f);
         {

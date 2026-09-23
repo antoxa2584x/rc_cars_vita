@@ -107,11 +107,15 @@
    alpha 50 -> 250 with it. */
 #define CP_PULSE_TIME 0.4f
 
-/* Flat alpha for a checkpoint that is NOT the one being headed for.
-   FUN_0052b1d0 opens with `cmp` on its two index arguments and `mov $0x32,%al`
-   when they differ -- 0x32 is 50 -- and FUN_0052b170 applies it across the whole
-   registered list. Every checkpoint is marked; only the current one breathes. */
-#define CP_ALPHA_OTHER 140.f
+/* Flat alpha for the GROUND MARKING of a checkpoint that is NOT the one being
+   headed for. FUN_0052b1d0 opens with `cmp` on its two index arguments and
+   `mov $0x32,%al` when they differ -- 0x32 is 50 -- and FUN_0052b170 writes it
+   into every registered ACP object's colour, `alpha << 24 | 0xffffff`. So the
+   graffiti of every checkpoint but the current one sits at 50/255, and the
+   current one's breathes. It was applied here to floating markers for a year,
+   and raised by hand to 140 to make them visible; the floating marker is one
+   quad over the current checkpoint only (cp_draw). */
+#define CP_ALPHA_OTHER 50.f
 
 /* Two PORT ADJUSTMENTS to the marker's placement, both driven by how it looked
    on screen rather than by anything recovered. Stated here so they are easy to
@@ -770,6 +774,11 @@ int cp_progress(const checkpoints_t *c, float x, float z, float *out_s);
 /* Draw the arrows. `eye` is the camera; the quad turns to face it. Call last,
    after everything else, and it leaves GL state as it found it. */
 void cp_draw(checkpoints_t *c, const float eye[3]);
+
+/* The engine's colour alpha, 0..1, for checkpoint k's own GROUND MARKING (its
+   ACP object, drawn by scene_draw_acp): the breathing value for the checkpoint
+   being headed for, CP_ALPHA_OTHER for every other. */
+float cp_paint_alpha(const checkpoints_t *c, int k);
 
 /* STRAIGHT-LINE metres from the car to the next checkpoint's marker, in 3D.
  *

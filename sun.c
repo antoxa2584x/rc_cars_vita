@@ -283,12 +283,15 @@ void sun_draw(const sun_t *s, const float eye[3],
         dir[0] /= dlen; dir[1] /= dlen; dir[2] /= dlen;
 
         /* Additive, and off the depth buffer -- flags 0xa0200005, mode 3 =
-           SRCCOLOR / ONE, so `dst' = src*src + dst`. No depth test because the
+           SRCALPHA / ONE, so `dst' = src*a + dst`. The source factor is `esi`,
+           which FUN_0045c6e0 loads with 5 (D3DBLEND_SRCALPHA) before its jump at
+           0x0045c74b; this was read as the mode number 3 (SRCCOLOR) and drew the
+           flares squared, their halos crushed. No depth test because the
            original draws these at the near plane (FUN_004799a0 writes
            cam+0x15c + 1e-06 into every vertex): a lens artefact is in the lens,
            not in the world. */
         glDisable(GL_DEPTH_TEST);
-        glBlendFunc(GL_SRC_COLOR, GL_ONE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         tanf2 = tanh_;
 
         for (i = 0; i < 5; i++) {
@@ -315,16 +318,13 @@ void sun_draw(const sun_t *s, const float eye[3],
                angle whatever the resolution. */
             half = SUN_FLARE_SIZE[i] * ep[2] * tanf2 * aspect;
             quad_world(q, wp, right, up, half);
-            /* THE FADE SCALES THE COLOUR, NOT THE ALPHA, and that is forced.
-               FUN_004797c0 packs the fade byte into the D3DCOLOR's alpha
-               (CONCAT31/21/11 of fade,R,G,B), but mode 3 is SRCCOLOR / ONE and
-               the source alpha takes no part in that blend -- a vertex alpha
-               here would fade nothing. Under an additive blend the only thing
-               that can dim a sprite is its colour. */
-            glColor4f(SUN_FLARE_RGB[i][0] / 255.f * s->alpha,
-                      SUN_FLARE_RGB[i][1] / 255.f * s->alpha,
-                      SUN_FLARE_RGB[i][2] / 255.f * s->alpha,
-                      1.f);
+            /* THE FADE IS THE ALPHA, as FUN_004797c0 packs it: the fade byte goes
+               into the D3DCOLOR's alpha (CONCAT31/21/11 of fade,R,G,B), and mode
+               3's SRCALPHA source factor is what makes it dim the sprite. */
+            glColor4f(SUN_FLARE_RGB[i][0] / 255.f,
+                      SUN_FLARE_RGB[i][1] / 255.f,
+                      SUN_FLARE_RGB[i][2] / 255.f,
+                      s->alpha);
             draw_quad(q, s->tex_flare[i]);
         }
         glEnable(GL_DEPTH_TEST);

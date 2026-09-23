@@ -412,13 +412,15 @@ typedef struct {
      * The engine has no positional push between cars at all (`carSubstepCCD`
      * caps a car's advance at 0.9 of a sphere radius per substep, so the proxies
      * barely overlap); the port has one because it has no CCD between cars. On a
-     * kinematic car it was bounded by `ai_bump_clamp`. On a SIMULATED one it
-     * went straight into the body, AI_DEPEN_PASSES times, and 8 passes of up to
-     * 0.285 m is a 1.457 m step -- measured, against a player control in the
-     * same places that never once exceeded its own velocity. So it is budgeted:
-     * a car may not be pushed further in a tick than it could DRIVE in a tick,
-     * which is the same bound aitest part 9 case 4c holds the offset to. What a
-     * car refuses, `ai_actor_move` already hands to the other body. */
+     * SIMULATED car it went straight into the body, AI_DEPEN_PASSES times, and 8
+     * passes of up to 0.285 m is a 1.457 m step -- measured, against a player
+     * control in the same places that never once exceeded its own velocity. So it
+     * is budgeted: a car may not be pushed further in a tick than it could DRIVE
+     * in a tick, which is the same bound aitest part 9 case 4c holds the offset
+     * to. A KINEMATIC car has the same budget now -- `ai_bump_clamp` bounds how
+     * far off its line it is, not how fast it gets there. Reset at the top of
+     * ai_step's loop for both modes. What a car refuses, `ai_actor_move` hands to
+     * the other body. */
     float sim_push;
 } ai_car;
 

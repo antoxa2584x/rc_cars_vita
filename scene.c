@@ -677,6 +677,7 @@ static void lm_bind(GLuint tex, const batch_t *b)
 /* Six clip planes, inward-facing, in model space. Valid only while cull_on. */
 static float cull_plane[6][4];
 static int cull_on;
+static int cull_planes_set;   /* planes hold a real frustum -- survives scene_cull_off */
 
 /* Whether draw_pass binds a normal array. Set around the car's own passes by
    main.c (scene_set_lighting), because GL takes the normal from the array only
@@ -943,7 +944,29 @@ void scene_set_frustum(const float m[16])
             cull_plane[p][c] = m[c * 4 + 3] + (float)SGN[p] * m[c * 4 + ROW[p]];
     }
     cull_on = 1;
+    cull_planes_set = 1;
 }
+
+int scene_sphere_visible(const float c[3], float r)
+{
+    int p;
+    if (!cull_planes_set)
+        return 1;
+    for (p = 0; p < 6; p++) {
+        const float *n = cull_plane[p];
+        /* The planes are rows of the view-projection and NOT normalised, so the
+           signed distance is the plane value over the normal's length. */
+        double len = sqrt((double)n[0] * n[0] + (double)n[1] * n[1]
+                          + (double)n[2] * n[2]);
+        double d = (double)n[0] * c[0] + (double)n[1] * c[1]
+                 + (double)n[2] * c[2] + n[3];
+        if (len > 1e-12 && d < -(double)r * len)
+            return 0;
+    }
+    return 1;
+}
+
+void scene_frustum_forget(void) { cull_planes_set = 0; cull_on = 0; }
 
 void scene_frustum_from_gl(void)
 {
@@ -1068,6 +1091,27 @@ static void draw_pass(const scene_t *s, unsigned int mask, unsigned int match,
  * their own threshold to survive this. The test is left ENABLED on the way out,
  * which is the state main.c establishes at init and assumes everywhere else.
  */
+void scene_draw_acp(const scene_t *s, unsigned int mask, unsigned int match,
+                    unsigned int acp_n)
+{
+    glDisable(GL_ALPHA_TEST);
+    draw_pass(s, mask | BATCH_ACP, match | BATCH_ACP, 0, (int)acp_n);
+    glEnable(GL_ALPHA_TEST);
+    draw_pass(s, mask | BATCH_ACP, match | BATCH_ACP, 1, (int)acp_n);
+    lm_bind(0, NULL);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+unsigned int scene_acp_count(const scene_t *s)
+{
+    unsigned int i, n = 0;
+    for (i = 0; s && i < s->n_batches; i++)
+        if ((s->batches[i].flags & BATCH_ACP) && s->batches[i].model > n)
+            n = s->batches[i].model;
+    return n;
+}
+
 void scene_draw(const scene_t *s, unsigned int mask, unsigned int match)
 {
     glDisable(GL_ALPHA_TEST);

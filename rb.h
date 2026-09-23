@@ -395,6 +395,13 @@ struct rb_car {
        `jump_latch` is the button edge detector, so holding Jump hops once. */
     float     jump_t;       /* phys + 0x6d4 */
     int       jump_latch;   /* phys + 0x123a0 */
+    /* THE HEADING rb_car_reset_upright rights the car to, when something is
+       bound to it -- FUN_004873c0's answer, the forward of the CAMERA that
+       follows this car. x and z only; rb_car_set_reset_heading sets it, and
+       rbcar_init's memset leaves it off, so a respawn placed by yaw keeps its
+       own. */
+    float     reset_fwd[2];
+    int       reset_fwd_on;
     rb_input  in;
     rb_tuning tune;
 };
@@ -772,13 +779,26 @@ int  rb_car_jump(rb_car *c, float dt);
  * body origin out of geometry with a RB_RESET_CLEAR_RADIUS sphere, at most
  * RB_RESET_CLEAR_PASSES times.
  *
- * The original prefers the direction of the track spline the car is nearest
- * (FUN_004873c0 / 0x00406660) and falls back to the car's own forward; the port
- * has no spline bound to the car, so it always takes the fallback. Same code
- * path in the original, just always the second branch. */
+ * THE HEADING IS THE CAMERA'S when a camera follows the car. FUN_004873c0 is not
+ * a spline lookup, which these notes said for a year: it walks the engine's
+ * VIEWPORT registry (DAT_014864dc, up to ten, each a 0x234-byte camera made by
+ * 0x405d00 off a screen rect) for the one whose +0x234 is this car's +0xf4, and
+ * 0x00406660 is mat4GetRow2 of THAT CAMERA's matrix -- its forward. So a car
+ * righted with Jump faces where the player is looking, and only a car nobody is
+ * watching falls back to its own flattened forward. The port had no camera
+ * bound and always took the fallback, which kept whatever heading the car had
+ * come to rest at -- sideways or backwards after a tumble -- and was reported as
+ * "when respawn not on checkpoint, car not looks toward race direction".
+ * rb_car_set_reset_heading is the binding; main.c sets it from the chase camera
+ * and clears it under the free-fly one. */
 #define RB_RESET_CLEAR_RADIUS  0.5f  /* the query's sphere radius, 0x3f000000 */
 #define RB_RESET_CLEAR_PASSES  10
 void rb_car_reset_upright(rb_car *c);
+
+/* Bind a heading for rb_car_reset_upright -- the forward of the camera following
+   this car, world space (only x and z are used). NULL unbinds, and the reset
+   then falls back to the car's own forward exactly as before. */
+void rb_car_set_reset_heading(rb_car *c, const float fwd[3]);
 
 /* --- driver -------------------------------------------------------------- */
 

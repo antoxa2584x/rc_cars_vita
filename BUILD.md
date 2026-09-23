@@ -65,6 +65,13 @@ Two packaging gotchas worth remembering:
     cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake ..
     make -j8            # -> rc_cars_vita<BUILD_VERSION>.vpk, e.g. rc_cars_vita0.81.vpk
 
+**The build folder holds ONE vpk.** Once the package is made, a post-build step
+(`cmake/prune_vpks.cmake`) deletes every other `rc_cars_vita*.vpk` in `build/` --
+each is ~290 MB and differs from the last only by its number, and an old one
+lying next to the new one is how a stale build gets installed. It does nothing if
+the new package is missing, and touches no other file. To keep old ones (A/B two
+builds on the card): `cmake -DKEEP_OLD_VPKS=ON ..`.
+
 Current `beach_1` payload: 74 textures (3.7 MB of pixels), 75 draw batches,
 57,636 vertices, 52,358 triangles, 5.1 MB scene file, 2.9 MB vpk.
 

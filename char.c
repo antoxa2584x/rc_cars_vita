@@ -15,7 +15,8 @@
  *                 why static will not do.
  *   the machines  a few floats each.
  *
- * Only instances within CHR_DRAW_DIST are posed at all, which is what keeps
+ * Only instances on screen and big enough to see are posed at all (chr_draw_range,
+ * scene_sphere_visible), which is what keeps
  * this off the frame budget: a Guard is 76 parts and 1,064 vertices, and a
  * track can place thirteen characters.
  */
@@ -372,8 +373,10 @@ static int load_file(chr_t *c, const char *path)
                 t = fabsf(m->bmax[a]);
                 if (t > far0) far0 = t;
             }
-            (void)dx; (void)dy; (void)dz;
             m->radius = far0;
+            t = dx > dy ? dx : dy;
+            if (dz > t) t = dz;
+            m->draw_dist = t / CHR_DRAW_MIN_ANGLE;
         }
         m->part = calloc(m->n_parts ? m->n_parts : 1, sizeof(chr_part_t));
         for (j = 0; j < m->n_parts; j++) {
@@ -2567,6 +2570,17 @@ static GLuint slot_tex(const chr_t *c, const chr_model_t *m, int variant,
     return c->tex[ti];
 }
 
+float chr_draw_range(const chr_t *c, unsigned int i)
+{
+    const chr_inst_t *in;
+    float d;
+    if (!c || i >= c->n_inst)
+        return 0.0f;
+    in = &c->inst[i];
+    d = c->model[in->model].draw_dist * in->scale;
+    return d < CHR_DRAW_FAR ? d : CHR_DRAW_FAR;
+}
+
 void char_draw(chr_t *c, const float eye[3])
 {
     unsigned int i, b, v;
@@ -2582,9 +2596,24 @@ void char_draw(chr_t *c, const float eye[3])
     c->skin_used = 0;
     for (i = 0; i < c->n_inst; i++) {
         chr_inst_t *in = &c->inst[i];
+        const chr_model_t *md = &c->model[in->model];
         float dx = in->x - eye[0], dy = in->y - eye[1], dz = in->z - eye[2];
+        float range = chr_draw_range(c, i), ctr[3], r;
+        /* HYSTERESIS on the range, and only on the range: a frustum edge is
+           crossed by turning, which is not the camera bobbing. */
+        if (in->drawn)
+            range *= CHR_DRAW_HYST;
         in->eye2 = dx * dx + dy * dy + dz * dz;
-        in->drawn = in->eye2 <= CHR_DRAW_DIST * CHR_DRAW_DIST;
+        in->drawn = in->eye2 <= range * range;
+        /* The pivot plus every rotation the draw can apply: `radius` is the
+           largest coordinate about the model origin, sqrt(3) of it encloses the
+           box, and the Vulture's shift moves the whole thing off the pivot. */
+        ctr[0] = in->x; ctr[1] = in->y; ctr[2] = in->z;
+        r = md->radius * 1.7320508f * in->scale;
+        if (in->place->kind == CHR_KIND_PATH && !strcmp(md->name, "Vulture"))
+            r += fabsf(CHR_VULTURE_SHIFTY) * in->scale;
+        if (in->drawn && !scene_sphere_visible(ctr, r))
+            in->drawn = 0;
     }
 
     /*

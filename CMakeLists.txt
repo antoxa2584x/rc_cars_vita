@@ -19,7 +19,7 @@ set(VITA_TITLEID  "RCCV00001")
 # a fix, minor for a feature; see BUILD.md, "Versioning". It names the package
 # (rc_cars_vita<BUILD_VERSION>.vpk), so the file on the card says which build it
 # is, and build.sh reads it back out of this file rather than keeping a copy.
-set(BUILD_VERSION "0.81")
+set(BUILD_VERSION "0.86")
 
 # APP_VER in the sfo is fixed width ##.##, so derive it instead of writing the
 # number twice. The minor is a FRACTION and pads on the right: 0.8 is 00.80.
@@ -133,3 +133,17 @@ vita_create_vpk(${VITA_VPK_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
   FILE sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
 )
+
+# PREVIOUS BUILDS ARE DELETED once this one is packaged: the build folder holds
+# exactly one rc_cars_vita<BUILD_VERSION>.vpk, the one just made. Each is ~290 MB
+# and differs from the last only by its number. cmake/prune_vpks.cmake refuses to
+# prune if the new package is missing. Configure with -DKEEP_OLD_VPKS=ON to keep
+# them, e.g. to A/B two builds on the card.
+option(KEEP_OLD_VPKS "keep earlier rc_cars_vita*.vpk in the build folder" OFF)
+if(NOT KEEP_OLD_VPKS)
+  add_custom_command(TARGET ${VITA_VPK_NAME}.vpk-vpk POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_CURRENT_BINARY_DIR}
+            -DKEEP=${VITA_VPK_NAME}.vpk
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/prune_vpks.cmake
+    VERBATIM)
+endif()

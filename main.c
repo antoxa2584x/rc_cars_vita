@@ -4029,6 +4029,18 @@ unsigned int acc_ticks = 0;
                  * a hop pressed on the line would sit in P, unintegrated, and
                  * launch the car on GO. The steering and throttle cannot do that
                  * -- they are read inside the tick that is not being spent. */
+                /* THE CAMERA BOUND TO THE CAR, which is where a Jump reset
+                   points it -- FUN_004873c0 (rb.h). The chase camera faces
+                   (-sin, 0, -cos) of the yaw it is drawn at (cam.h), orbit
+                   included, because that is the view the player sees; the
+                   free-fly camera follows nothing, so the car keeps its own. */
+                if (!free_cam && rcam.valid) {
+                    float h = (rcam.yaw + orbit_yaw) * DEG, cf[3];
+                    cf[0] = -sinf(h); cf[1] = 0.f; cf[2] = -cosf(h);
+                    rb_car_set_reset_heading(&rc, cf);
+                } else {
+                    rb_car_set_reset_heading(&rc, NULL);
+                }
                 int jumped = rbcar_jump(&rc,
                                         opts_held(&opts, OPT_JUMP, pad.buttons)
                                             && !menu.open
@@ -4932,7 +4944,20 @@ menu_only:
         glDepthMask(GL_FALSE);
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(-1.f, -2.f);
-        scene_draw(&track, BATCH_TRANSP, BATCH_TRANSP);
+        scene_draw(&track, BATCH_TRANSP | BATCH_ACP, BATCH_TRANSP);
+        /* THE CHECKPOINTS' OWN GRAFFITI, each at the colour FUN_0052b170 writes
+           into its ACP object: the one being headed for breathing, every other
+           one at a flat 50/255. Outside a race (cps off) and on a scene packed
+           before BATCH_ACP they draw at full, as they always did. */
+        {
+            unsigned int n = scene_acp_count(&track), an;
+            for (an = 1; an <= n; an++) {
+                float a = cps.enabled ? cp_paint_alpha(&cps, (int)an - 1) : 1.f;
+                glColor4f(1.f, 1.f, 1.f, a);
+                scene_draw_acp(&track, BATCH_TRANSP, BATCH_TRANSP, an);
+            }
+            glColor4f(1.f, 1.f, 1.f, 1.f);
+        }
         glPolygonOffset(0.f, 0.f);
         glDisable(GL_POLYGON_OFFSET_FILL);
         glDepthMask(GL_TRUE);

@@ -83,16 +83,36 @@ struct rb_car;
  * just woken up. The state machines are a few floats each, so 60 m costs
  * nothing.
  *
- * CHR_DRAW_DIST is measured from the EYE, because that is what drawing is about
- * -- and the two are not the same point. The chase camera sits about a metre
- * behind the car and the free camera can be anywhere at all. Past it the
+ * THE DRAW RANGE is measured from the EYE, because that is what drawing is
+ * about -- and the two are not the same point. The chase camera sits about a
+ * metre behind the car and the free camera can be anywhere at all. Past it the
  * instance is not posed, which is where the cost is: up to 89 matrix composes,
  * plus a blend over every vertex on a skinned model.
  *
- * It is the same order as ai.c's AI_DRAW_DIST (80 m) but shorter: an opponent
- * is a car the player is racing and a seagull is scenery.
+ * IT IS A SCREEN SIZE, NOT A DISTANCE, and a distance is what "objects
+ * disappear too early and it looks like flickering" was. One 45 m cap for every
+ * model dropped a 1.3 px Spider and a 63 px BTR at the same line -- measured at
+ * 45 m: the BTR 37 px tall, the Trailer, Hammer and Truck 42 to 52 px long, the
+ * people 15 px tall -- and with no hysteresis a camera hovering at the line at
+ * low speed toggled them every few frames. Nothing recovered caps it: the PS2
+ * chase camera sets a 300 m far plane (`carCamApply` -> `camSetFarPlane`,
+ * 0x43960000) and no character loader carries a visibility distance.
+ *
+ *   CHR_DRAW_MIN_ANGLE  THE PORT'S. The model's largest extent may not subtend
+ *                       less than this: 3 px of the 544 px screen at the 65
+ *                       degree field of view, 3 * 2 tan(32.5) / 544 rad. A
+ *                       person goes at 237 m, a Truck 640, a Spider 36.
+ *   CHR_DRAW_FAR        the engine's own chase-camera far plane, above.
+ *   CHR_DRAW_HYST       once drawn, an instance is kept until it is this much
+ *                       further out, so a range cannot be crossed back and
+ *                       forth by the camera's own bob. THE PORT'S.
+ *
+ * The frustum is tested too (scene_sphere_visible), which is what pays for the
+ * longer range: an instance off screen is not posed at all.
  */
-#define CHR_DRAW_DIST 45.0f
+#define CHR_DRAW_MIN_ANGLE 0.00703f
+#define CHR_DRAW_FAR       300.0f
+#define CHR_DRAW_HYST      1.10f
 #define CHR_STEP_DIST 60.0f
 
 /*
@@ -277,6 +297,7 @@ typedef struct {
      */
     float yaw_off;
     float radius;                   /* about the model origin, for culling */
+    float draw_dist;                /* unscaled: where it falls under CHR_DRAW_MIN_ANGLE */
     unsigned int max_verts;         /* largest skinned batch, for the scratch */
     unsigned int skin_verts;        /* ALL of them, summed -- see CHR_SKIN_RINGS */
     /* This model's entry in char_data.h's CHR_PROXY, resolved by name once at
@@ -572,6 +593,10 @@ void char_step(chr_t *c, float dt, const float car[3], const float car_fwd[3],
    has, and for the same reason. Takes the eye like prop_draw does, and for the
    same reason: the camera is not the car. */
 void char_draw(chr_t *c, const float eye[3]);
+
+/* How far from the eye instance `i` is drawn before hysteresis -- its model's
+   largest extent over CHR_DRAW_MIN_ANGLE, scaled, capped at CHR_DRAW_FAR. */
+float chr_draw_range(const chr_t *c, unsigned int i);
 
 /* Where an instance is, for the caller that wants to put a sound or a shadow on
    it. Returns 0 if `i` is out of range. */

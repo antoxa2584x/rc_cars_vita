@@ -1480,34 +1480,54 @@ static void part2_checkpoints(void)
     cp_draw(&c, eye);
     ck(cp_find_draw(20.f, 0.f) < 0, "the checkpoint you are standing on is NOT drawn",
        "%d draws, cp_2 at 2.0 m (MinDist %.2f)", glcap.n_draws, CP_MIN_DIST);
-    ck(cp_find_draw(0.f, 0.f) >= 0 && cp_find_draw(20.f, 20.f) >= 0,
-       "and the other two are", "%d draws total", glcap.n_draws);
+    ck(glcap.n_draws == 0,
+       "and no OTHER checkpoint gets a floating marker at all -- FUN_0052abc0 "
+       "draws the current one only", "%d draws total", glcap.n_draws);
 
     /* Back off so all three are beyond MaxDist. */
     eye[0] = 20.f; eye[1] = 1.f; eye[2] = -60.f;
     gl_cap_reset();
     cp_draw(&c, eye);
-    ck(glcap.n_draws == c.n, "ALL checkpoints are marked, not just the next",
+    ck(glcap.n_draws == 1 && cp_find_draw(20.f, 0.f) >= 0,
+       "ONE floating marker, over the checkpoint being headed for",
        "%d draws for %d checkpoints", glcap.n_draws, c.n);
     {
         int inext = cp_find_draw(20.f, 0.f);     /* cp_2, the current one */
-        int iother = cp_find_draw(0.f, 0.f);     /* cp_1 */
         ck(inext >= 0 && near(glcap.draws[inext].color[3], 220.f / 255.f, 1e-3f),
            "the one being headed for breathes up to the clamped 220",
            "alpha %.3f", inext >= 0 ? glcap.draws[inext].color[3] : -1.f);
-        ck(iother >= 0
-           && near(glcap.draws[iother].color[3], CP_ALPHA_OTHER / 255.f, 1e-3f),
-           "and the rest sit at the flat non-current alpha",
-           "alpha %.3f", iother >= 0 ? glcap.draws[iother].color[3] : -1.f);
-        ck(iother >= 0 && glcap.draws[iother].count == 4,
-           "each is one quad", "%d verts", iother >= 0 ? glcap.draws[iother].count : -1);
-        /* And READABLE. The engine's recovered 50/255 is what it tints solid
-           GATE OBJECTS with; the port has no gates, and 50 on a sprite over
-           textured sand is invisible -- which is the reported symptom. This
-           floor is the judgement, stated as a number a regression will trip. */
-        ck(iother >= 0 && glcap.draws[iother].color[3] > 0.3f,
-           "and are opaque enough to actually read on sand",
-           "alpha %.3f", iother >= 0 ? glcap.draws[iother].color[3] : -1.f);
+        ck(inext >= 0 && glcap.draws[inext].count == 4,
+           "it is one quad", "%d verts", inext >= 0 ? glcap.draws[inext].count : -1);
+        /* ADDED, not blended: flags 0x80000005 -> FUN_0045c3c0 bit 0x4 -> mode 3
+           -> SRCALPHA / ONE (0x0045c81e, esi = 5). Alpha-blended it drew dim. */
+        ck(inext >= 0 && glcap.draws[inext].blend
+           && glcap.draws[inext].blend_src == GL_SRC_ALPHA
+           && glcap.draws[inext].blend_dst == GL_ONE,
+           "and it is ADDED onto the scene -- mode 3, SRCALPHA / ONE",
+           "blend %d src 0x%x dst 0x%x", inext >= 0 ? glcap.draws[inext].blend : -1,
+           inext >= 0 ? glcap.draws[inext].blend_src : 0,
+           inext >= 0 ? glcap.draws[inext].blend_dst : 0);
+    }
+
+    /* THE GRAFFITI is where the flat 50 goes -- FUN_0052b170 writes it into every
+       registered ACP object's own colour. 0x32 is the `mov $0x32, %al` at the
+       head of FUN_0052b1d0; the current one's is the same breathing value the
+       marker has. Derived from those two numbers, not from the constant. */
+    {
+        float cur_lo, cur_hi, other;
+        c.t = 0.f;           cur_lo = cp_paint_alpha(&c, 1);
+        c.t = CP_PULSE_TIME; cur_hi = cp_paint_alpha(&c, 1);
+        other = cp_paint_alpha(&c, 0);
+        ck(near(other, (float)0x32 / 255.f, 1e-4f) && near(cp_paint_alpha(&c, 2), other, 1e-6f),
+           "every other checkpoint's GRAFFITI sits at the engine's flat 0x32",
+           "%.4f and %.4f against %.4f", other, cp_paint_alpha(&c, 2), 0x32 / 255.f);
+        ck(near(cur_lo, 50.f / 255.f, 1e-3f) && near(cur_hi, 220.f / 255.f, 1e-3f),
+           "and the current one's breathes 50 -> 220 with its marker",
+           "%.3f -> %.3f", cur_lo, cur_hi);
+        c.next = 2;
+        ck(near(cp_paint_alpha(&c, 1), other, 1e-6f),
+           "so a checkpoint just PASSED dims to it", "%.4f", cp_paint_alpha(&c, 1));
+        c.next = 1;
     }
 
     {   /* halfway up the ramp, measured on the current checkpoint */
@@ -1599,8 +1619,10 @@ static void part2_checkpoints(void)
            "tex %u, cp_ar_2_f1 is %u", seen[0], c.tex_common[0]);
 
         c.t = 0.05f;
+        c.next = 0;                              /* only the CURRENT one is drawn */
         gl_cap_reset();
         cp_draw(&c, eye);
+        c.next = 1;
         {
             int d = cp_find_draw(0.f, 0.f);      /* cp_1 -- index 0 */
             ck(d >= 0 && glcap.draws[d].tex == c.tex_custom[0],
@@ -1676,6 +1698,9 @@ static void part2_checkpoints(void)
            cp_find_draw(40.f, 0.f));
         /* AND THE FALLBACK IS THE OLD ANSWER, so a scene packed before
            pack_vsc.py grew `acp_N` still draws its arrows somewhere. */
+        d.next = 0;                  /* the fallback's own checkpoint, current */
+        gl_cap_reset();
+        cp_draw(&d, e3);
         ck(!d.cp[0].has_paint && cp_find_draw(0.f, 0.f) >= 0,
            "and falls back to the waypoint for a checkpoint with no paint",
            "paint %d, draw %d", d.cp[0].has_paint, cp_find_draw(0.f, 0.f));
@@ -1721,6 +1746,7 @@ static void part2_checkpoints(void)
         int rsp_aim_back = 0, rsp_refire = 0, rsp_phantom = 0;
         float rsp_worst_dot = 2.f;
 
+        int acp_tracks = 0, acp_bad = 0;
         for (t = 0; t < 10; t++) {
             char p[64];
             scene_t ts;
@@ -1739,6 +1765,39 @@ static void part2_checkpoints(void)
             col_load(p, &tc);
             cp_init(&rc, &ts, &tc);
             rc.enabled = (rc.n > 0);
+
+            /* EVERY CHECKPOINT'S GRAFFITI IS ITS OWN BATCH, so it can take its
+               own colour the way FUN_0052b170 gives it one: exactly one ACP
+               number per checkpoint, 1..n, and each number's batches centred on
+               that checkpoint's own paint -- which is `acp_N`, measured by the
+               packer off the same mesh by a different route (a vertex mean
+               against a batch's triangles). */
+            {
+                unsigned int an, bi;
+                int bad = 0;
+                if (scene_acp_count(&ts) != (unsigned)rc.n)
+                    bad = 1;
+                for (an = 1; an <= scene_acp_count(&ts) && !bad; an++) {
+                    double cx = 0, cz = 0; int nv = 0;
+                    for (bi = 0; bi < ts.n_batches; bi++) {
+                        const batch_t *b = &ts.batches[bi];
+                        unsigned int v;
+                        if (!(b->flags & BATCH_ACP) || b->model != an) continue;
+                        if (!(b->flags & BATCH_TRANSP)) bad = 1;
+                        for (v = 0; v < b->nverts; v++) {
+                            cx += b->verts[v].x; cz += b->verts[v].z; nv++;
+                        }
+                    }
+                    if (!nv) { bad = 1; break; }
+                    cx /= nv; cz /= nv;
+                    if (!rc.cp[an - 1].has_paint
+                        || fabs(cx - rc.cp[an - 1].paint[0]) > 1.0
+                        || fabs(cz - rc.cp[an - 1].paint[2]) > 1.0)
+                        bad = 1;
+                }
+                if (bad) acp_bad++;
+                acp_tracks++;
+            }
 
             /* THE MARKER'S GROUND IS THE FLOOR, NOT THE ROOF OVER IT.
              *
@@ -1911,6 +1970,9 @@ static void part2_checkpoints(void)
 
         ck(loaded == 10, "all ten packed tracks load (run from rccars_vita/)",
            "%d of 10", loaded);
+        ck(acp_tracks == 10 && acp_bad == 0,
+           "every checkpoint's graffiti is a batch of its own, on its own paint, "
+           "on all ten tracks", "%d of %d tracks wrong", acp_bad, acp_tracks);
         ck(cp_ground_n >= 45,
            "every track's checkpoints report a ground height",
            "%d checkpoints over %d tracks", cp_ground_n, loaded);
@@ -4558,6 +4620,13 @@ static void part6_fx(void)
  * joined strips across breaks survived the whole battery.
  */
 static float drive_x, drive_z, drive_yaw;
+/* THE BODY'S VELOCITY, which trace_step now reads: the engine lays nothing under
+   1 km/h of it and takes the mark's width across it. By default it is what the
+   drive actually does -- `step_m` a tick along the heading. A fixture that wants
+   the car to SLIDE sets drive_slip_deg, and the velocity is turned that far off
+   the heading while the car still moves along it (a sideways skid is the car
+   pointing one way and travelling another). */
+static float drive_slip_deg = 0.f;
 
 static int drive_trace2(trace_t *tr, rb_car *c, int steps, float step_m,
                         float curve_deg, int keep)
@@ -4579,9 +4648,18 @@ static int drive_trace2(trace_t *tr, rb_car *c, int steps, float step_m,
             c->hit[k].point[1] = 0.f;
             c->hit[k].point[2] = z + c->m[2] * lx + c->m[10] * lz;
         }
-        trace_step(tr, c, NULL, 1.f / 60.f);
-        x += c->m[8] * step_m;
-        z += c->m[10] * step_m;
+        {
+            double a = drive_slip_deg * 3.14159265358979 / 180.0;
+            float fx = c->m[8], fz = c->m[10];
+            float vx = (float)(fx * cos(a) + fz * sin(a));
+            float vz = (float)(-fx * sin(a) + fz * cos(a));
+            c->body.v[0] = vx * step_m * 60.f;
+            c->body.v[1] = 0.f;
+            c->body.v[2] = vz * step_m * 60.f;
+            trace_step(tr, c, NULL, 1.f / 60.f);
+            x += vx * step_m;
+            z += vz * step_m;
+        }
     }
     drive_x = x;
     drive_z = z;
@@ -4644,6 +4722,96 @@ static float mark_width_max(void)
             if (w > best) best = w;
         }
     return best;
+}
+
+/* ---------------------------------------------------------------- part 7b -- *
+ * TURNING ON THE SPOT, SLIDING, AND BACKING UP.
+ *
+ * Reported as "if turn almost on one place, wheel marks start acting weird".
+ * FUN_0052f310 answers all three from the CAR BODY's velocity (FUN_0050b6a0,
+ * phys+0x58e0): nothing under TRACE_MIN_KMH, the width across NORMAL x TRAVEL,
+ * and a strip that breaks when the car stops going forwards (param_6). The port
+ * marked at any speed and took the width off the AXLE, so a pivot painted a fan
+ * of slivers. Every expected value below is derived from the gate constant or
+ * from the geometry of the drive, not copied off a run.
+ */
+static int trace_quads_drawn(trace_t *tr, const float eye[3])
+{
+    gl_cap_reset();
+    trace_draw(tr, eye);
+    return tr->n_quads;
+}
+
+static void part7b_trace_pivot(void)
+{
+    static const char *tex[] = {"t_halfdry_tire2_1", "t_halfdry_tire2_2",
+                                "t_halfdry_tire2_3", "t_halfdry_tire2_4"};
+    scene_t *s = make_scene(tex, 4);
+    static const float eye[3] = {0.f, 0.f, 0.f};
+    trace_t tr;
+    rb_car c;
+    int used, q, d, i2, strips, k, last;
+    unsigned int seen[TRACE_RING];
+    double worst_cos = 0.0, worst_len_cos = 1.0;
+    float below = (TRACE_MIN_KMH * 0.9f) / 3.6f / 60.f;   /* metres a tick */
+    float above = (TRACE_MIN_KMH * 1.1f) / 3.6f / 60.f;
+
+    printf("\n-- part 7b: turning on the spot, sliding, backing up --\n");
+    trace_init(&tr, s);
+    fake_car(&c, 3.f, 0.f);
+    drive_slip_deg = 0.f;
+
+    /* 1. a pure pivot: the body does not travel, the wheels sweep a circle */
+    used = drive_trace(&tr, &c, 240, 0.f, 6.f);
+    q = trace_quads_drawn(&tr, eye);
+    ck(used == 0 && q == 0, "a car turning on the spot lays no mark",
+       "%d slots, %d quads after 240 ticks at 6 deg a tick", used, q);
+
+    /* 2. the gate is the body's speed, from both sides of it */
+    used = drive_trace(&tr, &c, 600, below, 3.f);
+    ck(used == 0, "  and nor does one creeping round at 0.9 of the km/h gate",
+       "%d slots", used);
+    used = drive_trace(&tr, &c, 600, above, 3.f);
+    ck(used > 0, "  but 1.1 of it marks", "%d slots", used);
+
+    /* 3. a sideways slide: pointing +Z, travelling +X at 3 m/s */
+    drive_slip_deg = 90.f;
+    drive_trace(&tr, &c, 120, 0.05f, 0.f);
+    drive_slip_deg = 0.f;
+    q = trace_quads_drawn(&tr, eye);
+    for (d = 0; d < glcap.n_draws; d++)
+        for (i2 = glcap.draws[d].first;
+             i2 + 5 < glcap.draws[d].first + glcap.draws[d].count; i2 += 6) {
+            float wx = glcap.pos[i2 + 1][0] - glcap.pos[i2][0];
+            float wz = glcap.pos[i2 + 1][2] - glcap.pos[i2][2];
+            float lx = glcap.pos[i2 + 2][0] - glcap.pos[i2 + 1][0];
+            float lz = glcap.pos[i2 + 2][2] - glcap.pos[i2 + 1][2];
+            double wl = sqrt((double)wx * wx + (double)wz * wz);
+            double ll = sqrt((double)lx * lx + (double)lz * lz);
+            if (wl > 1e-6 && fabs(wx) / wl > worst_cos) worst_cos = fabs(wx) / wl;
+            if (ll > 1e-6 && fabs(lx) / ll < worst_len_cos) worst_len_cos = fabs(lx) / ll;
+        }
+    ck(q > 0 && worst_cos < 0.01, "a sliding car's mark is as wide ACROSS its travel, not across its axle",
+       "%d quads, worst |cos(width, travel)| %.4f", q, worst_cos);
+    ck(q > 0 && worst_len_cos > 0.99, "  and each quad runs ALONG the travel -- no slivers",
+       "worst |cos(length, travel)| %.4f", worst_len_cos);
+
+    /* 4. forwards, then backwards down the same line: two strips, not one */
+    drive_trace(&tr, &c, 60, 0.05f, 0.f);
+    drive_trace2(&tr, &c, 60, -0.05f, 0.f, 1);
+    strips = 0; last = -1;
+    for (k = 0; k < TRACE_RING; k++) {
+        const trace_pt *p = &tr.w[2].pt[k];
+        int j, dup = 0;
+        if (!p->used) continue;
+        for (j = 0; j < strips; j++) if (seen[j] == p->strip) dup = 1;
+        if (!dup && strips < TRACE_RING) seen[strips++] = p->strip;
+        last = k;
+    }
+    (void)last;
+    ck(strips >= 2, "backing up starts a new strip -- param_6, the forwards flag",
+       "%d strip(s) on a rear wheel after 1 m forwards and 1 m back", strips);
+    (void)s;   /* fixture scaffolding, like part 7's own scene */
 }
 
 static void part7_trace(void)
@@ -6503,7 +6671,7 @@ static void part13_sun(void)
         if (glcap.draws[i].blend_src == GL_SRC_ALPHA
             && glcap.draws[i].blend_dst == GL_ONE_MINUS_SRC_ALPHA)
             n_alpha++;
-        if (glcap.draws[i].blend_src == GL_SRC_COLOR
+        if (glcap.draws[i].blend_src == GL_SRC_ALPHA
             && glcap.draws[i].blend_dst == GL_ONE)
             n_add++;
     }
@@ -6514,8 +6682,8 @@ static void part13_sun(void)
        "RGB while its alpha ramps",
        "%d of %d", n_alpha, glcap.n_draws);
     ck(n_add == 5,
-       "the five flare sprites ADD: flags 0xa0200005 mode 3 = SRCCOLOR/ONE, and "
-       "their alpha is 255 everywhere while the RGB ramps to black",
+       "the five flare sprites ADD: flags 0xa0200005 mode 3 = SRCALPHA/ONE "
+       "(esi = 5 at 0x0045c73e), their fade in the vertex alpha",
        "%d of %d", n_add, glcap.n_draws);
     ck(!glcap.draws[0].depth_mask,
        "nothing in the pass writes depth", "disc depth_mask=%d",
@@ -8333,6 +8501,7 @@ int main(void)
     part5_antenna();
     part6_fx();
     part7_trace();
+    part7b_trace_pivot();
     part8_envmap();
     part9_texquality();
     part10_culling();
